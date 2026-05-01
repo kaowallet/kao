@@ -165,11 +165,11 @@ impl ConnectTrezorScreen {
                 (Task::none(), None)
             }
             Message::BalanceFetched { hd_index, balance } => {
-                if let Stage::Picking { rows } = &mut self.stage {
-                    if let Some(r) = rows.iter_mut().find(|r| r.hd_index == hd_index) {
-                        r.fetching = false;
-                        r.balance = Some(balance);
-                    }
+                if let Stage::Picking { rows } = &mut self.stage
+                    && let Some(r) = rows.iter_mut().find(|r| r.hd_index == hd_index)
+                {
+                    r.fetching = false;
+                    r.balance = Some(balance);
                 }
                 (Task::none(), None)
             }

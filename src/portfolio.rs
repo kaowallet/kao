@@ -8,10 +8,11 @@
 //! WETH pool.
 
 use alloy::eips::BlockId;
-use alloy::primitives::{Address, Bytes, U256, keccak256};
+use alloy::primitives::{Address, Bytes, U256, address, keccak256};
 use alloy::providers::{Provider, RootProvider};
 use alloy::network::Ethereum;
-use std::str::FromStr;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{debug, trace, warn};
 
@@ -65,13 +66,13 @@ where
 
 // ── Uniswap V3 constants ────────────────────────────────────────────────────
 
-const WETH: &str = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2";
-const USDC: &str = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+const WETH: Address = address!("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2");
+const USDC: Address = address!("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
 
 /// Fee tier of the USDC/WETH pool used to derive ETH/USD.
 const ETH_PRICE_FEE: u32 = 500; // 0.05 %
 
-const UNISWAP_V3_FACTORY: &str = "0x1f98431c8ad98523631ae4a59f267346ea31f984";
+const UNISWAP_V3_FACTORY: Address = address!("0x1f98431c8ad98523631ae4a59f267346ea31f984");
 #[rustfmt::skip]
 const POOL_INIT_CODE_HASH: [u8; 32] = [
     0xe3, 0x4f, 0x19, 0x9b, 0x19, 0xb2, 0xb4, 0xf4,
@@ -93,7 +94,7 @@ enum PriceSource {
 struct TokenMeta {
     symbol: &'static str,
     name: &'static str,
-    address: &'static str,
+    address: Address,
     decimals: u8,
     logo_id: Option<&'static str>,
     price_source: PriceSource,
@@ -103,7 +104,7 @@ const TOKEN_LIST: &[TokenMeta] = &[
     TokenMeta {
         symbol: "USDC",
         name: "USD Coin",
-        address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+        address: address!("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
         decimals: 6,
         logo_id: Some("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
         price_source: PriceSource::UniswapWethPool { fee: 500 },
@@ -111,7 +112,7 @@ const TOKEN_LIST: &[TokenMeta] = &[
     TokenMeta {
         symbol: "USDT",
         name: "Tether",
-        address: "0xdac17f958d2ee523a2206206994597c13d831ec7",
+        address: address!("0xdac17f958d2ee523a2206206994597c13d831ec7"),
         decimals: 6,
         logo_id: None,
         price_source: PriceSource::UniswapWethPool { fee: 500 },
@@ -119,7 +120,7 @@ const TOKEN_LIST: &[TokenMeta] = &[
     TokenMeta {
         symbol: "WBTC",
         name: "Wrapped BTC",
-        address: "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599",
+        address: address!("0x2260fac5e5542a773aa44fbcfedf7c193bc2c599"),
         decimals: 8,
         logo_id: Some("0x2260fac5e5542a773aa44fbcfedf7c193bc2c599"),
         price_source: PriceSource::UniswapWethPool { fee: 3000 },
@@ -127,7 +128,7 @@ const TOKEN_LIST: &[TokenMeta] = &[
     TokenMeta {
         symbol: "WETH",
         name: "Wrapped Ether",
-        address: "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+        address: address!("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"),
         decimals: 18,
         logo_id: None,
         price_source: PriceSource::EthPeg,
@@ -135,7 +136,7 @@ const TOKEN_LIST: &[TokenMeta] = &[
     TokenMeta {
         symbol: "LINK",
         name: "Chainlink",
-        address: "0x514910771af9ca656af840dff83e8264ecf986ca",
+        address: address!("0x514910771af9ca656af840dff83e8264ecf986ca"),
         decimals: 18,
         logo_id: Some("0x514910771af9ca656af840dff83e8264ecf986ca"),
         price_source: PriceSource::UniswapWethPool { fee: 3000 },
@@ -143,7 +144,7 @@ const TOKEN_LIST: &[TokenMeta] = &[
     TokenMeta {
         symbol: "UNI",
         name: "Uniswap",
-        address: "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984",
+        address: address!("0x1f9840a85d5af5bf1d1762f925bdaddc4201f984"),
         decimals: 18,
         logo_id: None,
         price_source: PriceSource::UniswapWethPool { fee: 3000 },
@@ -151,7 +152,7 @@ const TOKEN_LIST: &[TokenMeta] = &[
     TokenMeta {
         symbol: "DAI",
         name: "Dai",
-        address: "0x6b175474e89094c44da98b954eedeac495271d0f",
+        address: address!("0x6b175474e89094c44da98b954eedeac495271d0f"),
         decimals: 18,
         logo_id: None,
         price_source: PriceSource::UniswapWethPool { fee: 3000 },
@@ -180,6 +181,18 @@ pub struct LiveToken {
     pub usd_price: f64,
     pub usd_value: f64,
     pub logo_id: Option<&'static str>,
+}
+
+// ── Cache ────────────────────────────────────────────────────────────────────
+
+/// In-memory portfolio cache keyed by owner address. Shared across the
+/// `App` and each `WalletScreen` rebuild so account switches can render the
+/// previously-fetched token list immediately while a fresh fetch refreshes
+/// it in the background. Process-lifetime only — cleared on app restart.
+pub type PortfolioCache = Arc<Mutex<HashMap<Address, Vec<LiveToken>>>>;
+
+pub fn new_cache() -> PortfolioCache {
+    Arc::new(Mutex::new(HashMap::new()))
 }
 
 // ── ERC-20 balance helpers ───────────────────────────────────────────────────
@@ -241,13 +254,12 @@ fn pool_address(token_a: Address, token_b: Address, fee: u32) -> Address {
     encoded[93] = ((fee >> 16) & 0xFF) as u8;
     encoded[94] = ((fee >> 8) & 0xFF) as u8;
     encoded[95] = (fee & 0xFF) as u8;
-    let salt = keccak256(&encoded);
+    let salt = keccak256(encoded);
 
     // CREATE2: keccak256(0xff ++ factory ++ salt ++ init_code_hash)[12..]
-    let factory = Address::from_str(UNISWAP_V3_FACTORY).expect("hardcoded factory");
     let mut buf = Vec::with_capacity(85);
     buf.push(0xff);
-    buf.extend_from_slice(factory.as_slice());
+    buf.extend_from_slice(UNISWAP_V3_FACTORY.as_slice());
     buf.extend_from_slice(salt.as_slice());
     buf.extend_from_slice(&POOL_INIT_CODE_HASH);
     let hash = keccak256(&buf);
@@ -308,13 +320,12 @@ fn eth_usd_from_sqrt_price(sqrt_price_x96: U256) -> f64 {
 /// Otherwise WETH is token0 (token is token1):
 ///   `token_in_eth = 10^(token_dec − 18) / raw_price`
 fn token_price_in_eth(sqrt_price_x96: U256, token_addr: Address, token_decimals: u8) -> f64 {
-    let weth = Address::from_str(WETH).expect("hardcoded WETH");
     let raw = sqrt_price_to_raw(sqrt_price_x96);
     if raw == 0.0 {
         return 0.0;
     }
     let dec_diff = token_decimals as i32 - 18;
-    if token_addr < weth {
+    if token_addr < WETH {
         // token is token0, WETH is token1
         raw * 10f64.powi(dec_diff)
     } else {
@@ -355,12 +366,10 @@ pub async fn fetch_portfolio(
     // 2. Fetch ERC-20 balances
     let mut erc20_balances: Vec<(usize, U256)> = Vec::new();
     for (i, token) in TOKEN_LIST.iter().enumerate() {
-        let contract = Address::from_str(token.address)
-            .map_err(|e| format!("bad address for {}: {e}", token.symbol))?;
         let label = format!("balanceOf({})", token.symbol);
         let outcome = with_rate_limit_retry(&label, || async {
             let tx = alloy::rpc::types::TransactionRequest::default()
-                .to(contract)
+                .to(token.address)
                 .input(alloy::rpc::types::TransactionInput::new(balance_of_calldata(owner)));
             provider.call(tx).block(block).await
         })
@@ -385,9 +394,7 @@ pub async fn fetch_portfolio(
     }
 
     // 3. ETH/USD price from the Uniswap V3 USDC/WETH pool
-    let weth_addr = Address::from_str(WETH).expect("hardcoded WETH");
-    let usdc_addr = Address::from_str(USDC).expect("hardcoded USDC");
-    let eth_price_pool = pool_address(usdc_addr, weth_addr, ETH_PRICE_FEE);
+    let eth_price_pool = pool_address(USDC, WETH, ETH_PRICE_FEE);
     let eth_usd = match read_sqrt_price(provider, eth_price_pool, block).await {
         Ok(sqrt) => {
             let price = eth_usd_from_sqrt_price(sqrt);
@@ -427,12 +434,10 @@ pub async fn fetch_portfolio(
         let price = match meta.price_source {
             PriceSource::EthPeg => eth_usd,
             PriceSource::UniswapWethPool { fee } => {
-                let token_addr =
-                    Address::from_str(meta.address).expect("hardcoded token address");
-                let pool = pool_address(token_addr, weth_addr, fee);
+                let pool = pool_address(meta.address, WETH, fee);
                 match read_sqrt_price(provider, pool, block).await {
                     Ok(sqrt) => {
-                        let in_eth = token_price_in_eth(sqrt, token_addr, meta.decimals);
+                        let in_eth = token_price_in_eth(sqrt, meta.address, meta.decimals);
                         let in_usd = in_eth * eth_usd;
                         trace!(
                             symbol = meta.symbol,
@@ -450,7 +455,6 @@ pub async fn fetch_portfolio(
             }
         };
         let (bal_str, bal_f64) = format_token_balance(*raw_balance, meta.decimals);
-        let contract_addr = Address::from_str(meta.address).expect("hardcoded token address");
         tokens.push(LiveToken {
             symbol: meta.symbol.into(),
             name: meta.name.into(),
@@ -458,7 +462,7 @@ pub async fn fetch_portfolio(
             balance_f64: bal_f64,
             balance_raw: *raw_balance,
             decimals: meta.decimals,
-            contract: Some(contract_addr),
+            contract: Some(meta.address),
             usd_price: price,
             usd_value: bal_f64 * price,
             logo_id: meta.logo_id,

@@ -281,6 +281,30 @@ fn filled_cell<'a>(t: KaoTheme, num: usize, word: &'a str) -> Element<'a, Messag
         .into()
 }
 
+fn blank_cell<'a>(t: KaoTheme, num: usize, input: Element<'a, Message>) -> Element<'a, Message> {
+    let inner = row![
+        text(format!("{num:>2}")).size(11).color(t.sub).font(mono()),
+        Space::new().width(6),
+        container(input).width(Length::Fill),
+    ]
+    .align_y(Alignment::Center);
+
+    container(inner)
+        .padding(Padding::from([2, 6]))
+        .width(Length::Fixed(120.0))
+        .style(move |_| container::Style {
+            background: Some(Background::Color(t.card_alt)),
+            border: Border {
+                color: t.border,
+                width: 1.0,
+                radius: Radius::from(10),
+            },
+            text_color: Some(t.text),
+            ..container::Style::default()
+        })
+        .into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,28 +418,4 @@ mod tests {
         let (_, outcome) = s.update(Message::WordSubmitted(last));
         assert!(matches!(outcome, Some(Outcome::Verified)));
     }
-}
-
-fn blank_cell<'a>(t: KaoTheme, num: usize, input: Element<'a, Message>) -> Element<'a, Message> {
-    let inner = row![
-        text(format!("{num:>2}")).size(11).color(t.sub).font(mono()),
-        Space::new().width(6),
-        container(input).width(Length::Fill),
-    ]
-    .align_y(Alignment::Center);
-
-    container(inner)
-        .padding(Padding::from([2, 6]))
-        .width(Length::Fixed(120.0))
-        .style(move |_| container::Style {
-            background: Some(Background::Color(t.card_alt)),
-            border: Border {
-                color: t.border,
-                width: 1.0,
-                radius: Radius::from(10),
-            },
-            text_color: Some(t.text),
-            ..container::Style::default()
-        })
-        .into()
 }

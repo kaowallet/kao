@@ -3,11 +3,11 @@
 //! Layout
 //! ------
 //! - `meta` table (`&str -> &[u8]`):
-//!   - `header`        : bincode of `Header` (version, salt, Argon2 params,
-//!                       authenticated check blob).
-//!   - `active_index`  : `u32` LE bytes; plaintext, since the index leaks
-//!                       nothing useful and we want `redb` range scans over
-//!                       account keys to remain cheap.
+//!   - `header`: bincode of `Header` (version, salt, Argon2 params,
+//!     authenticated check blob).
+//!   - `active_index`: `u32` LE bytes; plaintext, since the index leaks
+//!     nothing useful and we want `redb` range scans over
+//!     account keys to remain cheap.
 //! - `accounts` table (`u32 -> &[u8]`):
 //!   - value = `nonce(24) || ciphertext || tag(16)`. AAD binds the record to
 //!     its `redb` key (`b"accounts:" || key.to_le_bytes()`) so values can't

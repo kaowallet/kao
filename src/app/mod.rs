@@ -6,6 +6,7 @@ use secrecy::SecretString;
 use tracing::{debug, error, warn};
 
 use crate::net::{BalanceFetcher, NetworkClient};
+use crate::portfolio::{self, PortfolioCache};
 use crate::ui::connect_ledger::{
     ConnectLedgerScreen, Message as ConnectLedgerMessage, Outcome as ConnectLedgerOutcome,
 };
@@ -98,7 +99,10 @@ pub enum Screen {
     SelectHdAccount(SelectHdAccountScreen),
     ConnectLedger(ConnectLedgerScreen),
     ConnectTrezor(ConnectTrezorScreen),
-    Wallet(WalletScreen),
+    /// Boxed because `WalletScreen` is much larger than every other variant
+    /// (~700+ bytes vs tens). Without the indirection, every `mem::replace`
+    /// on `App::screen` would memcpy the full payload.
+    Wallet(Box<WalletScreen>),
 }
 
 // ── App ──────────────────────────────────────────────────────────────────────
@@ -135,6 +139,10 @@ pub struct App {
     /// process so the consensus sync only happens once. Held as a trait
     /// object so tests can substitute a deterministic mock.
     network: Arc<dyn BalanceFetcher>,
+    /// Process-lifetime portfolio cache keyed by address. The dashboard
+    /// reads it on construction (so account switches feel instant) and
+    /// writes through every successful fetch.
+    portfolio_cache: PortfolioCache,
 }
 
 impl App {
@@ -142,6 +150,7 @@ impl App {
         crate::settings::load();
         crate::net::refresh_auto_checkpoint();
         let network: Arc<dyn BalanceFetcher> = Arc::new(NetworkClient::new());
+        let portfolio_cache = portfolio::new_cache();
 
         if wallet::wallet_exists() {
             let app = App {
@@ -151,6 +160,7 @@ impl App {
                 setup_context: None,
                 pending_signer: None,
                 network,
+                portfolio_cache,
             };
             let task = focus_widget(crate::ui::unlock::PASSWORD_INPUT_ID).map(Message::Unlock);
             (app, task)
@@ -162,6 +172,7 @@ impl App {
                 setup_context: None,
                 pending_signer: None,
                 network,
+                portfolio_cache,
             };
             let task = focus_widget(crate::ui::create_password::PASSWORD_INPUT_ID)
                 .map(Message::CreatePassword);
@@ -197,19 +208,17 @@ impl App {
                     );
                 };
                 let new_address = wallet::account_address(&account);
-                if let Some(addr) = new_address {
-                    if wallet.contains_address(addr) {
-                        // Duplicate — refuse the add and put the wallet back.
-                        self.wallet = Some(wallet);
-                        let cancel = self.cancel_add_account();
-                        let warn = iced::Task::perform(
-                            async {
-                                "address already in wallet; not adding a duplicate".to_string()
-                            },
-                            Message::WalletError,
-                        );
-                        return iced::Task::batch(vec![warn, cancel]);
-                    }
+                if let Some(addr) = new_address
+                    && wallet.contains_address(addr)
+                {
+                    // Duplicate — refuse the add and put the wallet back.
+                    self.wallet = Some(wallet);
+                    let cancel = self.cancel_add_account();
+                    let warn = iced::Task::perform(
+                        async { "address already in wallet; not adding a duplicate".to_string() },
+                        Message::WalletError,
+                    );
+                    return iced::Task::batch(vec![warn, cancel]);
                 }
                 wallet.accounts.push(account);
                 wallet.active_index = wallet.accounts.len() - 1;
@@ -239,15 +248,20 @@ impl App {
             None => (Vec::new(), 0),
         };
         let started = std::time::Instant::now();
-        let screen =
-            WalletScreen::new(signer, accounts.clone(), active_index, self.network.clone());
+        let screen = WalletScreen::new(
+            signer,
+            accounts.clone(),
+            active_index,
+            self.network.clone(),
+            self.portfolio_cache.clone(),
+        );
         let address = screen.address_for_log();
         let balance_task = screen.fetch_balance_task().map(Message::WalletDashboard);
         let portfolio_task = screen.fetch_portfolio_task().map(Message::WalletDashboard);
         // Reverse-ENS lookup. No-ops when the active account is already
         // named, so account switches don't pile up redundant lookups.
         let ens_task = screen.fetch_ens_name_task().map(Message::WalletDashboard);
-        self.screen = Screen::Wallet(screen);
+        self.screen = Screen::Wallet(Box::new(screen));
         debug!(
             active_index,
             addr = %address,
@@ -362,17 +376,16 @@ impl App {
         // `into_signer()` would return a `KaoSigner::ViewOnly` placeholder
         // and the user would silently lose their real signer when the
         // broadcast task finished and tried to put it back.
-        if let Screen::Wallet(screen) = &self.screen {
-            if screen.is_send_busy() {
-                warn!("add-account refused: send in flight");
-                return iced::Task::perform(
-                    async {
-                        "transaction in flight; finish or cancel before adding an account"
-                            .to_string()
-                    },
-                    Message::WalletError,
-                );
-            }
+        if let Screen::Wallet(screen) = &self.screen
+            && screen.is_send_busy()
+        {
+            warn!("add-account refused: send in flight");
+            return iced::Task::perform(
+                async {
+                    "transaction in flight; finish or cancel before adding an account".to_string()
+                },
+                Message::WalletError,
+            );
         }
         // Take the signer out of the dashboard screen and stash it.
         let placeholder = Screen::SetupMethod(SetupMethodScreen::default());
@@ -813,9 +826,9 @@ impl App {
                 };
                 let (cmd, outcome) = screen.update(msg);
                 match outcome {
-                    Some(WalletDashboardOutcome::SwitchAccount(idx)) => self.switch_account(idx),
-                    Some(WalletDashboardOutcome::AddAccount) => self.begin_add_account(),
-                    Some(WalletDashboardOutcome::RenameActiveAccount(name)) => {
+                    Some(WalletDashboardOutcome::Switch(idx)) => self.switch_account(idx),
+                    Some(WalletDashboardOutcome::Add) => self.begin_add_account(),
+                    Some(WalletDashboardOutcome::RenameActive(name)) => {
                         let save = self.rename_active_account(name);
                         iced::Task::batch(vec![cmd.map(Message::WalletDashboard), save])
                     }
@@ -894,6 +907,33 @@ impl App {
 /// elapsed` near or above ~16ms appearing on the UI thread (look for
 /// `[switch] dashboard handoff scheduled in <large>`), the save has snuck
 /// back onto the iced event loop.
+fn save_descriptor_task(
+    descriptor: WalletDescriptor,
+    passphrase: SecretString,
+) -> iced::Task<Message> {
+    iced::Task::perform(
+        async move {
+            debug!("save descriptor: dispatching to spawn_blocking");
+            let started = std::time::Instant::now();
+            let join = tokio::task::spawn_blocking(move || {
+                let kdf_started = std::time::Instant::now();
+                let result = wallet::save_descriptor(&descriptor, &passphrase);
+                debug!(elapsed = ?kdf_started.elapsed(), "save descriptor: argon2+write finished");
+                result
+            })
+            .await;
+            let outcome = match join {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(join_err) => Err(format!("wallet save panicked: {join_err}")),
+            };
+            debug!(elapsed = ?started.elapsed(), ok = outcome.is_ok(), "save descriptor: done");
+            outcome
+        },
+        Message::WalletSaved,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -910,6 +950,7 @@ mod tests {
             setup_context: None,
             pending_signer: None,
             network,
+            portfolio_cache: portfolio::new_cache(),
         }
     }
 
@@ -1027,31 +1068,4 @@ mod tests {
         assert!(matches!(app.setup_context, Some(SetupContext::AddAccount)));
         assert!(matches!(app.screen, Screen::SetupMethod(_)));
     }
-}
-
-fn save_descriptor_task(
-    descriptor: WalletDescriptor,
-    passphrase: SecretString,
-) -> iced::Task<Message> {
-    iced::Task::perform(
-        async move {
-            debug!("save descriptor: dispatching to spawn_blocking");
-            let started = std::time::Instant::now();
-            let join = tokio::task::spawn_blocking(move || {
-                let kdf_started = std::time::Instant::now();
-                let result = wallet::save_descriptor(&descriptor, &passphrase);
-                debug!(elapsed = ?kdf_started.elapsed(), "save descriptor: argon2+write finished");
-                result
-            })
-            .await;
-            let outcome = match join {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(e)) => Err(e.to_string()),
-                Err(join_err) => Err(format!("wallet save panicked: {join_err}")),
-            };
-            debug!(elapsed = ?started.elapsed(), ok = outcome.is_ok(), "save descriptor: done");
-            outcome
-        },
-        Message::WalletSaved,
-    )
 }

@@ -224,10 +224,10 @@ mod tests {
         // test pins our reliance on the downstream validator: the Send flow
         // refuses zero amounts via `amount_units.is_zero()` regardless of
         // which branch alloy takes.
-        match parse_amount_units("0.0000001", 6) {
-            Ok(v) => assert!(v.is_zero(), "below-precision input must round to 0"),
-            Err(_) => {} // alternatively allowed
+        if let Ok(v) = parse_amount_units("0.0000001", 6) {
+            assert!(v.is_zero(), "below-precision input must round to 0");
         }
+        // Err is also allowed.
     }
 
     #[test]

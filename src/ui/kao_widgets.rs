@@ -522,13 +522,13 @@ pub fn colored_address<'a, M: 'a>(t: KaoTheme, addr: Address) -> Element<'a, M> 
     ]
     .spacing(0);
 
-    for i in 0..10 {
+    for (i, color) in chunk_colors.iter().enumerate() {
         let start = i * 4;
         let chunk = body[start..start + 4].to_string();
         spans = spans.push(
             text(chunk)
                 .size(14)
-                .color(chunk_colors[i])
+                .color(*color)
                 .font(mono_bold()),
         );
     }

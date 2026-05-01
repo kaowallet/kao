@@ -215,7 +215,7 @@ pub(super) fn format_usd(n: f64) -> String {
     let mut s = String::new();
     let digits: Vec<u8> = whole.abs().to_string().bytes().collect();
     for (i, b) in digits.iter().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             s.push(',');
         }
         s.push(*b as char);

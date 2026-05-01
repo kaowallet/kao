@@ -1,11 +1,11 @@
 //! Hardware-wallet connect screen for Ledger devices.
 //!
 //! Used in two modes:
-//!   - Setup    — first-run flow. Probes the device for 5 addresses and lets
-//!                the user pick which HD account to register.
-//!   - Reconnect — wallet was previously set up as Ledger; we already know
-//!                the saved path and just need to re-establish the USB
-//!                transport before entering the dashboard.
+//!     - Setup    — first-run flow. Probes the device for 5 addresses and lets
+//!                  the user pick which HD account to register.
+//!     - Reconnect — wallet was previously set up as Ledger; we already know
+//!                  the saved path and just need to re-establish the USB
+//!                  transport before entering the dashboard.
 
 use std::sync::Arc;
 
@@ -179,11 +179,11 @@ impl ConnectLedgerScreen {
                 (Task::none(), None)
             }
             Message::BalanceFetched { hd_index, balance } => {
-                if let Stage::Picking { rows } = &mut self.stage {
-                    if let Some(r) = rows.iter_mut().find(|r| r.hd_index == hd_index) {
-                        r.fetching = false;
-                        r.balance = Some(balance);
-                    }
+                if let Stage::Picking { rows } = &mut self.stage
+                    && let Some(r) = rows.iter_mut().find(|r| r.hd_index == hd_index)
+                {
+                    r.fetching = false;
+                    r.balance = Some(balance);
                 }
                 (Task::none(), None)
             }

@@ -150,7 +150,7 @@ impl WalletDescriptor {
     }
 
     pub fn contains_address(&self, target: Address) -> bool {
-        self.addresses().iter().any(|a| *a == target)
+        self.addresses().contains(&target)
     }
 }
 

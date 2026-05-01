@@ -43,7 +43,7 @@ use modal_chrome::ModalChrome;
 pub use nav::Nav;
 
 use crate::net::{BalanceFetcher, VerificationStatus};
-use crate::portfolio::LiveToken;
+use crate::portfolio::{LiveToken, PortfolioCache};
 use crate::settings;
 use crate::ui::kao_theme::{KaoTheme, ThemeKind};
 use crate::ui::kao_widgets::fill_style;
@@ -104,11 +104,11 @@ pub enum Message {
 /// Outcomes bubbled up to the parent app.
 #[derive(Debug, Clone)]
 pub enum Outcome {
-    SwitchAccount(usize),
-    AddAccount,
+    Switch(usize),
+    Add,
     /// User edited the active account's display name. Carries the new
     /// value (or `None` to clear back to the indexed default).
-    RenameActiveAccount(Option<String>),
+    RenameActive(Option<String>),
 }
 
 // ── State ───────────────────────────────────────────────────────────────────
@@ -163,6 +163,10 @@ pub struct WalletScreen {
     portfolio: Vec<LiveToken>,
     /// True while a portfolio fetch is in flight.
     portfolio_loading: bool,
+    /// Process-lifetime cache shared with `App` so switching back to a
+    /// previously-loaded account renders its tokens immediately while a
+    /// fresh fetch refreshes them in the background.
+    portfolio_cache: PortfolioCache,
     /// Inline rename draft for the active account. `Some(s)` means the
     /// header is showing the rename text input; `None` means it's showing
     /// the static name + pencil affordance.
@@ -175,8 +179,21 @@ impl WalletScreen {
         accounts: Vec<AccountDescriptor>,
         active_index: usize,
         network: Arc<dyn BalanceFetcher>,
+        portfolio_cache: PortfolioCache,
     ) -> Self {
         let address = signer.address();
+        // Seed from the cache when this address has been viewed before:
+        // the user sees their tokens immediately on switch and the
+        // background fetch (still kicked off by the App) refreshes
+        // values silently when it lands.
+        let cached = portfolio_cache
+            .lock()
+            .ok()
+            .and_then(|c| c.get(&address).cloned());
+        let (portfolio, portfolio_loading) = match cached {
+            Some(p) => (p, false),
+            None => (Vec::new(), true),
+        };
         Self {
             signer,
             address,
@@ -190,8 +207,9 @@ impl WalletScreen {
             network,
             verification: VerificationStatus::Connecting,
             settings_pane: SettingsPane::Root,
-            portfolio: Vec::new(),
-            portfolio_loading: true,
+            portfolio,
+            portfolio_loading,
+            portfolio_cache,
             rename_draft: None,
         }
     }
@@ -309,7 +327,12 @@ impl WalletScreen {
             Message::PortfolioFetched(result) => {
                 self.portfolio_loading = false;
                 match result {
-                    Ok(tokens) => self.portfolio = tokens,
+                    Ok(tokens) => {
+                        if let Ok(mut cache) = self.portfolio_cache.lock() {
+                            cache.insert(self.address, tokens.clone());
+                        }
+                        self.portfolio = tokens;
+                    }
                     Err(e) => warn!(error = %e, "portfolio fetch failed"),
                 }
             }
@@ -485,7 +508,7 @@ impl WalletScreen {
                 acc.set_name(Some(name.clone()));
                 // Bubble up so the App persists the rename to disk via
                 // its existing rename pipeline.
-                return (Task::none(), Some(Outcome::RenameActiveAccount(Some(name))));
+                return (Task::none(), Some(Outcome::RenameActive(Some(name))));
             }
             Message::ClipboardWritten => {}
             Message::OpenReceive => {
@@ -537,13 +560,13 @@ impl WalletScreen {
                     Some(account_dropdown::Outcome::Switch(idx)) => {
                         self.modal = Modal::None;
                         if idx != self.active_index && idx < self.accounts.len() {
-                            return (task, Some(Outcome::SwitchAccount(idx)));
+                            return (task, Some(Outcome::Switch(idx)));
                         }
                         return (task, None);
                     }
                     Some(account_dropdown::Outcome::Add) => {
                         self.modal = Modal::None;
-                        return (task, Some(Outcome::AddAccount));
+                        return (task, Some(Outcome::Add));
                     }
                     Some(account_dropdown::Outcome::Closed) => {
                         self.modal = Modal::None;
@@ -597,7 +620,7 @@ impl WalletScreen {
                 if let Some(acc) = self.accounts.get_mut(self.active_index) {
                     acc.set_name(cleaned.clone());
                 }
-                return (Task::none(), Some(Outcome::RenameActiveAccount(cleaned)));
+                return (Task::none(), Some(Outcome::RenameActive(cleaned)));
             }
             Message::CancelRename => {
                 self.rename_draft = None;

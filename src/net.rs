@@ -167,13 +167,10 @@ impl NetworkClient {
         let snapshot = current_snapshot();
         let mut s = self.state.lock().await;
 
-        let needs_rebuild = match (&s.client, &s.built_with) {
-            (Some(_), Some(prev)) => prev != &snapshot,
-            _ => true,
-        };
-
-        if !needs_rebuild {
-            return Ok(s.client.clone().expect("checked Some above"));
+        if let (Some(client), Some(prev)) = (&s.client, &s.built_with)
+            && prev == &snapshot
+        {
+            return Ok(client.clone());
         }
 
         if snapshot.rpcs.is_empty() {

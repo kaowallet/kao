@@ -30,8 +30,8 @@ const NAME_INPUT_ID: &str = "contacts:name";
 
 use crate::ui::kao_theme::KaoTheme;
 use crate::ui::kao_widgets::{
-    black, bold, card_style, colored_address, kao_scrollable_style, mono, primary_button,
-    secondary_button, small_secondary_button, text_input_style,
+    black, bold, card_style, colored_address, hover_tint, kao_scrollable_style, mono,
+    primary_button, secondary_button, small_secondary_button, text_input_style,
 };
 use crate::wallet::{Contact, ContactEns, ContactsBook, short_address};
 
@@ -1065,9 +1065,7 @@ fn small_danger_button<'a>(t: KaoTheme, label: &'a str) -> button::Button<'a, Me
         .padding(Padding::from([4, 10]))
         .style(move |_theme, status| button::Style {
             background: Some(Background::Color(match status {
-                button::Status::Hovered | button::Status::Pressed => {
-                    crate::ui::kao_theme::with_alpha(t.down, 0.14)
-                }
+                button::Status::Hovered | button::Status::Pressed => hover_tint(t.card_alt, t.down),
                 _ => t.card_alt,
             })),
             text_color: t.down,

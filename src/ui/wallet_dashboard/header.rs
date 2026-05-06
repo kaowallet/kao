@@ -8,7 +8,9 @@ use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
 use crate::net::VerificationStatus;
 use crate::ui::kao_theme::{KaoTheme, with_alpha};
-use crate::ui::kao_widgets::{black, bold, kao_text, mono, mono_bold, text_input_style, verification_badge};
+use crate::ui::kao_widgets::{
+    black, bold, hover_tint, kao_text, mono, mono_bold, text_input_style, verification_badge,
+};
 use crate::wallet::short_address;
 
 use super::{MOOD, Message};
@@ -113,7 +115,9 @@ fn static_name<'a>(t: KaoTheme, display_name: String) -> Element<'a, Message> {
         .on_press(Message::BeginRenameAccount)
         .style(move |_theme, status| button::Style {
             background: Some(Background::Color(match status {
-                button::Status::Hovered | button::Status::Pressed => with_alpha(t.text, 0.06),
+                button::Status::Hovered | button::Status::Pressed => {
+                    hover_tint(Color::TRANSPARENT, t.text)
+                }
                 _ => Color::TRANSPARENT,
             })),
             text_color: t.sub,
@@ -142,13 +146,16 @@ fn rename_input<'a>(t: KaoTheme, draft: &'a str) -> Element<'a, Message> {
         .width(Length::Fixed(220.0))
         .style(move |_theme, status| text_input_style(t, status));
 
+    let commit_idle = with_alpha(t.up, 0.08);
     let commit = button(text("✓").size(13).color(t.up).font(black()))
         .padding(Padding::from([3, 8]))
         .on_press(Message::CommitRename)
         .style(move |_theme, status| button::Style {
             background: Some(Background::Color(match status {
-                button::Status::Hovered | button::Status::Pressed => with_alpha(t.up, 0.16),
-                _ => with_alpha(t.up, 0.08),
+                button::Status::Hovered | button::Status::Pressed => {
+                    hover_tint(commit_idle, t.up)
+                }
+                _ => commit_idle,
             })),
             text_color: t.up,
             border: Border {
@@ -164,7 +171,9 @@ fn rename_input<'a>(t: KaoTheme, draft: &'a str) -> Element<'a, Message> {
         .on_press(Message::CancelRename)
         .style(move |_theme, status| button::Style {
             background: Some(Background::Color(match status {
-                button::Status::Hovered | button::Status::Pressed => with_alpha(t.text, 0.08),
+                button::Status::Hovered | button::Status::Pressed => {
+                    hover_tint(Color::TRANSPARENT, t.text)
+                }
                 _ => Color::TRANSPARENT,
             })),
             text_color: t.sub,

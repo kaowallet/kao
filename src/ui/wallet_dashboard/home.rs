@@ -8,8 +8,8 @@ use crate::chain::Chain;
 use crate::portfolio::LiveToken;
 use crate::ui::kao_theme::{KaoTheme, mix, with_alpha};
 use crate::ui::kao_widgets::{
-    bold, card_style, kao_fit, kao_scrollable_style, kao_text, kaomoji_for_index, mono,
-    mono_black, mono_bold, token_avatar,
+    bold, card_style, hover_fill, kao_fit, kao_scrollable_style, kao_text, kaomoji_for_index,
+    mono, mono_black, mono_bold, token_avatar,
 };
 use crate::wallet::KaoSigner;
 
@@ -150,7 +150,7 @@ fn quick_action<'a>(
     .width(Length::Fill)
     .style(move |_theme, status| button::Style {
         background: Some(Background::Color(match status {
-            button::Status::Hovered | button::Status::Pressed => mix(bg, accent, 0.06),
+            button::Status::Hovered | button::Status::Pressed => hover_fill(bg, accent),
             _ => bg,
         })),
         text_color: accent,

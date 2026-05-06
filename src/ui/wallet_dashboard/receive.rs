@@ -8,8 +8,8 @@ use iced::keyboard;
 use iced::widget::{Space, button, column, container, qr_code, text};
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Subscription, Task};
 
-use crate::ui::kao_theme::{KaoTheme, mix};
-use crate::ui::kao_widgets::{black, kao_fit, modal_wrapper, mono};
+use crate::ui::kao_theme::KaoTheme;
+use crate::ui::kao_widgets::{black, hover_fill, kao_fit, modal_wrapper, mono};
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -146,7 +146,7 @@ impl ReceivePane {
         .style(move |_theme, status| button::Style {
             background: Some(Background::Color(match status {
                 button::Status::Hovered | button::Status::Pressed => {
-                    mix(btn_bg, Color::WHITE, 0.08)
+                    hover_fill(btn_bg, Color::WHITE)
                 }
                 _ => btn_bg,
             })),

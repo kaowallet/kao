@@ -197,6 +197,34 @@ pub fn kao_scrollable_style(t: KaoTheme, status: scrollable::Status) -> scrollab
 
 // ── Buttons ────────────────────────────────────────────────────────────────
 
+/// Canonical hover background for a solid-fill button (primary action,
+/// large copy/CTA buttons, quick-action chips). Lightens `idle` toward
+/// `fg` by 10% — strong enough to read on a saturated accent fill.
+///
+/// Pair with [`hover_tint`] on chip/outline/transparent buttons. Two
+/// intensities are intentional: filled buttons need more lift to feel
+/// like they responded, while tinted chips at 0.10 read as alarming.
+pub fn hover_fill(idle: Color, fg: Color) -> Color {
+    mix(idle, fg, 0.10)
+}
+
+/// Canonical hover background for a chip / outlined / icon / link
+/// button. Tints `idle` toward `intent` by 8%. `intent` is the label's
+/// color (`t.text` for neutral, `t.down` for destructive, `t.up` for
+/// confirm) so a destructive hover tints red without reading louder
+/// than a neutral one.
+///
+/// When `idle` is fully transparent (e.g. plain text-only icon
+/// buttons), falls back to an alpha tint of `intent` since mixing
+/// against transparent produces a near-invisible result.
+pub fn hover_tint(idle: Color, intent: Color) -> Color {
+    if idle.a < 0.01 {
+        with_alpha(intent, 0.08)
+    } else {
+        mix(idle, intent, 0.08)
+    }
+}
+
 pub fn primary_button<'a, M: Clone + 'a>(
     t: KaoTheme,
     label: &'a str,
@@ -213,7 +241,7 @@ pub fn primary_button<'a, M: Clone + 'a>(
     .width(Length::Fill)
     .style(move |_theme, status| button::Style {
         background: Some(Background::Color(match status {
-            button::Status::Hovered | button::Status::Pressed if enabled => mix(bg, fg, 0.1),
+            button::Status::Hovered | button::Status::Pressed if enabled => hover_fill(bg, fg),
             _ => bg,
         })),
         text_color: fg,
@@ -236,7 +264,7 @@ pub fn secondary_button<'a, M: Clone + 'a>(t: KaoTheme, label: &'a str) -> butto
     .width(Length::Fill)
     .style(move |_theme, status| button::Style {
         background: Some(Background::Color(match status {
-            button::Status::Hovered | button::Status::Pressed => mix(t.card_alt, t.text, 0.06),
+            button::Status::Hovered | button::Status::Pressed => hover_tint(t.card_alt, t.text),
             _ => t.card_alt,
         })),
         text_color: t.text,
@@ -260,7 +288,7 @@ pub fn small_secondary_button<'a, M: Clone + 'a>(
         .padding(Padding::from([4, 10]))
         .style(move |_theme, status| button::Style {
             background: Some(Background::Color(match status {
-                button::Status::Hovered | button::Status::Pressed => mix(t.card_alt, t.text, 0.06),
+                button::Status::Hovered | button::Status::Pressed => hover_tint(t.card_alt, t.text),
                 _ => t.card_alt,
             })),
             text_color: t.text,
@@ -280,7 +308,9 @@ pub fn link_button<'a, M: Clone + 'a>(t: KaoTheme, label: &'a str) -> button::Bu
         .padding(Padding::from([6, 10]))
         .style(move |_theme, status| button::Style {
             background: Some(Background::Color(match status {
-                button::Status::Hovered | button::Status::Pressed => with_alpha(t.text, 0.06),
+                button::Status::Hovered | button::Status::Pressed => {
+                    hover_tint(Color::TRANSPARENT, t.text)
+                }
                 _ => Color::TRANSPARENT,
             })),
             text_color: t.sub,

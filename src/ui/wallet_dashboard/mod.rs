@@ -1406,7 +1406,26 @@ fn compute_max_amount(tk: &LiveToken, p: &SendPane) -> String {
     } else {
         raw
     };
-    format_units(max_raw, tk.decimals).unwrap_or_else(|_| tk.balance.replace(',', ""))
+    let raw_str =
+        format_units(max_raw, tk.decimals).unwrap_or_else(|_| tk.balance.replace(',', ""));
+    trim_trailing_decimal_zeros(&raw_str)
+}
+
+/// Strip trailing zeros (and the dangling decimal point) from a decimal
+/// string. `format_units` always pads to `decimals` fractional digits, so
+/// "1.000000000000000000" comes back from a 1 ETH balance — pumping that
+/// into the amount input shows the user a wall of zeros after the value
+/// they actually care about.
+fn trim_trailing_decimal_zeros(s: &str) -> String {
+    if !s.contains('.') {
+        return s.to_string();
+    }
+    let trimmed = s.trim_end_matches('0').trim_end_matches('.');
+    if trimmed.is_empty() {
+        "0".into()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Spawn a forward ENS resolution task for the Send recipient input.
@@ -1688,5 +1707,17 @@ mod tests {
         );
         // Sanity: the initial active-address response did clear it.
         assert!(!baseline_loading);
+    }
+
+    #[test]
+    fn trim_trailing_decimal_zeros_strips_padding() {
+        // `format_units` pads to `decimals`; "1 ETH" comes back with 18
+        // trailing zeros. The amount-input must show "1", not the wall.
+        assert_eq!(trim_trailing_decimal_zeros("1.000000000000000000"), "1");
+        assert_eq!(trim_trailing_decimal_zeros("0.500000000000000000"), "0.5");
+        assert_eq!(trim_trailing_decimal_zeros("0.000000000000000000"), "0");
+        // Non-trailing zeros and integer-only inputs are preserved.
+        assert_eq!(trim_trailing_decimal_zeros("0.123456789012"), "0.123456789012");
+        assert_eq!(trim_trailing_decimal_zeros("42"), "42");
     }
 }

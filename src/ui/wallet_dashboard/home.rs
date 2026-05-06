@@ -234,7 +234,7 @@ pub(super) fn format_usd(n: f64) -> String {
 /// on an L2. Mainnet entries stay bare ("USDC"); L2 entries get a
 /// suffix ("USDC (Base)", "ETH (Optimism)") so a portfolio that spans
 /// chains is unambiguous at a glance without a separate chain column.
-fn format_symbol(symbol: &str, chain: Chain) -> String {
+pub(super) fn format_symbol(symbol: &str, chain: Chain) -> String {
     match chain {
         Chain::Mainnet => symbol.to_string(),
         Chain::Base | Chain::Optimism => format!("{symbol} ({})", chain.label()),

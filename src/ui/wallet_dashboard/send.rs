@@ -25,6 +25,7 @@ use crate::ui::kao_widgets::{
     secondary_button, text_input_style,
 };
 use crate::ui::wallet_dashboard::function_panel;
+use super::home::format_symbol;
 use crate::wallet::tx::{SendPlan, SendToken, TxQuote, parse_amount_units};
 use crate::wallet::{Contact, ContactsBook};
 
@@ -909,7 +910,9 @@ impl SendPane {
 
         let token = portfolio.get(self.token_idx);
         let token_bal = token.map(|t| t.balance.as_str()).unwrap_or("0");
-        let token_sym = token.map(|t| t.symbol.as_str()).unwrap_or("ETH");
+        let token_sym_with_chain = token
+            .map(|t| format_symbol(&t.symbol, t.chain))
+            .unwrap_or_else(|| "ETH".into());
         let amount_input = text_input("0.00", &self.amount)
             .on_input(Message::SetAmount)
             .padding(14)
@@ -948,7 +951,7 @@ impl SendPane {
         };
 
         let bal_line = row![
-            text(format!("Balance: {} {}", token_bal, token_sym))
+            text(format!("Balance: {} {}", token_bal, token_sym_with_chain))
                 .size(12)
                 .color(t.sub),
             Space::new().width(Length::Fill),
@@ -994,10 +997,16 @@ impl SendPane {
         let active = i == self.token_idx;
         let border_col = if active { t.a1 } else { t.border };
         let bg = if active { t.ab1 } else { t.card };
+        // Always render the chain label below the symbol. The portfolio
+        // can carry the same symbol on multiple chains (USDC on Mainnet
+        // and Base, ETH on Mainnet and Optimism); without a chain line
+        // those tabs are visually identical and clicking the wrong one
+        // sends on the wrong network.
         let inner = column![
             kao_text(t, kaomoji_for_index(i), 11.0),
             Space::new().height(1),
             text(&tk.symbol).size(12).color(t.text).font(bold()),
+            text(tk.chain.label()).size(9).color(t.sub).font(mono()),
         ]
         .align_x(Alignment::Center)
         .spacing(0);

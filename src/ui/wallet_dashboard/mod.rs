@@ -7,12 +7,13 @@
 
 use std::mem;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alloy::primitives::{Address, TxHash};
+use iced::border::Radius;
 use iced::widget::operation::focus as focus_widget;
-use iced::widget::{column, container, row, stack};
-use iced::{Element, Length, Subscription, Task};
+use iced::widget::{Space, column, container, row, stack, text};
+use iced::{Alignment, Background, Border, Element, Length, Padding, Subscription, Task};
 use tracing::{debug, info, warn};
 
 mod account_dropdown;
@@ -49,6 +50,11 @@ pub(super) const MOOD: &str = "(´｡• ᵕ •｡`)";
 /// enough that providers without server-side paging stay responsive.
 const HISTORY_LIMIT: usize = 50;
 
+/// How long after a copy we wait before nuking the clipboard. Doubles as
+/// the lifetime of the bottom-right "autoclear in N…" chip — the chip's
+/// progress bar fills this whole duration.
+const CLIPBOARD_CLEAR_SECS: u64 = 10;
+
 use modal_chrome::ModalChrome;
 pub use nav::Nav;
 
@@ -57,7 +63,8 @@ use crate::net::{BalanceFetcher, VerificationStatus};
 use crate::portfolio::{LiveToken, PortfolioCache};
 use crate::settings;
 use crate::ui::kao_theme::{KaoTheme, ThemeKind};
-use crate::ui::kao_widgets::fill_style;
+use crate::ui::kao_theme::with_alpha;
+use crate::ui::kao_widgets::{fill_style, mono};
 use crate::wallet::tx::SendPlan;
 use crate::wallet::{
     AccountDescriptor, Contact, ContactsBook, KaoSigner, SignerHandoff, handoff_with,
@@ -147,6 +154,20 @@ pub enum Message {
     },
     /// Side-effect ack from a clipboard write. No-op handler.
     ClipboardWritten,
+    /// Auto-clear timer fired. Carries the generation it was armed
+    /// against; if a fresher copy bumped the counter, this dispatches
+    /// nothing and returns. Otherwise it kicks the ownership-check
+    /// `clipboard::read` so we don't clobber unrelated content the user
+    /// copied after the wallet's copy.
+    ClipboardClearArmed { generation: u64 },
+    /// Result of the ownership check. Clears the system clipboard only
+    /// when its current contents still match what the wallet wrote
+    /// (guards against the user copying a phone number five seconds
+    /// later and having it nuked at second ten).
+    ClipboardClearProbe {
+        generation: u64,
+        actual: Option<String>,
+    },
 }
 
 /// Outcomes bubbled up to the parent app.
@@ -236,6 +257,33 @@ pub struct WalletScreen {
     /// `Arc<RwLock<…>>` so a contact edit is visible everywhere on the
     /// next view tick without rebuilding the dashboard.
     contacts: Arc<RwLock<ContactsBook>>,
+    /// Active clipboard auto-clear, set when the user copies anything
+    /// from a child modal (Send, TxDetails). Drives the bottom-right
+    /// countdown chip and the deferred ownership-checked clear.
+    clipboard_clear: Option<ClipboardClearState>,
+    /// Monotonic counter bumped on every fresh copy so a stale
+    /// `ClipboardClearArmed` / `ClipboardClearProbe` from an older arm
+    /// can't clobber the chip or the clipboard.
+    clipboard_clear_gen: u64,
+}
+
+/// Tracks an in-flight clipboard auto-clear: when it lands, what we
+/// wrote so the ownership check can decide whether to clear, and the
+/// generation the timer was armed against for stale-task dispatch.
+#[derive(Debug, Clone)]
+struct ClipboardClearState {
+    /// What the wallet wrote into the system clipboard. Compared
+    /// against the live clipboard contents at probe time — if they
+    /// differ, the user copied something else after us and we leave
+    /// their content alone.
+    expected: String,
+    /// Wall-clock instant the clear is scheduled to fire. The corner
+    /// chip subtracts `Instant::now()` from this each frame to draw the
+    /// countdown text and the progress bar.
+    deadline: Instant,
+    /// Generation tag matched by the ack messages. Bumped on every
+    /// fresh copy so a stale arm can't fire after a newer one.
+    generation: u64,
 }
 
 impl WalletScreen {
@@ -287,6 +335,8 @@ impl WalletScreen {
             history: Vec::new(),
             history_loading: true,
             contacts,
+            clipboard_clear: None,
+            clipboard_clear_gen: 0,
         }
     }
 
@@ -295,6 +345,33 @@ impl WalletScreen {
     /// and wants to park the signer to return cheaply later.
     pub fn into_signer(self) -> KaoSigner {
         self.signer
+    }
+
+    /// Write `text` to the system clipboard and arm the deferred clear.
+    /// Bumps the generation counter so any older arm fires stale and
+    /// no-ops. The returned task batches the write itself with a
+    /// `tokio::time::sleep` that emits `ClipboardClearArmed` once the
+    /// deadline passes — the ownership check happens at that point, not
+    /// here.
+    fn arm_clipboard_clear(&mut self, text: String) -> Task<Message> {
+        self.clipboard_clear_gen = self.clipboard_clear_gen.wrapping_add(1);
+        let generation = self.clipboard_clear_gen;
+        self.clipboard_clear = Some(ClipboardClearState {
+            expected: text.clone(),
+            deadline: Instant::now() + Duration::from_secs(CLIPBOARD_CLEAR_SECS),
+            generation,
+        });
+        let timer = Task::perform(
+            async move {
+                tokio::time::sleep(Duration::from_secs(CLIPBOARD_CLEAR_SECS)).await;
+                generation
+            },
+            |generation| Message::ClipboardClearArmed { generation },
+        );
+        Task::batch([
+            iced::clipboard::write(text).map(|_: ()| Message::ClipboardWritten),
+            timer,
+        ])
     }
 
     /// True while a send is in flight (the signer has been moved into a
@@ -699,8 +776,7 @@ impl WalletScreen {
                         return (Task::batch([task, ens_task]), None);
                     }
                     Some(send::Outcome::CopyText(s)) => {
-                        let copy_task =
-                            iced::clipboard::write(s).map(|_: ()| Message::ClipboardWritten);
+                        let copy_task = self.arm_clipboard_clear(s);
                         return (Task::batch([task, copy_task, ens_task]), None);
                     }
                     Some(send::Outcome::SaveAsContact { address, ens }) => {
@@ -795,6 +871,40 @@ impl WalletScreen {
                 return (Task::none(), Some(Outcome::RenameActive(Some(name))));
             }
             Message::ClipboardWritten => {}
+            Message::ClipboardClearArmed { generation } => {
+                // Stale arm — a fresher copy bumped the counter — drop.
+                if self
+                    .clipboard_clear
+                    .as_ref()
+                    .is_none_or(|s| s.generation != generation)
+                {
+                    return (Task::none(), None);
+                }
+                // Read the live clipboard so the next handler can decide
+                // whether the value is still ours. Doing the check at
+                // probe time (instead of unconditionally clearing) keeps
+                // us from clobbering content the user copied in the
+                // meantime from outside the wallet.
+                let task = iced::clipboard::read()
+                    .map(move |actual| Message::ClipboardClearProbe { generation, actual });
+                return (task, None);
+            }
+            Message::ClipboardClearProbe { generation, actual } => {
+                let Some(state) = &self.clipboard_clear else {
+                    return (Task::none(), None);
+                };
+                if state.generation != generation {
+                    return (Task::none(), None);
+                }
+                let still_ours = actual.as_deref() == Some(state.expected.as_str());
+                self.clipboard_clear = None;
+                if still_ours {
+                    let clear = iced::clipboard::write(String::new())
+                        .map(|_: ()| Message::ClipboardWritten);
+                    return (clear, None);
+                }
+                return (Task::none(), None);
+            }
             Message::OpenReceive => {
                 self.modal = Modal::Receive(ReceivePane::new(self.address));
                 self.chrome.open();
@@ -856,8 +966,7 @@ impl WalletScreen {
                         return (task, None);
                     }
                     Some(tx_details::Outcome::CopyText(s)) => {
-                        let copy = iced::clipboard::write(s)
-                            .map(|_: ()| Message::ClipboardWritten);
+                        let copy = self.arm_clipboard_clear(s);
                         return (Task::batch([task, copy]), None);
                     }
                     None => return (task, None),
@@ -1036,13 +1145,15 @@ impl WalletScreen {
             SettingsPane::Contacts(p) => subs.push(p.subscription().map(Message::Contacts)),
             _ => {}
         }
-        if self.chrome.is_animating() {
+        if self.chrome.is_animating() || self.clipboard_clear.is_some() {
             // `time::every` actively drives ticks (and therefore redraws)
             // on a timer; `window::frames()` only observes redraws the
             // runtime already decided to do, which left the animation idle
             // between unrelated events. 16 ms (~60 Hz) is plenty for the
             // 220 ms ease — going faster just burns CPU during the modal
-            // open/close transition.
+            // open/close transition. The clipboard countdown chip rides
+            // the same subscription so its progress bar animates smoothly
+            // for the 10-second auto-clear window.
             subs.push(iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick));
         }
         Subscription::batch(subs)
@@ -1077,7 +1188,7 @@ impl WalletScreen {
             Err(_) => send::ContactsView::default(),
         };
 
-        match &self.modal {
+        let composed: Element<'_, Message> = match &self.modal {
             Modal::None => background,
             Modal::Send(p) => stack![
                 background,
@@ -1113,6 +1224,16 @@ impl WalletScreen {
                 ]
                 .into()
             }
+        };
+
+        // Bottom-right clipboard auto-clear chip rides on top of
+        // whatever modal layer is currently visible. The chip is a
+        // pointer-event sink only over its own card area; the rest of
+        // the overlay is `Space`, so clicks on the screen below pass
+        // through to the active modal/dashboard.
+        match &self.clipboard_clear {
+            None => composed,
+            Some(state) => stack![composed, clipboard_clear_chip(t, state)].into(),
         }
     }
 
@@ -1166,6 +1287,107 @@ impl WalletScreen {
     }
 
 
+}
+
+// ── Clipboard auto-clear chip ──────────────────────────────────────────────
+
+/// Bottom-right chip rendered while the clipboard auto-clear is armed.
+/// Two stacked rows: the countdown text on top, a thin progress bar
+/// below. The bar drains as time elapses; when the bar reaches zero
+/// the `ClipboardClearArmed` task fires, the ownership check runs, and
+/// the clipboard is cleared if its contents still match what we wrote.
+fn clipboard_clear_chip<'a>(
+    t: KaoTheme,
+    state: &'a ClipboardClearState,
+) -> Element<'a, Message> {
+    let now = Instant::now();
+    let total = Duration::from_secs(CLIPBOARD_CLEAR_SECS);
+    let remaining = state.deadline.saturating_duration_since(now);
+    // `as_secs()` truncates; the +1 unless exactly on a second boundary
+    // means the user reads "10…" the moment the chip lands and
+    // counts down through "1…" for the final second instead of seeing
+    // a flash of "0…" before the chip disappears.
+    let secs_label = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
+    let fraction = (remaining.as_secs_f32() / total.as_secs_f32()).clamp(0.0, 1.0);
+
+    // Custom progress bar built from two fixed-width inner containers
+    // in a row so we can theme it without leaning on the iced default.
+    // 160 px is wide enough to read at-a-glance and narrow enough that
+    // the chip stays compact on small windows.
+    const BAR_WIDTH: f32 = 160.0;
+    const BAR_HEIGHT: f32 = 4.0;
+    let filled_px = BAR_WIDTH * fraction;
+    let rest_px = BAR_WIDTH - filled_px;
+    let filled = container(Space::new())
+        .width(Length::Fixed(filled_px))
+        .height(Length::Fixed(BAR_HEIGHT))
+        .style(move |_| container::Style {
+            background: Some(Background::Color(t.a1)),
+            border: Border {
+                color: iced::Color::TRANSPARENT,
+                width: 0.0,
+                radius: Radius::from(2),
+            },
+            ..container::Style::default()
+        });
+    let rest = container(Space::new())
+        .width(Length::Fixed(rest_px))
+        .height(Length::Fixed(BAR_HEIGHT))
+        .style(move |_| container::Style {
+            background: Some(Background::Color(with_alpha(t.border, 0.6))),
+            border: Border {
+                color: iced::Color::TRANSPARENT,
+                width: 0.0,
+                radius: Radius::from(2),
+            },
+            ..container::Style::default()
+        });
+    let bar = row![filled, rest]
+        .width(Length::Fixed(BAR_WIDTH))
+        .align_y(Alignment::Center);
+
+    let label = text(format!("autoclear in {secs_label}…"))
+        .size(11)
+        .color(t.sub)
+        .font(mono());
+
+    let card = container(
+        column![
+            row![text("📋").size(11), Space::new().width(6), label]
+                .align_y(Alignment::Center),
+            Space::new().height(6),
+            bar,
+        ]
+        .width(Length::Shrink),
+    )
+    .padding(Padding::from([8, 12]))
+    .style(move |_| container::Style {
+        background: Some(Background::Color(t.card_alt)),
+        border: Border {
+            color: with_alpha(t.border, 0.7),
+            width: 1.0,
+            radius: Radius::from(10),
+        },
+        text_color: Some(t.text),
+        ..container::Style::default()
+    });
+
+    // Pin to bottom-right: column[Space::Fill, row[Space::Fill, card]]
+    // with 16 px of breathing room on the right and bottom edges.
+    let bottom_row = row![
+        Space::new().width(Length::Fill),
+        card,
+        Space::new().width(16),
+    ]
+    .width(Length::Fill);
+    column![
+        Space::new().height(Length::Fill),
+        bottom_row,
+        Space::new().height(16),
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
 }
 
 // ── Send-flow helpers ──────────────────────────────────────────────────────

@@ -1,12 +1,17 @@
 use std::sync::{Arc, RwLock};
 
+use iced::border::Radius;
 use iced::widget::operation::focus as focus_widget;
-use iced::{Element, Subscription};
+use iced::widget::{Space, column, container, mouse_area, row, stack, text};
+use iced::{Alignment, Background, Border, Element, Length, Padding, Subscription};
 use secrecy::SecretString;
 use tracing::{debug, error, warn};
 
 use crate::net::{BalanceFetcher, NetworkClient};
 use crate::portfolio::{self, PortfolioCache};
+use crate::settings;
+use crate::ui::kao_theme::{KaoTheme, with_alpha};
+use crate::ui::kao_widgets::bold;
 use crate::ui::connect_ledger::{
     ConnectLedgerScreen, Message as ConnectLedgerMessage, Outcome as ConnectLedgerOutcome,
 };
@@ -85,6 +90,11 @@ pub enum Message {
     /// save was dispatched.
     ContactsSaved(Result<(), String>),
     WalletError(String),
+    /// Auto-dismiss tick for the wallet-error toast. Carries the
+    /// generation counter the timer was spawned with — a newer error
+    /// supersedes by bumping the counter, which makes the older
+    /// timer's dismissal a no-op when it fires.
+    DismissError { generation: u64 },
 }
 
 // ── Screens ──────────────────────────────────────────────────────────────────
@@ -165,7 +175,28 @@ pub struct App {
     /// single-threaded, so the lock is always uncontested in practice;
     /// it exists to keep the type plumbing honest, not for contention.
     contacts: Arc<RwLock<ContactsBook>>,
+    /// Latest wallet-error toast, or `None` when nothing is on screen.
+    /// Cleared by the auto-dismiss `Task::perform` spawned when the
+    /// toast lands, or replaced by a newer error mid-lifetime.
+    toast: Option<ToastState>,
+    /// Monotonic counter bumped on every fresh error so an older
+    /// dismissal task firing late can no-op against a newer toast.
+    toast_gen: u64,
 }
+
+/// Single-toast state. We don't queue — a fresher error replaces the
+/// previous message rather than stacking, so the user always reads the
+/// most relevant signal.
+#[derive(Debug)]
+struct ToastState {
+    msg: String,
+    generation: u64,
+}
+
+/// Auto-dismiss timeout for the wallet-error toast. Long enough to read
+/// a sentence comfortably, short enough that a missed glance gets a
+/// second chance via the dismiss button.
+const TOAST_LIFETIME_SECS: u64 = 5;
 
 impl App {
     pub fn new() -> (Self, iced::Task<Message>) {
@@ -185,6 +216,8 @@ impl App {
                 network,
                 portfolio_cache,
                 contacts,
+                toast: None,
+                toast_gen: 0,
             };
             let task = focus_widget(crate::ui::unlock::PASSWORD_INPUT_ID).map(Message::Unlock);
             (app, task)
@@ -198,6 +231,8 @@ impl App {
                 network,
                 portfolio_cache,
                 contacts,
+                toast: None,
+                toast_gen: 0,
             };
             let task = focus_widget(crate::ui::create_password::PASSWORD_INPUT_ID)
                 .map(Message::CreatePassword);
@@ -998,13 +1033,38 @@ impl App {
             // ── Error handling ──────────────────────────────────────
             Message::WalletError(e) => {
                 error!(error = %e, "wallet error");
+                self.toast_gen = self.toast_gen.wrapping_add(1);
+                let generation = self.toast_gen;
+                self.toast = Some(ToastState {
+                    msg: e,
+                    generation,
+                });
+                // Schedule the auto-dismiss tick. Generation-tagged so a
+                // late firing can't clear a newer toast: replacement
+                // bumps the counter, and the stale `DismissError`
+                // arrives with `g != self.toast_gen` and no-ops.
+                iced::Task::perform(
+                    async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(
+                            TOAST_LIFETIME_SECS,
+                        ))
+                        .await;
+                        generation
+                    },
+                    |generation| Message::DismissError { generation },
+                )
+            }
+            Message::DismissError { generation } => {
+                if self.toast.as_ref().is_some_and(|s| s.generation == generation) {
+                    self.toast = None;
+                }
                 iced::Task::none()
             }
         }
     }
 
     pub fn view(&self) -> Element<'_, Message> {
-        match &self.screen {
+        let screen: Element<'_, Message> = match &self.screen {
             Screen::CreatePassword(screen) => screen.view().map(Message::CreatePassword),
             Screen::Unlock(screen) => screen.view().map(Message::Unlock),
             Screen::SelectRpc(screen) => screen.view().map(Message::SelectRpc),
@@ -1022,6 +1082,14 @@ impl App {
             Screen::ConnectLedger(screen) => screen.view().map(Message::ConnectLedger),
             Screen::ConnectTrezor(screen) => screen.view().map(Message::ConnectTrezor),
             Screen::Wallet(screen) => screen.view().map(Message::WalletDashboard),
+        };
+
+        match &self.toast {
+            None => screen,
+            Some(state) => {
+                let t = KaoTheme::for_kind(settings::theme());
+                stack![screen, error_toast(t, state)].into()
+            }
         }
     }
 
@@ -1050,6 +1118,67 @@ impl App {
             Screen::Wallet(screen) => screen.subscription().map(Message::WalletDashboard),
         }
     }
+}
+
+/// Bottom-center toast for the latest wallet error. Auto-dismisses
+/// after `TOAST_LIFETIME_SECS`; the ✕ chip on the right lets the user
+/// clear it sooner. The container width is capped (`max_width(480)`) so
+/// the toast looks like a chip on wide windows but still wraps cleanly
+/// on narrow ones, and the rest of the overlay is `Space` so pointer
+/// events on the screen below pass through.
+fn error_toast<'a>(t: KaoTheme, state: &'a ToastState) -> Element<'a, Message> {
+    let generation = state.generation;
+    let dismiss = mouse_area(
+        container(text("✕").size(13).color(t.down).font(bold()))
+            .padding(Padding::from([2, 6])),
+    )
+    .on_press(Message::DismissError { generation })
+    .interaction(iced::mouse::Interaction::Pointer);
+
+    let body = row![
+        text("⚠").size(14).color(t.down).font(bold()),
+        Space::new().width(8),
+        container(text(state.msg.as_str()).size(12).color(t.down).font(bold()))
+            .width(Length::Fill),
+        Space::new().width(10),
+        dismiss,
+    ]
+    .align_y(Alignment::Center)
+    .width(Length::Fill);
+
+    let card = container(body)
+        .padding(Padding::from([10, 14]))
+        .width(Length::Fill)
+        .max_width(480.0)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(with_alpha(t.down, 0.18))),
+            border: Border {
+                color: with_alpha(t.down, 0.5),
+                width: 1.0,
+                radius: Radius::from(12),
+            },
+            text_color: Some(t.down),
+            ..container::Style::default()
+        });
+
+    // Pin to the bottom-center of the window: column[Space::Fill, row]
+    // so the card hugs the bottom, with horizontal centering inside the
+    // row and 16px breathing room from the window edge.
+    let centered = row![
+        Space::new().width(Length::Fill),
+        card,
+        Space::new().width(Length::Fill),
+    ]
+    .width(Length::Fill);
+
+    column![
+        Space::new().height(Length::Fill),
+        centered,
+        Space::new().height(16),
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
 }
 
 /// Dispatch `wallet::save_descriptor` to tokio's blocking pool. The Argon2id
@@ -1178,6 +1307,8 @@ mod tests {
             network,
             portfolio_cache: portfolio::new_cache(),
             contacts: Arc::new(RwLock::new(ContactsBook::new())),
+            toast: None,
+            toast_gen: 0,
         }
     }
 

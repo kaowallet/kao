@@ -16,10 +16,11 @@ use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 
 use alloy::primitives::Address;
+use iced::border::Radius;
 use iced::keyboard;
 use iced::widget::operation::{focus as focus_widget, focus_next, focus_previous};
-use iced::widget::{Space, column, container, mouse_area, row, scrollable, text, text_input};
-use iced::{Alignment, Element, Length, Padding, Subscription, Task};
+use iced::widget::{Space, button, column, container, mouse_area, row, scrollable, text, text_input};
+use iced::{Alignment, Background, Border, Element, Length, Padding, Subscription, Task};
 
 /// Stable ID for the NAME field so we can auto-focus it when the user
 /// opens Add / Edit. Tab navigation past the name then walks through
@@ -101,7 +102,15 @@ pub enum Message {
     Back,
     OpenAdd,
     OpenEdit(usize),
+    /// First click on a contact's "Delete" stages the row for deletion
+    /// (the card swaps its actions to Cancel / Confirm delete). A second
+    /// click on the *same* index then executes the destructive path.
+    /// Clicking Delete on a different card just moves the staged index;
+    /// nothing is destroyed without an explicit confirm.
     Delete(usize),
+    /// User backed out of a staged deletion. Clears `pending_delete`
+    /// without touching the contacts book.
+    CancelDelete,
     NameChanged(String),
     /// Single-field address input: accepts `0x…` hex or an ENS-shaped
     /// name (`vitalik.eth`). Hex parses synchronously; ENS triggers a
@@ -210,6 +219,11 @@ pub struct ContactsPane {
     /// Last validation errors. Rendered as a small red block above the
     /// Save button. Cleared on every keystroke that could fix the input.
     validation: Vec<String>,
+    /// Index of a contact the user has clicked Delete on but not yet
+    /// confirmed. The card at this index renders Cancel / Confirm delete
+    /// instead of Edit / Delete. Cleared on any navigation event so a
+    /// stale staged index can't survive into a different list.
+    pending_delete: Option<usize>,
 }
 
 impl ContactsPane {
@@ -222,6 +236,7 @@ impl ContactsPane {
             resolution_seq: 0,
             last_dispatched_seq: None,
             validation: Vec::new(),
+            pending_delete: None,
         }
     }
 
@@ -251,6 +266,7 @@ impl ContactsPane {
             resolution_seq: 0,
             last_dispatched_seq: None,
             validation: Vec::new(),
+            pending_delete: None,
         };
         // Route the prefill through the same set_address path as a
         // normal user keystroke so the resolution state is consistent
@@ -280,6 +296,7 @@ impl ContactsPane {
                 self.resolution = AddressResolution::Empty;
                 self.resolution_seq = self.resolution_seq.wrapping_add(1);
                 self.validation.clear();
+                self.pending_delete = None;
                 (focus_widget(NAME_INPUT_ID), None)
             }
             Message::OpenEdit(idx) => {
@@ -314,16 +331,30 @@ impl ContactsPane {
                     editing_addr: Some(addr),
                 };
                 self.validation.clear();
+                self.pending_delete = None;
                 self.set_address(address_input);
                 (focus_widget(NAME_INPUT_ID), None)
             }
             Message::Delete(idx) => {
+                // First click stages the row; second click on the same
+                // index executes. Clicking Delete on a different card
+                // moves the staged index but never destroys without an
+                // explicit confirm.
+                if self.pending_delete != Some(idx) {
+                    self.pending_delete = Some(idx);
+                    return (Task::none(), None);
+                }
+                self.pending_delete = None;
                 let mut snapshot = match self.book.read() {
                     Ok(b) => b.clone(),
                     Err(_) => return (Task::none(), None),
                 };
                 snapshot.remove(idx);
                 (Task::none(), Some(Outcome::SaveRequested(snapshot.into_vec())))
+            }
+            Message::CancelDelete => {
+                self.pending_delete = None;
+                (Task::none(), None)
             }
             Message::NameChanged(s) => {
                 self.draft.name = s;
@@ -462,6 +493,7 @@ impl ContactsPane {
         self.resolution = AddressResolution::Empty;
         self.resolution_seq = self.resolution_seq.wrapping_add(1);
         self.validation.clear();
+        self.pending_delete = None;
     }
 
     fn handle_save(&mut self) -> (Task<Message>, Option<Outcome>) {
@@ -676,15 +708,17 @@ impl ContactsPane {
         // 2-column grid. Pair contacts up; an odd trailing entry gets
         // a same-shape empty placeholder so the last row's card keeps
         // its column width instead of stretching across both slots.
+        let pending = self.pending_delete;
         let mut grid = column![].spacing(10).width(Length::Fill);
         let mut iter = snapshot.into_iter().enumerate().peekable();
         while iter.peek().is_some() {
             let (i_a, c_a) = iter.next().expect("peeked above");
-            let cell_a: Element<'_, Message> = container(list_card(t, i_a, c_a))
-                .width(Length::FillPortion(1))
-                .into();
+            let cell_a: Element<'_, Message> =
+                container(list_card(t, i_a, c_a, pending == Some(i_a)))
+                    .width(Length::FillPortion(1))
+                    .into();
             let cell_b: Element<'_, Message> = match iter.next() {
-                Some((i_b, c_b)) => container(list_card(t, i_b, c_b))
+                Some((i_b, c_b)) => container(list_card(t, i_b, c_b, pending == Some(i_b)))
                     .width(Length::FillPortion(1))
                     .into(),
                 None => Space::new().width(Length::FillPortion(1)).into(),
@@ -824,7 +858,7 @@ fn address_parse_hint<'a>(t: KaoTheme, r: &AddressResolution) -> Element<'a, Mes
     }
 }
 
-fn list_card<'a>(t: KaoTheme, idx: usize, c: Contact) -> Element<'a, Message> {
+fn list_card<'a>(t: KaoTheme, idx: usize, c: Contact, pending_delete: bool) -> Element<'a, Message> {
     let kao_glyph = if c.kaomoji.is_empty() {
         DEFAULT_KAOMOJI.to_string()
     } else {
@@ -870,12 +904,25 @@ fn list_card<'a>(t: KaoTheme, idx: usize, c: Contact) -> Element<'a, Message> {
         .color(t.sub)
         .wrapping(text::Wrapping::WordOrGlyph);
 
-    let actions = row![
-        small_secondary_button(t, "Edit").on_press(Message::OpenEdit(idx)),
-        Space::new().width(8),
-        small_secondary_button(t, "Delete").on_press(Message::Delete(idx)),
-    ]
-    .align_y(Alignment::Center);
+    // When a delete is staged on this card, the actions row swaps to
+    // Cancel / Confirm-delete. Confirm carries the destructive color
+    // (`t.down`) so the second click reads as the dangerous one — the
+    // only way to actually destroy the contact.
+    let actions = if pending_delete {
+        row![
+            small_secondary_button(t, "Cancel").on_press(Message::CancelDelete),
+            Space::new().width(8),
+            small_danger_button(t, "Confirm delete").on_press(Message::Delete(idx)),
+        ]
+        .align_y(Alignment::Center)
+    } else {
+        row![
+            small_secondary_button(t, "Edit").on_press(Message::OpenEdit(idx)),
+            Space::new().width(8),
+            small_secondary_button(t, "Delete").on_press(Message::Delete(idx)),
+        ]
+        .align_y(Alignment::Center)
+    };
 
     let inner = column![
         header_row,
@@ -1004,6 +1051,33 @@ where
     column![label, Space::new().height(6), row]
         .width(Length::Fill)
         .into()
+}
+
+/// Compact destructive-action button used for the "Confirm delete" step.
+/// Mirrors `small_secondary_button`'s shape but renders the label and
+/// border in the theme's `down` color so the user reads it as the
+/// dangerous half of the Cancel / Confirm pair. Local to this file —
+/// the contacts pane is the only place a destructive action surfaces
+/// today, and giving the helper a wider home would be designing for a
+/// hypothetical future caller.
+fn small_danger_button<'a>(t: KaoTheme, label: &'a str) -> button::Button<'a, Message> {
+    button(text(label.to_string()).size(11).color(t.down).font(bold()))
+        .padding(Padding::from([4, 10]))
+        .style(move |_theme, status| button::Style {
+            background: Some(Background::Color(match status {
+                button::Status::Hovered | button::Status::Pressed => {
+                    crate::ui::kao_theme::with_alpha(t.down, 0.14)
+                }
+                _ => t.card_alt,
+            })),
+            text_color: t.down,
+            border: Border {
+                color: t.down,
+                width: 1.0,
+                radius: Radius::from(8),
+            },
+            ..button::Style::default()
+        })
 }
 
 /// Strict `.eth`-suffix check used by the contacts add/edit form.

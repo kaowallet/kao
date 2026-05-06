@@ -5,10 +5,12 @@
 //! Save invalidates the shared `BalanceFetcher` so the next balance/portfolio
 //! fetch rebuilds Helios against the new endpoints.
 //!
-//! The L2 entries (Base / Optimism) and per-chain consensus URLs are
-//! UI-only for now: settings + `net.rs` are still mainnet-only, so on save
-//! we only persist the Mainnet exec/consensus values. The L2 fields stay
-//! in screen state across the session and are dropped on close.
+//! Mainnet is the only chain whose RPCs are persisted today: settings +
+//! `net.rs` are still mainnet-only. The form deliberately renders only the
+//! Mainnet pair so the user doesn't believe an L2 edit will save — L2
+//! rows return once per-chain plumbing lands. The `Draft` still carries
+//! a `PerChain<String>` so reintroducing those rows is a render-only
+//! change.
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -158,39 +160,39 @@ impl NetworksPane {
         .align_y(Alignment::Center)
         .width(Length::Fill);
 
-        // Per-chain execution RPC inputs.
-        let mut exec_rows = column![].spacing(6).width(Length::Fill);
-        for chain in Chain::ALL {
-            let value = self.draft.exec.get(chain);
-            let input = text_input("https://…", value)
-                .on_input(move |s| Message::ExecChanged(chain, s))
-                .padding(Padding::from([6, 10]))
-                .style(move |_theme, status| text_input_style(t, status));
-            exec_rows = exec_rows.push(labeled_row(t, chain.label(), input.into()));
-        }
+        // Mainnet is the only chain we persist today. Render exactly one
+        // row per section so the form can't promise an L2 edit will save.
+        let exec_input = text_input("https://…", self.draft.exec.get(Chain::Mainnet))
+            .on_input(|s| Message::ExecChanged(Chain::Mainnet, s))
+            .padding(Padding::from([6, 10]))
+            .style(move |_theme, status| text_input_style(t, status));
+        let exec_rows = column![labeled_row(t, Chain::Mainnet.label(), exec_input.into())]
+            .spacing(6)
+            .width(Length::Fill);
         let exec_section = section(
             t,
-            "Execution RPCs",
+            "Execution RPC",
             "(◕‿◕✿)",
-            "One endpoint per chain. Helios verifies every Mainnet response against the consensus layer; L2 entries are stored locally for now.",
+            "Helios verifies every response against the consensus layer. Per-chain endpoints land once L2 support ships.",
             exec_rows.into(),
         );
 
-        // Per-chain consensus RPC inputs — same layout as execution.
-        let mut consensus_rows = column![].spacing(6).width(Length::Fill);
-        for chain in Chain::ALL {
-            let value = self.draft.consensus.get(chain);
-            let input = text_input("https://…", value)
-                .on_input(move |s| Message::ConsensusChanged(chain, s))
-                .padding(Padding::from([6, 10]))
-                .style(move |_theme, status| text_input_style(t, status));
-            consensus_rows = consensus_rows.push(labeled_row(t, chain.label(), input.into()));
-        }
+        let consensus_input = text_input("https://…", self.draft.consensus.get(Chain::Mainnet))
+            .on_input(|s| Message::ConsensusChanged(Chain::Mainnet, s))
+            .padding(Padding::from([6, 10]))
+            .style(move |_theme, status| text_input_style(t, status));
+        let consensus_rows = column![labeled_row(
+            t,
+            Chain::Mainnet.label(),
+            consensus_input.into(),
+        )]
+        .spacing(6)
+        .width(Length::Fill);
         let consensus_section = section(
             t,
-            "Consensus RPCs",
+            "Consensus RPC",
             "( ´ ▽ ` )ﾉ",
-            "Beacon-chain LC API endpoints Helios bootstraps from. Mainnet is required; the L2 rows are kept locally until per-chain plumbing lands.",
+            "Beacon-chain LC API endpoint Helios bootstraps from.",
             consensus_rows.into(),
         );
 

@@ -1116,24 +1116,39 @@ impl SendPane {
             }
         };
 
-        // Native ETH only: warn if amount + gas > balance.
+        // Warn whenever ETH on this chain can't cover gas (and, for native
+        // sends, gas + amount). The ERC-20 case used to be skipped, which
+        // let users with dust ETH hit Confirm and watch the broadcast fail
+        // mid-flight. Look up the native-ETH entry on the same chain as the
+        // selected token; if we can't locate it (cold cache, fetch failed)
+        // skip the check rather than false-warn.
         let insufficient_eth_warning: Element<'_, Message> = match (token, self.quote) {
-            (Some(tk), Some(q)) if tk.contract.is_none() => {
-                if let Ok(amt) = parse_amount_units(&self.amount, tk.decimals) {
-                    if amt.saturating_add(q.eth_cost_wei) > tk.balance_raw {
+            (Some(tk), Some(q)) => {
+                let eth_balance = portfolio
+                    .iter()
+                    .find(|p| p.chain == tk.chain && p.contract.is_none())
+                    .map(|p| p.balance_raw);
+                let needed = if tk.contract.is_none() {
+                    parse_amount_units(&self.amount, tk.decimals)
+                        .ok()
+                        .map(|amt| amt.saturating_add(q.eth_cost_wei))
+                } else {
+                    Some(q.eth_cost_wei)
+                };
+                match (eth_balance, needed) {
+                    (Some(bal), Some(need)) if need > bal => {
+                        let label = if tk.contract.is_none() {
+                            "Insufficient ETH for amount + gas"
+                        } else {
+                            "Insufficient ETH on this chain to pay gas"
+                        };
                         container(
-                            text("Insufficient ETH for amount + gas")
-                                .size(12)
-                                .color(t.down)
-                                .font(bold()),
+                            text(label).size(12).color(t.down).font(bold()),
                         )
                         .padding(Padding::from([6, 0]))
                         .into()
-                    } else {
-                        Space::new().height(0).into()
                     }
-                } else {
-                    Space::new().height(0).into()
+                    _ => Space::new().height(0).into(),
                 }
             }
             _ => Space::new().height(0).into(),

@@ -12,9 +12,12 @@
 //! - **Unknown** — selector + "Unverified call" hint and truncated
 //!   raw calldata.
 //!
-//! Warnings (`InfiniteApproval`, `UnverifiedBytecode`, `AmbiguousSignature`)
-//! render as a tinted strip at the foot of the panel — scary enough to
-//! be noticed, not modal.
+//! Warnings render as tinted strips. `AmbiguousSignature` rides *above*
+//! the header — when several signatures collide on the same selector,
+//! the title we show is provisional, so the warning has to land before
+//! the user reads the name (and the title gets muted to match).
+//! `InfiniteApproval` / `UnverifiedBytecode` qualify the call without
+//! contradicting the title and stay in the strip below the args.
 //!
 //! `Empty` (native ETH transfer, no calldata) returns `None` — the
 //! caller skips the panel and the divider so the review card stays the
@@ -60,7 +63,17 @@ fn loading_view<'a, M: 'a>(t: KaoTheme) -> Element<'a, M> {
 }
 
 fn panel<'a, M: 'a>(t: KaoTheme, d: &'a DecodedCall) -> Element<'a, M> {
-    let mut col = column![header(t, d)].spacing(6);
+    // AmbiguousSignature warnings precede the header — they cast doubt
+    // on the title itself, so the user must see them first. The other
+    // warning kinds qualify the call without undermining the name and
+    // ride below the arg rows in the foot strip.
+    let mut col = column![].spacing(6);
+    for w in &d.warnings {
+        if matches!(w, Warning::AmbiguousSignature { .. }) {
+            col = col.push(warning_strip(t, w));
+        }
+    }
+    col = col.push(header(t, d));
 
     for arg in &d.args {
         col = col.push(arg_row(t, arg));
@@ -72,9 +85,14 @@ fn panel<'a, M: 'a>(t: KaoTheme, d: &'a DecodedCall) -> Element<'a, M> {
         col = col.push(unknown_call_body(t, d));
     }
 
-    if !d.warnings.is_empty() {
+    let mut foot_warnings = d
+        .warnings
+        .iter()
+        .filter(|w| !matches!(w, Warning::AmbiguousSignature { .. }))
+        .peekable();
+    if foot_warnings.peek().is_some() {
         col = col.push(Space::new().height(4));
-        for w in &d.warnings {
+        for w in foot_warnings {
             col = col.push(warning_strip(t, w));
         }
     }
@@ -88,9 +106,20 @@ fn header<'a, M: 'a>(t: KaoTheme, d: &'a DecodedCall) -> Element<'a, M> {
         Some(name) => format!("{}(…)", name),
         None => format!("0x{:02x}{:02x}{:02x}{:02x}", d.selector[0], d.selector[1], d.selector[2], d.selector[3]),
     };
+    // For Ambiguous the title is just one of several plausible names —
+    // mute it so the chunk doesn't visually claim authority. The banner
+    // above carries the full candidate list. Resolved/TypesOnly/Unknown
+    // keep the strong text color.
+    let title_color = if matches!(d.state, ResolutionState::Ambiguous) {
+        t.sub
+    } else {
+        t.text
+    };
     let subtitle: Option<String> = match d.state {
         ResolutionState::Resolved => None,
-        ResolutionState::Ambiguous => Some("ambiguous · several signatures match".into()),
+        // Banner above the header conveys this; a duplicate subtitle
+        // would just split the user's attention.
+        ResolutionState::Ambiguous => None,
         ResolutionState::TypesOnly => Some("decoded from bytecode · no name".into()),
         ResolutionState::Unknown => Some("unverified call".into()),
         ResolutionState::Empty => None,
@@ -99,7 +128,7 @@ fn header<'a, M: 'a>(t: KaoTheme, d: &'a DecodedCall) -> Element<'a, M> {
     let mut col = column![
         label,
         Space::new().height(2),
-        text(title).size(13).color(t.text).font(bold()),
+        text(title).size(13).color(title_color).font(bold()),
     ]
     .spacing(0);
     if let Some(s) = subtitle {

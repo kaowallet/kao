@@ -22,7 +22,7 @@ For too long we've been relying on slow and vulnerable JavaScript for building u
 
 - [ ] WalletConnect
 - [ ] ERC-7730 clear signing support
-- Kohaku-aligned integrations:
+- [ ] Kohaku-aligned integrations:
     - [ ] Stealth Addresses
     - [ ] Privacy Pools
     - [ ] Tornado Cash

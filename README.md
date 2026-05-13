@@ -30,3 +30,4 @@ For too long we've been relying on slow and vulnerable JavaScript for building u
 - [ ] optional Revoke Cash integration
 - [ ] CoW Swap integration
 - [ ] Tor support
+

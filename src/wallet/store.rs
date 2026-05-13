@@ -3,7 +3,7 @@
 //! Layout
 //! ------
 //! - `meta` table (`&str -> &[u8]`):
-//!   - `header`: bincode of `Header` (salt, Argon2 params, authenticated
+//!   - `header`: postcard of `Header` (salt, Argon2 params, authenticated
 //!     check blob, monotonic epoch).
 //!   - `active_index`: `u32` LE bytes; plaintext, since the index leaks
 //!     nothing useful and we want `redb` range scans over
@@ -32,7 +32,7 @@
 //! lags the keyring is a rollback. See `enforce_rollback_policy` for the
 //! full table including the legitimate restore-from-backup path.
 //!
-//! The header's `epoch` field is in plaintext bincode but bound into the
+//! The header's `epoch` field is in plaintext postcard but bound into the
 //! AAD of `auth_check` (see `header_aad`) and re-sealed on every save, so
 //! an attacker can't restore an older snapshot AND rewrite the on-disk
 //! epoch byte to slip past the keyring check — that tampering surfaces
@@ -275,7 +275,7 @@ fn save_to(path: &Path, desc: &WalletDescriptor, pw: &SecretString) -> Result<()
         header.argon2_p_cost,
     )?;
 
-    let header_bytes = bincode::serialize(&header)
+    let header_bytes = postcard::to_stdvec(&header)
         .map_err(|e| WalletError::Encryption(format!("serialize header: {e}")))?;
 
     {
@@ -303,7 +303,7 @@ fn save_to(path: &Path, desc: &WalletDescriptor, pw: &SecretString) -> Result<()
 
         for (i, account) in desc.accounts.iter().enumerate() {
             let idx = i as u32;
-            let plaintext = bincode::serialize(account)
+            let plaintext = postcard::to_stdvec(account)
                 .map_err(|e| WalletError::Encryption(format!("serialize account {i}: {e}")))?;
             let aad = account_aad(idx);
             let blob = encrypt_blob(master_key.as_slice(), &aad, &plaintext)?;
@@ -520,7 +520,7 @@ fn load_from_with_policy(
         let idx = k.value();
         let aad = account_aad(idx);
         let plaintext = decrypt_blob(master_key.as_slice(), &aad, v.value())?;
-        let account: AccountDescriptor = bincode::deserialize(&plaintext)
+        let account: AccountDescriptor = postcard::from_bytes(&plaintext)
             .map_err(|e| WalletError::Encryption(format!("deserialize account {idx}: {e}")))?;
         accounts.push((idx, account));
     }
@@ -539,7 +539,7 @@ fn load_from_with_policy(
 }
 
 fn deserialize_header(bytes: &[u8]) -> Result<Header, WalletError> {
-    bincode::deserialize::<Header>(bytes)
+    postcard::from_bytes::<Header>(bytes)
         .map_err(|e| WalletError::Encryption(format!("deserialize header: {e}")))
 }
 
@@ -686,7 +686,7 @@ fn save_contacts_to(
         }
         for (i, contact) in contacts.iter().enumerate() {
             let idx = i as u32;
-            let plaintext = bincode::serialize(contact)
+            let plaintext = postcard::to_stdvec(contact)
                 .map_err(|e| WalletError::Encryption(format!("serialize contact {i}: {e}")))?;
             let aad = contact_aad(idx);
             let blob = encrypt_blob(master_key.as_slice(), &aad, &plaintext)?;
@@ -747,7 +747,7 @@ fn load_contacts_from(path: &Path, pw: &SecretString) -> Result<Vec<Contact>, Wa
         let idx = k.value();
         let aad = contact_aad(idx);
         let plaintext = decrypt_blob(master_key.as_slice(), &aad, v.value())?;
-        let contact: Contact = bincode::deserialize(&plaintext)
+        let contact: Contact = postcard::from_bytes(&plaintext)
             .map_err(|e| WalletError::Encryption(format!("deserialize contact {idx}: {e}")))?;
         entries.push((idx, contact));
     }
@@ -913,7 +913,7 @@ mod tests {
     fn argon2_params_survive_header_roundtrip() {
         // Header is the only place the Argon2 work factors are stored. Tuning
         // the defaults later must not invalidate existing wallets, so confirm
-        // a saved header round-trips through bincode with the values intact.
+        // a saved header round-trips through postcard with the values intact.
         let original = Header {
             salt: [0x7e; SALT_LEN],
             argon2_m_cost_kib: 12_345,
@@ -922,7 +922,7 @@ mod tests {
             auth_check: vec![0xaa; 64],
             epoch: 42,
         };
-        let bytes = bincode::serialize(&original).unwrap();
+        let bytes = postcard::to_stdvec(&original).unwrap();
         let parsed = deserialize_header(&bytes).unwrap();
         assert_eq!(parsed.salt, original.salt);
         assert_eq!(parsed.argon2_m_cost_kib, original.argon2_m_cost_kib);
@@ -1203,9 +1203,9 @@ mod tests {
             let meta = txn.open_table(META_TABLE).unwrap();
             meta.get(HEADER_KEY).unwrap().unwrap().value().to_vec()
         };
-        let mut header: Header = bincode::deserialize(&header_bytes).unwrap();
+        let mut header: Header = postcard::from_bytes(&header_bytes).unwrap();
         mutate(&mut header);
-        let new_bytes = bincode::serialize(&header).unwrap();
+        let new_bytes = postcard::to_stdvec(&header).unwrap();
         let db = Database::create(path).unwrap();
         let txn = db.begin_write().unwrap();
         {
@@ -1217,7 +1217,7 @@ mod tests {
 
     #[test]
     fn tampered_header_epoch_field_fails_to_load() {
-        // The plaintext `epoch` byte in the bincoded header is the lever an
+        // The plaintext `epoch` byte in the postcard-encoded header is the lever an
         // attacker would pull to defeat rollback protection: restore an
         // older snapshot and rewrite its epoch to match (or exceed) the
         // keyring's last-seen value, so `enforce_rollback_policy` waves it
@@ -1250,7 +1250,7 @@ mod tests {
     fn rollback_with_epoch_rewrite_is_blocked() {
         // End-to-end version of the attack the AAD binding exists to
         // defeat: save twice (file/keyring at epoch=2), restore the
-        // epoch=1 snapshot, then patch the bincoded epoch byte from 1 to
+        // epoch=1 snapshot, then patch the postcard-encoded epoch byte from 1 to
         // 2 so the keyring check passes. Without the AAD binding this
         // would load the old account set silently. With the binding,
         // auth_check decrypt fails because it was sealed at epoch=1.

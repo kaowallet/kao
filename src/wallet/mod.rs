@@ -453,13 +453,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn account_bincode_roundtrip_local() {
+    fn account_postcard_roundtrip_local() {
         let acc = AccountDescriptor::Local {
             name: Some("Treasury".into()),
             key_bytes: [0xab; 32],
         };
-        let encoded = bincode::serialize(&acc).unwrap();
-        let decoded: AccountDescriptor = bincode::deserialize(&encoded).unwrap();
+        let encoded = postcard::to_stdvec(&acc).unwrap();
+        let decoded: AccountDescriptor = postcard::from_bytes(&encoded).unwrap();
         match decoded {
             AccountDescriptor::Local { name, key_bytes } => {
                 assert_eq!(name.as_deref(), Some("Treasury"));
@@ -470,14 +470,14 @@ mod tests {
     }
 
     #[test]
-    fn account_bincode_roundtrip_ledger() {
+    fn account_postcard_roundtrip_ledger() {
         let acc = AccountDescriptor::Ledger {
             name: None,
             path: LedgerHdPath::LedgerLive(3),
             address: [0x11; 20],
         };
-        let encoded = bincode::serialize(&acc).unwrap();
-        let decoded: AccountDescriptor = bincode::deserialize(&encoded).unwrap();
+        let encoded = postcard::to_stdvec(&acc).unwrap();
+        let decoded: AccountDescriptor = postcard::from_bytes(&encoded).unwrap();
         match decoded {
             AccountDescriptor::Ledger {
                 name,
@@ -493,14 +493,14 @@ mod tests {
     }
 
     #[test]
-    fn account_bincode_roundtrip_trezor() {
+    fn account_postcard_roundtrip_trezor() {
         let acc = AccountDescriptor::Trezor {
             name: None,
             path: TrezorHdPath::TrezorLive(2),
             address: [0x22; 20],
         };
-        let encoded = bincode::serialize(&acc).unwrap();
-        let decoded: AccountDescriptor = bincode::deserialize(&encoded).unwrap();
+        let encoded = postcard::to_stdvec(&acc).unwrap();
+        let decoded: AccountDescriptor = postcard::from_bytes(&encoded).unwrap();
         match decoded {
             AccountDescriptor::Trezor {
                 name,
@@ -516,7 +516,7 @@ mod tests {
     }
 
     #[test]
-    fn wallet_descriptor_bincode_roundtrip() {
+    fn wallet_descriptor_postcard_roundtrip() {
         let desc = WalletDescriptor {
             accounts: vec![
                 AccountDescriptor::Local {
@@ -531,8 +531,8 @@ mod tests {
             ],
             active_index: 1,
         };
-        let encoded = bincode::serialize(&desc).unwrap();
-        let decoded: WalletDescriptor = bincode::deserialize(&encoded).unwrap();
+        let encoded = postcard::to_stdvec(&desc).unwrap();
+        let decoded: WalletDescriptor = postcard::from_bytes(&encoded).unwrap();
         assert_eq!(decoded.accounts.len(), 2);
         assert_eq!(decoded.active_index, 1);
         assert!(matches!(

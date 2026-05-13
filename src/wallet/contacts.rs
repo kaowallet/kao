@@ -140,7 +140,7 @@ mod tests {
     }
 
     #[test]
-    fn contact_bincode_roundtrip_full() {
+    fn contact_postcard_roundtrip_full() {
         let c = Contact {
             name: "vitalik".into(),
             address: [0xab; 20],
@@ -151,16 +151,16 @@ mod tests {
                 last_resolved_addr: [0xab; 20],
             }),
         };
-        let bytes = bincode::serialize(&c).unwrap();
-        let back: Contact = bincode::deserialize(&bytes).unwrap();
+        let bytes = postcard::to_stdvec(&c).unwrap();
+        let back: Contact = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(back, c);
     }
 
     #[test]
-    fn contact_bincode_roundtrip_no_ens() {
+    fn contact_postcard_roundtrip_no_ens() {
         let c = contact(0x42, "Friend");
-        let bytes = bincode::serialize(&c).unwrap();
-        let back: Contact = bincode::deserialize(&bytes).unwrap();
+        let bytes = postcard::to_stdvec(&c).unwrap();
+        let back: Contact = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(back, c);
         assert!(back.ens.is_none());
     }

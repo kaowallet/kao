@@ -23,7 +23,7 @@ use alloy::primitives::{Address, B256, U256};
 use async_trait::async_trait;
 
 use crate::chain::Chain;
-use crate::portfolio::LiveToken;
+use crate::portfolio::{DiscoveredToken, LiveToken};
 use crate::settings::{self, IndexerProvider};
 
 mod alchemy;
@@ -264,6 +264,30 @@ fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
     era as i64 * 146_097 + doe - 719_468
 }
 
+/// Project the indexer's token-holdings rows down to *just* the
+/// (address, symbol, name, decimals) tuples the on-chain Multicall3 walk
+/// needs for discovery. Indexer-reported balances and prices are
+/// intentionally dropped — those round-trip through Multicall3 against
+/// the chain RPC instead, so the user never trusts an indexer's
+/// unverified balance.
+///
+/// Native ETH rows (`contract: None`) are filtered out because
+/// `portfolio::fetch_portfolio_with_discovery` already handles native
+/// ETH via `Multicall3.getEthBalance`.
+pub fn into_discovered_tokens(tokens: Vec<IndexedToken>) -> Vec<DiscoveredToken> {
+    tokens
+        .into_iter()
+        .filter_map(|t| {
+            t.contract.map(|address| DiscoveredToken {
+                symbol: t.symbol,
+                name: t.name,
+                address,
+                decimals: t.decimals,
+            })
+        })
+        .collect()
+}
+
 /// Convert indexer-fetched tokens to the dashboard's `LiveToken` shape so
 /// the existing portfolio UI can render them without touching every call
 /// site. Indexer-supplied prices may be missing — those map to `0.0` in
@@ -339,6 +363,66 @@ mod tests {
         assert_eq!(parse_iso8601("1970-01-01T00:00:00.000000Z"), 0);
         assert_eq!(parse_iso8601("2024-01-01T00:00:00.000000Z"), 1_704_067_200);
         assert_eq!(parse_iso8601("2024-06-15T12:34:56.000000Z"), 1_718_454_896);
+    }
+
+    /// `into_discovered_tokens` is the discovery-mode hand-off: it must
+    /// drop the indexer's native-ETH row (since `fetch_portfolio_with_discovery`
+    /// handles ETH on its own via `Multicall3.getEthBalance`) and forward
+    /// each ERC-20 row's metadata without touching the indexer's reported
+    /// balance/price fields — those flow through Multicall3 instead, so
+    /// the user never trusts an unverified balance from the indexer.
+    #[test]
+    fn into_discovered_tokens_drops_native_eth_and_keeps_metadata() {
+        let usdc: Address =
+            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".parse().unwrap();
+        let beef: Address = "0x000000000000000000000000000000000000beef".parse().unwrap();
+        let tokens = vec![
+            IndexedToken {
+                symbol: "ETH".into(),
+                name: "Ethereum".into(),
+                contract: None,
+                decimals: 18,
+                balance_raw: U256::from(999u64),
+                balance_f64: 1.0,
+                balance: "1".into(),
+                usd_price: Some(3000.0),
+                usd_value: Some(3000.0),
+                logo_url: None,
+            },
+            IndexedToken {
+                symbol: "USDC".into(),
+                name: "USD Coin".into(),
+                contract: Some(usdc),
+                decimals: 6,
+                balance_raw: U256::from(123_456u64),
+                balance_f64: 0.123456,
+                balance: "0.123456".into(),
+                // Bogus indexer-reported price; must not leak into the
+                // discovered row.
+                usd_price: Some(99.0),
+                usd_value: Some(12.0),
+                logo_url: None,
+            },
+            IndexedToken {
+                symbol: "BEEF".into(),
+                name: "Beef".into(),
+                contract: Some(beef),
+                decimals: 9,
+                balance_raw: U256::from(1u8),
+                balance_f64: 0.0,
+                balance: "0".into(),
+                usd_price: None,
+                usd_value: None,
+                logo_url: None,
+            },
+        ];
+        let discovered = into_discovered_tokens(tokens);
+        assert_eq!(discovered.len(), 2, "native ETH row must be dropped");
+        assert_eq!(discovered[0].address, usdc);
+        assert_eq!(discovered[0].symbol, "USDC");
+        assert_eq!(discovered[0].decimals, 6);
+        assert_eq!(discovered[1].address, beef);
+        assert_eq!(discovered[1].decimals, 9);
     }
 
     #[test]

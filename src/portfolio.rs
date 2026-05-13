@@ -395,6 +395,53 @@ fn merge_overlay(overlay: &[OverlayEntry], tokenlist: Vec<TokenMeta>) -> Vec<Tok
     out
 }
 
+/// Token a caller has discovered out-of-band (e.g. an indexer's
+/// `balances` enumeration) and wants the on-chain walk to price + size
+/// alongside the chain's curated overlay. The indexer's own
+/// balance/price fields are dropped — those round-trip through
+/// Multicall3 here, since the indexer's snapshot isn't light-client
+/// verified.
+#[derive(Debug, Clone)]
+pub struct DiscoveredToken {
+    pub symbol: String,
+    pub name: String,
+    pub address: Address,
+    pub decimals: u8,
+}
+
+/// Union the chain's curated token list with caller-supplied discovered
+/// rows. The curated overlay wins on address collision so its known
+/// Uniswap fee tier sticks; otherwise we'd downgrade a staple to a
+/// pool-probe and burn an extra Multicall3 subcall per refresh.
+/// Discovered tokens default to `UniswapWethPoolProbe` because the
+/// indexer doesn't carry fee-tier info.
+fn merge_discovered(base: &[TokenMeta], discovered: &[DiscoveredToken]) -> Vec<TokenMeta> {
+    let mut seen: std::collections::HashSet<Address> =
+        base.iter().map(|t| t.address).collect();
+    let mut out: Vec<TokenMeta> = base
+        .iter()
+        .map(|t| TokenMeta {
+            symbol: t.symbol.clone(),
+            name: t.name.clone(),
+            address: t.address,
+            decimals: t.decimals,
+            price_source: t.price_source,
+        })
+        .collect();
+    for d in discovered {
+        if seen.insert(d.address) {
+            out.push(TokenMeta {
+                symbol: Cow::Owned(d.symbol.clone()),
+                name: Cow::Owned(d.name.clone()),
+                address: d.address,
+                decimals: d.decimals,
+                price_source: PriceSource::UniswapWethPoolProbe,
+            });
+        }
+    }
+    out
+}
+
 static MAINNET_TOKENS: LazyLock<Vec<TokenMeta>> = LazyLock::new(|| {
     // Mainnet stays on the curated overlay alone — see `MAINNET_OVERLAY`.
     MAINNET_OVERLAY.iter().map(OverlayEntry::to_meta).collect()
@@ -679,6 +726,35 @@ pub async fn fetch_portfolio(
     chain: Chain,
     provider: &RootProvider<Ethereum>,
 ) -> Result<Vec<LiveToken>, String> {
+    fetch_portfolio_for_tokens(owner, chain, provider, tokens_for(chain)).await
+}
+
+/// Same as `fetch_portfolio`, but also includes caller-supplied
+/// discovered tokens (e.g. ERC-20s an indexer's `balances` call
+/// enumerated for this address). The chain's curated overlay still wins
+/// on address collision so known Uniswap fee tiers are preserved.
+///
+/// The indexer's reported balances and prices are intentionally
+/// discarded — discovery is *only* used to learn which token contracts
+/// to interrogate. All balances and prices then flow through Multicall3
+/// against the chain RPC, so the user never sees an indexer-claimed
+/// balance the on-chain state doesn't back.
+pub async fn fetch_portfolio_with_discovery(
+    owner: Address,
+    chain: Chain,
+    provider: &RootProvider<Ethereum>,
+    discovered: &[DiscoveredToken],
+) -> Result<Vec<LiveToken>, String> {
+    let merged = merge_discovered(tokens_for(chain), discovered);
+    fetch_portfolio_for_tokens(owner, chain, provider, &merged).await
+}
+
+async fn fetch_portfolio_for_tokens(
+    owner: Address,
+    chain: Chain,
+    provider: &RootProvider<Ethereum>,
+    token_list: &[TokenMeta],
+) -> Result<Vec<LiveToken>, String> {
     // Pin every call in this batch to the finalized block. Public RPC fleets
     // load-balance across upstreams that drift a block or two apart at the
     // tip; a "latest" tag intermittently lands on a node that doesn't yet
@@ -686,7 +762,6 @@ pub async fn fetch_portfolio(
     // available on every upstream and gives a consistent state snapshot.
     let block = BlockId::finalized();
 
-    let token_list = tokens_for(chain);
     let factory = factory_for(chain);
     let weth = weth_for(chain);
     let usdc = usdc_for(chain);
@@ -998,6 +1073,71 @@ mod tokenlist_tests {
         );
         assert_eq!(merged.len(), BASE_OVERLAY.len() + 1);
         assert!(merged.iter().any(|t| t.address == only_in_tokenlist));
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+
+    /// Curated overlay must win on address collision: a discovered row
+    /// pointing at a staple (e.g. USDC) would otherwise shadow the
+    /// overlay's known Uniswap fee tier with `UniswapWethPoolProbe`,
+    /// costing an extra Multicall3 subcall per refresh to rediscover
+    /// the same pool we already had pinned.
+    #[test]
+    fn discovered_does_not_override_overlay_fee_tier() {
+        let usdc_mainnet = address!("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
+        let discovered = vec![DiscoveredToken {
+            symbol: "FAKE".into(),
+            name: "Imposter USDC".into(),
+            address: usdc_mainnet,
+            decimals: 18,
+        }];
+        let merged = merge_discovered(&MAINNET_TOKENS, &discovered);
+        assert_eq!(merged.len(), MAINNET_TOKENS.len(), "collision must dedupe");
+        let row = merged.iter().find(|t| t.address == usdc_mainnet).unwrap();
+        assert_eq!(row.symbol, "USDC", "overlay symbol wins");
+        assert_eq!(row.decimals, 6, "overlay decimals win");
+        assert!(
+            matches!(row.price_source, PriceSource::UniswapWethPool { fee: 500 }),
+            "overlay fee tier must beat discovered Probe",
+        );
+    }
+
+    /// Discovered rows the overlay doesn't carry must pass through and
+    /// default to `UniswapWethPoolProbe` — the indexer doesn't surface
+    /// fee tiers, so price discovery has to probe at fetch time.
+    #[test]
+    fn discovered_appends_new_addresses_as_probe() {
+        let only_in_indexer = address!("0x0000000000000000000000000000000000beef00");
+        let merged = merge_discovered(
+            &MAINNET_TOKENS,
+            &[DiscoveredToken {
+                symbol: "BEEF".into(),
+                name: "Beef Token".into(),
+                address: only_in_indexer,
+                decimals: 9,
+            }],
+        );
+        assert_eq!(merged.len(), MAINNET_TOKENS.len() + 1);
+        let row = merged.iter().find(|t| t.address == only_in_indexer).unwrap();
+        assert_eq!(row.symbol, "BEEF");
+        assert_eq!(row.decimals, 9);
+        assert!(matches!(row.price_source, PriceSource::UniswapWethPoolProbe));
+    }
+
+    /// Empty-discovery must collapse to the curated overlay exactly —
+    /// this is the "indexer offline or no holdings" path, and it must
+    /// behave identically to `fetch_portfolio`'s default token list.
+    #[test]
+    fn empty_discovery_returns_overlay_verbatim() {
+        let merged = merge_discovered(&MAINNET_TOKENS, &[]);
+        assert_eq!(merged.len(), MAINNET_TOKENS.len());
+        for (m, base) in merged.iter().zip(MAINNET_TOKENS.iter()) {
+            assert_eq!(m.address, base.address);
+            assert_eq!(m.symbol, base.symbol);
+        }
     }
 }
 

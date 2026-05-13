@@ -478,31 +478,61 @@ impl WalletScreen {
                         "fetching portfolio",
                     );
                     let started = std::time::Instant::now();
-                    // Prefer the indexer when one is wired up for this
-                    // chain (one HTTP round-trip vs. two Multicall3
-                    // batches against the chain's RPC). When the user
-                    // picks `IndexerProvider::None`, `build_indexer_for`
-                    // returns `NoopIndexer`; on L2 we then fall back to
-                    // the on-chain walk, which iterates the bundled
-                    // Superchain tokenlist plus a small per-chain
-                    // overlay for staples (USDC, WETH, …).
+                    // Routing:
+                    //
+                    // * Mainnet uses the indexer for *discovery only* — it
+                    //   enumerates the ERC-20 contracts this address holds,
+                    //   then balances and Uniswap prices are read on-chain
+                    //   via Multicall3. The indexer's own balance/price
+                    //   fields are dropped, so a malicious or stale indexer
+                    //   can't fake what the user sees. When the indexer is
+                    //   `NoopIndexer` or fails, we fall back to the curated
+                    //   `MAINNET_OVERLAY` (still over Multicall3).
+                    // * L2 chains keep the current indexer-as-source flow:
+                    //   one HTTP round-trip vs. two Multicall3 batches, and
+                    //   the on-chain walk's L2 token list (overlay + bundled
+                    //   Superchain tokenlist) is already its fallback.
                     let indexer = crate::indexer::build_indexer_for(chain);
-                    let from_indexer = indexer
-                        .balances(address)
-                        .await
-                        .ok()
-                        .filter(|v| !v.is_empty());
-                    let result = if let Some(tokens) = from_indexer {
-                        Ok(crate::indexer::into_live_tokens(chain, tokens))
-                    } else {
+                    let result = if chain == crate::chain::Chain::Mainnet {
+                        let discovered = indexer
+                            .balances(address)
+                            .await
+                            .ok()
+                            .map(crate::indexer::into_discovered_tokens)
+                            .unwrap_or_default();
                         match network.provider(chain).await {
                             Some(p) => {
-                                crate::portfolio::fetch_portfolio(address, chain, &p).await
+                                crate::portfolio::fetch_portfolio_with_discovery(
+                                    address,
+                                    chain,
+                                    &p,
+                                    &discovered,
+                                )
+                                .await
                             }
                             None => Err(format!(
                                 "no execution RPCs configured for {}",
                                 chain.label()
                             )),
+                        }
+                    } else {
+                        let from_indexer = indexer
+                            .balances(address)
+                            .await
+                            .ok()
+                            .filter(|v| !v.is_empty());
+                        if let Some(tokens) = from_indexer {
+                            Ok(crate::indexer::into_live_tokens(chain, tokens))
+                        } else {
+                            match network.provider(chain).await {
+                                Some(p) => {
+                                    crate::portfolio::fetch_portfolio(address, chain, &p).await
+                                }
+                                None => Err(format!(
+                                    "no execution RPCs configured for {}",
+                                    chain.label()
+                                )),
+                            }
                         }
                     };
                     debug!(

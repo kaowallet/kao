@@ -110,7 +110,18 @@ pub async fn fetch_onchain_history(
     if trace_filter_supported(provider, chain, latest).await {
         match fetch_native_traces(provider, owner, chain, from_block, latest).await {
             Ok(traces) => rows.extend(traces),
-            Err(e) => warn!(error = %e, "trace_filter native-eth fetch failed"),
+            Err(e) => {
+                // Common case is a stingy trace cap (dRPC: 100 blocks)
+                // that even chunked splitting can't satisfy. Mark the
+                // chain unsupported so future fetches don't re-probe,
+                // and demote the noise to debug.
+                debug!(
+                    chain = ?chain,
+                    error = %e,
+                    "trace_filter native-eth disabled for this chain",
+                );
+                disable_trace_filter(chain).await;
+            }
         }
     }
 
@@ -557,6 +568,16 @@ async fn trace_filter_supported(
     supported
 }
 
+/// Set the per-chain trace_filter verdict to "unsupported" for the
+/// remainder of the process. Called when a fetch errors with a range
+/// cap so tight that even chunked splitting can't satisfy it (e.g.
+/// dRPC's 100-block trace cap), so the next history refresh skips
+/// trace_filter outright instead of warning every time.
+async fn disable_trace_filter(chain: Chain) {
+    let cache = TRACE_AVAILABLE.get_or_init(|| RwLock::new(HashMap::new()));
+    cache.write().await.insert(chain, false);
+}
+
 async fn fetch_native_traces(
     provider: &RootProvider<Ethereum>,
     owner: Address,
@@ -565,31 +586,21 @@ async fn fetch_native_traces(
     to_block: u64,
 ) -> Result<Vec<IndexedTx>, String> {
     let from_str = format!("{owner:#x}");
-    let from_p = json!([{
-        "fromBlock": format!("0x{:x}", from_block),
-        "toBlock": format!("0x{:x}", to_block),
-        "fromAddress": [from_str.clone()],
-    }]);
-    let to_p = json!([{
-        "fromBlock": format!("0x{:x}", from_block),
-        "toBlock": format!("0x{:x}", to_block),
-        "toAddress": [from_str],
-    }]);
-    let (sent, recv): (Result<Vec<Value>, _>, Result<Vec<Value>, _>) = tokio::join!(
-        provider.client().request("trace_filter", from_p),
-        provider.client().request("trace_filter", to_p),
+    let (sent, recv) = tokio::join!(
+        trace_filter_chunked(provider, &from_str, true, from_block, to_block, 0),
+        trace_filter_chunked(provider, &from_str, false, from_block, to_block, 0),
     );
     let mut out: Vec<IndexedTx> = Vec::new();
-    for traces in [sent, recv] {
-        match traces {
-            Ok(v) => {
-                for t in v {
-                    if let Some(row) = trace_to_indexed(&t, owner, chain) {
-                        out.push(row);
-                    }
-                }
+    // Either side erroring is fatal — caller disables trace_filter on
+    // this chain so we don't keep retrying. The Vec we'd return without
+    // both sides isn't worth having (asymmetric coverage).
+    let sent_v = sent?;
+    let recv_v = recv?;
+    for v in [sent_v, recv_v] {
+        for t in v {
+            if let Some(row) = trace_to_indexed(&t, owner, chain) {
+                out.push(row);
             }
-            Err(e) => warn!(error = %e, "trace_filter side-fetch failed"),
         }
     }
     // Dedupe on (tx_hash, value, from, to) — a single trace from the
@@ -597,6 +608,61 @@ async fn fetch_native_traces(
     let mut seen: HashSet<(B256, U256, Address, Option<Address>)> = HashSet::new();
     out.retain(|r| seen.insert((r.hash, r.value, r.from, r.to)));
     Ok(out)
+}
+
+/// Recursive `trace_filter` over `[from, to]`, halving the range when
+/// the RPC reports a cap error. Mirrors `get_logs_chunked`. The initial
+/// 50k window won't survive providers with very tight caps (dRPC: 100
+/// blocks), and that's the signal `fetch_native_traces`'s caller uses
+/// to disable trace_filter for the chain — see `disable_trace_filter`.
+async fn trace_filter_chunked(
+    provider: &RootProvider<Ethereum>,
+    addr_hex: &str,
+    is_sender_side: bool,
+    from: u64,
+    to: u64,
+    depth: u32,
+) -> Result<Vec<Value>, String> {
+    let key = if is_sender_side { "fromAddress" } else { "toAddress" };
+    let params = json!([{
+        "fromBlock": format!("0x{:x}", from),
+        "toBlock": format!("0x{:x}", to),
+        key: [addr_hex],
+    }]);
+    let result: Result<Vec<Value>, _> = provider
+        .client()
+        .request("trace_filter", params)
+        .await;
+    match result {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            let msg = e.to_string();
+            if depth < MAX_SPLIT_DEPTH
+                && to.saturating_sub(from) >= MIN_RANGE
+                && is_range_cap(&msg)
+            {
+                let mid = from + (to - from) / 2;
+                debug!(
+                    side = if is_sender_side { "sent" } else { "recv" },
+                    from, to, mid, depth,
+                    "trace_filter range cap; splitting",
+                );
+                let lhs = Box::pin(trace_filter_chunked(
+                    provider, addr_hex, is_sender_side, from, mid, depth + 1,
+                ))
+                .await?;
+                let rhs = Box::pin(trace_filter_chunked(
+                    provider, addr_hex, is_sender_side, mid + 1, to, depth + 1,
+                ))
+                .await?;
+                let mut out = lhs;
+                out.extend(rhs);
+                Ok(out)
+            } else {
+                Err(format!("trace_filter: {msg}"))
+            }
+        }
+    }
 }
 
 fn trace_to_indexed(t: &Value, owner: Address, chain: Chain) -> Option<IndexedTx> {

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 mod sync_4byte;
 
 use std::path::{Path, PathBuf};

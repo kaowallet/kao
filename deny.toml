@@ -1,0 +1,179 @@
+[graph]
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+[advisories]
+version = 2
+yanked = "deny"
+# Threat-model note shared by every ignored advisory below.
+#
+# Every entry enters the build through helios (helios-core, helios-ethereum,
+# or helios-opstack). The wallet's security-critical surfaces — Argon2id KDF,
+# XChaCha20-Poly1305 authenticated storage, and transaction signing via
+# alloy/k256 — are pure-rust crates that never call into any of the affected
+# code. Helios's job is to talk to public RPCs and verify the responses with
+# merkle / light-client proofs, so the blast radius for anything that
+# subverts helios is bounded at "RPC peer can lie about chain state, light
+# client catches the lie" — not key exfiltration.
+#
+# Entries are grouped by the helios subtree they live in. Revisit each group
+# when helios upgrades the upstream dep that pins it (jsonrpsee 0.19,
+# libp2p 0.51, reqwest's hickory-dns feature, alloy 1.x), or when any
+# non-helios direct dep starts pulling the affected crate — that would be a
+# new attack surface worth fixing at the source.
+ignore = [
+    # ── helios TLS subtree (jsonrpsee 0.19.0 → rustls 0.21, rustls-webpki
+    #    0.101.7, rustls-pemfile 1.0.4, webpki-roots 0.24) ────────────────
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained. No known vuln; archived in favor of rustls-pki-types' PemObject, which jsonrpsee 0.19's rustls 0.21 predates. No keys on this path." },
+    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.101.7 URI name-constraint bypass. Requires a misissued cert to exploit. Worst case: an attacker MITMs RPC responses; the light client rejects them as inconsistent with the verified header chain — liveness loss, not confidentiality." },
+    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.101.7 wildcard name-constraint bypass. Same misissuance precondition and same blast-radius cap as -0098." },
+    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.101.7 CRL-parse panic, reachable pre-verification. rustls doesn't fetch CRLs by default and we never pass any in; worst-case failure mode is a helios task panic, not key compromise." },
+
+    # ── helios libp2p subtree (helios-opstack → libp2p 0.51 and friends) ─
+    # libp2p here is op-stack peer transport. Its noise/identity keys are
+    # ephemeral peer-transport keys generated at helios startup — completely
+    # disjoint from the wallet's k256 signing keys.
+    { id = "RUSTSEC-2024-0344", reason = "curve25519-dalek 3.2.0 Scalar29/Scalar52 timing variability, in libp2p-noise handshake. Worst case is leakage of helios's libp2p transport key, which only authenticates p2p sessions — wallet signing keys live in alloy/k256 and never reach this code." },
+    { id = "RUSTSEC-2025-0161", reason = "libsecp256k1 0.7.2 unmaintained. Used by libp2p-identity for p2p peer IDs only — wallet transaction signing goes through alloy/k256 directly. No known vuln." },
+    { id = "RUSTSEC-2024-0384", reason = "instant 0.1.13 unmaintained. Time-measurement utility used by libp2p/parking_lot 0.11/wasm-timer. No known vuln, no exposure beyond clock reads." },
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error 1.0.4 unmaintained. Build-time only, used by multihash-derive in the libp2p subtree. No runtime surface." },
+
+    # ── helios DNS subtree (reqwest 0.12 → hickory-resolver/hickory-proto) ─
+    # reqwest only uses hickory when the `hickory-dns` feature is on (helios
+    # enables it). Both issues fail-closed into DoS: the wallet can't fetch
+    # chain data, but keys never touch this path.
+    { id = "RUSTSEC-2026-0118", reason = "hickory-proto 0.25.2 NSEC3 closest-encloser proof: unbounded loop on cross-zone responses can OOM the resolver task. Caps at helios losing RPC connectivity; no fix path until helios moves to hickory 0.26." },
+    { id = "RUSTSEC-2026-0119", reason = "hickory-proto 0.25.2 O(n²) name compression on encode: CPU DoS via crafted DNS messages. Same DoS-only cap as -0118." },
+
+    # ── alloy/build-time ──────────────────────────────────────────────────
+    { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 unmaintained. Build-time proc-macro used by alloy-primitives via alloy-chains. No known vuln, no runtime surface." },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "Zlib",
+    "MPL-2.0",
+    "0BSD",
+    "Unlicense",
+    # Kao itself.
+    "AGPL-3.0-or-later",
+    # Pulled in transitively by iced: clipboard-win, error-code.
+    "BSL-1.0",
+    # Pulled in transitively by iced → image → ravif → rav1e → libfuzzer-sys.
+    "NCSA",
+    # Mozilla's bundled root-cert list (webpki-roots, webpki-root-certs).
+    "CDLA-Permissive-2.0",
+]
+exceptions = []
+
+# helios-* subcrates omit a `license` field in their per-crate Cargo.toml,
+# but the workspace LICENSE at the repo root is MIT. Clarify each subcrate
+# so cargo-deny treats them as MIT instead of unlicensed.
+[[licenses.clarify]]
+crate = "helios-common"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+crate = "helios-consensus-core"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+crate = "helios-core"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+crate = "helios-ethereum"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+crate = "helios-opstack"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+crate = "helios-revm-utils"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+crate = "helios-verifiable-api-client"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+crate = "helios-verifiable-api-types"
+expression = "MIT"
+license-files = []
+
+[bans]
+multiple-versions = "warn"
+# The helios-ethereum and helios-opstack git deps appear as wildcards because
+# they pin via `rev` rather than a published version. The rev pin is the
+# stronger guarantee — accept the wildcard form for git/path deps only.
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+# Threat-model note on openssl:
+#
+# We previously denied openssl/openssl-sys outright. Helios pulls them in
+# anyway via reqwest's default `native-tls` feature (and `openssl` itself
+# is a declared-but-unused workspace dep in helios with the "vendored"
+# feature — so when openssl is present at all, it's statically linked,
+# never the system copy). cargo features are additive across the build
+# graph, so we can't suppress this from the consumer side; the only
+# escape is forking helios.
+#
+# We accept coexistence:
+#  - helios is the *only* path to openssl-vendored in the build. The
+#    sensitive surfaces — key derivation (Argon2id), authenticated
+#    storage (XChaCha20-Poly1305), and transaction signing (alloy/k256)
+#    — are pure-rust and never touch openssl.
+#  - helios's role is querying public chain data over TLS; responses are
+#    merkle/light-client verified, so a TLS-stack compromise there
+#    degrades to "RPC peer can lie about chain state, light client
+#    catches the lie" rather than "MITM exfiltrates keys".
+#  - openssl is the `vendored` build, so there's no system-libssl link
+#    and no platform-version drift (esp. on Windows).
+#
+# Revisit if: (a) helios ships a rustls feature flag upstream, (b) we
+# fork helios to flip reqwest's TLS features, or (c) any non-helios
+# direct dep starts pulling openssl — that would be a new attack surface
+# worth blocking.
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = [
+    "https://github.com/a16z/helios",
+    "https://github.com/bbqsrc/core2",
+]
+
+[sources.allow-org]
+github = []
+gitlab = []
+bitbucket = []

@@ -303,6 +303,219 @@ pub async fn sign_and_send(
     Ok(hash)
 }
 
+// ── Raw-tx pipeline (WalletConnect `eth_sendTransaction`) ────────────────
+//
+// The Send pane builds a `SendPlan` (native ETH or ERC-20 transfer) and
+// hands it to `build_quote` + `sign_and_send`. dApps via WalletConnect
+// produce arbitrary calldata that doesn't fit either shape — a swap, a
+// stake, an L2 deposit — and need a parallel entry point that takes the
+// raw `(from, to, value, data)` tuple. The two paths share `TxQuote` and
+// the EIP-1559 envelope construction; the divergence is purely at the
+// input boundary.
+
+/// Inputs for an arbitrary EIP-1559 transaction supplied by an external
+/// caller (today: the WalletConnect engine handling `eth_sendTransaction`).
+///
+/// dApp-supplied hints (`gas_limit_hint`, `nonce_hint`, fee hints) are
+/// treated as advisory only:
+/// - `gas_limit_hint`: the quote always re-estimates locally; the higher
+///   of (dApp hint, our estimate) wins, defending against dApps that
+///   under-provision a stake/swap that's grown more expensive since they
+///   computed their hint.
+/// - `nonce_hint`: if present, the quote cross-checks against the pending
+///   nonce from the provider. A mismatch is a hard error — the dApp is
+///   asking us to broadcast at a stale nonce, which would either revert
+///   on-chain or, worse, replay an old intent.
+/// - Fee hints are currently ignored; we use the provider's
+///   `eth_estimateFee` numbers. The user reviews the cost on the WC modal
+///   the same way they review a native Send.
+///
+/// Phase 4 deliverable. Fields are constructed by
+/// `walletconnect::methods::parse_eth_send_transaction_params` and read by
+/// `build_quote_raw` / `sign_raw` in Phase 6 once the UI flow is wired up.
+/// `dead_code` allow comes off as Phase 6 lands.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct RawTxRequest {
+    pub from: Address,
+    /// `None` for contract creation. Rare via WC but spec-allowed.
+    pub to: Option<Address>,
+    pub value: U256,
+    pub input: Bytes,
+    pub chain: Chain,
+    pub gas_limit_hint: Option<u64>,
+    pub nonce_hint: Option<u64>,
+}
+
+/// Quote an arbitrary tx. Same shape as `build_quote` but takes a
+/// [`RawTxRequest`] in place of `SendPlan`. Simulation is skipped for now —
+/// `sim::simulate_tx` is currently `SendPlan`-shaped and a refactor to
+/// accept raw inputs is Phase 7 hardening. Until then, the WC review modal
+/// gets gas + fees + nonce but no preflight revert reason. The clear-
+/// signing calldata decode (via `src/decode/`) is the primary review
+/// affordance for dApp txs anyway.
+#[allow(dead_code)] // Phase 6 wires this up; tested via `sign_raw` round-trip in Phase 4.
+pub async fn build_quote_raw(
+    provider: &RootProvider<Ethereum>,
+    _network: Arc<dyn BalanceFetcher>,
+    raw: &RawTxRequest,
+) -> Result<TxQuote, String> {
+    let to_label = match raw.to {
+        Some(a) => format!("{a}"),
+        None => "(create)".to_string(),
+    };
+    info!(
+        chain = %raw.chain.label(),
+        chain_id = raw.chain.chain_id(),
+        from = %raw.from,
+        to = %to_label,
+        value_wei = %raw.value,
+        input_len = raw.input.len(),
+        gas_hint = ?raw.gas_limit_hint,
+        nonce_hint = ?raw.nonce_hint,
+        "raw quote: starting",
+    );
+
+    let mut req = alloy::rpc::types::TransactionRequest::default()
+        .from(raw.from)
+        .value(raw.value)
+        .input(alloy::rpc::types::TransactionInput::new(raw.input.clone()));
+    if let Some(to) = raw.to {
+        req = req.to(to);
+    }
+
+    let estimated = match provider.estimate_gas(req).await {
+        Ok(g) => g,
+        Err(e) => {
+            warn!(error = %e, "raw quote: estimate_gas failed");
+            return Err(format!("estimate_gas: {e}"));
+        }
+    };
+    // Take the larger of (estimate, dApp hint). Under-provisioning is a
+    // common dApp bug that surfaces as a mid-execution out-of-gas revert;
+    // over-provisioning costs at most the unused gas refund.
+    let gas_limit = match raw.gas_limit_hint {
+        Some(hint) => estimated.max(hint),
+        None => estimated,
+    };
+
+    let fees = match provider.estimate_eip1559_fees().await {
+        Ok(f) => f,
+        Err(e) => {
+            warn!(error = %e, "raw quote: estimate_eip1559_fees failed");
+            return Err(format!("estimate_eip1559_fees: {e}"));
+        }
+    };
+
+    let nonce = match provider.get_transaction_count(raw.from).pending().await {
+        Ok(n) => n,
+        Err(e) => {
+            warn!(error = %e, "raw quote: get_transaction_count failed");
+            return Err(format!("get_transaction_count: {e}"));
+        }
+    };
+
+    // Defence-in-depth nonce check. The dApp passing a non-matching nonce
+    // is asking us to broadcast at a stale point in the account's history
+    // — either replaying an old intent or front-running its own queue.
+    // Either way, refuse loudly rather than carry it through to broadcast.
+    if let Some(hint) = raw.nonce_hint
+        && hint != nonce
+    {
+        return Err(format!(
+            "dApp-supplied nonce {hint} doesn't match pending nonce {nonce}"
+        ));
+    }
+
+    let eth_cost_wei = U256::from(gas_limit).saturating_mul(U256::from(fees.max_fee_per_gas));
+
+    info!(
+        gas_limit,
+        max_fee_per_gas = fees.max_fee_per_gas,
+        max_priority_fee_per_gas = fees.max_priority_fee_per_gas,
+        nonce,
+        eth_cost_wei = %eth_cost_wei,
+        "raw quote: ready (sim deferred — Phase 7)",
+    );
+
+    Ok(TxQuote {
+        gas_limit,
+        max_fee_per_gas: fees.max_fee_per_gas,
+        max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
+        nonce,
+        eth_cost_wei,
+        sim: SimulationResult::unavailable(),
+    })
+}
+
+/// Sign a raw `RawTxRequest` and return the encoded envelope **plus the
+/// computed transaction hash**. No network access — used by both
+/// `sign_and_send_raw` (which then broadcasts) and the
+/// `eth_signTransaction` WC handler (which hands the envelope back to the
+/// dApp without broadcasting).
+#[allow(dead_code)] // Phase 6 wires this up.
+pub async fn sign_raw(
+    signer: &KaoSigner,
+    raw: &RawTxRequest,
+    quote: &TxQuote,
+) -> Result<(TxHash, Bytes), String> {
+    let mut tx = TxEip1559 {
+        chain_id: raw.chain.chain_id(),
+        nonce: quote.nonce,
+        gas_limit: quote.gas_limit,
+        max_fee_per_gas: quote.max_fee_per_gas,
+        max_priority_fee_per_gas: quote.max_priority_fee_per_gas,
+        to: match raw.to {
+            Some(a) => TxKind::Call(a),
+            None => TxKind::Create,
+        },
+        value: raw.value,
+        access_list: Default::default(),
+        input: raw.input.clone(),
+    };
+
+    let sig = signer
+        .sign_tx(&mut tx)
+        .await
+        .map_err(|e| format!("sign failed: {e}"))?;
+    let envelope: TxEnvelope = tx.into_signed(sig).into();
+    let hash = *envelope.tx_hash();
+    let raw_bytes = Bytes::from(envelope.encoded_2718());
+    Ok((hash, raw_bytes))
+}
+
+/// Sign + broadcast a raw request. Mirror of `sign_and_send` for dApp-
+/// supplied tx shapes.
+#[allow(dead_code)] // Phase 6 wires this up.
+pub async fn sign_and_send_raw(
+    provider: &RootProvider<Ethereum>,
+    signer: &KaoSigner,
+    raw: &RawTxRequest,
+    quote: &TxQuote,
+) -> Result<TxHash, String> {
+    let (hash, raw_bytes) = sign_raw(signer, raw, quote).await?;
+    debug!(
+        raw_len = raw_bytes.len(),
+        "raw sign+send: broadcasting envelope"
+    );
+    let pending = provider
+        .send_raw_transaction(&raw_bytes)
+        .await
+        .map_err(|e| format!("broadcast failed: {e}"))?;
+    let broadcast_hash = *pending.tx_hash();
+    // Sanity-check: the hash we computed locally must match what the node
+    // returns. A mismatch points at a tampered RPC; surface it loudly.
+    if broadcast_hash != hash {
+        warn!(
+            local_hash = %format!("{hash:#x}"),
+            broadcast_hash = %format!("{broadcast_hash:#x}"),
+            "raw sign+send: hash mismatch between local compute and broadcast response",
+        );
+    }
+    info!(hash = %format!("{hash:#x}"), "raw sign+send: broadcast ok");
+    Ok(hash)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

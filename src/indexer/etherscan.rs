@@ -586,7 +586,11 @@ mod tests {
         let tx = convert_token_tx(raw, owner).expect("converts");
         assert!(matches!(tx.status, TxStatus::Success));
         assert!(matches!(tx.direction, TxDirection::In));
-        assert_eq!(tx.value, U256::ZERO, "outer-tx ETH value zero on token rows");
+        assert_eq!(
+            tx.value,
+            U256::ZERO,
+            "outer-tx ETH value zero on token rows"
+        );
         let token = tx.token.unwrap();
         assert_eq!(token.symbol, "USDC");
         assert_eq!(token.decimals, 6);
@@ -644,8 +648,7 @@ mod tests {
             .unwrap();
         let other = "0x000000000000000000000000000000000000beef";
         let hash_shared = "0x1111111111111111111111111111111111111111111111111111111111111111";
-        let hash_only_normal =
-            "0x2222222222222222222222222222222222222222222222222222222222222222";
+        let hash_only_normal = "0x2222222222222222222222222222222222222222222222222222222222222222";
 
         let normal = vec![
             // shared hash — should be dropped because the token row wins.
@@ -711,10 +714,7 @@ mod tests {
             .map(|i| RawTx {
                 block_number: (1000 + i).to_string(),
                 timestamp: "0".into(),
-                hash: format!(
-                    "0x{:064x}",
-                    i + 1
-                ),
+                hash: format!("0x{:064x}", i + 1),
                 from: format!("{owner:#x}"),
                 to: "0x000000000000000000000000000000000000beef".into(),
                 value: "0".into(),

@@ -21,6 +21,12 @@ fn main() {
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={}", assets.display());
+    // WalletConnect Cloud project id, baked into the binary via
+    // `option_env!` in `walletconnect::runtime`. Re-running on change
+    // keeps `cargo build` cache-coherent: without this directive, cargo
+    // wouldn't notice a new env value and would hand back a stale binary
+    // with the previous (or empty) id compiled in.
+    println!("cargo:rerun-if-env-changed=KAO_WC_PROJECT_ID");
 
     let mut entries: Vec<(&'static str, String, PathBuf)> = Vec::new();
     for chain in CHAINS {

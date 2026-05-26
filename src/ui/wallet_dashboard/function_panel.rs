@@ -265,5 +265,15 @@ fn ty_short(ty: &alloy::dyn_abi::DynSolType) -> String {
         DynSolType::Array(inner) => format!("{}[]", ty_short(inner)),
         DynSolType::FixedArray(inner, n) => format!("{}[{}]", ty_short(inner), n),
         DynSolType::Function => "function".into(),
+        // Enabling alloy's `eip712` feature (for WalletConnect typed-data
+        // signing) exposes this variant. Calldata-decode paths don't see
+        // it in practice — `CustomStruct` only appears in EIP-712 type
+        // resolvers, not in evmole's 4-byte function-arg list — but the
+        // match has to be exhaustive. Render as `name(field1,field2,…)`
+        // for the same compact look as `Tuple`.
+        DynSolType::CustomStruct { name, tuple, .. } => {
+            let inner: Vec<String> = tuple.iter().map(ty_short).collect();
+            format!("{name}({})", inner.join(","))
+        }
     }
 }

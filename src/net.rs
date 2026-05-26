@@ -1360,11 +1360,7 @@ impl BalanceFetcher for CallMock {
     async fn provider(&self, _: Chain) -> Option<RootProvider<Ethereum>> {
         None
     }
-    async fn get_code(
-        &self,
-        addr: Address,
-        _: Chain,
-    ) -> Result<VerifiedRead<Bytes>, String> {
+    async fn get_code(&self, addr: Address, _: Chain) -> Result<VerifiedRead<Bytes>, String> {
         let (value, verified) = self
             .code
             .lock()
@@ -1405,11 +1401,7 @@ impl BalanceFetcher for CallMock {
             .unwrap_or((Bytes::new(), true));
         Ok(VerifiedRead { value, verified })
     }
-    async fn get_balance_raw(
-        &self,
-        _: Address,
-        _: Chain,
-    ) -> Result<VerifiedRead<U256>, String> {
+    async fn get_balance_raw(&self, _: Address, _: Chain) -> Result<VerifiedRead<U256>, String> {
         Ok(VerifiedRead {
             value: U256::ZERO,
             verified: true,
@@ -1460,9 +1452,18 @@ mod pure_tests {
 
     #[test]
     fn verification_status_from_u8_unknown_defaults_to_connecting() {
-        assert_eq!(VerificationStatus::from_u8(0), VerificationStatus::Connecting);
-        assert_eq!(VerificationStatus::from_u8(99), VerificationStatus::Connecting);
-        assert_eq!(VerificationStatus::from_u8(u8::MAX), VerificationStatus::Connecting);
+        assert_eq!(
+            VerificationStatus::from_u8(0),
+            VerificationStatus::Connecting
+        );
+        assert_eq!(
+            VerificationStatus::from_u8(99),
+            VerificationStatus::Connecting
+        );
+        assert_eq!(
+            VerificationStatus::from_u8(u8::MAX),
+            VerificationStatus::Connecting
+        );
     }
 
     #[test]

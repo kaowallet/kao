@@ -55,6 +55,15 @@ use super::{AccountDescriptor, Contact, WalletDescriptor, WalletError, keyring a
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const ACCOUNTS_TABLE: TableDefinition<u32, &[u8]> = TableDefinition::new("accounts");
 const CONTACTS_TABLE: TableDefinition<u32, &[u8]> = TableDefinition::new("contacts");
+/// WalletConnect Sign v2 settled sessions. Keyed by 32-byte topic
+/// (not a sequential index), so the engine's persist-on-settle and
+/// delete-on-disconnect paths are O(1) lookups instead of full scans.
+///
+/// `dead_code` allow: the table + its AAD helpers + the public load/save
+/// functions are reachable only from tests in Phase 5; Phase 6 wires the
+/// App-level handler that calls them on engine events.
+#[allow(dead_code)]
+const WC_SESSIONS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("wc_sessions");
 
 const NONCE_LEN: usize = 24;
 const TAG_LEN: usize = 16;
@@ -65,6 +74,8 @@ const ACTIVE_INDEX_KEY: &str = "active_index";
 const HEADER_AAD: &[u8] = b"header:auth_check";
 const ACCOUNT_AAD_PREFIX: &[u8] = b"accounts:";
 const CONTACT_AAD_PREFIX: &[u8] = b"contacts:";
+#[allow(dead_code)]
+const WC_SESSION_AAD_PREFIX: &[u8] = b"wc_sessions:";
 
 const AUTH_CONSTANT: &[u8] = b"KAO_AUTH";
 
@@ -611,6 +622,17 @@ fn contact_aad(idx: u32) -> Vec<u8> {
     out
 }
 
+/// AAD for a WalletConnect session row. Binds the ciphertext to its topic
+/// — a row swap between two sessions would surface as a decrypt failure
+/// on next load instead of silently mixing symKeys.
+#[allow(dead_code)]
+fn wc_session_aad(topic: &[u8; 32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(WC_SESSION_AAD_PREFIX.len() + 32);
+    out.extend_from_slice(WC_SESSION_AAD_PREFIX);
+    out.extend_from_slice(topic);
+    out
+}
+
 /// Persist the contacts list under the existing wallet's master key.
 ///
 /// Reuses the same per-row AEAD pattern as accounts but lives in its own
@@ -629,6 +651,194 @@ pub fn save_contacts(contacts: &[Contact], passphrase: &SecretString) -> Result<
 
 pub fn load_contacts(passphrase: &SecretString) -> Result<Vec<Contact>, WalletError> {
     load_contacts_from(&db_path(), passphrase)
+}
+
+// ── WalletConnect sessions ──────────────────────────────────────────────
+//
+// Same row-AAD encryption shape as the accounts/contacts tables, keyed by
+// 32-byte session topic instead of a sequential u32. Sessions are
+// short-lived per row (the user can disconnect at any time) but the engine
+// only writes batched snapshots — Argon2id derivation runs once per save
+// regardless of how many sessions changed, matching the contacts path.
+
+/// Replace the entire `wc_sessions` table with `sessions`. Atomic — the
+/// commit either succeeds (all rows present) or fails (table unchanged).
+/// The bulk-replace shape is intentional: a session-by-session API would
+/// require either caching the master key (lifetime concern) or re-running
+/// Argon2id per write (latency concern), and the engine already mirrors
+/// its session map in memory so it can hand the full set to one call.
+#[allow(dead_code)] // Phase 6 wires this up via the App-level WC handler.
+pub fn save_wc_sessions(
+    sessions: &[crate::walletconnect::session::PersistedSession],
+    passphrase: &SecretString,
+) -> Result<(), WalletError> {
+    save_wc_sessions_to(&db_path(), sessions, passphrase)
+}
+
+/// Load every persisted WC session. Returns `[]` for fresh wallets where
+/// the table has never been created.
+#[allow(dead_code)] // Phase 6 wires this up.
+pub fn load_all_wc_sessions(
+    passphrase: &SecretString,
+) -> Result<Vec<crate::walletconnect::session::PersistedSession>, WalletError> {
+    load_all_wc_sessions_from(&db_path(), passphrase)
+}
+
+#[allow(dead_code)] // Phase 6.
+fn save_wc_sessions_to(
+    path: &Path,
+    sessions: &[crate::walletconnect::session::PersistedSession],
+    pw: &SecretString,
+) -> Result<(), WalletError> {
+    let db = Database::create(path).map_err(redb_err)?;
+    restrict_to_owner(path, 0o600)?;
+    let txn = db.begin_write().map_err(redb_err)?;
+
+    // Auth-check against header — same gate as contacts. Without an
+    // existing wallet, persisting WC sessions is a logic error.
+    let header = {
+        let meta = txn.open_table(META_TABLE).map_err(redb_err)?;
+        match meta.get(HEADER_KEY).map_err(redb_err)? {
+            Some(v) => deserialize_header(v.value())?,
+            None => {
+                return Err(WalletError::Encryption(
+                    "save_wc_sessions called before wallet exists".into(),
+                ));
+            }
+        }
+    };
+    let master_key = derive_master_key(
+        pw,
+        &header.salt,
+        header.argon2_m_cost_kib,
+        header.argon2_t_cost,
+        header.argon2_p_cost,
+    )?;
+    decrypt_blob(
+        master_key.as_slice(),
+        &header_aad(header.epoch),
+        &header.auth_check,
+    )
+    .map_err(|_| WalletError::Encryption("incorrect password".into()))?;
+
+    {
+        let mut tbl = txn.open_table(WC_SESSIONS_TABLE).map_err(redb_err)?;
+        // Wipe-then-insert — matches contacts. Smaller list correctly drops
+        // sessions the engine has marked deleted (sessionDelete inbound or
+        // local Disconnect).
+        let existing_keys: Vec<Vec<u8>> = {
+            let mut acc = Vec::new();
+            for entry in tbl.iter().map_err(redb_err)? {
+                let (k, _) = entry.map_err(redb_err)?;
+                acc.push(k.value().to_vec());
+            }
+            acc
+        };
+        for k in existing_keys {
+            tbl.remove(k.as_slice()).map_err(redb_err)?;
+        }
+        for session in sessions {
+            let plaintext = postcard::to_stdvec(session)
+                .map_err(|e| WalletError::Encryption(format!("serialize wc_session: {e}")))?;
+            let aad = wc_session_aad(&session.topic);
+            let blob = encrypt_blob(master_key.as_slice(), &aad, &plaintext)?;
+            tbl.insert(session.topic.as_slice(), blob.as_slice())
+                .map_err(redb_err)?;
+        }
+    }
+
+    txn.commit().map_err(redb_err)?;
+    Ok(())
+}
+
+#[allow(dead_code)] // Phase 6.
+fn load_all_wc_sessions_from(
+    path: &Path,
+    pw: &SecretString,
+) -> Result<Vec<crate::walletconnect::session::PersistedSession>, WalletError> {
+    let db = match Database::open(path) {
+        Ok(db) => db,
+        Err(redb::DatabaseError::Storage(redb::StorageError::Io(e)))
+            if e.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Err(WalletError::NotFound);
+        }
+        Err(e) => return Err(redb_err(e)),
+    };
+    let txn = db.begin_read().map_err(redb_err)?;
+
+    let meta = txn.open_table(META_TABLE).map_err(redb_err)?;
+    let header_guard = meta
+        .get(HEADER_KEY)
+        .map_err(redb_err)?
+        .ok_or_else(|| WalletError::Encryption("missing header in store".into()))?;
+    let header = deserialize_header(header_guard.value())?;
+
+    let master_key = derive_master_key(
+        pw,
+        &header.salt,
+        header.argon2_m_cost_kib,
+        header.argon2_t_cost,
+        header.argon2_p_cost,
+    )?;
+    decrypt_blob(
+        master_key.as_slice(),
+        &header_aad(header.epoch),
+        &header.auth_check,
+    )
+    .map_err(|_| WalletError::Encryption("incorrect password".into()))?;
+
+    // Missing table is fine for fresh wallets — return empty.
+    let tbl = match txn.open_table(WC_SESSIONS_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(redb_err(e)),
+    };
+
+    let mut sessions = Vec::new();
+    for entry in tbl.iter().map_err(redb_err)? {
+        let (k, v) = entry.map_err(redb_err)?;
+        let topic_bytes = k.value();
+        if topic_bytes.len() != 32 {
+            // Defensive: a malformed key shouldn't exist (we only write
+            // 32-byte topics) but log + skip rather than fail the whole
+            // load — the engine can rebuild any missed sessions from the
+            // dApp's next inbound.
+            warn!(
+                len = topic_bytes.len(),
+                "wc_session row has non-32-byte topic key, skipping"
+            );
+            continue;
+        }
+        let mut topic = [0u8; 32];
+        topic.copy_from_slice(topic_bytes);
+        let aad = wc_session_aad(&topic);
+        let plaintext = match decrypt_blob(master_key.as_slice(), &aad, v.value()) {
+            Ok(pt) => pt,
+            Err(e) => {
+                // A single corrupt session shouldn't prevent the rest from
+                // loading. Log + skip; engine will treat the dApp's next
+                // sessionRequest as unknown-topic and drop it (the dApp
+                // will then re-pair).
+                warn!(error = ?e, "wc_session decrypt failed, skipping row");
+                continue;
+            }
+        };
+        let session: crate::walletconnect::session::PersistedSession =
+            match postcard::from_bytes(&plaintext) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "wc_session deserialize failed, skipping row");
+                    continue;
+                }
+            };
+        sessions.push(session);
+    }
+    // No particular order — sessions are keyed by content-addressed topic,
+    // not by user-visible index. Sort by topic bytes for determinism in
+    // tests + restore logs.
+    sessions.sort_by_key(|s| s.topic);
+    Ok(sessions)
 }
 
 fn save_contacts_to(
@@ -1462,5 +1672,169 @@ mod tests {
             decrypt_blob(&key, &account_aad(0), &blob_a).unwrap(),
             plaintext,
         );
+    }
+
+    // ── WalletConnect sessions ─────────────────────────────────────
+
+    fn sample_wc_session(
+        topic_byte: u8,
+        sym_byte: u8,
+        name: &str,
+    ) -> crate::walletconnect::session::PersistedSession {
+        use std::collections::BTreeMap;
+        let mut namespaces = BTreeMap::new();
+        namespaces.insert(
+            "eip155".to_string(),
+            crate::walletconnect::protocol::NamespaceSettled {
+                chains: vec!["eip155:1".to_string()],
+                accounts: vec!["eip155:1:0x1111111111111111111111111111111111111111".to_string()],
+                methods: vec!["personal_sign".to_string()],
+                events: vec!["chainChanged".to_string()],
+            },
+        );
+        crate::walletconnect::session::PersistedSession {
+            topic: [topic_byte; 32],
+            sym_key: [sym_byte; 32],
+            peer_metadata: crate::walletconnect::session::PersistedPeerMetadata {
+                name: name.to_string(),
+                description: format!("test session {name}"),
+                url: format!("https://{name}.example"),
+                icons: vec![],
+                redirect: None,
+            },
+            namespaces,
+            expiry: 1_700_000_000,
+            relay_protocol: "irn".to_string(),
+        }
+    }
+
+    #[test]
+    fn wc_sessions_save_and_load_roundtrip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet.redb");
+        let desc = WalletDescriptor::single(AccountDescriptor::Local {
+            name: None,
+            key_bytes: [0x42; 32],
+        });
+        save_to(&path, &desc, &pw("pw")).unwrap();
+
+        let sessions = vec![
+            sample_wc_session(0xAA, 0x11, "dapp-a"),
+            sample_wc_session(0xBB, 0x22, "dapp-b"),
+        ];
+        save_wc_sessions_to(&path, &sessions, &pw("pw")).unwrap();
+        let loaded = load_all_wc_sessions_from(&path, &pw("pw")).unwrap();
+        assert_eq!(loaded.len(), 2);
+        // Loader sorts by topic for determinism.
+        assert_eq!(loaded[0].topic, [0xAA; 32]);
+        assert_eq!(loaded[0].sym_key, [0x11; 32]);
+        assert_eq!(loaded[0].peer_metadata.name, "dapp-a");
+        assert_eq!(loaded[1].topic, [0xBB; 32]);
+        assert_eq!(loaded[1].peer_metadata.name, "dapp-b");
+    }
+
+    #[test]
+    fn wc_sessions_load_returns_empty_when_table_missing() {
+        // Fresh wallets — no WC table has ever been created.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet.redb");
+        let desc = WalletDescriptor::single(AccountDescriptor::Local {
+            name: None,
+            key_bytes: [0x42; 32],
+        });
+        save_to(&path, &desc, &pw("pw")).unwrap();
+        let loaded = load_all_wc_sessions_from(&path, &pw("pw")).unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn wc_sessions_save_overwrite_drops_removed_rows() {
+        // Disconnecting a session removes it from the engine's in-memory
+        // map; the next save must drop the corresponding redb row.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet.redb");
+        let desc = WalletDescriptor::single(AccountDescriptor::Local {
+            name: None,
+            key_bytes: [0x42; 32],
+        });
+        save_to(&path, &desc, &pw("pw")).unwrap();
+
+        let initial = vec![
+            sample_wc_session(0x01, 0x11, "a"),
+            sample_wc_session(0x02, 0x22, "b"),
+            sample_wc_session(0x03, 0x33, "c"),
+        ];
+        save_wc_sessions_to(&path, &initial, &pw("pw")).unwrap();
+        // Drop "b" — engine processed a wc_sessionDelete for it.
+        let after = vec![
+            sample_wc_session(0x01, 0x11, "a"),
+            sample_wc_session(0x03, 0x33, "c"),
+        ];
+        save_wc_sessions_to(&path, &after, &pw("pw")).unwrap();
+        let loaded = load_all_wc_sessions_from(&path, &pw("pw")).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].topic, [0x01; 32]);
+        assert_eq!(loaded[1].topic, [0x03; 32]);
+    }
+
+    #[test]
+    fn wc_sessions_save_refuses_wrong_password() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet.redb");
+        let desc = WalletDescriptor::single(AccountDescriptor::Local {
+            name: None,
+            key_bytes: [0x42; 32],
+        });
+        save_to(&path, &desc, &pw("right")).unwrap();
+        let sessions = vec![sample_wc_session(0x01, 0x11, "a")];
+        let err = save_wc_sessions_to(&path, &sessions, &pw("wrong")).unwrap_err();
+        assert!(matches!(err, WalletError::Encryption(_)));
+    }
+
+    #[test]
+    fn wc_sessions_load_refuses_wrong_password() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet.redb");
+        let desc = WalletDescriptor::single(AccountDescriptor::Local {
+            name: None,
+            key_bytes: [0x42; 32],
+        });
+        save_to(&path, &desc, &pw("right")).unwrap();
+        let sessions = vec![sample_wc_session(0x01, 0x11, "a")];
+        save_wc_sessions_to(&path, &sessions, &pw("right")).unwrap();
+        let err = load_all_wc_sessions_from(&path, &pw("wrong")).unwrap_err();
+        assert!(matches!(err, WalletError::Encryption(_)));
+    }
+
+    #[test]
+    fn wc_session_aad_bound_to_topic() {
+        // A row swap between two sessions (topic A's ciphertext moved into
+        // topic B's row) must fail to decrypt — the per-topic AAD is the
+        // load-bearing defence here.
+        let topic_a = [0xAA; 32];
+        let topic_b = [0xBB; 32];
+        let aad_a = wc_session_aad(&topic_a);
+        let aad_b = wc_session_aad(&topic_b);
+        assert_ne!(aad_a, aad_b);
+
+        let key = [0x42u8; 32];
+        let plaintext = b"session-blob";
+        let blob = encrypt_blob(&key, &aad_a, plaintext).unwrap();
+        assert!(decrypt_blob(&key, &aad_b, &blob).is_err());
+        assert_eq!(decrypt_blob(&key, &aad_a, &blob).unwrap(), plaintext);
+    }
+
+    #[test]
+    fn wc_session_aad_distinct_from_accounts_aad() {
+        // Cross-table swap: a ciphertext from the accounts table mustn't
+        // decrypt as a WC session and vice versa, even if topic/account-idx
+        // happen to share leading bytes.
+        let key = [0x42u8; 32];
+        let plaintext = b"x";
+        let topic = [0u8; 32];
+        let blob_wc = encrypt_blob(&key, &wc_session_aad(&topic), plaintext).unwrap();
+        let blob_acct = encrypt_blob(&key, &account_aad(0), plaintext).unwrap();
+        assert!(decrypt_blob(&key, &account_aad(0), &blob_wc).is_err());
+        assert!(decrypt_blob(&key, &wc_session_aad(&topic), &blob_acct).is_err());
     }
 }

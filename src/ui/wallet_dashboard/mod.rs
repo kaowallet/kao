@@ -32,6 +32,7 @@ mod settings_root;
 mod sidebar;
 mod swap;
 mod tx_details;
+mod wc_panes;
 
 use account_dropdown::AccountDropdown;
 use contacts_settings::ContactsPane;
@@ -173,6 +174,44 @@ pub enum Message {
         generation: u64,
         actual: Option<String>,
     },
+    // ── WalletConnect ──────────────────────────────────────────────────
+    /// App tells the dashboard the WC state changed (proposal arrived,
+    /// session settled, etc) and the modal slot may need to open. The
+    /// dashboard reads `wc_state` and reconciles.
+    WcStateChanged,
+    /// Each keystroke into the Home pane's "Paste wc: URI" input.
+    WcPasteInput(String),
+    /// User pressed Enter / Connect on the wc URI input. Dispatches
+    /// `WcCommand::PairWithUri` to the engine via the global handle.
+    WcSubmitUri,
+    /// User clicked Approve on the current proposal modal. Carries the
+    /// `proposal_id` so a stale modal redraw can't approve the wrong one.
+    WcApproveProposal(u64),
+    /// User clicked Reject on the current proposal modal.
+    WcRejectProposal(u64),
+    /// User clicked Approve on the current request modal. The dashboard
+    /// runs the per-method signer code, then dispatches `ApproveRequest`
+    /// with the result or `RejectRequest` on signer error.
+    WcApproveRequest(u64),
+    /// User clicked Reject on the current request modal.
+    WcRejectRequest(u64),
+    /// Result of an async signer task spawned from `WcApproveRequest`.
+    /// `request_id` lets the engine match this back to the original
+    /// request even if the user has since dismissed the modal.
+    WcRequestSigned {
+        request_id: u64,
+        result: Result<serde_json::Value, crate::walletconnect::protocol::JsonRpcError>,
+    },
+    /// User clicked Disconnect on a row in the Sessions settings pane.
+    WcDisconnectSession(crate::walletconnect::crypto::Topic),
+    /// User clicked "Sessions" in Settings → Root.
+    OpenWcSessionsSettings,
+    /// User clicked the ✕ on the WC error banner.
+    WcDismissError,
+    /// User clicked "Show details" / "Hide details" on the proposal modal.
+    /// Toggles the raw-namespace expander so the wall-of-eip155-IDs is
+    /// hidden by default but reachable for power users.
+    WcToggleProposalDetails,
 }
 
 /// Outcomes bubbled up to the parent app.
@@ -198,6 +237,13 @@ enum Modal {
     Swap(SwapPane),
     AccountDropdown(AccountDropdown),
     TxDetails(TxDetailsPane),
+    /// WalletConnect modal slot. The actual proposal-vs-request shape lives
+    /// in `wc_state.current_modal` so the engine subscription can mutate
+    /// the queue in place without rebuilding the dashboard. This variant
+    /// is just "a WC modal is on screen" — view() reads `wc_state` for the
+    /// contents. Kept as its own variant rather than reusing Modal::None so
+    /// the chrome animation runs and other modals can't open underneath.
+    Wc,
 }
 
 /// Which settings pane is currently rendered. The Settings nav slot can show
@@ -208,6 +254,11 @@ enum SettingsPane {
     Networks(NetworksPane),
     Appearance,
     Contacts(ContactsPane),
+    /// WalletConnect sessions list. Read-only view of `wc_state.sessions`
+    /// with a per-row Disconnect button. No screen-local state — the list
+    /// is rebuilt from `wc_state` on every render so a settle event lands
+    /// without re-entering the pane.
+    WcSessions,
 }
 
 #[derive(Debug)]
@@ -283,6 +334,19 @@ pub struct WalletScreen {
     /// `ClipboardClearArmed` / `ClipboardClearProbe` from an older arm
     /// can't clobber the chip or the clipboard.
     clipboard_clear_gen: u64,
+    /// Shared WalletConnect UI state. Written by App as engine events
+    /// land (via `Message::Wc`), read by the dashboard's view + the
+    /// Sessions settings pane. Mirrors the contacts `Arc<RwLock<…>>`
+    /// pattern so a settle event repaints without rebuilding the dashboard.
+    wc_state: Arc<RwLock<crate::walletconnect::state::WcState>>,
+    /// Live "Paste wc: URI" input on the Home pane. Lives on the
+    /// dashboard rather than `WcState` so the iced `text_input` can
+    /// borrow from a stable self-lifetime location instead of a
+    /// short-lived RwLock guard.
+    wc_paste_input: String,
+    /// Whether the proposal modal's raw-namespace expander is open. Reset
+    /// on each new proposal (see the `WcStateChanged` handler).
+    wc_proposal_details_expanded: bool,
 }
 
 /// Tracks an in-flight clipboard auto-clear: when it lands, what we
@@ -312,6 +376,7 @@ impl WalletScreen {
     /// `Some(_)` is passed by `App::switch_account` so switching
     /// accounts while reading the Activity feed doesn't yank the user
     /// back to Home.
+    #[allow(clippy::too_many_arguments)] // App-level wiring; refactoring this to a struct would just move the same fields with no readability win.
     pub fn new(
         signer: KaoSigner,
         accounts: Vec<AccountDescriptor>,
@@ -319,6 +384,7 @@ impl WalletScreen {
         network: Arc<dyn BalanceFetcher>,
         portfolio_cache: PortfolioCache,
         contacts: Arc<RwLock<ContactsBook>>,
+        wc_state: Arc<RwLock<crate::walletconnect::state::WcState>>,
         initial_nav: Option<Nav>,
     ) -> Self {
         let address = signer.address();
@@ -365,6 +431,9 @@ impl WalletScreen {
             contacts,
             clipboard_clear: None,
             clipboard_clear_gen: 0,
+            wc_state,
+            wc_paste_input: String::new(),
+            wc_proposal_details_expanded: false,
         }
     }
 
@@ -1312,6 +1381,229 @@ impl WalletScreen {
                     None => return (task, None),
                 }
             }
+            // ── WalletConnect ──────────────────────────────────────────
+            Message::WcStateChanged => {
+                let has_modal = self
+                    .wc_state
+                    .read()
+                    .map(|g| g.current_modal.is_some())
+                    .unwrap_or(false);
+                match (&self.modal, has_modal) {
+                    (Modal::None, true) => {
+                        self.modal = Modal::Wc;
+                        self.chrome.open();
+                        // Fresh modal — collapse the proposal details
+                        // expander so each new proposal starts in the
+                        // "summary" view, never inheriting a stale toggle
+                        // from the previous one.
+                        self.wc_proposal_details_expanded = false;
+                    }
+                    (Modal::Wc, false) => {
+                        // Modal queue drained while the chrome was still
+                        // open (e.g. dApp deleted the session before the
+                        // user approved). Tear down the slot.
+                        self.chrome.start_close();
+                    }
+                    _ => {
+                        // Either a non-WC modal is open (we don't preempt
+                        // a Send-in-flight to show a WC modal — the
+                        // event sits in `wc_state.queue` until the user
+                        // closes the active modal) or there is no
+                        // change to the slot.
+                    }
+                }
+            }
+            Message::WcPasteInput(s) => {
+                self.wc_paste_input = s;
+                if let Ok(mut g) = self.wc_state.write() {
+                    g.last_error = None;
+                }
+            }
+            Message::WcSubmitUri => {
+                let uri = self.wc_paste_input.trim().to_string();
+                if uri.is_empty() {
+                    return (Task::none(), None);
+                }
+                use crate::walletconnect::engine::WcCommand;
+                use crate::walletconnect::runtime::dispatch;
+                match dispatch(WcCommand::PairWithUri { uri: uri.clone() }) {
+                    Ok(()) => {
+                        self.wc_paste_input.clear();
+                        if let Ok(mut g) = self.wc_state.write() {
+                            g.last_error = None;
+                        }
+                    }
+                    Err(()) => {
+                        if let Ok(mut g) = self.wc_state.write() {
+                            g.last_error = Some(
+                                "WalletConnect is offline — try again in a moment".to_string(),
+                            );
+                        }
+                    }
+                }
+            }
+            Message::WcApproveProposal(proposal_id) => {
+                // Build the settled namespaces from the proposal's
+                // required + optional, restricted to Kao's supported
+                // chains and methods. Methods missing from
+                // `walletconnect::methods::handle_method` are dropped so a
+                // dApp asking for legacy `eth_sign` doesn't end up with an
+                // unenforceable scope. Accounts are stamped with the
+                // active address per CAIP-10.
+                let snap = match self.wc_state.read() {
+                    Ok(g) => g.clone(),
+                    Err(_) => return (Task::none(), None),
+                };
+                let proposal = match snap.current_modal {
+                    Some(crate::walletconnect::state::WcModal::Proposal(p))
+                        if p.proposal_id == proposal_id =>
+                    {
+                        p
+                    }
+                    _ => return (Task::none(), None),
+                };
+                let namespaces = build_approved_namespaces(self.address, &proposal);
+                let wallet_metadata = kao_wallet_metadata();
+                use crate::walletconnect::engine::WcCommand;
+                use crate::walletconnect::runtime::dispatch;
+                let _ = dispatch(WcCommand::ApproveProposal {
+                    proposal_id,
+                    namespaces,
+                    wallet_metadata,
+                });
+                // Close the modal now — the SessionSettled event will
+                // refresh the sessions list. The chrome animation drives
+                // the visual close; the Tick handler clears Modal::Wc.
+                if let Ok(mut g) = self.wc_state.write() {
+                    let _ = g.pop_current();
+                }
+                if matches!(self.modal, Modal::Wc)
+                    && let Ok(g) = self.wc_state.read()
+                    && g.current_modal.is_none()
+                {
+                    self.chrome.start_close();
+                }
+            }
+            Message::WcRejectProposal(proposal_id) => {
+                use crate::walletconnect::engine::WcCommand;
+                use crate::walletconnect::runtime::dispatch;
+                let _ = dispatch(WcCommand::RejectProposal {
+                    proposal_id,
+                    reason: "User rejected".to_string(),
+                });
+                if let Ok(mut g) = self.wc_state.write() {
+                    // Only pop if the active modal is this proposal; a
+                    // stale message after the user already moved on
+                    // should not eject the next modal off the queue.
+                    let stale = !matches!(
+                        &g.current_modal,
+                        Some(crate::walletconnect::state::WcModal::Proposal(p))
+                            if p.proposal_id == proposal_id
+                    );
+                    if !stale {
+                        let _ = g.pop_current();
+                    }
+                }
+                if matches!(self.modal, Modal::Wc)
+                    && let Ok(g) = self.wc_state.read()
+                    && g.current_modal.is_none()
+                {
+                    self.chrome.start_close();
+                }
+            }
+            Message::WcApproveRequest(request_id) => {
+                let snap = match self.wc_state.read() {
+                    Ok(g) => g.clone(),
+                    Err(_) => return (Task::none(), None),
+                };
+                let req = match snap.current_modal {
+                    Some(crate::walletconnect::state::WcModal::Request(r))
+                        if r.request_id == request_id =>
+                    {
+                        r
+                    }
+                    _ => return (Task::none(), None),
+                };
+                let task = spawn_wc_method_task(&self.signer, req);
+                return (task, None);
+            }
+            Message::WcRequestSigned { request_id, result } => {
+                use crate::walletconnect::engine::WcCommand;
+                use crate::walletconnect::runtime::dispatch;
+                let cmd = match result {
+                    Ok(v) => WcCommand::ApproveRequest {
+                        request_id,
+                        result: v,
+                    },
+                    Err(e) => WcCommand::RejectRequest {
+                        request_id,
+                        error: Some(e),
+                    },
+                };
+                let _ = dispatch(cmd);
+                if let Ok(mut g) = self.wc_state.write() {
+                    let stale = !matches!(
+                        &g.current_modal,
+                        Some(crate::walletconnect::state::WcModal::Request(r))
+                            if r.request_id == request_id
+                    );
+                    if !stale {
+                        let _ = g.pop_current();
+                    }
+                }
+                if matches!(self.modal, Modal::Wc)
+                    && let Ok(g) = self.wc_state.read()
+                    && g.current_modal.is_none()
+                {
+                    self.chrome.start_close();
+                }
+            }
+            Message::WcRejectRequest(request_id) => {
+                use crate::walletconnect::engine::WcCommand;
+                use crate::walletconnect::runtime::dispatch;
+                let _ = dispatch(WcCommand::RejectRequest {
+                    request_id,
+                    error: None,
+                });
+                if let Ok(mut g) = self.wc_state.write() {
+                    let stale = !matches!(
+                        &g.current_modal,
+                        Some(crate::walletconnect::state::WcModal::Request(r))
+                            if r.request_id == request_id
+                    );
+                    if !stale {
+                        let _ = g.pop_current();
+                    }
+                }
+                if matches!(self.modal, Modal::Wc)
+                    && let Ok(g) = self.wc_state.read()
+                    && g.current_modal.is_none()
+                {
+                    self.chrome.start_close();
+                }
+            }
+            Message::WcDisconnectSession(topic) => {
+                use crate::walletconnect::engine::WcCommand;
+                use crate::walletconnect::runtime::dispatch;
+                let _ = dispatch(WcCommand::Disconnect {
+                    topic,
+                    reason: "User disconnected".to_string(),
+                });
+                // The engine will emit SessionDeleted; App will update
+                // `wc_state.sessions`. No optimistic local removal — a
+                // failed disconnect would otherwise leave the UI lying.
+            }
+            Message::OpenWcSessionsSettings => {
+                self.settings_pane = SettingsPane::WcSessions;
+            }
+            Message::WcDismissError => {
+                if let Ok(mut g) = self.wc_state.write() {
+                    g.last_error = None;
+                }
+            }
+            Message::WcToggleProposalDetails => {
+                self.wc_proposal_details_expanded = !self.wc_proposal_details_expanded;
+            }
         }
         (Task::none(), None)
     }
@@ -1334,7 +1626,7 @@ impl WalletScreen {
             Modal::TxDetails(p) => {
                 subs.push(p.subscription().map(Message::TxDetails));
             }
-            Modal::None => {}
+            Modal::Wc | Modal::None => {}
         }
         match &self.settings_pane {
             SettingsPane::Networks(p) => subs.push(p.subscription().map(Message::Networks)),
@@ -1364,7 +1656,18 @@ impl WalletScreen {
     pub fn view(&self) -> Element<'_, Message> {
         let t = self.theme();
 
-        let app = row![sidebar::view(t, self.nav), self.main_pane(t)]
+        // Hold the wc_state read guard for the full view tick. Falls back
+        // to an owned default snapshot on poisoning. The guard outlives
+        // every iced widget that borrows from `wc` because both `main_pane`
+        // and the modal layer drop their references before view() returns.
+        let wc_guard = self.wc_state.read().ok();
+        let wc_fallback = crate::walletconnect::state::WcState::default();
+        let wc: &crate::walletconnect::state::WcState = match &wc_guard {
+            Some(g) => g,
+            None => &wc_fallback,
+        };
+
+        let app = row![sidebar::view(t, self.nav), self.main_pane(t, wc)]
             .width(Length::Fill)
             .height(Length::Fill);
 
@@ -1408,6 +1711,18 @@ impl WalletScreen {
                 p.view(t, self.chrome.progress(), &tx_book)
                     .map(Message::TxDetails)
             }
+            Modal::Wc => {
+                // Reuse the already-held `wc` guard from above. If the
+                // active modal slot has been cleared while the chrome was
+                // still open (close-animation race), render an empty box
+                // — the next Tick clears Modal::Wc.
+                wc_panes::view(
+                    t,
+                    wc,
+                    self.chrome.progress(),
+                    self.wc_proposal_details_expanded,
+                )
+            }
         };
         let composed: Element<'_, Message> = stack![background, modal_layer].into();
 
@@ -1426,7 +1741,11 @@ impl WalletScreen {
 
     // ── Main pane (header + body) ──────────────────────────────────────────
 
-    fn main_pane<'a>(&'a self, t: KaoTheme) -> Element<'a, Message> {
+    fn main_pane<'a>(
+        &'a self,
+        t: KaoTheme,
+        wc: &crate::walletconnect::state::WcState,
+    ) -> Element<'a, Message> {
         // Hold the read guard for the duration of `main_pane`. iced
         // views are synchronous and the lock is uncontested, so the
         // guard's lifetime safely outlives the returned Element.
@@ -1437,7 +1756,14 @@ impl WalletScreen {
             None => &empty_book,
         };
         let body: Element<'_, Message> = match self.nav {
-            Nav::Home => home::view(t, &self.signer, &self.portfolio, self.portfolio_loading),
+            Nav::Home => home::view(
+                t,
+                &self.signer,
+                &self.portfolio,
+                self.portfolio_loading,
+                wc,
+                &self.wc_paste_input,
+            ),
             Nav::Activity => {
                 // Show the error placeholder only when every configured
                 // chain failed *and* nothing rendered. Otherwise partial
@@ -1466,6 +1792,7 @@ impl WalletScreen {
                 SettingsPane::Networks(p) => p.view(t).map(Message::Networks),
                 SettingsPane::Appearance => appearance::view(t, self.theme_kind),
                 SettingsPane::Contacts(p) => p.view(t).map(Message::Contacts),
+                SettingsPane::WcSessions => wc_panes::sessions_view(t, wc),
             },
         };
 
@@ -1766,6 +2093,150 @@ fn spawn_broadcast_task(
     )
 }
 
+// ── WalletConnect helpers ────────────────────────────────────────────────
+
+/// Build the settled-namespaces map for a sessionPropose approval.
+///
+/// Restricts the proposal's requested chains to Kao's supported set
+/// (`Chain::from_chain_id`) and methods to those `walletconnect::methods`
+/// can actually dispatch. Accounts are stamped with the active address per
+/// CAIP-10. Non-EIP-155 namespaces (cosmos, solana, …) are dropped — Kao
+/// only speaks EVM.
+fn build_approved_namespaces(
+    active: Address,
+    proposal: &crate::walletconnect::state::UiProposal,
+) -> std::collections::BTreeMap<String, crate::walletconnect::protocol::NamespaceSettled> {
+    use crate::chain::Chain;
+    use crate::walletconnect::methods::SUPPORTED_METHODS;
+    use crate::walletconnect::protocol::NamespaceSettled;
+    use std::collections::BTreeMap;
+
+    let mut out: BTreeMap<String, NamespaceSettled> = BTreeMap::new();
+    // Merge required + optional in proposal order. The dApp gets back the
+    // intersection of what they asked for and what we support.
+    for (key, ns) in proposal.required.iter().chain(proposal.optional.iter()) {
+        if key != "eip155" {
+            continue;
+        }
+        let mut chains: Vec<String> = Vec::new();
+        for c in &ns.chains {
+            if let Some(num) = c
+                .strip_prefix("eip155:")
+                .and_then(|s| s.parse::<u64>().ok())
+                && Chain::from_chain_id(num).is_some()
+            {
+                let id = format!("eip155:{num}");
+                if !chains.contains(&id) {
+                    chains.push(id);
+                }
+            }
+        }
+        if chains.is_empty() {
+            // Fall back to Mainnet so the dApp always has at least one
+            // chain to operate against — refusing the proposal is the
+            // user's job, not ours.
+            chains.push("eip155:1".to_string());
+        }
+        let methods: Vec<String> = ns
+            .methods
+            .iter()
+            .filter(|m| SUPPORTED_METHODS.iter().any(|sm| sm == m))
+            .cloned()
+            .collect();
+        let events = ns.events.clone();
+        let accounts: Vec<String> = chains.iter().map(|c| format!("{c}:{active:#x}")).collect();
+        // Merge with any existing entry (required + optional both hit this
+        // path) — extend without duplicates.
+        let entry = out.entry(key.clone()).or_insert(NamespaceSettled {
+            chains: Vec::new(),
+            accounts: Vec::new(),
+            methods: Vec::new(),
+            events: Vec::new(),
+        });
+        for c in chains {
+            if !entry.chains.contains(&c) {
+                entry.chains.push(c);
+            }
+        }
+        for m in methods {
+            if !entry.methods.contains(&m) {
+                entry.methods.push(m);
+            }
+        }
+        for e in events {
+            if !entry.events.contains(&e) {
+                entry.events.push(e);
+            }
+        }
+        for a in accounts {
+            if !entry.accounts.contains(&a) {
+                entry.accounts.push(a);
+            }
+        }
+    }
+    out
+}
+
+/// Static `PeerMetadata` for Kao, sent on every sessionSettle. The dApp
+/// shows this to the user as "you're connected to Kao". Kept minimal:
+/// real wallets serve their icon over HTTPS, but Kao is desktop-only and
+/// has no canonical icon URL yet.
+fn kao_wallet_metadata() -> crate::walletconnect::protocol::PeerMetadata {
+    crate::walletconnect::protocol::PeerMetadata {
+        name: "Kao".to_string(),
+        description: "Kaomoji-centered desktop wallet".to_string(),
+        url: "https://github.com/Wehi/kao".to_string(),
+        icons: vec![],
+        redirect: None,
+    }
+}
+
+/// Spawn an async task that runs the per-method signer code for a
+/// `wc_sessionRequest`. The signer is borrowed from the dashboard; only
+/// non-clonable signers (Trezor/Ledger) need the same care as the Send
+/// pane, but `personal_sign` / `eth_signTypedData_v4` don't take
+/// ownership of the underlying device transport — they call into
+/// alloy's signer APIs which clone the inner signer state. For raw-tx
+/// methods we currently reject at the dispatch site, so no signer move
+/// is needed.
+fn spawn_wc_method_task(
+    signer: &KaoSigner,
+    req: crate::walletconnect::state::UiRequest,
+) -> Task<Message> {
+    let request_id = req.request_id;
+    let signer_clone = match signer.share_for_wc() {
+        Some(s) => s,
+        None => {
+            // Hardware / view-only — surface as a JSON-RPC error so the
+            // dApp sees a clear "user's wallet doesn't support this from
+            // this account" instead of timing out.
+            use crate::walletconnect::protocol::{ERROR_UNAUTHORIZED_METHOD, JsonRpcError};
+            let err = JsonRpcError {
+                code: ERROR_UNAUTHORIZED_METHOD,
+                message: "Hardware and view-only accounts can't sign for dApps yet".to_string(),
+                data: None,
+            };
+            return Task::done(Message::WcRequestSigned {
+                request_id,
+                result: Err(err),
+            });
+        }
+    };
+    Task::perform(
+        async move {
+            let result = crate::walletconnect::methods::handle_method(
+                &signer_clone,
+                &req.method,
+                &req.params,
+                &req.chain_id,
+            )
+            .await;
+            (request_id, result)
+        },
+        |(request_id, result)| Message::WcRequestSigned { request_id, result },
+    )
+}
+
 #[cfg(test)]
 #[allow(unused_must_use)]
 mod tests {
@@ -1792,6 +2263,7 @@ mod tests {
             Arc::new(MockFetcher::new()),
             cache,
             Arc::new(RwLock::new(ContactsBook::new())),
+            Arc::new(RwLock::new(crate::walletconnect::state::WcState::default())),
             None,
         )
     }

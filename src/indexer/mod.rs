@@ -526,10 +526,7 @@ mod tests {
     fn iso8601_with_timezone_offset_ignored() {
         // Only the first 19 chars of the timestamp are parsed — fractions
         // and timezones are ignored.
-        assert_eq!(
-            parse_iso8601("2024-01-01T00:00:00+05:30"),
-            1_704_067_200,
-        );
+        assert_eq!(parse_iso8601("2024-01-01T00:00:00+05:30"), 1_704_067_200,);
     }
 
     #[test]

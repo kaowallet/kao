@@ -294,11 +294,20 @@ mod tests {
     #[test]
     fn keccak_selector_round_trip() {
         // transfer(address,uint256) → 0xa9059cbb
-        assert_eq!(keccak4("transfer(address,uint256)"), [0xa9, 0x05, 0x9c, 0xbb]);
+        assert_eq!(
+            keccak4("transfer(address,uint256)"),
+            [0xa9, 0x05, 0x9c, 0xbb]
+        );
         // approve(address,uint256) → 0x095ea7b3
-        assert_eq!(keccak4("approve(address,uint256)"), [0x09, 0x5e, 0xa7, 0xb3]);
+        assert_eq!(
+            keccak4("approve(address,uint256)"),
+            [0x09, 0x5e, 0xa7, 0xb3]
+        );
         // A bogus pair must NOT round-trip.
-        assert_ne!(keccak4("transfer(address,uint256)"), [0x00, 0x00, 0x00, 0x00]);
+        assert_ne!(
+            keccak4("transfer(address,uint256)"),
+            [0x00, 0x00, 0x00, 0x00]
+        );
     }
 
     #[test]

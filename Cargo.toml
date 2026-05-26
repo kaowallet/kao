@@ -9,7 +9,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-alloy = { version = "2.0.1", features = ["full", "signer-mnemonic", "signer-ledger", "signer-trezor"] }
+alloy = { version = "2.0.1", features = ["full", "signer-mnemonic", "signer-ledger", "signer-trezor", "dyn-abi", "eip712"] }
 async-trait = "0.1"
 # Helios's API is built against alloy 1.x; we need its BlockId type to call
 # eth_getBalance against the verified light-client. alloy 1.x and 2.x share
@@ -33,6 +33,11 @@ alloy-rpc-types-eth = "1"
 op-alloy-rpc-types = "0.20"
 argon2 = "0.5.3"
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }
+# Standard padded base64 (RFC 4648). Used to encode WalletConnect Sign v2
+# envelope bytes into the relay's JSON-RPC string payload field — every
+# `Publish` carries the envelope as a base64 string. Not a security
+# boundary; the encryption is the AEAD beneath it.
+base64 = "0.22"
 chacha20poly1305 = "0.10.1"
 dirs = "6"
 # UTS-46 / ENSIP-15 normalization for ENS names. Rejects bidi controls,
@@ -47,6 +52,15 @@ ens-normalize-rs = "0.1.1"
 evmole = "0.8"
 futures = "0.3"
 getrandom = "0.4.2"
+# Hex decoding for the `symKey` parameter of `wc:` pairing URIs and the
+# `topic` segment (both spec'd as lowercase hex). No security boundary;
+# the AEAD beneath the symKey is what authenticates.
+hex = "0.4"
+# HKDF-SHA256 for WalletConnect Sign v2 session-key derivation:
+# `HKDF(salt=empty, ikm=x25519_shared_secret, info=empty, len=32)` produces
+# the session symKey from the ECDH output during sessionSettle handshake.
+# Spec: https://specs.walletconnect.com/2.0/specs/clients/core/crypto/crypto-keys
+hkdf = "0.12"
 # Pinned to commit on tag 0.11.1. Bump deliberately rather than tracking a branch.
 helios-ethereum = { git = "https://github.com/a16z/helios", rev = "204c998a927348e1c000a664f08d5b37b1b0d924" }
 # Same git rev as helios-ethereum: both crates ship from the a16z/helios
@@ -79,7 +93,30 @@ revm = { version = "29.0.1", default-features = false, features = [
     "optional_no_base_fee",
 ] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# rustls is in the dep graph twice over: reqwest's `rustls-tls` enables the
+# `aws-lc-rs` provider, while `relay_client`'s `rustls` feature pulls in
+# `ring`. With both providers compiled in, rustls 0.23 refuses to auto-pick a
+# default and panics at first handshake ("Could not automatically determine
+# the process-level CryptoProvider"). Adding rustls as a direct dep with
+# `aws-lc-rs` makes `crypto::aws_lc_rs::default_provider()` callable from
+# `main.rs` — see the `install_default()` call there. Default features are
+# off so we don't accidentally double-link a third provider; `std` is the
+# only must-have.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
+# WalletConnect Sign v2 relay transport. Apache-2.0. Pinned to the post-revert
+# HEAD on `main` (rev `f8d83ae`) — `v0.32.0` predates the topic-format revert
+# fix that landed in #106. Only `relay_client` (WebSocket + HTTP transport) and
+# `relay_rpc` (auth tokens + domain types) are pulled in; the `cacao` feature
+# is deliberately NOT enabled — it depends on `alloy 0.3` and would create a
+# parallel alloy alongside Kao's `alloy 2.0.1`. We re-implement CACAO signing
+# (if/when needed for one-click-auth) against alloy 2.x directly.
+relay_client = { git = "https://github.com/reown-com/reown-rust", rev = "f8d83ae", default-features = false, features = ["rustls"] }
+relay_rpc = { git = "https://github.com/reown-com/reown-rust", rev = "f8d83ae", default-features = false }
 secrecy = "0.10.3"
+# SHA-256 for WalletConnect Sign v2 topic derivation: `topic = sha256(symKey)`,
+# 32 bytes, displayed as lowercase hex. Same crate version as helios's
+# transitive sha2 0.10 — cargo unifies into one build.
+sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "sync"] }
@@ -87,6 +124,18 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
+# Ephemeral x25519 keypair for the WalletConnect Sign v2 sessionSettle
+# handshake (Type 1 envelope). Wallet generates a one-shot keypair per
+# pairing, sends its public key in the envelope header, and discards the
+# secret after deriving the session symKey via ECDH + HKDF-SHA256.
+#
+# Note: a second x25519-dalek 1.1.1 already lives transitively in the
+# build via libp2p-noise (helios-opstack → libp2p chain). Cargo links
+# both. The 1.1.1 copy authenticates helios p2p sessions only; this 2.x
+# direct dep handles WalletConnect's session-establishment crypto. They
+# never share key material. Drop the 1.1.1 transitive when helios's
+# libp2p dep updates.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 zeroize = { version = "1.8.2", features = ["derive"] }
 
 # OS keyring access. Used as the external trust anchor for rollback-protection

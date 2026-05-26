@@ -97,6 +97,21 @@ pub enum Message {
     DismissError {
         generation: u64,
     },
+    /// WalletConnect subscription emission. The engine runs on a tokio
+    /// task spawned by the subscription worker; events flow back here
+    /// for state mirroring + persistence.
+    Wc(crate::walletconnect::runtime::WcSubMsg),
+    /// Result of the off-thread `load_all_wc_sessions`. Lands shortly
+    /// after unlock; on success installs the WC bootstrap so the next
+    /// subscription tick picks it up.
+    WcSessionsLoaded(Result<Vec<crate::walletconnect::session::PersistedSession>, String>),
+    /// Result of the off-thread `save_wc_sessions` call. Errors only —
+    /// the in-memory state was already updated synchronously. Phase 6b
+    /// leaves the persistence path stubbed so this variant is currently
+    /// unreachable; lands as live work when the engine grows a Snapshot
+    /// command (sym_key isn't carried in the UI state mirror).
+    #[allow(dead_code)]
+    WcSessionsSaved(Result<(), String>),
 }
 
 // ── Screens ──────────────────────────────────────────────────────────────────
@@ -184,6 +199,18 @@ pub struct App {
     /// Monotonic counter bumped on every fresh error so an older
     /// dismissal task firing late can no-op against a newer toast.
     toast_gen: u64,
+    /// Shared WalletConnect read/write state, populated by the engine
+    /// subscription and read by the wallet dashboard. App is the only
+    /// writer; the dashboard reads on every view tick. Lives behind an
+    /// `Arc<RwLock<…>>` so the engine's settle/delete events repaint
+    /// without rebuilding the dashboard. Mirrors the contacts pattern.
+    wc_state: Arc<RwLock<crate::walletconnect::state::WcState>>,
+    /// Subscription-identity counter for the WC worker. Bumped each
+    /// time we (re-)install bootstrap so iced unmounts the prior worker
+    /// recipe and mounts a fresh one. Starts at 0 — the worker stays
+    /// dormant (an empty stream) until at least one bump happens after
+    /// unlock.
+    wc_generation: u32,
 }
 
 /// Single-toast state. We don't queue — a fresher error replaces the
@@ -208,6 +235,7 @@ impl App {
         let portfolio_cache = portfolio::new_cache();
 
         let contacts = Arc::new(RwLock::new(ContactsBook::new()));
+        let wc_state = Arc::new(RwLock::new(crate::walletconnect::state::WcState::default()));
         if wallet::wallet_exists() {
             let app = App {
                 screen: Screen::Unlock(UnlockScreen::default()),
@@ -220,6 +248,8 @@ impl App {
                 contacts,
                 toast: None,
                 toast_gen: 0,
+                wc_state,
+                wc_generation: 0,
             };
             let task = focus_widget(crate::ui::unlock::PASSWORD_INPUT_ID).map(Message::Unlock);
             (app, task)
@@ -235,6 +265,8 @@ impl App {
                 contacts,
                 toast: None,
                 toast_gen: 0,
+                wc_state,
+                wc_generation: 0,
             };
             let task = focus_widget(crate::ui::create_password::PASSWORD_INPUT_ID)
                 .map(Message::CreatePassword);
@@ -324,6 +356,7 @@ impl App {
             self.network.clone(),
             self.portfolio_cache.clone(),
             self.contacts.clone(),
+            self.wc_state.clone(),
             initial_nav,
         );
         let address = screen.address_for_log();
@@ -545,9 +578,19 @@ impl App {
                             .expect("passphrase just set")
                             .clone(),
                     );
+                    let load_wc_sessions = load_wc_sessions_task(
+                        self.passphrase
+                            .as_ref()
+                            .expect("passphrase just set")
+                            .clone(),
+                    );
+                    // Sequence the two post-unlock loads — redb holds a
+                    // process-level exclusive lock on `wallet.redb`, so
+                    // running them concurrently fails the second `Database::open`
+                    // with "Database already open. Cannot acquire lock."
                     return iced::Task::batch(vec![
                         self.enter_active_from_wallet(None),
-                        load_contacts,
+                        load_contacts.chain(load_wc_sessions),
                     ]);
                 }
                 cmd.map(Message::Unlock)
@@ -1077,6 +1120,57 @@ impl App {
                 }
                 iced::Task::none()
             }
+
+            // ── WalletConnect runtime messages ──────────────────────
+            Message::Wc(sub_msg) => self.handle_wc_sub_msg(sub_msg),
+            Message::WcSessionsLoaded(result) => {
+                let sessions = match result {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(error = %e, "wc sessions load failed; starting with empty session set");
+                        Vec::new()
+                    }
+                };
+                // Mirror into the UI state immediately so the Sessions
+                // pane and modal "from {peer}" lookups have the restored
+                // entries even before the engine's batch_subscribe
+                // round-trips on the relay.
+                if let Ok(mut g) = self.wc_state.write() {
+                    g.sessions = sessions
+                        .iter()
+                        .map(|p| crate::walletconnect::state::UiSession {
+                            topic: crate::walletconnect::crypto::Topic::from_bytes(p.topic),
+                            peer: p.peer_metadata.clone().into(),
+                            namespaces: p.namespaces.clone(),
+                            expiry: p.expiry,
+                        })
+                        .collect();
+                }
+                // Resolve the project_id from settings → fall back to
+                // the bundled default. Settings override lives in
+                // `settings::wc_project_id_override`.
+                let project_id = crate::settings::wc_project_id_override().unwrap_or_else(|| {
+                    crate::walletconnect::runtime::KAO_DEFAULT_WC_PROJECT_ID.to_string()
+                });
+                crate::walletconnect::runtime::install_bootstrap(
+                    crate::walletconnect::runtime::WcBootstrap {
+                        project_id,
+                        identity_key: crate::walletconnect::runtime::generate_identity_key(),
+                        initial_sessions: sessions,
+                    },
+                );
+                // Bump the subscription generation so iced unmounts any
+                // dormant worker recipe and mounts a fresh one that
+                // drains the bootstrap we just installed.
+                self.wc_generation = self.wc_generation.wrapping_add(1);
+                iced::Task::none()
+            }
+            Message::WcSessionsSaved(result) => {
+                if let Err(e) = result {
+                    error!(error = %e, "wc sessions save error");
+                }
+                iced::Task::none()
+            }
         }
     }
 
@@ -1110,7 +1204,188 @@ impl App {
         }
     }
 
+    /// Apply a single WC subscription message: mirror status into
+    /// `wc_state`, mutate the modal queue on proposal/request events,
+    /// persist sessions on settle/delete, surface non-fatal engine
+    /// errors as a one-line banner on the Home pane.
+    ///
+    /// Returns any follow-up tasks (a save dispatch for sessions, and
+    /// a forwarded `WcStateChanged` so the dashboard re-syncs its
+    /// modal slot).
+    fn handle_wc_sub_msg(
+        &mut self,
+        sub_msg: crate::walletconnect::runtime::WcSubMsg,
+    ) -> iced::Task<Message> {
+        use crate::walletconnect::engine::WcEvent;
+        use crate::walletconnect::runtime::WcSubMsg;
+        use crate::walletconnect::state::{UiProposal, UiRequest, UiSession, WcModal, WcStatus};
+        match sub_msg {
+            WcSubMsg::Idle => {
+                if let Ok(mut g) = self.wc_state.write() {
+                    g.status = WcStatus::Idle;
+                }
+                iced::Task::none()
+            }
+            WcSubMsg::Connecting => {
+                if let Ok(mut g) = self.wc_state.write() {
+                    g.status = WcStatus::Connecting;
+                    g.last_error = None;
+                }
+                iced::Task::none()
+            }
+            WcSubMsg::Connected => {
+                if let Ok(mut g) = self.wc_state.write() {
+                    g.status = WcStatus::Connected;
+                    g.last_error = None;
+                }
+                iced::Task::none()
+            }
+            WcSubMsg::Failed(e) => {
+                if let Ok(mut g) = self.wc_state.write() {
+                    g.status = WcStatus::Failed(e.clone());
+                    g.last_error = Some(e);
+                }
+                iced::Task::none()
+            }
+            WcSubMsg::Engine(WcEvent::Paired { pairing_topic: _ }) => iced::Task::none(),
+            WcSubMsg::Engine(WcEvent::ProposalReceived {
+                proposal_id,
+                peer,
+                required_namespaces,
+                optional_namespaces,
+            }) => {
+                if let Ok(mut g) = self.wc_state.write() {
+                    g.enqueue(WcModal::Proposal(UiProposal {
+                        proposal_id,
+                        peer,
+                        required: required_namespaces,
+                        optional: optional_namespaces,
+                    }));
+                }
+                iced::Task::done(Message::WalletDashboard(
+                    crate::ui::wallet_dashboard::Message::WcStateChanged,
+                ))
+            }
+            WcSubMsg::Engine(WcEvent::SessionSettled {
+                topic,
+                peer,
+                namespaces,
+                expiry,
+            }) => {
+                if let Ok(mut g) = self.wc_state.write() {
+                    // Idempotent: a SessionSettled re-emission (rare —
+                    // engine never re-emits, but defensive) shouldn't
+                    // duplicate the row.
+                    g.sessions.retain(|s| s.topic != topic);
+                    g.sessions.push(UiSession {
+                        topic,
+                        peer,
+                        namespaces,
+                        expiry,
+                    });
+                }
+                let save = self.persist_wc_sessions_task();
+                iced::Task::batch(vec![
+                    iced::Task::done(Message::WalletDashboard(
+                        crate::ui::wallet_dashboard::Message::WcStateChanged,
+                    )),
+                    save,
+                ])
+            }
+            WcSubMsg::Engine(WcEvent::RequestReceived {
+                request_id,
+                session_topic,
+                peer,
+                chain_id,
+                method,
+                params,
+            }) => {
+                if let Ok(mut g) = self.wc_state.write() {
+                    g.enqueue(WcModal::Request(UiRequest {
+                        request_id,
+                        session_topic,
+                        peer,
+                        chain_id,
+                        method,
+                        params,
+                    }));
+                }
+                iced::Task::done(Message::WalletDashboard(
+                    crate::ui::wallet_dashboard::Message::WcStateChanged,
+                ))
+            }
+            WcSubMsg::Engine(WcEvent::SessionDeleted { topic, reason: _ }) => {
+                if let Ok(mut g) = self.wc_state.write() {
+                    g.sessions.retain(|s| s.topic != topic);
+                }
+                self.persist_wc_sessions_task()
+            }
+            WcSubMsg::Engine(WcEvent::Error { context, message }) => {
+                if let Ok(mut g) = self.wc_state.write() {
+                    g.last_error = Some(format!("{context}: {message}"));
+                }
+                iced::Task::none()
+            }
+        }
+    }
+
+    fn persist_wc_sessions_task(&self) -> iced::Task<Message> {
+        let Some(passphrase) = self.passphrase.as_ref().cloned() else {
+            // Unreachable in normal flow — WC isn't initialised until
+            // after unlock. Quiet no-op rather than logging on every
+            // settle to avoid noise during integration tests.
+            return iced::Task::none();
+        };
+        let sessions: Vec<crate::walletconnect::session::PersistedSession> =
+            match self.wc_state.read() {
+                Ok(g) => g
+                    .sessions
+                    .iter()
+                    .map(|s| crate::walletconnect::session::PersistedSession {
+                        topic: *s.topic.as_bytes(),
+                        sym_key: [0u8; 32], // placeholder — see note below
+                        peer_metadata: s.peer.clone().into(),
+                        namespaces: s.namespaces.clone(),
+                        expiry: s.expiry,
+                        relay_protocol: "irn".to_string(),
+                    })
+                    .collect(),
+                Err(_) => return iced::Task::none(),
+            };
+        // sym_key is what makes the persistence load-bearing — without
+        // it, a restored session can't decrypt inbound relay messages.
+        // The UI state intentionally doesn't carry it (it's a secret).
+        // The engine owns the canonical sym_key; persistence has to go
+        // through the engine, not the UI mirror. For Phase 6b's UI
+        // wiring we leave this as a no-op stub so the disk format
+        // doesn't get poisoned with zeroed symKeys — the engine will
+        // gain a dedicated `WcCommand::Snapshot` path before sessions
+        // truly survive restart.
+        let _ = sessions;
+        let _ = passphrase;
+        iced::Task::none()
+    }
+
     pub fn subscription(&self) -> Subscription<Message> {
+        let mut subs: Vec<Subscription<Message>> = Vec::new();
+        // Mount the WC worker once the wallet is unlocked (gen > 0).
+        // The generation participates in the subscription identity so a
+        // re-unlock with fresh bootstrap data triggers iced to unmount
+        // the old recipe and mount a new one — letting the worker drain
+        // the new bootstrap cell.
+        if self.wc_generation > 0 {
+            subs.push(
+                Subscription::run_with(self.wc_generation, |_gen: &u32| {
+                    crate::walletconnect::runtime::wc_worker()
+                })
+                .map(Message::Wc),
+            );
+        }
+        subs.push(self.screen_subscription());
+        Subscription::batch(subs)
+    }
+
+    fn screen_subscription(&self) -> Subscription<Message> {
         match &self.screen {
             Screen::CreatePassword(screen) => screen.subscription().map(Message::CreatePassword),
             Screen::Unlock(_) => Subscription::none(),
@@ -1250,6 +1525,26 @@ fn load_contacts_task(passphrase: SecretString) -> iced::Task<Message> {
     )
 }
 
+/// Off-thread `wallet::load_all_wc_sessions`. Argon2id-gated like the
+/// contacts load, so kept off the iced event loop. Returns
+/// `Vec<PersistedSession>` on success — empty when the table is fresh.
+fn load_wc_sessions_task(passphrase: SecretString) -> iced::Task<Message> {
+    iced::Task::perform(
+        async move {
+            let join = tokio::task::spawn_blocking(move || {
+                crate::wallet::store::load_all_wc_sessions(&passphrase)
+            })
+            .await;
+            match join {
+                Ok(Ok(vec)) => Ok(vec),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(join_err) => Err(format!("wc sessions load panicked: {join_err}")),
+            }
+        },
+        Message::WcSessionsLoaded,
+    )
+}
+
 /// Off-thread `wallet::save_contacts`. Mirrors `save_descriptor_task`:
 /// Argon2 verifies the password against the stored auth_check, then the
 /// contacts table is rewritten in a single redb txn. The in-memory book
@@ -1324,6 +1619,8 @@ mod tests {
             contacts: Arc::new(RwLock::new(ContactsBook::new())),
             toast: None,
             toast_gen: 0,
+            wc_state: Arc::new(RwLock::new(crate::walletconnect::state::WcState::default())),
+            wc_generation: 0,
         }
     }
 

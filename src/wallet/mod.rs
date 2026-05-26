@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 pub mod contacts;
 mod keyring;
 pub mod sim;
-mod store;
+pub mod store;
 pub mod tx;
 
 pub use contacts::{Contact, ContactEns, ContactsBook};
@@ -24,8 +24,8 @@ pub use store::db_exists as wallet_exists;
 // that lands; suppress the unused-import warning until then.
 #[allow(unused_imports)]
 pub use store::{
-    load_contacts, load_descriptor, load_descriptor_accepting_keyring_reset, save_contacts,
-    save_descriptor,
+    load_all_wc_sessions, load_contacts, load_descriptor, load_descriptor_accepting_keyring_reset,
+    save_contacts, save_descriptor, save_wc_sessions,
 };
 
 /// Errors that can occur during wallet operations.
@@ -324,6 +324,79 @@ impl KaoSigner {
             KaoSigner::ViewOnly(_) => Err(alloy::signers::Error::UnsupportedOperation(
                 alloy::signers::UnsupportedSignerOperation::SignTransaction,
             )),
+        }
+    }
+
+    /// Sign a UTF-8 byte slice with the EIP-191 personal_sign prefix
+    /// (`"\x19Ethereum Signed Message:\n" + len + message`).
+    ///
+    /// All three sign-capable variants delegate to `Signer::sign_message`,
+    /// which applies the EIP-191 framing internally. For Ledger and Trezor
+    /// the device displays the message text and asks the user to confirm
+    /// on-device; for Local the signature happens in-process.
+    ///
+    /// `ViewOnly` returns `UnsupportedOperation(SignMessage)` — the WC
+    /// dispatcher surfaces this as JSON-RPC error 5000 to the dApp.
+    pub async fn sign_personal(&self, message: &[u8]) -> Result<Signature, alloy::signers::Error> {
+        match self {
+            KaoSigner::Local(s) => Signer::sign_message(s, message).await,
+            KaoSigner::Ledger(s) => Signer::sign_message(s, message).await,
+            KaoSigner::Trezor(s) => Signer::sign_message(s, message).await,
+            KaoSigner::ViewOnly(_) => Err(alloy::signers::Error::UnsupportedOperation(
+                alloy::signers::UnsupportedSignerOperation::SignMessage,
+            )),
+        }
+    }
+
+    /// Sign an EIP-712 v4 typed-data payload.
+    ///
+    /// Local and Ledger work natively — `PrivateKeySigner` computes the
+    /// EIP-712 hash and signs it locally; `LedgerSigner` overrides
+    /// `sign_dynamic_typed_data` to use the device's structured-data
+    /// signing protocol (the user sees the struct fields on the device
+    /// screen).
+    ///
+    /// Trezor is **deliberately rejected** here: as of alloy-signer-trezor
+    /// 2.0.1, `sign_dynamic_typed_data` is not overridden, so it falls
+    /// through to the trait's default impl which hashes locally and calls
+    /// `sign_hash` — and Trezor's `sign_hash` returns `UnsupportedOperation`
+    /// because the device requires structured input. Surfacing the failure
+    /// here, with the right enum variant, lets the WC dispatcher pick the
+    /// right user-facing message ("Your Trezor cannot display this typed
+    /// data") instead of a generic "unsupported".
+    ///
+    /// `ViewOnly` returns `UnsupportedOperation(SignTypedData)`.
+    pub async fn sign_typed_data(
+        &self,
+        payload: &alloy::dyn_abi::TypedData,
+    ) -> Result<Signature, alloy::signers::Error> {
+        match self {
+            KaoSigner::Local(s) => Signer::sign_dynamic_typed_data(s, payload).await,
+            KaoSigner::Ledger(s) => Signer::sign_dynamic_typed_data(s, payload).await,
+            KaoSigner::Trezor(_) | KaoSigner::ViewOnly(_) => {
+                Err(alloy::signers::Error::UnsupportedOperation(
+                    alloy::signers::UnsupportedSignerOperation::SignTypedData,
+                ))
+            }
+        }
+    }
+}
+
+impl KaoSigner {
+    /// Produce a cheap, `Clone`-able copy of this signer for handing into
+    /// short-lived async tasks (today: WalletConnect sign requests).
+    ///
+    /// Returns:
+    /// - `Some(KaoSigner::Local(...))` for software keys — `PrivateKeySigner`
+    ///   is `Clone` because it just wraps the secret bytes.
+    /// - `None` for hardware (`Ledger` / `Trezor`) and `ViewOnly`. Hardware
+    ///   transports are exclusive — Kao only holds one open USB handle per
+    ///   device and the dashboard already owns it. The WC request modal
+    ///   surfaces this as "Hardware signing for dApps lands in a follow-up".
+    pub fn share_for_wc(&self) -> Option<KaoSigner> {
+        match self {
+            KaoSigner::Local(s) => Some(KaoSigner::Local(s.clone())),
+            KaoSigner::Ledger(_) | KaoSigner::Trezor(_) | KaoSigner::ViewOnly(_) => None,
         }
     }
 }
@@ -814,7 +887,10 @@ mod tests {
         };
         let dyn_tx: &mut dyn SignableTransaction<_> = &mut tx;
         let err = signer.sign_tx(dyn_tx).await.unwrap_err();
-        assert!(matches!(err, alloy::signers::Error::UnsupportedOperation(_)));
+        assert!(matches!(
+            err,
+            alloy::signers::Error::UnsupportedOperation(_)
+        ));
     }
 
     #[test]

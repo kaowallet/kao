@@ -20,9 +20,12 @@ pub fn view<'a>(
     signer: &'a KaoSigner,
     portfolio: &'a [LiveToken],
     portfolio_loading: bool,
+    wc: &crate::walletconnect::state::WcState,
+    wc_paste_input: &'a str,
 ) -> Element<'a, Message> {
     let hero = balance_hero(t, portfolio);
     let actions = quick_actions(t, signer);
+    let wc_paste = super::wc_panes::paste_card(t, wc, wc_paste_input);
     let assets_label = text("ASSETS").size(11).color(t.sub).font(bold());
     let mut assets = column![].spacing(5);
     if portfolio_loading {
@@ -40,6 +43,8 @@ pub fn view<'a>(
 
     let content = column![
         hero,
+        Space::new().height(14),
+        wc_paste,
         Space::new().height(18),
         actions,
         Space::new().height(18),

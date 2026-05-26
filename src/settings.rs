@@ -103,6 +103,16 @@ struct State {
     /// to the public mainnet endpoint baked into the indexer.
     blockscout_base_url: Option<String>,
     blockscout_api_key: Option<String>,
+    /// Whether the WalletConnect Verify API
+    /// (`verify.walletconnect.com/v2/attestation/{id}`) is fetched on
+    /// every inbound `wc_sessionPropose` / `wc_sessionRequest`. Default
+    /// on; flipping off trades the SCAM hard-deny for the privacy
+    /// upside of not leaking attestation ids to a third party.
+    wc_verify_api_enabled: bool,
+    /// User-supplied WalletConnect Cloud project id. `None` falls back
+    /// to the compile-time `KAO_DEFAULT_WC_PROJECT_ID`. Public identifier
+    /// (NOT a secret) — registered at `cloud.reown.com`.
+    wc_project_id_override: Option<String>,
 }
 
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
@@ -138,6 +148,8 @@ fn default_state() -> State {
         drpc_api_key: None,
         blockscout_base_url: None,
         blockscout_api_key: None,
+        wc_verify_api_enabled: true,
+        wc_project_id_override: None,
     }
 }
 
@@ -197,6 +209,11 @@ struct OnDisk {
     blockscout_base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     blockscout_api_key: Option<String>,
+    /// `None` on load = "default on" — absence preserves the secure default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wc_verify_api_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wc_project_id_override: Option<String>,
 }
 
 /// True iff `s` parses as an HTTPS URL. Non-HTTPS endpoints are dropped on
@@ -269,6 +286,10 @@ fn parse(text: &str) -> State {
         .blockscout_base_url
         .filter(|s| !s.is_empty() && is_https_url(s));
     state.blockscout_api_key = on_disk.blockscout_api_key.filter(|s| !s.is_empty());
+    if let Some(b) = on_disk.wc_verify_api_enabled {
+        state.wc_verify_api_enabled = b;
+    }
+    state.wc_project_id_override = on_disk.wc_project_id_override.filter(|s| !s.is_empty());
     state
 }
 
@@ -300,6 +321,12 @@ fn serialize(state: &State) -> String {
         drpc_api_key: state.drpc_api_key.clone(),
         blockscout_base_url: state.blockscout_base_url.clone(),
         blockscout_api_key: state.blockscout_api_key.clone(),
+        wc_verify_api_enabled: if state.wc_verify_api_enabled {
+            None
+        } else {
+            Some(false)
+        },
+        wc_project_id_override: state.wc_project_id_override.clone(),
     };
     toml::to_string(&on_disk).expect("serializing settings cannot fail")
 }
@@ -519,6 +546,44 @@ pub fn set_blockscout_api_key(value: Option<String>) {
         .lock()
         .expect("settings mutex poisoned")
         .blockscout_api_key = value.filter(|s| !s.is_empty());
+    write_all();
+}
+
+/// WalletConnect Verify API toggle. `true` is the secure default — wallet
+/// hard-denies `SCAM` / `INVALID` attestations with no click-through.
+#[allow(dead_code)] // Phase 6b UI consumes.
+pub fn wc_verify_api_enabled() -> bool {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .wc_verify_api_enabled
+}
+
+#[allow(dead_code)] // Phase 6b Settings pane.
+pub fn set_wc_verify_api_enabled(value: bool) {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .wc_verify_api_enabled = value;
+    write_all();
+}
+
+/// User-supplied WC Cloud project id. `None` → bundled default.
+#[allow(dead_code)] // Phase 6b.
+pub fn wc_project_id_override() -> Option<String> {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .wc_project_id_override
+        .clone()
+}
+
+#[allow(dead_code)] // Phase 6b.
+pub fn set_wc_project_id_override(value: Option<String>) {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .wc_project_id_override = value.filter(|s| !s.is_empty());
     write_all();
 }
 
@@ -757,6 +822,8 @@ mod tests {
             drpc_api_key: Some("DRPC_TEST_KEY".into()),
             blockscout_base_url: Some("https://base.blockscout.com".into()),
             blockscout_api_key: Some("BLOCKSCOUT_TEST_KEY".into()),
+            wc_verify_api_enabled: false,
+            wc_project_id_override: Some("USER_PROJECT_ID".into()),
         };
         let serialized = serialize(&original);
         let parsed = parse(&serialized);
@@ -805,10 +872,7 @@ mod tests {
     #[test]
     fn nonempty_passes_through_or_returns_none() {
         assert!(nonempty(&[]).is_none());
-        assert_eq!(
-            nonempty(&["a".to_string()]),
-            Some(vec!["a".to_string()])
-        );
+        assert_eq!(nonempty(&["a".to_string()]), Some(vec!["a".to_string()]));
     }
 
     #[test]
@@ -915,7 +979,10 @@ mod tests {
         );
         // Only the https URL survives; existing list is replaced because the
         // filtered new list is non-empty.
-        assert_eq!(target.get(Chain::Mainnet), &vec!["https://kept".to_string()]);
+        assert_eq!(
+            target.get(Chain::Mainnet),
+            &vec!["https://kept".to_string()]
+        );
     }
 
     #[test]
@@ -928,7 +995,10 @@ mod tests {
             Some(vec!["http://nope".into()]),
         );
         // Existing entry preserved.
-        assert_eq!(target.get(Chain::Mainnet), &vec!["https://existing".to_string()]);
+        assert_eq!(
+            target.get(Chain::Mainnet),
+            &vec!["https://existing".to_string()]
+        );
     }
 
     #[test]
@@ -936,7 +1006,10 @@ mod tests {
         let mut target = PerChain::<Vec<String>>::default();
         target.set(Chain::Mainnet, vec!["https://existing".into()]);
         apply_rpc_list(&mut target, Chain::Mainnet, None);
-        assert_eq!(target.get(Chain::Mainnet), &vec!["https://existing".to_string()]);
+        assert_eq!(
+            target.get(Chain::Mainnet),
+            &vec!["https://existing".to_string()]
+        );
     }
 
     #[cfg(unix)]
@@ -967,7 +1040,10 @@ mod tests {
         let cl = default_consensus_rpcs();
         assert!(!cl.is_empty());
         for u in cl {
-            assert!(u.starts_with("https://"), "default consensus rpc must be https: {u}");
+            assert!(
+                u.starts_with("https://"),
+                "default consensus rpc must be https: {u}"
+            );
         }
     }
 
@@ -984,7 +1060,10 @@ mod tests {
         let _ = theme();
         assert_eq!(indexer_provider(), default_state().indexer_provider);
         // Per-chain rpcs default to the Mainnet list.
-        assert_eq!(rpcs(Chain::Mainnet), default_state().rpcs.get(Chain::Mainnet).clone());
+        assert_eq!(
+            rpcs(Chain::Mainnet),
+            default_state().rpcs.get(Chain::Mainnet).clone()
+        );
         // Consensus rpcs for Mainnet match the seeded default.
         assert_eq!(
             consensus_rpcs(Chain::Mainnet),
@@ -1000,7 +1079,10 @@ mod tests {
             vec![Chain::Optimism.default_consensus_url().to_string()],
         );
         // auto_checkpoint starts at the built-in constant.
-        assert_eq!(auto_checkpoint(), B256::from_str(BUILTIN_CHECKPOINT).unwrap());
+        assert_eq!(
+            auto_checkpoint(),
+            B256::from_str(BUILTIN_CHECKPOINT).unwrap()
+        );
         // checkpoint_override starts as None.
         assert!(checkpoint_override().is_none());
     }
@@ -1040,6 +1122,8 @@ mod tests {
             drpc_api_key: None,
             blockscout_base_url: None,
             blockscout_api_key: None,
+            wc_verify_api_enabled: true,
+            wc_project_id_override: None,
         };
         let text = serialize(&state);
         let reparsed: OnDisk = toml::from_str(&text).expect("output must be valid toml");

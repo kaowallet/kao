@@ -14,6 +14,11 @@ use super::Message;
 const SETTINGS_ROWS: &[(&str, &str, &str)] = &[
     ("Security", "(⌐■_■)", "Seed phrase · lock screen"),
     ("Networks", "( ・∀・)ﾉ", "Mainnet · testnets · L2s"),
+    (
+        "Sessions",
+        "(づ｡◕‿‿◕｡)づ",
+        "Connected dApps · WalletConnect",
+    ),
     ("Contacts", "(✿◠‿◠)", "Named addresses · saved recipients"),
     ("Notifications", "ヾ(＾∇＾)", "Price alerts · tx updates"),
     ("Appearance", "(｡◕‿◕｡)", "Theme · palette"),
@@ -27,6 +32,7 @@ pub fn view<'a>(t: KaoTheme) -> Element<'a, Message> {
             "Networks" => Some(Message::OpenNetworksSettings),
             "Appearance" => Some(Message::OpenAppearanceSettings),
             "Contacts" => Some(Message::OpenContactsSettings),
+            "Sessions" => Some(Message::OpenWcSessionsSettings),
             _ => None,
         };
         list = list.push(settings_row(t, label, kao, sub, on_click));

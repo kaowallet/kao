@@ -11,6 +11,11 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # WalletConnect Cloud project_id baked into the release binary. Stored
+  # as a repo secret (Settings → Secrets and variables → Actions). The
+  # `require-secret` job below fails the release loudly when this is
+  # missing rather than letting a placeholder binary ship.
+  KAO_WC_PROJECT_ID: ${{ secrets.KAO_WC_PROJECT_ID }}
 
 jobs:
   verify-ci:
@@ -31,9 +36,25 @@ jobs:
             --json conclusion \
             | grep -q '"conclusion":"success"'
 
+  require-secret:
+    name: require KAO_WC_PROJECT_ID
+    runs-on: ubuntu-latest
+    steps:
+      - name: ensure project_id secret is set
+        # Github expression context masks empty secrets to "", which is
+        # exactly the failure shape we need to detect. Fails the job with
+        # a load-bearing error message instead of letting the binary
+        # build silently with the placeholder embedded.
+        run: |
+          set -euo pipefail
+          if [ -z "${{ secrets.KAO_WC_PROJECT_ID }}" ]; then
+            echo "::error::KAO_WC_PROJECT_ID secret is not set. Configure it in Settings → Secrets and variables → Actions before tagging a release." >&2
+            exit 1
+          fi
+
   build:
     name: build (${{ matrix.target }})
-    needs: verify-ci
+    needs: [verify-ci, require-secret]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

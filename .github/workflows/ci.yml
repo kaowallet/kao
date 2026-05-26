@@ -12,6 +12,14 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # Optional WalletConnect Cloud project_id. When the repo secret is set,
+  # CI compiles with the real id baked in; otherwise the placeholder in
+  # `walletconnect::runtime` is used. We intentionally don't fail CI when
+  # the secret is absent — fork PRs and contributor branches don't have
+  # access to org secrets, and we want their clippy/test jobs to pass.
+  # Release builds (see release.yml) consume the same secret with the
+  # placeholder fallback removed.
+  KAO_WC_PROJECT_ID: ${{ secrets.KAO_WC_PROJECT_ID }}
 
 jobs:
   fmt:

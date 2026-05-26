@@ -372,8 +372,7 @@ mod tests {
         fn is_error<E: std::error::Error>() {}
         is_error::<KeyringError>();
 
-        let boxed: Box<dyn std::error::Error> =
-            Box::new(KeyringError::Backend("x".into()));
+        let boxed: Box<dyn std::error::Error> = Box::new(KeyringError::Backend("x".into()));
         assert!(format!("{boxed}").contains("backend"));
     }
 

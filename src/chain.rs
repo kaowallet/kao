@@ -34,6 +34,19 @@ impl Chain {
         }
     }
 
+    /// Reverse of [`Chain::chain_id`]: map an EIP-155 chain id back to a
+    /// `Chain`, returning `None` for chains Kao doesn't support. Used by the
+    /// WalletConnect dispatcher to translate CAIP-2 (`eip155:N`) into the
+    /// internal enum before quoting/signing dApp transactions.
+    pub fn from_chain_id(id: u64) -> Option<Chain> {
+        match id {
+            1 => Some(Chain::Mainnet),
+            8453 => Some(Chain::Base),
+            10 => Some(Chain::Optimism),
+            _ => None,
+        }
+    }
+
     /// Human-friendly network label for the review screen
     /// ("Ethereum Mainnet", "OP Mainnet", "Base"). Distinct from `label()`,
     /// which is the short navigation-row name.
@@ -188,8 +201,10 @@ mod tests {
         for c in Chain::ALL {
             assert!(c.default_consensus_url().starts_with("https://"));
         }
-        let urls: std::collections::HashSet<_> =
-            Chain::ALL.iter().map(|c| c.default_consensus_url()).collect();
+        let urls: std::collections::HashSet<_> = Chain::ALL
+            .iter()
+            .map(|c| c.default_consensus_url())
+            .collect();
         assert_eq!(urls.len(), 3);
     }
 

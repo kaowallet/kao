@@ -152,7 +152,8 @@ pub async fn handle_personal_sign(
             "personal_sign requires [message, address] or [address, message]",
         ));
     }
-    let (message_str, _address) = personal_sign_decode_order(&arr[0], &arr[1])?;
+    let (message_str, address) = personal_sign_decode_order(&arr[0], &arr[1])?;
+    ensure_request_matches_signer(signer, address)?;
     let message_bytes = decode_personal_sign_message(&message_str)?;
 
     let sig = signer
@@ -160,6 +161,33 @@ pub async fn handle_personal_sign(
         .await
         .map_err(map_signer_error)?;
     Ok(json!(format!("0x{}", hex::encode(sig.as_bytes()))))
+}
+
+/// Refuse to sign if the request's `from` doesn't match the wallet's active
+/// signer. The dApp picks the address in `personal_sign` / `eth_signTypedData_v4`
+/// params; the engine's scope check covers chain+method but not the per-request
+/// account, so the dApp could otherwise extract a signature from whichever
+/// account happens to be active at the moment of approval — a confused deputy
+/// that's especially dangerous after the user account-switches mid-session.
+///
+/// `ERROR_UNAUTHORIZED_METHOD` (3001) is the closest WC error: the request is
+/// well-formed but the wallet isn't authorised to satisfy it under the current
+/// signer.
+fn ensure_request_matches_signer(
+    signer: &KaoSigner,
+    requested: Address,
+) -> Result<(), JsonRpcError> {
+    let active = signer.address();
+    if active != requested {
+        return Err(JsonRpcError {
+            code: ERROR_UNAUTHORIZED_METHOD,
+            message: format!(
+                "request's from {requested:#x} does not match the active wallet address {active:#x}",
+            ),
+            data: None,
+        });
+    }
+    Ok(())
 }
 
 /// Decode the two-string params into `(message, address)` regardless of the
@@ -234,11 +262,12 @@ pub async fn handle_eth_sign_typed_data_v4(
 
     // First element is always the address (no order ambiguity here — the
     // typed-data side is a structured object/string, never an address).
-    let _address = arr[0]
+    let address = arr[0]
         .as_str()
         .ok_or_else(|| invalid_params("address must be a string"))?
         .parse::<Address>()
         .map_err(|_| invalid_params("invalid address"))?;
+    ensure_request_matches_signer(signer, address)?;
 
     // Second element: object OR JSON-encoded string.
     let typed_data: TypedData = match &arr[1] {
@@ -586,6 +615,45 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.code, ERROR_UNAUTHORIZED_METHOD);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn personal_sign_rejects_from_other_than_signer() {
+        // dApp asked for a signature `from` address X, but the wallet's
+        // active signer is Y. Must refuse — otherwise an attacker can
+        // extract a signature from whichever account happens to be
+        // active when the user clicks Approve.
+        let (signer, _signer_addr) = local_signer();
+        let other = Address::from([0x11; 20]);
+        let err = handle_personal_sign(
+            &signer,
+            &json!(["0x48656c6c6f", format!("{other:#x}")]),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ERROR_UNAUTHORIZED_METHOD);
+        assert!(err.message.contains("does not match"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn typed_data_v4_rejects_from_other_than_signer() {
+        let (signer, _signer_addr) = local_signer();
+        let other = Address::from([0x22; 20]);
+        let typed_data = json!({
+            "types": {"EIP712Domain":[{"name":"chainId","type":"uint256"}],"X":[{"name":"a","type":"uint256"}]},
+            "primaryType": "X",
+            "domain": {"chainId": 1},
+            "message": {"a": "1"}
+        });
+        let err = handle_eth_sign_typed_data_v4(
+            &signer,
+            &json!([format!("{other:#x}"), typed_data]),
+            "eip155:1",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ERROR_UNAUTHORIZED_METHOD);
+        assert!(err.message.contains("does not match"));
     }
 
     #[tokio::test(flavor = "current_thread")]

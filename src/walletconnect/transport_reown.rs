@@ -508,12 +508,7 @@ mod tests {
             fail_count: 5,
             attempts: 0,
         };
-        retry_until_connected(
-            &mut rec,
-            Duration::from_secs(1),
-            Duration::from_secs(2),
-        )
-        .await;
+        retry_until_connected(&mut rec, Duration::from_secs(1), Duration::from_secs(2)).await;
         let elapsed = tokio::time::Instant::now() - start;
         assert_eq!(rec.attempts, 6);
         // 1 + 2 + 2 + 2 + 2 + 2 = 11s. If clamping were broken we'd see
@@ -523,5 +518,4 @@ mod tests {
             "backoff failed to clamp at max — slept {elapsed:?}",
         );
     }
-
 }

@@ -331,7 +331,7 @@ mod tests {
 
         // strings_offset for the (only) selector.
         let off = u32::from_le_bytes(blob[20..24].try_into().unwrap()) as usize;
-        let abs = 16 /* header */ + 1 * 8 /* index */ + off;
+        let abs = 16 /* header */ + 8 /* index */ + off;
         let sig_count = u16::from_le_bytes(blob[abs..abs + 2].try_into().unwrap());
         assert_eq!(sig_count, 1);
         let sig_len = u16::from_le_bytes(blob[abs + 2..abs + 4].try_into().unwrap()) as usize;

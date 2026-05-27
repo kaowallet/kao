@@ -1721,6 +1721,7 @@ impl WalletScreen {
                     wc,
                     self.chrome.progress(),
                     self.wc_proposal_details_expanded,
+                    self.signer.address(),
                 )
             }
         };

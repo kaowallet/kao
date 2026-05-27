@@ -912,6 +912,40 @@ impl WcEngineRunner {
                     return;
                 }
 
+                // Per-account scope: the request's `from` (if any) must be a
+                // CAIP-10 account the session was settled with. Catches the
+                // dApp asking us to sign as account A on a session that
+                // only approved account B — the method dispatcher checks
+                // the same invariant against the *active* signer, this
+                // check enforces it against the *session's* approved set
+                // before the user ever sees the modal.
+                if let Some(err) = self.check_request_account_scope(
+                    topic,
+                    &params.chain_id,
+                    &params.request.method,
+                    &params.request.params,
+                ) {
+                    let session_sym = self.sessions.get(&topic).map(|s| s.sym_key.clone());
+                    if let Some(sym) = session_sym {
+                        let response = JsonRpcResponse {
+                            id: req.id,
+                            jsonrpc: JsonRpcVersion,
+                            payload: JsonRpcResult::Error { error: err },
+                        };
+                        let _ = self
+                            .publish_encrypted(
+                                topic,
+                                &sym,
+                                &response,
+                                TAG_SESSION_REQUEST_RES,
+                                TTL_SESSION_REQUEST,
+                                false,
+                            )
+                            .await;
+                    }
+                    return;
+                }
+
                 let request_id = self.next_request_id();
                 let peer = self
                     .sessions
@@ -1069,6 +1103,64 @@ impl WcEngineRunner {
             });
         }
         None
+    }
+
+    /// Verify the request's `from` address (when the method carries one) is
+    /// one of the CAIP-10 accounts settled in this session's namespace.
+    ///
+    /// Returns `None` when:
+    ///   - the method doesn't carry an address (`wc_sessionPing`, etc.),
+    ///   - the params can't be parsed to extract one (defer to the method
+    ///     dispatcher's `ERROR_INVALID_PARAMS`),
+    ///   - the session/namespace is missing (caller's earlier scope check
+    ///     already failed and we never reach here in practice).
+    ///
+    /// Returns `Some(ERROR_UNAUTHORIZED_METHOD)` when an address was extracted
+    /// but doesn't match any settled account. The dApp gets a clear refusal
+    /// before the user is shown a modal — closing the confused-deputy gap
+    /// where a session for account A could elicit a signature from account B
+    /// (e.g. after the user switched the active account mid-session).
+    fn check_request_account_scope(
+        &self,
+        topic: Topic,
+        chain_id: &str,
+        method: &str,
+        params: &serde_json::Value,
+    ) -> Option<JsonRpcError> {
+        let requested = extract_request_from_address(method, params)?;
+        let session = self.sessions.get(&topic)?;
+        let ns_key = chain_id.split(':').next().unwrap_or("");
+        let namespace = session.namespaces.get(ns_key)?;
+
+        // CAIP-10: "<namespace>:<reference>:<address>". The wallet stamps
+        // accounts lowercased via `{:#x}`; the dApp may send checksum-case.
+        // Compare the trailing address segment as parsed `Address` so casing
+        // is irrelevant.
+        let approved = namespace
+            .accounts
+            .iter()
+            .filter(|a| {
+                // Restrict comparison to entries for this request's chain;
+                // signing as A on mainnet doesn't license signing as A on
+                // Optimism unless the session settled both explicitly.
+                a.rsplit_once(':')
+                    .map(|(prefix, _)| prefix == chain_id)
+                    .unwrap_or(false)
+            })
+            .filter_map(|a| a.rsplit_once(':').and_then(|(_, addr)| addr.parse().ok()))
+            .any(|a: alloy::primitives::Address| a == requested);
+
+        if approved {
+            None
+        } else {
+            Some(JsonRpcError {
+                code: ERROR_UNAUTHORIZED_METHOD,
+                message: format!(
+                    "request from {requested:#x} is not a settled account on {chain_id}",
+                ),
+                data: None,
+            })
+        }
     }
 
     /// Drop pending session-requests older than the relay's
@@ -1232,6 +1324,50 @@ fn fresh_jsonrpc_id_seed() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(1)
+}
+
+/// Pull the request's `from` Ethereum address out of a method's inner params.
+///
+/// Returns `None` when the method doesn't carry one (`wc_sessionPing`,
+/// `wallet_switchEthereumChain`, …) or when the params don't parse — in the
+/// latter case the per-method dispatcher will surface `ERROR_INVALID_PARAMS`
+/// itself; the engine-level account check only fires when we can confidently
+/// pin down the requested account.
+///
+/// `personal_sign` accepts either `[message, address]` or
+/// `[address, message]` — same dual-order tolerance as the dispatcher.
+fn extract_request_from_address(
+    method: &str,
+    params: &serde_json::Value,
+) -> Option<alloy::primitives::Address> {
+    use alloy::primitives::Address;
+    let arr = params.as_array()?;
+    match method {
+        "personal_sign" => {
+            if arr.len() < 2 {
+                return None;
+            }
+            let a = arr[0].as_str()?;
+            let b = arr[1].as_str()?;
+            // Whichever side parses as an address is the address; if both
+            // do, prefer the spec order `[message, address]`.
+            match (a.parse::<Address>(), b.parse::<Address>()) {
+                (Ok(_), Ok(b_addr)) => Some(b_addr),
+                (Err(_), Ok(b_addr)) => Some(b_addr),
+                (Ok(a_addr), Err(_)) => Some(a_addr),
+                (Err(_), Err(_)) => None,
+            }
+        }
+        "eth_signTypedData" | "eth_signTypedData_v4" => arr.first()?.as_str()?.parse().ok(),
+        "eth_sendTransaction" | "eth_signTransaction" => arr
+            .first()?
+            .as_object()?
+            .get("from")?
+            .as_str()?
+            .parse()
+            .ok(),
+        _ => None,
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -2229,6 +2365,121 @@ mod tests {
         // No auto-error publish (only the user's eventual approve/reject
         // produces an outbound).
         assert!(transport.published.lock().unwrap().is_empty());
+    }
+
+    /// `check_request_account_scope` rejects sign requests whose `from`
+    /// isn't in the session's settled CAIP-10 accounts. Closes the
+    /// confused-deputy gap where a session for account A could be used to
+    /// elicit a signature from a different account.
+    #[test]
+    fn check_request_account_scope_rejects_unsettled_from() {
+        let (mut engine, _transport, _in_tx, _event_rx) = build_engine();
+        let sym = SymKey::random();
+        let topic = derive_topic(&sym);
+        let mut namespaces = BTreeMap::new();
+        namespaces.insert(
+            "eip155".to_string(),
+            NamespaceSettled {
+                chains: vec!["eip155:1".to_string()],
+                accounts: vec!["eip155:1:0x1111111111111111111111111111111111111111".to_string()],
+                methods: vec![
+                    "personal_sign".to_string(),
+                    "eth_signTypedData_v4".to_string(),
+                ],
+                events: vec![],
+            },
+        );
+        engine.sessions.insert(
+            topic,
+            Session {
+                topic,
+                sym_key: sym,
+                peer_metadata: wallet_metadata(),
+                namespaces,
+                expiry: 1_700_000_000,
+                relay_protocol: "irn".to_string(),
+            },
+        );
+
+        // Settled account → None (in scope), either param order accepted.
+        let settled = "0x1111111111111111111111111111111111111111";
+        let other = "0x2222222222222222222222222222222222222222";
+
+        assert!(
+            engine
+                .check_request_account_scope(
+                    topic,
+                    "eip155:1",
+                    "personal_sign",
+                    &json!(["0xfeed", settled]),
+                )
+                .is_none()
+        );
+        // Legacy [address, message] order.
+        assert!(
+            engine
+                .check_request_account_scope(
+                    topic,
+                    "eip155:1",
+                    "personal_sign",
+                    &json!([settled, "0xfeed"]),
+                )
+                .is_none()
+        );
+        // Checksum case shouldn't matter — same address.
+        let checksum = "0x1111111111111111111111111111111111111111";
+        assert!(
+            engine
+                .check_request_account_scope(
+                    topic,
+                    "eip155:1",
+                    "personal_sign",
+                    &json!(["0xfeed", checksum]),
+                )
+                .is_none()
+        );
+
+        // Different address → UNAUTHORIZED_METHOD.
+        let err = engine
+            .check_request_account_scope(
+                topic,
+                "eip155:1",
+                "personal_sign",
+                &json!(["0xfeed", other]),
+            )
+            .unwrap();
+        assert_eq!(err.code, ERROR_UNAUTHORIZED_METHOD);
+
+        // Same gate applies to eth_signTypedData_v4.
+        let err = engine
+            .check_request_account_scope(
+                topic,
+                "eip155:1",
+                "eth_signTypedData_v4",
+                &json!([other, {"types":{},"primaryType":"X","domain":{},"message":{}}]),
+            )
+            .unwrap();
+        assert_eq!(err.code, ERROR_UNAUTHORIZED_METHOD);
+
+        // Method without an address → no gate (returns None and defers to
+        // the per-method dispatcher's own validation).
+        assert!(
+            engine
+                .check_request_account_scope(topic, "eip155:1", "wc_sessionPing", &json!({}),)
+                .is_none()
+        );
+
+        // Unparseable params → defer (no gate).
+        assert!(
+            engine
+                .check_request_account_scope(
+                    topic,
+                    "eip155:1",
+                    "personal_sign",
+                    &json!(["just one element"]),
+                )
+                .is_none()
+        );
     }
 
     /// `check_session_scope` directly — pure function exercise to lock

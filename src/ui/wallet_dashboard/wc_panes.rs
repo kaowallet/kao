@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use alloy::primitives::Address;
 use iced::border::Radius;
 use iced::widget::{Space, button, column, container, row, scrollable, text};
 use iced::{Alignment, Background, Border, Element, Length, Padding};
@@ -14,8 +15,8 @@ use iced::{Alignment, Background, Border, Element, Length, Padding};
 use crate::chain::Chain;
 use crate::ui::kao_theme::{KaoTheme, with_alpha};
 use crate::ui::kao_widgets::{
-    bold, card_style, hover_tint, kao_scrollable_style, modal_wrapper, mono, mono_bold,
-    primary_button, secondary_button, small_secondary_button,
+    bold, card_style, colored_address, hover_tint, kao_scrollable_style, modal_wrapper, mono,
+    mono_bold, primary_button, secondary_button, small_secondary_button,
 };
 use crate::walletconnect::methods::{SUPPORTED_METHODS, method_label};
 use crate::walletconnect::protocol::{NamespaceProposal, NamespaceSettled, PeerMetadata};
@@ -36,12 +37,13 @@ pub fn view(
     wc: &WcState,
     progress: f32,
     proposal_details_expanded: bool,
+    active: Address,
 ) -> Element<'static, Message> {
     let body: Element<'static, Message> = match &wc.current_modal {
         Some(WcModal::Proposal(p)) => {
             proposal_body(t, p, wc.queue_len(), proposal_details_expanded)
         }
-        Some(WcModal::Request(r)) => request_body(t, r, wc.queue_len()),
+        Some(WcModal::Request(r)) => request_body(t, r, wc.queue_len(), active),
         None => empty_body(t),
     };
 
@@ -334,7 +336,12 @@ fn grant_preview_card(t: KaoTheme, g: &GrantPreview) -> Element<'static, Message
         .into()
 }
 
-fn request_body(t: KaoTheme, r: &UiRequest, total: usize) -> Element<'static, Message> {
+fn request_body(
+    t: KaoTheme,
+    r: &UiRequest,
+    total: usize,
+    active: Address,
+) -> Element<'static, Message> {
     let title: &'static str = match r.method.as_str() {
         "personal_sign" => "Sign message",
         "eth_signTypedData" | "eth_signTypedData_v4" => "Sign typed data",
@@ -382,6 +389,38 @@ fn request_body(t: KaoTheme, r: &UiRequest, total: usize) -> Element<'static, Me
 
     let meta = row![method_chip, Space::new().width(8), chain_chip].width(Length::Fill);
 
+    // "Sign as 0xABCD…" card — the address whose key will produce the
+    // signature, rendered with the same colour-chunked checksum the rest
+    // of the wallet uses so it's unmistakable which account is signing.
+    // The dApp picks the `from` in the params; the engine's account-scope
+    // check already refuses anything outside the session's settled
+    // accounts, but a request that does match the session may still match
+    // a *different* account than the one the user is currently looking at
+    // (e.g. they switched away from the original signer mid-session and
+    // the engine teardown is in flight). Showing the actual signing
+    // address — and warning visibly when it doesn't match the request's
+    // `from` — closes the user-visible side of that confused-deputy gap.
+    let signer_card = container(
+        column![
+            text("SIGN AS").size(10).color(t.sub).font(bold()),
+            Space::new().height(6),
+            colored_address(t, active),
+        ]
+        .width(Length::Fill),
+    )
+    .padding(Padding::from([13, 15]))
+    .width(Length::Fill)
+    .style(move |_| card_style(t));
+
+    let mismatch_warning: Element<'static, Message> = match request_from_address(&r.method, &r.params) {
+        Some(requested) if requested != active => banner(
+            t,
+            "The dApp asked to sign as a different address. Approving will produce a signature from this wallet's active account instead — only continue if that's what you want.",
+            t.down,
+        ),
+        _ => Space::new().width(0).height(0).into(),
+    };
+
     let payload = section(t, "PAYLOAD", payload_body(t, &r.method, &r.params));
 
     // For unsupported flows the engine still emits RequestReceived (we
@@ -416,14 +455,51 @@ fn request_body(t: KaoTheme, r: &UiRequest, total: usize) -> Element<'static, Me
         Space::new().height(12),
         meta,
         Space::new().height(12),
-        warning,
+        signer_card,
+        Space::new().height(10),
+        mismatch_warning,
         Space::new().height(8),
+        warning,
+        Space::new().height(4),
         payload,
         Space::new().height(18),
         actions,
     ]
     .width(Length::Fill)
     .into()
+}
+
+/// Pull the request's `from` address from its params, mirroring the
+/// engine's [`crate::walletconnect::engine`] extraction. Returns `None`
+/// when the method doesn't carry a from-address (e.g. `wc_sessionPing`)
+/// or when the params can't be parsed — the UI then just skips the
+/// mismatch warning rather than guessing.
+fn request_from_address(method: &str, params: &serde_json::Value) -> Option<Address> {
+    let arr = params.as_array()?;
+    match method {
+        "personal_sign" => {
+            if arr.len() < 2 {
+                return None;
+            }
+            let a = arr[0].as_str()?;
+            let b = arr[1].as_str()?;
+            match (a.parse::<Address>(), b.parse::<Address>()) {
+                (Ok(_), Ok(b_addr)) => Some(b_addr),
+                (Err(_), Ok(b_addr)) => Some(b_addr),
+                (Ok(a_addr), Err(_)) => Some(a_addr),
+                (Err(_), Err(_)) => None,
+            }
+        }
+        "eth_signTypedData" | "eth_signTypedData_v4" => arr.first()?.as_str()?.parse().ok(),
+        "eth_sendTransaction" | "eth_signTransaction" => arr
+            .first()?
+            .as_object()?
+            .get("from")?
+            .as_str()?
+            .parse()
+            .ok(),
+        _ => None,
+    }
 }
 
 fn modal_header(
@@ -1043,6 +1119,71 @@ mod tests {
         let g = compute_grant_preview(&p);
         assert!(g.required_dropped);
         assert_eq!(g.granted_chains, vec!["Mainnet"]);
+    }
+
+    #[test]
+    fn request_from_address_extracts_personal_sign_either_order() {
+        let addr_str = "0x1234567890abcdef1234567890abcdef12345678";
+        let expected: Address = addr_str.parse().unwrap();
+
+        // Spec order: [message, address].
+        let params = serde_json::json!(["0xfeed", addr_str]);
+        assert_eq!(request_from_address("personal_sign", &params), Some(expected));
+
+        // Legacy order: [address, message].
+        let params = serde_json::json!([addr_str, "0xfeed"]);
+        assert_eq!(request_from_address("personal_sign", &params), Some(expected));
+
+        // Two-arg, neither parses → None (defer to dispatcher).
+        let params = serde_json::json!(["msg", "not-an-address"]);
+        assert_eq!(request_from_address("personal_sign", &params), None);
+
+        // Single element → can't tell which is which.
+        let params = serde_json::json!([addr_str]);
+        assert_eq!(request_from_address("personal_sign", &params), None);
+    }
+
+    #[test]
+    fn request_from_address_extracts_typed_data_first_param() {
+        let addr_str = "0x2222222222222222222222222222222222222222";
+        let expected: Address = addr_str.parse().unwrap();
+        let typed = serde_json::json!({"types":{},"primaryType":"X","domain":{},"message":{}});
+        let params = serde_json::json!([addr_str, typed]);
+        assert_eq!(
+            request_from_address("eth_signTypedData_v4", &params),
+            Some(expected),
+        );
+        assert_eq!(
+            request_from_address("eth_signTypedData", &params),
+            Some(expected),
+        );
+    }
+
+    #[test]
+    fn request_from_address_extracts_tx_from_field() {
+        let addr_str = "0x3333333333333333333333333333333333333333";
+        let expected: Address = addr_str.parse().unwrap();
+        let params = serde_json::json!([{"from": addr_str, "to": "0x4242424242424242424242424242424242424242"}]);
+        assert_eq!(
+            request_from_address("eth_sendTransaction", &params),
+            Some(expected),
+        );
+        assert_eq!(
+            request_from_address("eth_signTransaction", &params),
+            Some(expected),
+        );
+    }
+
+    #[test]
+    fn request_from_address_returns_none_for_methods_without_address() {
+        assert_eq!(
+            request_from_address("wc_sessionPing", &serde_json::json!({})),
+            None,
+        );
+        assert_eq!(
+            request_from_address("wallet_switchEthereumChain", &serde_json::json!([{"chainId":"0x1"}])),
+            None,
+        );
     }
 
     #[test]

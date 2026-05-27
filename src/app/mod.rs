@@ -470,6 +470,32 @@ impl App {
             }
         };
         self.pending_signer = None;
+
+        // Tear down every live WC session before handing the dashboard a
+        // new signer. WC sessions are settled with a specific CAIP-10
+        // account — letting them stay live across an account switch
+        // would let a dApp that paired with account A request a
+        // signature from account B (whichever one the user now sees
+        // active). Both the engine state (disconnect commands → the
+        // relay's `wc_sessionDelete`) and the UI state (sessions /
+        // pending modal queue) are cleared synchronously so an inbound
+        // `wc_sessionRequest` racing the disconnects can't surface a
+        // modal under the new signer.
+        {
+            use crate::walletconnect::engine::WcCommand;
+            use crate::walletconnect::runtime::dispatch;
+            if let Ok(mut g) = self.wc_state.write() {
+                for s in &g.sessions {
+                    let _ = dispatch(WcCommand::Disconnect {
+                        topic: s.topic,
+                        reason: "Wallet account switched".to_string(),
+                    });
+                }
+                g.sessions.clear();
+                g.current_modal = None;
+                g.queue.clear();
+            }
+        }
         // Preserve the active dashboard tab across the rebuild — switching
         // accounts while reading the Activity feed shouldn't yank the
         // user back to Home.

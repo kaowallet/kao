@@ -2340,4 +2340,275 @@ mod tests {
         let pruned2 = engine.prune_stale_requests();
         assert!(pruned2.is_empty());
     }
+
+    // ── Transport reconnect tests ────────────────────────────────────
+    //
+    // Reconnect-handling exists because the relay drops every topic
+    // subscription on disconnect. If the engine doesn't re-subscribe
+    // after `TransportEvent::Reconnected`, live sessions silently
+    // stop receiving inbound traffic — which is exactly what bit us
+    // on the load-balancing (code 4010) hour-rotation drop.
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn transport_reconnected_resubscribes_pairings_and_sessions() {
+        // Seed with a persisted session so `sessions` has an entry, then
+        // pair fresh so `pairings` has one too. After clearing the
+        // recorder, fire `Reconnected` and confirm the engine re-issues
+        // batch_subscribe with both topics.
+        let session_topic = Topic::from_bytes([0xAA; 32]);
+        let (mut engine, transport, _in_tx, mut event_rx) =
+            build_engine_with_sessions(vec![persisted_session(0xAA, 0x11)]);
+        engine.restore_initial_sessions().await;
+
+        // Add a pairing the normal way.
+        let pairing_sym = SymKey::random();
+        let pairing_topic = derive_topic(&pairing_sym);
+        engine
+            .handle_command(WcCommand::PairWithUri {
+                uri: make_pair_uri(&pairing_sym),
+            })
+            .await;
+        // Drain "Paired" + restore subscribes so the post-reconnect
+        // assertion only sees what reconnect itself published.
+        while event_rx.try_recv().is_ok() {}
+        transport.subscribed.lock().unwrap().clear();
+
+        engine
+            .handle_transport_event(TransportEvent::Reconnected)
+            .await;
+
+        let subs = transport.subscribed.lock().unwrap();
+        assert_eq!(subs.len(), 2, "expected both topics, got {subs:?}");
+        assert!(subs.contains(&session_topic));
+        assert!(subs.contains(&pairing_topic));
+        // Reconnected on the happy path is silent — no error events.
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn transport_reconnected_with_no_topics_is_noop() {
+        // Fresh engine, no pairings, no sessions. Reconnected must not
+        // call `batch_subscribe([])` — the relay treats that as an
+        // error and we'd spam the log.
+        let (mut engine, transport, _in_tx, mut event_rx) = build_engine();
+        engine
+            .handle_transport_event(TransportEvent::Reconnected)
+            .await;
+        assert!(transport.subscribed.lock().unwrap().is_empty());
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    /// The actual user-facing regression this whole feature exists to
+    /// prevent: after the relay drops (4010 load-balance, network blip,
+    /// whatever) and the transport reconnects, an inbound session_request
+    /// on a previously-live session must still decrypt and emit
+    /// `RequestReceived`. The relay-side subscription was lost on
+    /// disconnect, so this implicitly validates that the engine
+    /// re-subscribed AND that nothing in the session map was wiped.
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_survives_reconnect_and_decrypts_inbound_request() {
+        let sym = SymKey::from_bytes([0x77; 32]);
+        let topic = derive_topic(&sym);
+        let mut persisted = persisted_session(topic.as_bytes()[0], sym.as_bytes()[0]);
+        persisted.topic = *topic.as_bytes();
+        persisted.sym_key = *sym.as_bytes();
+
+        let (mut engine, transport, in_tx, mut event_rx) =
+            build_engine_with_sessions(vec![persisted]);
+        engine.restore_initial_sessions().await;
+        transport.subscribed.lock().unwrap().clear();
+        while event_rx.try_recv().is_ok() {}
+
+        // Relay drops, then reconnects. Engine must re-subscribe to the
+        // session topic — without this, the dApp's next request would go
+        // to /dev/null.
+        engine
+            .handle_transport_event(TransportEvent::Disconnected {
+                reason: "code 4010 load balancing".into(),
+            })
+            .await;
+        engine
+            .handle_transport_event(TransportEvent::Reconnected)
+            .await;
+        assert!(
+            transport.subscribed.lock().unwrap().contains(&topic),
+            "session topic must be re-subscribed after reconnect",
+        );
+
+        // Drain the synthetic "Disconnected → Error" event before the
+        // real assertion.
+        while event_rx.try_recv().is_ok() {}
+
+        // dApp's session_request finally arrives via the new subscription.
+        // The sym key must still be in the engine's session map for this
+        // to decrypt; if reconnect had wiped sessions, decrypt would fail
+        // silently and we'd never see RequestReceived.
+        let req = JsonRpcRequest {
+            id: 99,
+            jsonrpc: JsonRpcVersion,
+            method: "wc_sessionRequest".to_string(),
+            params: serde_json::to_value(SessionRequestParams {
+                chain_id: "eip155:1".to_string(),
+                request: InnerRequest {
+                    method: "personal_sign".to_string(),
+                    params: json!(["0xfeed", "0x1111111111111111111111111111111111111111"]),
+                    expiry: None,
+                },
+            })
+            .unwrap(),
+        };
+        let env = encode_envelope_type0(&sym, &serde_json::to_vec(&req).unwrap());
+        in_tx
+            .send(InboundMessage {
+                topic,
+                message_b64: envelope_to_b64(&env),
+                tag: TAG_SESSION_REQUEST_REQ,
+                published_at: None,
+            })
+            .unwrap();
+        let msg = engine.inbound_rx.recv().await.unwrap();
+        engine.handle_inbound(msg).await;
+
+        match event_rx.try_recv().unwrap() {
+            WcEvent::RequestReceived {
+                method, chain_id, ..
+            } => {
+                assert_eq!(method, "personal_sign");
+                assert_eq!(chain_id, "eip155:1");
+            }
+            other => panic!("expected RequestReceived, got {other:?}"),
+        }
+    }
+
+    /// A reconnect must not silently drop a pending proposal: the user
+    /// could be staring at the approval modal when the relay rotates.
+    /// Walking pair → proposal → reconnect → approve verifies the
+    /// publish still goes out and the session settles, i.e. nothing in
+    /// the proposal/session pipeline depends on relay liveness.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_proposal_survives_reconnect_and_can_be_approved() {
+        let (mut engine, transport, in_tx, mut event_rx) = build_engine();
+        let pairing_sym = SymKey::random();
+        let pairing_topic = derive_topic(&pairing_sym);
+        engine
+            .handle_command(WcCommand::PairWithUri {
+                uri: make_pair_uri(&pairing_sym),
+            })
+            .await;
+        let dapp_kp = EphemeralKeypair::generate();
+        inject_propose_msg(&in_tx, pairing_topic, &pairing_sym, &dapp_kp, 42);
+        let msg = engine.inbound_rx.recv().await.unwrap();
+        engine.handle_inbound(msg).await;
+        // Drain Paired + ProposalReceived.
+        while event_rx.try_recv().is_ok() {}
+
+        // Relay drops mid-flight; transport reconnects.
+        engine
+            .handle_transport_event(TransportEvent::Disconnected {
+                reason: "code 4010".into(),
+            })
+            .await;
+        engine
+            .handle_transport_event(TransportEvent::Reconnected)
+            .await;
+        while event_rx.try_recv().is_ok() {}
+
+        // pending_proposals entry must still be there — the user can
+        // approve as if nothing happened.
+        assert!(
+            engine.pending_proposals.contains_key(&1),
+            "proposal must survive reconnect",
+        );
+        let pre_publish_count = transport.published.lock().unwrap().len();
+
+        let mut ns = BTreeMap::new();
+        ns.insert(
+            "eip155".to_string(),
+            NamespaceSettled {
+                chains: vec!["eip155:1".to_string()],
+                accounts: vec!["eip155:1:0x1111111111111111111111111111111111111111".to_string()],
+                methods: vec!["personal_sign".to_string()],
+                events: vec!["chainChanged".to_string()],
+            },
+        );
+        engine
+            .handle_command(WcCommand::ApproveProposal {
+                proposal_id: 1,
+                namespaces: ns,
+                wallet_metadata: wallet_metadata(),
+            })
+            .await;
+
+        // Approve must publish both the propose-response and the
+        // sessionSettle (two new publishes since the snapshot above).
+        let post = transport.published.lock().unwrap().len();
+        assert_eq!(
+            post - pre_publish_count,
+            2,
+            "approve_proposal must publish propose-response + sessionSettle after reconnect",
+        );
+        // And the SessionSettled event must fire.
+        let mut got_settled = false;
+        while let Ok(ev) = event_rx.try_recv() {
+            if let WcEvent::SessionSettled { .. } = ev {
+                got_settled = true;
+                break;
+            }
+        }
+        assert!(got_settled, "expected SessionSettled after approve");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn transport_reconnected_resubscribe_failure_emits_error() {
+        // After reconnect, batch_subscribe fails. Engine must surface
+        // this as an Error rather than panicking — the worst case is
+        // the user sees "WalletConnect offline" and relaunches, which
+        // is bad UX but not data loss.
+        #[derive(Default)]
+        struct FailingTransport;
+        #[async_trait::async_trait]
+        impl RelayTransport for FailingTransport {
+            async fn subscribe(&self, _: Topic) -> Result<(), TransportError> {
+                Ok(())
+            }
+            async fn batch_subscribe(&self, _: &[Topic]) -> Result<(), TransportError> {
+                Err(TransportError::ConnectionLost)
+            }
+            async fn publish(&self, _: PublishMessage) -> Result<(), TransportError> {
+                Ok(())
+            }
+            async fn unsubscribe(&self, _: Topic) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+        let (_in_tx, in_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (tev_tx, tev_rx) = mpsc::unbounded_channel::<TransportEvent>();
+        std::mem::forget(cmd_tx);
+        std::mem::forget(tev_tx);
+        let mut engine = WcEngineRunner::new(
+            Box::new(FailingTransport),
+            in_rx,
+            tev_rx,
+            cmd_rx,
+            event_tx,
+            vec![persisted_session(0xCC, 0x33)],
+        );
+        // Don't run restore — it'd emit its own error and clutter the
+        // assertion. Instead, hop straight to the reconnect path.
+        engine
+            .handle_transport_event(TransportEvent::Reconnected)
+            .await;
+        match event_rx.try_recv().unwrap() {
+            WcEvent::Error { context, message } => {
+                assert_eq!(context, "transport");
+                assert!(
+                    message.contains("post-reconnect"),
+                    "expected 'post-reconnect' marker in {message}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
 }

@@ -230,10 +230,71 @@ fn mint_connection_options(
     Ok(ConnectionOptions::new(project_id.clone(), auth).with_address(address))
 }
 
+/// One reconnect attempt: re-mint JWT + ask reown to dial the relay.
+/// Returns the same `TransportError` shape the rest of the transport
+/// uses so the retry helper can stay generic over what "an attempt" is.
+#[async_trait::async_trait]
+trait Reconnector: Send {
+    async fn attempt(&mut self) -> Result<(), TransportError>;
+}
+
+/// Production reconnector: re-mints a fresh JWT every attempt (the prior
+/// one may have aged out of its hour-long TTL by the time we get here)
+/// and asks the cloned reown `Client` to dial.
+struct ReownReconnector {
+    client: Client,
+    project_id: ProjectId,
+    identity_key: SigningKey,
+    address: String,
+}
+
+#[async_trait::async_trait]
+impl Reconnector for ReownReconnector {
+    async fn attempt(&mut self) -> Result<(), TransportError> {
+        let opts = mint_connection_options(&self.project_id, &self.identity_key, &self.address)?;
+        self.client
+            .connect(&opts)
+            .await
+            .map_err(|e| TransportError::Other(format!("relay reconnect: {e}")))
+    }
+}
+
+/// Retry an attempt with exponential backoff, doubling from
+/// `initial_backoff` up to `max_backoff`. Returns when the attempt
+/// finally succeeds; loops forever on persistent failure (the only
+/// escape is the caller dropping the task — see `ReownTransport::Drop`).
+///
+/// Split out from `reconnect_loop` so the backoff math is exercisable
+/// under `tokio::time::pause()` without standing up a fake relay.
+async fn retry_until_connected<R: Reconnector>(
+    reconnector: &mut R,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+) {
+    let mut backoff = initial_backoff;
+    loop {
+        tokio::time::sleep(backoff).await;
+        match reconnector.attempt().await {
+            Ok(()) => {
+                tracing::info!("WalletConnect relay reconnect: succeeded");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    backoff_secs = backoff.as_secs(),
+                    "WalletConnect relay reconnect attempt failed",
+                );
+                backoff = (backoff * 2).min(max_backoff);
+            }
+        }
+    }
+}
+
 /// Background reconnect loop. Drains disconnect signals from the
 /// `ConnectionHandler`; for each, emits `Disconnected` to the engine,
-/// retries `client.connect()` with exponential backoff until it succeeds,
-/// then emits `Reconnected` so the engine knows to re-subscribe.
+/// hands off to `retry_until_connected`, then emits `Reconnected` so the
+/// engine knows to re-subscribe.
 ///
 /// Exits when either:
 /// * the `disconnect_tx` is dropped (transport gone, reown event loop
@@ -248,6 +309,12 @@ async fn reconnect_loop(
     mut disconnect_rx: mpsc::UnboundedReceiver<String>,
     events_tx: mpsc::UnboundedSender<TransportEvent>,
 ) {
+    let mut reconnector = ReownReconnector {
+        client,
+        project_id,
+        identity_key,
+        address,
+    };
     while let Some(reason) = disconnect_rx.recv().await {
         tracing::info!(reason = %reason, "WalletConnect relay reconnect: starting");
         if events_tx
@@ -256,30 +323,12 @@ async fn reconnect_loop(
         {
             return;
         }
-
-        let mut backoff = RECONNECT_INITIAL_BACKOFF;
-        loop {
-            tokio::time::sleep(backoff).await;
-            match mint_connection_options(&project_id, &identity_key, &address) {
-                Ok(opts) => match client.connect(&opts).await {
-                    Ok(()) => {
-                        tracing::info!("WalletConnect relay reconnect: succeeded");
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            backoff_secs = backoff.as_secs(),
-                            "WalletConnect relay reconnect attempt failed",
-                        );
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!(error = %e, "WalletConnect JWT mint failed during reconnect");
-                }
-            }
-            backoff = (backoff * 2).min(RECONNECT_MAX_BACKOFF);
-        }
+        retry_until_connected(
+            &mut reconnector,
+            RECONNECT_INITIAL_BACKOFF,
+            RECONNECT_MAX_BACKOFF,
+        )
+        .await;
 
         // Drain any extra disconnect signals queued while we were
         // reconnecting — the upstream loop already raced to the new
@@ -377,4 +426,102 @@ mod tests {
         let bad = ReownTopic::from(Arc::<str>::from("deadbeef".to_string()));
         assert!(parse_reown_topic(&bad).is_none());
     }
+
+    /// Mint succeeds and produces a non-empty JWT field on each call. The
+    /// reconnect loop relies on this being callable repeatedly — every
+    /// reconnect attempt re-mints because the prior JWT may have aged out
+    /// of its hour-long TTL by the time we get here.
+    #[test]
+    fn mint_connection_options_succeeds_per_call() {
+        use rand::rngs::OsRng;
+        let key = SigningKey::generate(&mut OsRng);
+        let project_id: ProjectId = "kao_test_project_id".to_string().into();
+        let address = RELAY_WEBSOCKET_ADDRESS.to_string();
+        // Two consecutive mints must both succeed — no hidden one-shot
+        // state in the helper.
+        mint_connection_options(&project_id, &key, &address).unwrap();
+        mint_connection_options(&project_id, &key, &address).unwrap();
+    }
+
+    /// Scripted reconnector — fails the first N attempts, then succeeds.
+    /// Lets the backoff test count attempts without a real relay.
+    struct ScriptedReconnector {
+        fail_count: usize,
+        attempts: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl Reconnector for ScriptedReconnector {
+        async fn attempt(&mut self) -> Result<(), TransportError> {
+            self.attempts += 1;
+            if self.attempts <= self.fail_count {
+                Err(TransportError::ConnectionLost)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Backoff actually backs off: configured to fail 3 times then
+    /// succeed, the helper must call `attempt` exactly 4 times and the
+    /// total simulated time elapsed must reflect 100ms + 200ms + 400ms
+    /// + 800ms = 1.5s of sleeps (initial + 3 doublings). Under
+    /// `start_paused`, tokio auto-advances the clock for any
+    /// uncontested `sleep`, so the test runs in real-time milliseconds
+    /// regardless of the simulated wait.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn retry_until_connected_backs_off_then_succeeds() {
+        let start = tokio::time::Instant::now();
+        let mut rec = ScriptedReconnector {
+            fail_count: 3,
+            attempts: 0,
+        };
+        retry_until_connected(
+            &mut rec,
+            Duration::from_millis(100),
+            Duration::from_secs(10),
+        )
+        .await;
+        let elapsed = tokio::time::Instant::now() - start;
+        assert_eq!(rec.attempts, 4, "3 failures then 1 success");
+        // 100 + 200 + 400 + 800 = 1500ms of sleeps before the 4th
+        // (successful) attempt returns. Sanity bracket — anything in
+        // 1400–1600 covers normal scheduler jitter on the simulated clock.
+        assert!(
+            elapsed >= Duration::from_millis(1400),
+            "expected ≥1400ms of simulated sleep, got {elapsed:?}",
+        );
+        assert!(
+            elapsed <= Duration::from_millis(1600),
+            "expected ≤1600ms of simulated sleep, got {elapsed:?}",
+        );
+    }
+
+    /// Backoff caps at `max_backoff` — without this clamp, an extended
+    /// outage would push the next attempt out to literal hours.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn retry_until_connected_clamps_to_max_backoff() {
+        let start = tokio::time::Instant::now();
+        // 5 failures with initial=1s, max=2s → sleeps: 1, 2, 2, 2, 2, 2 = 11s
+        // (initial then doubling clamps immediately).
+        let mut rec = ScriptedReconnector {
+            fail_count: 5,
+            attempts: 0,
+        };
+        retry_until_connected(
+            &mut rec,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        )
+        .await;
+        let elapsed = tokio::time::Instant::now() - start;
+        assert_eq!(rec.attempts, 6);
+        // 1 + 2 + 2 + 2 + 2 + 2 = 11s. If clamping were broken we'd see
+        // 1 + 2 + 4 + 8 + 16 + 32 = 63s instead.
+        assert!(
+            elapsed <= Duration::from_millis(11_500),
+            "backoff failed to clamp at max — slept {elapsed:?}",
+        );
+    }
+
 }

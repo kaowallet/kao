@@ -161,6 +161,10 @@ keyring = { version = "3.6.3", features = ["sync-secret-service", "crypto-rust",
 
 [dev-dependencies]
 tempfile = "3"
+# `test-util` enables `tokio::time::pause` / `start_paused = true`, which the
+# reconnect-backoff tests use to advance the simulated clock instantly
+# instead of literally sleeping 11+ seconds.
+tokio = { version = "1", features = ["rt", "sync", "test-util", "macros"] }
 
 # Workarounds for two upstream-broken transitive deps pulled in by
 # helios-opstack. Drop both entries the moment the upstreams ship fixes

@@ -39,6 +39,18 @@ pub enum Outcome {
     Closed,
 }
 
+impl Outcome {
+    /// Variant name for the GUI state trace.
+    fn name(&self) -> &'static str {
+        match self {
+            Outcome::Switch(_) => "Switch",
+            Outcome::SelectSafe(_) => "SelectSafe",
+            Outcome::Add => "Add",
+            Outcome::Closed => "Closed",
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct AccountDropdown;
 
@@ -48,6 +60,16 @@ impl AccountDropdown {
     }
 
     pub fn update(&mut self, msg: Message) -> (Task<Message>, Option<Outcome>) {
+        crate::trace_msg!("account_dropdown", &msg);
+        // Stateless overlay — no coarse state to diff; log outcomes only.
+        let (task, outcome) = self.update_inner(msg);
+        if let Some(o) = &outcome {
+            crate::trace::outcome("account_dropdown", o.name());
+        }
+        (task, outcome)
+    }
+
+    fn update_inner(&mut self, msg: Message) -> (Task<Message>, Option<Outcome>) {
         match msg {
             Message::Select(idx) => (Task::none(), Some(Outcome::Switch(idx))),
             Message::SelectSafe(idx) => (Task::none(), Some(Outcome::SelectSafe(idx))),

@@ -1324,10 +1324,11 @@ pub fn proxy_enabled() -> bool {
 }
 
 pub fn set_proxy_enabled(value: bool) {
-    ensure()
-        .lock()
-        .expect("settings mutex poisoned")
-        .proxy_enabled = value;
+    let old = {
+        let mut state = ensure().lock().expect("settings mutex poisoned");
+        std::mem::replace(&mut state.proxy_enabled, value)
+    };
+    crate::trace::state("settings", "proxy_enabled", old, value);
     write_all();
 }
 
@@ -1336,7 +1337,11 @@ pub fn proxy_type() -> ProxyType {
 }
 
 pub fn set_proxy_type(value: ProxyType) {
-    ensure().lock().expect("settings mutex poisoned").proxy_type = value;
+    let old = {
+        let mut state = ensure().lock().expect("settings mutex poisoned");
+        std::mem::replace(&mut state.proxy_type, value)
+    };
+    crate::trace::state("settings", "proxy_type", old.key(), value.key());
     write_all();
 }
 
@@ -1361,10 +1366,25 @@ pub fn set_proxy_address(value: String) {
     } else {
         "127.0.0.1:9050".to_string()
     };
-    ensure()
-        .lock()
-        .expect("settings mutex poisoned")
-        .proxy_address = v;
+    // Privacy: never log the address itself — only whether it's the Tor
+    // default or a custom endpoint (revealing a bespoke host:port could
+    // deanonymize the user's proxy setup).
+    const TOR_DEFAULT: &str = "127.0.0.1:9050";
+    let kind = |a: &str| {
+        if a == TOR_DEFAULT {
+            "default"
+        } else {
+            "custom"
+        }
+    };
+    let to = kind(&v);
+    let from = {
+        let mut state = ensure().lock().expect("settings mutex poisoned");
+        let from = kind(&state.proxy_address).to_string();
+        state.proxy_address = v.clone();
+        from
+    };
+    crate::trace::state("settings", "proxy_address", from, to);
     write_all();
 }
 

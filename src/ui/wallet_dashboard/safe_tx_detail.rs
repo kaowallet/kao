@@ -282,6 +282,7 @@ impl SafeTxDetailPane {
         if auto {
             self.inner_sim_auto_retried = true;
         }
+        crate::trace::state("safe_tx_detail", "inner_sim", "…", sim_name(&result));
         self.inner_sim = Some(result);
         auto
     }
@@ -292,6 +293,7 @@ impl SafeTxDetailPane {
         if auto {
             self.exec_sim_auto_retried = true;
         }
+        crate::trace::state("safe_tx_detail", "exec_sim", "…", sim_name(&result));
         self.exec_sim = Some(result);
         auto
     }
@@ -325,6 +327,19 @@ impl SafeTxDetailPane {
     }
 
     pub fn update(&mut self, msg: Message) -> (Task<Message>, Option<Outcome>) {
+        crate::trace_msg!("safe_tx_detail", &msg);
+        let busy_before = self.busy;
+        let (task, outcome) = self.update_inner(msg);
+        if busy_before != self.busy {
+            crate::trace::state("safe_tx_detail", "busy", busy_before, self.busy);
+        }
+        if let Some(o) = &outcome {
+            crate::trace::outcome("safe_tx_detail", o.name());
+        }
+        (task, outcome)
+    }
+
+    fn update_inner(&mut self, msg: Message) -> (Task<Message>, Option<Outcome>) {
         match msg {
             // Copy-toast kick — the widget already copied + marked the toast.
             Message::AddressCopied => (Task::none(), None),

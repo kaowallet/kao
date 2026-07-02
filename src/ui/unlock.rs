@@ -27,7 +27,7 @@ pub enum UnlockError {
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    PasswordInput(String),
+    PasswordInput(crate::trace::SecretInput),
     UnlockPressed,
     PasswordSubmitted,
     UnlockResult(Result<WalletDescriptor, UnlockError>),
@@ -40,6 +40,16 @@ pub enum Outcome {
         passphrase: SecretString,
         descriptor: WalletDescriptor,
     },
+}
+
+impl Outcome {
+    /// Variant name for the GUI state trace — never the payload, which
+    /// carries the session passphrase.
+    fn name(&self) -> &'static str {
+        match self {
+            Outcome::Unlocked { .. } => "Unlocked",
+        }
+    }
 }
 
 /// Map a `WalletError` from the loader into the unlock screen's
@@ -68,9 +78,22 @@ pub struct UnlockScreen {
 
 impl UnlockScreen {
     pub fn update(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
+        crate::trace_msg!("unlock", &message);
+        let busy_before = self.unlocking;
+        let (task, outcome) = self.update_inner(message);
+        if busy_before != self.unlocking {
+            crate::trace::state("unlock", "busy", busy_before, self.unlocking);
+        }
+        if let Some(o) = &outcome {
+            crate::trace::outcome("unlock", o.name());
+        }
+        (task, outcome)
+    }
+
+    fn update_inner(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
         match message {
             Message::PasswordInput(p) => {
-                self.password = Zeroizing::new(p);
+                self.password = p.take();
                 (Task::none(), None)
             }
             Message::PasswordSubmitted | Message::UnlockPressed => (self.try_unlock(), None),
@@ -145,7 +168,7 @@ impl UnlockScreen {
         let password_input = text_input("Password", self.password.as_str())
             .id(PASSWORD_INPUT_ID)
             .secure(true)
-            .on_input(Message::PasswordInput)
+            .on_input(|s| Message::PasswordInput(s.into()))
             .on_submit(Message::PasswordSubmitted)
             .padding(Padding::from([12, 14]))
             .size(14)

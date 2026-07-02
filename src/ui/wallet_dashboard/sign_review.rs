@@ -186,6 +186,21 @@ pub struct SignReview {
 }
 
 impl SignReview {
+    /// Coarse phase name for the GUI state trace: "prepare" while the legs are
+    /// still being built/decoded, "confirm" once they're shown and the gate is
+    /// live, "signing" after the user confirmed and the signing task runs. The
+    /// transitions themselves happen in the coordinator (`wallet_dashboard`),
+    /// which diffs this name across its dispatch.
+    pub fn phase(&self) -> &'static str {
+        if self.signing_since.is_some() {
+            "signing"
+        } else if self.legs_loading {
+            "prepare"
+        } else {
+            "confirm"
+        }
+    }
+
     /// Build a pending review whose legs are still being prepared.
     pub fn pending(
         title: String,
@@ -195,7 +210,7 @@ impl SignReview {
         seq: u64,
         action: SignAction,
     ) -> Self {
-        Self {
+        let review = Self {
             title,
             subtitle,
             order,
@@ -205,7 +220,12 @@ impl SignReview {
             seq,
             action,
             signing_since: None,
-        }
+        };
+        // Coordinator-driven open: every caller assigns this straight into the
+        // overlay slot (guarded by an is-already-open early return), so the
+        // open transition is traced at the one construction site.
+        crate::trace::state("sign_review", "phase", "closed", review.phase());
+        review
     }
 }
 

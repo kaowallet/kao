@@ -803,7 +803,11 @@ pub fn theme() -> ThemeKind {
 }
 
 pub fn set_theme(kind: ThemeKind) {
-    ensure().lock().expect("settings mutex poisoned").theme = kind;
+    let old = {
+        let mut state = ensure().lock().expect("settings mutex poisoned");
+        std::mem::replace(&mut state.theme, kind)
+    };
+    crate::trace::state("settings", "theme", old.key(), kind.key());
     write_all();
 }
 
@@ -869,11 +873,20 @@ fn synthesize_exec_url(chain: Chain) -> Option<String> {
 }
 
 pub fn set_rpcs(chain: Chain, list: Vec<String>) {
-    ensure()
-        .lock()
-        .expect("settings mutex poisoned")
-        .rpcs
-        .set(chain, list);
+    let to_len = list.len();
+    let from_len = {
+        let mut state = ensure().lock().expect("settings mutex poisoned");
+        let from = state.rpcs.get(chain).len();
+        state.rpcs.set(chain, list);
+        from
+    };
+    // URLs can embed API keys — log list lengths only.
+    crate::trace::state(
+        "settings",
+        &format!("rpcs_{}", chain.label()),
+        from_len,
+        to_len,
+    );
     write_all();
 }
 
@@ -897,11 +910,20 @@ pub fn consensus_rpcs(chain: Chain) -> Vec<String> {
 }
 
 pub fn set_consensus_rpcs(chain: Chain, list: Vec<String>) {
-    ensure()
-        .lock()
-        .expect("settings mutex poisoned")
-        .consensus_rpcs
-        .set(chain, list);
+    let to_len = list.len();
+    let from_len = {
+        let mut state = ensure().lock().expect("settings mutex poisoned");
+        let from = state.consensus_rpcs.get(chain).len();
+        state.consensus_rpcs.set(chain, list);
+        from
+    };
+    // URLs can embed API keys — log list lengths only.
+    crate::trace::state(
+        "settings",
+        &format!("consensus_rpcs_{}", chain.label()),
+        from_len,
+        to_len,
+    );
     write_all();
 }
 
@@ -946,10 +968,14 @@ pub fn custom_network(chain_id: u64) -> Option<CustomNetwork> {
 /// validated UI state without corrupting the file.
 pub fn set_custom_networks(networks: Vec<CustomNetwork>) {
     let normalized = normalize_custom_networks(networks);
-    ensure()
-        .lock()
-        .expect("settings mutex poisoned")
-        .custom_networks = normalized;
+    let to_len = normalized.len();
+    let from_len = {
+        let mut state = ensure().lock().expect("settings mutex poisoned");
+        let from = state.custom_networks.len();
+        state.custom_networks = normalized;
+        from
+    };
+    crate::trace::state("settings", "custom_networks", from_len, to_len);
     write_all();
 }
 
@@ -961,10 +987,20 @@ pub fn checkpoint_override() -> Option<B256> {
 }
 
 pub fn set_checkpoint_override(value: Option<B256>) {
-    ensure()
-        .lock()
-        .expect("settings mutex poisoned")
-        .checkpoint_override = value;
+    let old = {
+        let mut state = ensure().lock().expect("settings mutex poisoned");
+        std::mem::replace(&mut state.checkpoint_override, value)
+    };
+    let display = |v: Option<B256>| {
+        v.map(|b| b.to_string())
+            .unwrap_or_else(|| "none".to_string())
+    };
+    crate::trace::state(
+        "settings",
+        "checkpoint_override",
+        display(old),
+        display(value),
+    );
     write_all();
 }
 
@@ -976,11 +1012,19 @@ pub fn indexer_provider() -> IndexerProvider {
 }
 
 pub fn set_indexer_provider(value: IndexerProvider) {
-    ensure()
-        .lock()
-        .expect("settings mutex poisoned")
-        .indexer_provider = value;
+    let old = {
+        let mut state = ensure().lock().expect("settings mutex poisoned");
+        std::mem::replace(&mut state.indexer_provider, value)
+    };
+    crate::trace::state("settings", "indexer_provider", old.key(), value.key());
     write_all();
+}
+
+/// Presence label for logging credential-bearing settings (API keys, RPC
+/// keys, URLs that can embed keys): neither content nor length may reach
+/// the log stream.
+fn presence(is_set: bool) -> &'static str {
+    if is_set { "set" } else { "cleared" }
 }
 
 pub fn etherscan_api_key() -> Option<String> {
@@ -993,10 +1037,16 @@ pub fn etherscan_api_key() -> Option<String> {
 
 #[allow(dead_code)]
 pub fn set_etherscan_api_key(value: Option<String>) {
-    ensure()
-        .lock()
-        .expect("settings mutex poisoned")
-        .etherscan_api_key = value.filter(|s| !s.is_empty());
+    let value = value.filter(|s| !s.is_empty());
+    let to = presence(value.is_some());
+    let from = {
+        let mut state = ensure().lock().expect("settings mutex poisoned");
+        let from = presence(state.etherscan_api_key.is_some());
+        state.etherscan_api_key = value;
+        from
+    };
+    // Credential — presence only.
+    crate::trace::state("settings", "etherscan_api_key", from, to);
     write_all();
 }
 
@@ -1009,10 +1059,16 @@ pub fn alchemy_api_key() -> Option<String> {
 }
 
 pub fn set_alchemy_api_key(value: Option<String>) {
-    ensure()
-        .lock()
-        .expect("settings mutex poisoned")
-        .alchemy_api_key = value.filter(|s| !s.is_empty());
+    let value = value.filter(|s| !s.is_empty());
+    let to = presence(value.is_some());
+    let from = {
+        let mut state = ensure().lock().expect("settings mutex poisoned");
+        let from = presence(state.alchemy_api_key.is_some());
+        state.alchemy_api_key = value;
+        from
+    };
+    // Credential — presence only.
+    crate::trace::state("settings", "alchemy_api_key", from, to);
     write_all();
 }
 
@@ -1025,10 +1081,16 @@ pub fn drpc_api_key() -> Option<String> {
 }
 
 pub fn set_drpc_api_key(value: Option<String>) {
-    ensure()
-        .lock()
-        .expect("settings mutex poisoned")
-        .drpc_api_key = value.filter(|s| !s.is_empty());
+    let value = value.filter(|s| !s.is_empty());
+    let to = presence(value.is_some());
+    let from = {
+        let mut state = ensure().lock().expect("settings mutex poisoned");
+        let from = presence(state.drpc_api_key.is_some());
+        state.drpc_api_key = value;
+        from
+    };
+    // Credential — presence only.
+    crate::trace::state("settings", "drpc_api_key", from, to);
     write_all();
 }
 
@@ -1042,10 +1104,15 @@ pub fn blockscout_base_url() -> Option<String> {
 
 pub fn set_blockscout_base_url(value: Option<String>) {
     let cleaned = value.filter(|s| !s.is_empty() && is_https_url(s));
-    ensure()
-        .lock()
-        .expect("settings mutex poisoned")
-        .blockscout_base_url = cleaned;
+    let to = presence(cleaned.is_some());
+    let from = {
+        let mut state = ensure().lock().expect("settings mutex poisoned");
+        let from = presence(state.blockscout_base_url.is_some());
+        state.blockscout_base_url = cleaned;
+        from
+    };
+    // URL can embed credentials — presence only.
+    crate::trace::state("settings", "blockscout_base_url", from, to);
     write_all();
 }
 
@@ -1058,10 +1125,16 @@ pub fn blockscout_api_key() -> Option<String> {
 }
 
 pub fn set_blockscout_api_key(value: Option<String>) {
-    ensure()
-        .lock()
-        .expect("settings mutex poisoned")
-        .blockscout_api_key = value.filter(|s| !s.is_empty());
+    let value = value.filter(|s| !s.is_empty());
+    let to = presence(value.is_some());
+    let from = {
+        let mut state = ensure().lock().expect("settings mutex poisoned");
+        let from = presence(state.blockscout_api_key.is_some());
+        state.blockscout_api_key = value;
+        from
+    };
+    // Credential — presence only.
+    crate::trace::state("settings", "blockscout_api_key", from, to);
     write_all();
 }
 
@@ -1075,10 +1148,22 @@ pub fn kao_server_url() -> String {
 
 pub fn set_kao_server_url(value: String) {
     let url = parse_kao_server_input(&value).unwrap_or_else(|| DEFAULT_KAO_SERVER_URL.to_string());
-    ensure()
-        .lock()
-        .expect("settings mutex poisoned")
-        .kao_server_url = url;
+    // URL can embed credentials — log default/custom only, never the value.
+    let label = |u: &str| {
+        if u == DEFAULT_KAO_SERVER_URL {
+            "default"
+        } else {
+            "custom"
+        }
+    };
+    let to = label(&url);
+    let from = {
+        let mut state = ensure().lock().expect("settings mutex poisoned");
+        let from = label(&state.kao_server_url);
+        state.kao_server_url = url;
+        from
+    };
+    crate::trace::state("settings", "kao_server_url", from, to);
     write_all();
 }
 
@@ -1103,10 +1188,11 @@ pub fn rpc_provider() -> RpcProvider {
 }
 
 pub fn set_rpc_provider(value: RpcProvider) {
-    ensure()
-        .lock()
-        .expect("settings mutex poisoned")
-        .rpc_provider = value;
+    let old = {
+        let mut state = ensure().lock().expect("settings mutex poisoned");
+        std::mem::replace(&mut state.rpc_provider, value)
+    };
+    crate::trace::state("settings", "rpc_provider", old.key(), value.key());
     write_all();
 }
 
@@ -1119,7 +1205,16 @@ pub fn rpc_key() -> Option<String> {
 }
 
 pub fn set_rpc_key(value: Option<String>) {
-    ensure().lock().expect("settings mutex poisoned").rpc_key = value.filter(|s| !s.is_empty());
+    let value = value.filter(|s| !s.is_empty());
+    let to = presence(value.is_some());
+    let from = {
+        let mut state = ensure().lock().expect("settings mutex poisoned");
+        let from = presence(state.rpc_key.is_some());
+        state.rpc_key = value;
+        from
+    };
+    // Credential — presence only.
+    crate::trace::state("settings", "rpc_key", from, to);
     write_all();
 }
 
@@ -1132,10 +1227,16 @@ pub fn custom_rpc_url() -> Option<String> {
 }
 
 pub fn set_custom_rpc_url(value: Option<String>) {
-    ensure()
-        .lock()
-        .expect("settings mutex poisoned")
-        .custom_rpc_url = value.filter(|s| !s.is_empty());
+    let value = value.filter(|s| !s.is_empty());
+    let to = presence(value.is_some());
+    let from = {
+        let mut state = ensure().lock().expect("settings mutex poisoned");
+        let from = presence(state.custom_rpc_url.is_some());
+        state.custom_rpc_url = value;
+        from
+    };
+    // URL can embed credentials — presence only.
+    crate::trace::state("settings", "custom_rpc_url", from, to);
     write_all();
 }
 
@@ -1147,10 +1248,11 @@ pub fn api_provider() -> ApiProvider {
 }
 
 pub fn set_api_provider(value: ApiProvider) {
-    ensure()
-        .lock()
-        .expect("settings mutex poisoned")
-        .api_provider = value;
+    let old = {
+        let mut state = ensure().lock().expect("settings mutex poisoned");
+        std::mem::replace(&mut state.api_provider, value)
+    };
+    crate::trace::state("settings", "api_provider", old.key(), value.key());
     write_all();
 }
 
@@ -1163,7 +1265,16 @@ pub fn api_key() -> Option<String> {
 }
 
 pub fn set_api_key(value: Option<String>) {
-    ensure().lock().expect("settings mutex poisoned").api_key = value.filter(|s| !s.is_empty());
+    let value = value.filter(|s| !s.is_empty());
+    let to = presence(value.is_some());
+    let from = {
+        let mut state = ensure().lock().expect("settings mutex poisoned");
+        let from = presence(state.api_key.is_some());
+        state.api_key = value;
+        from
+    };
+    // Credential — presence only.
+    crate::trace::state("settings", "api_key", from, to);
     write_all();
 }
 
@@ -1175,10 +1286,11 @@ pub fn safe_tx_service() -> SafeTxService {
 }
 
 pub fn set_safe_tx_service(value: SafeTxService) {
-    ensure()
-        .lock()
-        .expect("settings mutex poisoned")
-        .safe_tx_service = value;
+    let old = {
+        let mut state = ensure().lock().expect("settings mutex poisoned");
+        std::mem::replace(&mut state.safe_tx_service, value)
+    };
+    crate::trace::state("settings", "safe_tx_service", old.key(), value.key());
     write_all();
 }
 
@@ -1192,10 +1304,15 @@ pub fn safe_tx_service_url() -> Option<String> {
 
 pub fn set_safe_tx_service_url(value: Option<String>) {
     let cleaned = value.filter(|s| !s.is_empty() && is_https_url(s));
-    ensure()
-        .lock()
-        .expect("settings mutex poisoned")
-        .safe_tx_service_url = cleaned;
+    let to = presence(cleaned.is_some());
+    let from = {
+        let mut state = ensure().lock().expect("settings mutex poisoned");
+        let from = presence(state.safe_tx_service_url.is_some());
+        state.safe_tx_service_url = cleaned;
+        from
+    };
+    // URL can embed credentials — presence only.
+    crate::trace::state("settings", "safe_tx_service_url", from, to);
     write_all();
 }
 

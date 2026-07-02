@@ -25,6 +25,17 @@ pub enum Outcome {
     Back,
 }
 
+impl Outcome {
+    /// Variant name for the GUI state trace.
+    fn name(&self) -> &'static str {
+        match self {
+            Outcome::Ledger => "Ledger",
+            Outcome::Trezor => "Trezor",
+            Outcome::Back => "Back",
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct SelectHardwareWalletScreen {}
 
@@ -39,7 +50,8 @@ struct DeviceCard<'a> {
 
 impl SelectHardwareWalletScreen {
     pub fn update(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
-        match message {
+        crate::trace_msg!("select_hw", &message);
+        let (task, outcome) = match message {
             Message::ConnectLedger => (Task::none(), Some(Outcome::Ledger)),
             Message::ConnectTrezor => (Task::none(), Some(Outcome::Trezor)),
             Message::BackPressed => (Task::none(), Some(Outcome::Back)),
@@ -56,7 +68,11 @@ impl SelectHardwareWalletScreen {
                 _ => (Task::none(), None),
             },
             Message::KeyboardEvent(_) => (Task::none(), None),
+        };
+        if let Some(o) = &outcome {
+            crate::trace::outcome("select_hw", o.name());
         }
+        (task, outcome)
     }
 
     pub fn view(&self) -> Element<'_, Message> {

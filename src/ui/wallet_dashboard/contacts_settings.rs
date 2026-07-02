@@ -154,6 +154,17 @@ pub enum Outcome {
     SaveRequested(Vec<Contact>),
 }
 
+impl Outcome {
+    /// Variant name for the GUI state trace — never the payload (the
+    /// `SaveRequested` contacts vec would flood the stream).
+    fn name(&self) -> &'static str {
+        match self {
+            Outcome::Closed => "Closed",
+            Outcome::SaveRequested(_) => "SaveRequested",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct Draft {
     name: String,
@@ -191,6 +202,21 @@ enum AddressResolution {
     Error { name: String, msg: String },
 }
 
+impl AddressResolution {
+    /// Variant name for the GUI state trace.
+    fn name(&self) -> &'static str {
+        match self {
+            AddressResolution::Empty => "Empty",
+            AddressResolution::Invalid => "Invalid",
+            AddressResolution::Hex(_) => "Hex",
+            AddressResolution::Resolving { .. } => "Resolving",
+            AddressResolution::Resolved { .. } => "Resolved",
+            AddressResolution::NotFound { .. } => "NotFound",
+            AddressResolution::Error { .. } => "Error",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum Mode {
     List,
@@ -199,6 +225,21 @@ enum Mode {
         /// `None` means Add mode (the draft becomes a new contact).
         editing_addr: Option<Address>,
     },
+}
+
+impl Mode {
+    /// Coarse pane-mode name for the GUI state trace. Add and Edit are
+    /// both `Mode::Edit` internally; the trace splits them the same way
+    /// the header title does.
+    fn name(&self) -> &'static str {
+        match self {
+            Mode::List => "List",
+            Mode::Edit { editing_addr: None } => "Add",
+            Mode::Edit {
+                editing_addr: Some(_),
+            } => "Edit",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -277,6 +318,51 @@ impl ContactsPane {
     }
 
     pub fn update(&mut self, msg: Message) -> (Task<Message>, Option<Outcome>) {
+        crate::trace_msg!("contacts", &msg);
+        // Diff the pane's coarse state across the dispatch so every
+        // transition is logged no matter which arm (or helper) did it.
+        let mode_before = self.mode.name();
+        let resolution_before = self.resolution.name();
+        let pending_before = self.pending_delete;
+        let validation_before = self.validation.len();
+
+        let (task, outcome) = self.update_inner(msg);
+
+        if mode_before != self.mode.name() {
+            crate::trace::state("contacts", "mode", mode_before, self.mode.name());
+        }
+        if resolution_before != self.resolution.name() {
+            crate::trace::state(
+                "contacts",
+                "resolution",
+                resolution_before,
+                self.resolution.name(),
+            );
+        }
+        if pending_before != self.pending_delete {
+            let fmt = |v: Option<usize>| v.map_or("none".to_string(), |i| i.to_string());
+            crate::trace::state(
+                "contacts",
+                "pending_delete",
+                fmt(pending_before),
+                fmt(self.pending_delete),
+            );
+        }
+        if validation_before != self.validation.len() {
+            crate::trace::state(
+                "contacts",
+                "validation_errors",
+                validation_before,
+                self.validation.len(),
+            );
+        }
+        if let Some(o) = &outcome {
+            crate::trace::outcome("contacts", o.name());
+        }
+        (task, outcome)
+    }
+
+    fn update_inner(&mut self, msg: Message) -> (Task<Message>, Option<Outcome>) {
         match msg {
             // Copy-toast kick — the widget already copied + marked the toast.
             Message::AddressCopied => (Task::none(), None),

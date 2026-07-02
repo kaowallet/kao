@@ -118,6 +118,16 @@ pub enum Outcome {
     },
 }
 
+impl Outcome {
+    /// Variant name for the GUI state trace — never the payload.
+    fn name(&self) -> &'static str {
+        match self {
+            Outcome::RequestQuote(_) => "RequestQuote",
+            Outcome::RequestPlace { .. } => "RequestPlace",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct SwapComposer {
     /// The CoW network the swap runs on — chosen explicitly via the switch.
@@ -163,6 +173,17 @@ impl SwapComposer {
     /// Reset to a blank slate (used by the Apps pane after a successful place,
     /// keeping the chosen slippage).
     pub fn reset(&mut self) {
+        // Called by the host outside `update`, so the wrapper diff can't see
+        // these transitions — log the coarse ones here.
+        if self.quote.is_some() {
+            crate::trace::state("composer", "quote", "some", "none");
+        }
+        if self.quoting {
+            crate::trace::state("composer", "quoting", true, false);
+        }
+        if self.error.is_some() {
+            crate::trace::state("composer", "error", "some", "none");
+        }
         self.sell = None;
         self.buy = None;
         self.sell_filter.clear();
@@ -175,6 +196,47 @@ impl SwapComposer {
     }
 
     pub fn update(&mut self, msg: Message) -> Option<Outcome> {
+        crate::trace_msg!("composer", &msg);
+        let chain_before = self.chain;
+        let quoting_before = self.quoting;
+        let quote_before = self.quote.is_some();
+        let error_before = self.error.is_some();
+        let outcome = self.update_inner(msg);
+        if chain_before != self.chain {
+            crate::trace::state(
+                "composer",
+                "chain",
+                chain_before.label(),
+                self.chain.label(),
+            );
+        }
+        if quoting_before != self.quoting {
+            crate::trace::state("composer", "quoting", quoting_before, self.quoting);
+        }
+        let p = |present: bool| if present { "some" } else { "none" };
+        if quote_before != self.quote.is_some() {
+            crate::trace::state(
+                "composer",
+                "quote",
+                p(quote_before),
+                p(self.quote.is_some()),
+            );
+        }
+        if error_before != self.error.is_some() {
+            crate::trace::state(
+                "composer",
+                "error",
+                p(error_before),
+                p(self.error.is_some()),
+            );
+        }
+        if let Some(o) = &outcome {
+            crate::trace::outcome("composer", o.name());
+        }
+        outcome
+    }
+
+    fn update_inner(&mut self, msg: Message) -> Option<Outcome> {
         match msg {
             Message::SetChain(chain) => {
                 if self.chain != chain {
@@ -299,6 +361,10 @@ impl SwapComposer {
     /// Surface an error from the coordinator (e.g. a failed placement) into the
     /// composer so it renders inline.
     pub fn set_error(&mut self, e: String) {
+        // Called by the host outside `update` — log the appearance here.
+        if self.error.is_none() {
+            crate::trace::state("composer", "error", "none", "some");
+        }
         self.error = Some(e);
     }
 

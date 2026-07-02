@@ -24,7 +24,9 @@ const BLANK_COUNT: usize = 4;
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    WordInput(usize, String),
+    // The typed word is a seed word — redacted at the type level so the
+    // derived Debug of this (and any containing) enum is safe to log.
+    WordInput(usize, crate::trace::SecretInput),
     WordSubmitted(usize),
     Verify,
     BackPressed,
@@ -41,6 +43,17 @@ pub enum Outcome {
         key_bytes: Zeroizing<[u8; 32]>,
         address: Address,
     },
+}
+
+impl Outcome {
+    /// Variant name for the GUI state trace — never the payload, which
+    /// carries the seed phrase and key bytes on `Back`.
+    fn name(&self) -> &'static str {
+        match self {
+            Outcome::Verified => "Verified",
+            Outcome::Back { .. } => "Back",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -111,12 +124,29 @@ impl VerifySeedScreen {
     }
 
     pub fn update(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
+        crate::trace_msg!("verify_seed", &message);
+        let verified_before = self.verified;
+        let focused_before = self.focused;
+        let (task, outcome) = self.update_inner(message);
+        if verified_before != self.verified {
+            crate::trace::state("verify_seed", "verified", verified_before, self.verified);
+        }
+        if focused_before != self.focused {
+            crate::trace::state("verify_seed", "focused", focused_before, self.focused);
+        }
+        if let Some(o) = &outcome {
+            crate::trace::outcome("verify_seed", o.name());
+        }
+        (task, outcome)
+    }
+
+    fn update_inner(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
         match message {
             Message::WordInput(idx, val) => {
                 if idx < self.inputs.len() {
                     // Replacing the Zeroizing<String> drops the old buffer,
                     // which zeros it before deallocation.
-                    self.inputs[idx] = Zeroizing::new(val);
+                    self.inputs[idx] = val.take();
                 }
                 (Task::none(), None)
             }
@@ -185,7 +215,7 @@ impl VerifySeedScreen {
                 {
                     let input = text_input("?", self.inputs[blank_pos].as_str())
                         .id(input_id(blank_pos))
-                        .on_input(move |v| Message::WordInput(blank_pos, v))
+                        .on_input(move |v| Message::WordInput(blank_pos, v.into()))
                         .on_submit(Message::WordSubmitted(blank_pos))
                         .padding(Padding::from([6, 8]))
                         .size(13)

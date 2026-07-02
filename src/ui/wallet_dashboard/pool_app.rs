@@ -23,6 +23,7 @@ use iced::{
 };
 use secrecy::{ExposeSecret, SecretString};
 use tracing::{debug, warn};
+use zeroize::{Zeroize, Zeroizing};
 
 use super::send::{ContactsView, PickerEntry, PickerKind};
 use crate::chain::Chain;
@@ -47,7 +48,9 @@ pub enum Message {
     // setup / identity
     CreateIdentity,
     OpenRestore,
-    RestoreInput(String),
+    /// Restore-phrase keystrokes — redacted at the type level so the derived
+    /// `Debug` (and thus the GUI trace) never sees the mnemonic.
+    RestoreInput(crate::trace::SecretInput),
     RestoreSubmit,
     // backup
     OpenBackup,
@@ -167,6 +170,21 @@ impl TargetResolution {
             _ => None,
         }
     }
+
+    /// Variant name for the GUI state trace.
+    fn name(&self) -> &'static str {
+        match self {
+            TargetResolution::Empty => "Empty",
+            TargetResolution::Invalid => "Invalid",
+            TargetResolution::Address(_) => "Address",
+            TargetResolution::Resolving { .. } => "Resolving",
+            TargetResolution::AddressVerifying { .. } => "AddressVerifying",
+            TargetResolution::Resolved { .. } => "Resolved",
+            TargetResolution::NotFound { .. } => "NotFound",
+            TargetResolution::Error { .. } => "Error",
+            TargetResolution::EnsDivergence { .. } => "EnsDivergence",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -195,6 +213,26 @@ pub enum Outcome {
     /// Leave the Privacy Pools app — the Apps coordinator returns to the
     /// launcher (never bubbles to the dashboard).
     Close,
+}
+
+impl Outcome {
+    /// Variant name for the GUI state trace — never the payload:
+    /// `RestoreIdentity` carries the mnemonic and `CopyText` can carry the
+    /// revealed backup phrase.
+    fn name(&self) -> &'static str {
+        match self {
+            Outcome::CreateIdentity => "CreateIdentity",
+            Outcome::RestoreIdentity(_) => "RestoreIdentity",
+            Outcome::RevealBackup => "RevealBackup",
+            Outcome::Sync(_) => "Sync",
+            Outcome::Deposit { .. } => "Deposit",
+            Outcome::Quote(_) => "Quote",
+            Outcome::Submit { .. } => "Submit",
+            Outcome::Ragequit { .. } => "Ragequit",
+            Outcome::CopyText(_) => "CopyText",
+            Outcome::Close => "Close",
+        }
+    }
 }
 
 /// Which pool op just broadcast — carried on [`Message::PoolSubmitted`] so the
@@ -245,6 +283,23 @@ enum View {
     Success,
 }
 
+impl View {
+    /// Variant name for the GUI state trace.
+    fn name(self) -> &'static str {
+        match self {
+            View::Setup => "Setup",
+            View::Restore => "Restore",
+            View::Backup => "Backup",
+            View::Overview => "Overview",
+            View::Deposit => "Deposit",
+            View::Withdraw => "Withdraw",
+            View::Review => "Review",
+            View::Proving => "Proving",
+            View::Success => "Success",
+        }
+    }
+}
+
 pub struct PoolApp {
     view: View,
     has_identity: bool,
@@ -279,7 +334,10 @@ pub struct PoolApp {
     revealed: bool,
     did_copy: bool,
     // restore
-    restore_input: String,
+    /// Live `text_input` buffer for the recovery phrase. `Zeroizing<String>`
+    /// zeros the heap allocation each time the input is replaced (every
+    /// keystroke) and on drop.
+    restore_input: Zeroizing<String>,
     // deposit draft
     deposit_pool: usize,
     deposit_amount: String,
@@ -342,7 +400,7 @@ impl PoolApp {
             backup_phrase: None,
             revealed: false,
             did_copy: false,
-            restore_input: String::new(),
+            restore_input: Zeroizing::new(String::new()),
             deposit_pool: 0,
             deposit_amount: String::new(),
             withdraw_pool: 0,
@@ -365,17 +423,30 @@ impl PoolApp {
 
     // ── coordinator-driven setters ──────────────────────────────────────────
 
+    /// Set the active view, logging the transition — the coordinator-driven
+    /// setters run outside `update`, where the wrapper's before/after diff
+    /// can't see them.
+    fn switch_view(&mut self, view: View) {
+        if self.view != view {
+            crate::trace::state("pool", "view", self.view.name(), view.name());
+        }
+        self.view = view;
+    }
+
     /// First open: ask the coordinator to load the identity + sync.
     pub fn on_open(&mut self) -> Option<Outcome> {
         Some(Outcome::Sync(self.chain))
     }
 
     pub fn set_identity(&mut self, has: bool) {
+        if self.has_identity != has {
+            crate::trace::state("pool", "has_identity", self.has_identity, has);
+        }
         self.has_identity = has;
         if has && matches!(self.view, View::Setup | View::Restore) {
-            self.view = View::Overview;
+            self.switch_view(View::Overview);
         } else if !has {
-            self.view = View::Setup;
+            self.switch_view(View::Setup);
             // A removed identity (lock / reset / switch) invalidates any
             // in-flight deposit markers + approval status — they belong to the
             // old identity's notes.
@@ -386,6 +457,9 @@ impl PoolApp {
     }
 
     pub fn set_syncing(&mut self, syncing: bool) {
+        if self.syncing != syncing {
+            crate::trace::state("pool", "syncing", self.syncing, syncing);
+        }
         // Start the animation clock on the leading edge, clear it when the sync
         // finishes (so a fresh sync restarts the wave from zero).
         match (syncing, self.syncing_started) {
@@ -397,6 +471,10 @@ impl PoolApp {
     }
 
     pub fn set_error(&mut self, e: Option<String>) {
+        if self.error.is_some() != e.is_some() {
+            let s = |present: bool| if present { "some" } else { "none" };
+            crate::trace::state("pool", "error", s(self.error.is_some()), s(e.is_some()));
+        }
         self.error = e;
     }
 
@@ -474,7 +552,7 @@ impl PoolApp {
     /// review overlay opens over it, or on cancel), clearing the proving screen.
     pub fn reset_to_overview(&mut self) {
         self.proving_started = None;
-        self.view = View::Overview;
+        self.switch_view(View::Overview);
     }
 
     /// Enter the Backup view with the recovery phrase (masked until revealed).
@@ -482,12 +560,12 @@ impl PoolApp {
         self.backup_phrase = Some(phrase);
         self.revealed = false;
         self.did_copy = false;
-        self.view = View::Backup;
+        self.switch_view(View::Backup);
     }
 
     pub fn set_quote(&mut self, quote: QuoteResponse) {
         self.quote = Some(quote);
-        self.view = View::Review;
+        self.switch_view(View::Review);
     }
 
     /// Whether the withdrawal target field currently needs a forward name
@@ -523,6 +601,7 @@ impl PoolApp {
         if seq != self.withdraw_resolution_seq {
             return;
         }
+        let res_before = self.withdraw_resolution.name();
         let before = self.withdraw_resolution.recipient();
         match &self.withdraw_resolution {
             TargetResolution::Resolving { name: pending } if pending == &name => {
@@ -555,6 +634,15 @@ impl PoolApp {
         if before != self.withdraw_resolution.recipient() {
             self.quote = None;
         }
+        // Coordinator-driven, so the update wrapper's diff can't see this.
+        if res_before != self.withdraw_resolution.name() {
+            crate::trace::state(
+                "pool",
+                "resolution",
+                res_before,
+                self.withdraw_resolution.name(),
+            );
+        }
     }
 
     /// Set the withdrawal target from raw input, updating the resolution state.
@@ -586,7 +674,7 @@ impl PoolApp {
     pub fn set_proving(&mut self, label: impl Into<String>) {
         self.proving_started = Some(Instant::now());
         self.proving_label = label.into();
-        self.view = View::Proving;
+        self.switch_view(View::Proving);
     }
 
     /// A broadcast landed — show the durable success screen with the tx hash so
@@ -602,13 +690,61 @@ impl PoolApp {
         self.proving_started = None;
         self.error = None;
         self.submitted = Some((kind, tx));
-        self.view = View::Success;
+        self.switch_view(View::Success);
         Some(Outcome::Sync(self.chain))
     }
 
     // ── update ──────────────────────────────────────────────────────────────
 
     pub fn update(&mut self, msg: Message) -> Option<Outcome> {
+        match &msg {
+            // Skipped: ~60 Hz animation frames would drown the trace stream.
+            Message::Tick => {}
+            // Ignored-keystroke events Debug-format their typed text — trace
+            // the variant only so stray unfocused typing can't leak.
+            Message::Key(_) => crate::trace_msg!("pool", &format_args!("Key(..)")),
+            other => crate::trace_msg!("pool", other),
+        }
+        let view_before = self.view;
+        let chain_before = self.chain;
+        let error_before = self.error.is_some();
+        let revealed_before = self.revealed;
+        let quote_before = self.quote.is_some();
+        let resolution_before = self.withdraw_resolution.name();
+
+        let outcome = self.update_inner(msg);
+
+        if view_before != self.view {
+            crate::trace::state("pool", "view", view_before.name(), self.view.name());
+        }
+        if chain_before != self.chain {
+            crate::trace::state("pool", "chain", chain_before.label(), self.chain.label());
+        }
+        let s = |present: bool| if present { "some" } else { "none" };
+        if error_before != self.error.is_some() {
+            crate::trace::state("pool", "error", s(error_before), s(self.error.is_some()));
+        }
+        if revealed_before != self.revealed {
+            crate::trace::state("pool", "revealed", revealed_before, self.revealed);
+        }
+        if quote_before != self.quote.is_some() {
+            crate::trace::state("pool", "quote", s(quote_before), s(self.quote.is_some()));
+        }
+        if resolution_before != self.withdraw_resolution.name() {
+            crate::trace::state(
+                "pool",
+                "resolution",
+                resolution_before,
+                self.withdraw_resolution.name(),
+            );
+        }
+        if let Some(o) = &outcome {
+            crate::trace::outcome("pool", o.name());
+        }
+        outcome
+    }
+
+    fn update_inner(&mut self, msg: Message) -> Option<Outcome> {
         self.error = None;
         match msg {
             Message::CreateIdentity => Some(Outcome::CreateIdentity),
@@ -617,7 +753,8 @@ impl PoolApp {
                 None
             }
             Message::RestoreInput(v) => {
-                self.restore_input = v;
+                // `take()` keeps the phrase in a zeroizing buffer end to end.
+                self.restore_input = v.take();
                 None
             }
             Message::RestoreSubmit => {
@@ -633,7 +770,7 @@ impl PoolApp {
                     self.error = Some(format!("Invalid recovery phrase: {e}"));
                     return None;
                 }
-                self.restore_input.clear();
+                self.restore_input.zeroize();
                 Some(Outcome::RestoreIdentity(SecretString::new(
                     phrase.into_boxed_str(),
                 )))
@@ -696,7 +833,7 @@ impl PoolApp {
             Message::Back => {
                 // Esc on the success screen dismisses it like the Done button.
                 if matches!(self.view, View::Success) {
-                    return self.update(Message::SubmittedDone);
+                    return self.update_inner(Message::SubmittedDone);
                 }
                 self.view = match self.view {
                     View::Deposit | View::Withdraw | View::Backup => View::Overview,
@@ -819,7 +956,7 @@ impl PoolApp {
                     ..
                 } = event
                 {
-                    return self.update(Message::Back);
+                    return self.update_inner(Message::Back);
                 }
                 None
             }
@@ -1013,8 +1150,8 @@ impl PoolApp {
             vspace(6),
             screen_subtitle(t, "Enter your 24-word Privacy Pools recovery phrase."),
             vspace(18),
-            text_input("word1 word2 word3 …", &self.restore_input)
-                .on_input(Message::RestoreInput)
+            text_input("word1 word2 word3 …", self.restore_input.as_str())
+                .on_input(|s| Message::RestoreInput(s.into()))
                 .on_submit(Message::RestoreSubmit)
                 .padding(12)
                 .style(move |_theme, s| text_input_style(t, s)),

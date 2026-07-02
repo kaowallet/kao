@@ -18,8 +18,8 @@ pub const CONFIRM_INPUT_ID: &str = "confirm_input";
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    PasswordInput(String),
-    ConfirmInput(String),
+    PasswordInput(crate::trace::SecretInput),
+    ConfirmInput(crate::trace::SecretInput),
     CreatePressed,
     PasswordSubmitted,
     ConfirmSubmitted,
@@ -32,6 +32,16 @@ pub enum Outcome {
     /// User picked a valid passphrase. The parent should hold this for the
     /// remainder of the setup flow (to encrypt the wallet on save).
     Created(SecretString),
+}
+
+impl Outcome {
+    /// Variant name for the GUI state trace — never the payload, which
+    /// carries the chosen passphrase.
+    fn name(&self) -> &'static str {
+        match self {
+            Outcome::Created(_) => "Created",
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -53,15 +63,42 @@ enum Focus {
     Confirm,
 }
 
+impl Focus {
+    fn name(self) -> &'static str {
+        match self {
+            Focus::Password => "Password",
+            Focus::Confirm => "Confirm",
+        }
+    }
+}
+
 impl CreatePasswordScreen {
     pub fn update(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
+        crate::trace_msg!("create_password", &message);
+        let focus_before = self.focused;
+        let (task, outcome) = self.update_inner(message);
+        if focus_before != self.focused {
+            crate::trace::state(
+                "create_password",
+                "focus",
+                focus_before.name(),
+                self.focused.name(),
+            );
+        }
+        if let Some(o) = &outcome {
+            crate::trace::outcome("create_password", o.name());
+        }
+        (task, outcome)
+    }
+
+    fn update_inner(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
         match message {
             Message::PasswordInput(p) => {
-                self.password = Zeroizing::new(p);
+                self.password = p.take();
                 (Task::none(), None)
             }
             Message::ConfirmInput(c) => {
-                self.confirm = Zeroizing::new(c);
+                self.confirm = c.take();
                 (Task::none(), None)
             }
             Message::PasswordSubmitted => {
@@ -127,7 +164,7 @@ impl CreatePasswordScreen {
         let password_input = text_input("Password", self.password.as_str())
             .id(PASSWORD_INPUT_ID)
             .secure(true)
-            .on_input(Message::PasswordInput)
+            .on_input(|s| Message::PasswordInput(s.into()))
             .on_submit(Message::PasswordSubmitted)
             .padding(Padding::from([12, 14]))
             .size(14)
@@ -137,7 +174,7 @@ impl CreatePasswordScreen {
         let confirm_input = text_input("Confirm password", self.confirm.as_str())
             .id(CONFIRM_INPUT_ID)
             .secure(true)
-            .on_input(Message::ConfirmInput)
+            .on_input(|s| Message::ConfirmInput(s.into()))
             .on_submit(Message::ConfirmSubmitted)
             .padding(Padding::from([12, 14]))
             .size(14)

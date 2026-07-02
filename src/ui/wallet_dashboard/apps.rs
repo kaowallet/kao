@@ -64,6 +64,18 @@ enum AppsView {
     PrivacyPools,
 }
 
+impl AppsView {
+    /// Variant name for the GUI state trace.
+    fn name(self) -> &'static str {
+        match self {
+            AppsView::Launcher => "Launcher",
+            AppsView::Swap => "Swap",
+            AppsView::Names => "Names",
+            AppsView::PrivacyPools => "PrivacyPools",
+        }
+    }
+}
+
 // `Request*`-prefixed by design (these are the requests the pane bubbles up);
 // one-shot, so the QuoteResponse size gap isn't worth boxing.
 #[allow(clippy::large_enum_variant, clippy::enum_variant_names)]
@@ -90,6 +102,21 @@ pub enum Outcome {
     /// services it (discover/sync/quote/prove/submit, seed plumbing) and feeds
     /// the result back via [`AppsPane::pool_pane`].
     Pool(pool_app::Outcome),
+}
+
+impl Outcome {
+    /// Variant name for the GUI state trace — never the payload.
+    fn name(&self) -> &'static str {
+        match self {
+            Outcome::RequestQuote(_) => "RequestQuote",
+            Outcome::RequestPlace { .. } => "RequestPlace",
+            Outcome::RequestCancel { .. } => "RequestCancel",
+            Outcome::CopyText(_) => "CopyText",
+            Outcome::RefreshOrders => "RefreshOrders",
+            Outcome::Name(_) => "Name",
+            Outcome::Pool(_) => "Pool",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -138,6 +165,23 @@ impl AppsPane {
     }
 
     pub fn update(&mut self, msg: Message) -> Option<Outcome> {
+        // Pool's Tick is a ~16ms animation frame (proving spinner / loading
+        // skeleton) — tracing it would drown the stream.
+        if !matches!(msg, Message::Pool(pool_app::Message::Tick)) {
+            crate::trace_msg!("apps", &msg);
+        }
+        let view_before = self.view.name();
+        let outcome = self.update_inner(msg);
+        if view_before != self.view.name() {
+            crate::trace::state("apps", "view", view_before, self.view.name());
+        }
+        if let Some(o) = &outcome {
+            crate::trace::outcome("apps", o.name());
+        }
+        outcome
+    }
+
+    fn update_inner(&mut self, msg: Message) -> Option<Outcome> {
         match msg {
             Message::OpenSwapApp => {
                 self.view = AppsView::Swap;

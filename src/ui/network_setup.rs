@@ -75,6 +75,19 @@ impl WizardStep {
         }
     }
 
+    /// Variant name for the GUI state trace.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Rpc => "Rpc",
+            Self::Api => "Api",
+            Self::SafeTx => "SafeTx",
+            Self::Proxy => "Proxy",
+            Self::Consensus => "Consensus",
+            Self::CustomNetworks => "CustomNetworks",
+            Self::Review => "Review",
+        }
+    }
+
     fn title(self) -> &'static str {
         match self {
             Self::Rpc => "RPC Provider",
@@ -154,8 +167,9 @@ pub enum WizardMode {
     Settings,
 }
 
-/// A user-typed secret (an API key) held in the wizard draft and in the
-/// key-carrying `Message` variants. Behaves like a `String` for the wizard's
+/// A user-typed secret (an API key, or an RPC URL that commonly embeds one
+/// in its path) held in the wizard draft and in the key-carrying `Message`
+/// variants. Behaves like a `String` for the wizard's
 /// purposes, but its `Debug` is redacted so a stray `{:?}` on a `Message` or
 /// `WizardDraft` — or a panic backtrace that formats one — never prints the
 /// key. (The key is still persisted to `settings.toml` in plaintext; that file
@@ -172,6 +186,12 @@ impl SecretInput {
     fn clear(&mut self) {
         self.0.clear();
     }
+
+    /// Unwrap into the inner `String` — only for draft fields that store
+    /// the value unwrapped (values that persist plaintext in settings.toml).
+    fn into_inner(self) -> String {
+        self.0
+    }
 }
 
 impl std::fmt::Debug for SecretInput {
@@ -186,6 +206,34 @@ impl From<String> for SecretInput {
     }
 }
 
+/// Keyboard-event wrapper whose `Debug` hides what was typed. A raw
+/// `keyboard::Event` carries the produced text and character keys (releases
+/// reach `keyboard::listen` even while a text_input is focused), so a `{:?}`
+/// of a containing message — in this screen's trace or a parent
+/// dispatcher's — would otherwise echo API keys typed into the wizard
+/// keystroke by keystroke. Named keys (Enter, Escape, …) stay visible since
+/// they drive wizard navigation.
+#[derive(Clone)]
+pub(crate) struct KeyEvent(keyboard::Event);
+
+impl std::fmt::Debug for KeyEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(named),
+                ..
+            } => write!(f, "KeyEvent(KeyPressed({named:?}))"),
+            keyboard::Event::KeyPressed { .. } => f.write_str("KeyEvent(KeyPressed(<redacted>))"),
+            keyboard::Event::KeyReleased {
+                key: keyboard::Key::Named(named),
+                ..
+            } => write!(f, "KeyEvent(KeyReleased({named:?}))"),
+            keyboard::Event::KeyReleased { .. } => f.write_str("KeyEvent(KeyReleased(<redacted>))"),
+            keyboard::Event::ModifiersChanged(m) => write!(f, "KeyEvent(ModifiersChanged({m:?}))"),
+        }
+    }
+}
+
 /// One editable custom-network row in the wizard. All fields are strings so
 /// the form can hold partially-typed input (e.g. a chain id mid-edit); they're
 /// parsed/validated on `Continue` and converted to [`settings::CustomNetwork`]
@@ -194,7 +242,8 @@ impl From<String> for SecretInput {
 struct CustomNetworkDraft {
     name: String,
     chain_id: String,
-    rpc_url: String,
+    // Redacted: custom RPC URLs commonly embed a provider key in the path.
+    rpc_url: SecretInput,
     symbol: String,
     enabled: bool,
 }
@@ -205,7 +254,7 @@ impl CustomNetworkDraft {
     fn is_blank(&self) -> bool {
         self.name.trim().is_empty()
             && self.chain_id.trim().is_empty()
-            && self.rpc_url.trim().is_empty()
+            && self.rpc_url.as_str().trim().is_empty()
             && self.symbol.trim().is_empty()
     }
 
@@ -224,7 +273,8 @@ impl CustomNetworkDraft {
 struct WizardDraft {
     rpc_provider: RpcProvider,
     rpc_key: SecretInput,
-    custom_rpc_url: String,
+    // Redacted: custom RPC URLs commonly embed a provider key in the path.
+    custom_rpc_url: SecretInput,
     kao_server_url: String,
     api_provider: ApiProvider,
     api_key: SecretInput,
@@ -251,7 +301,7 @@ impl Default for WizardDraft {
         Self {
             rpc_provider: RpcProvider::default(),
             rpc_key: SecretInput::default(),
-            custom_rpc_url: String::new(),
+            custom_rpc_url: SecretInput::default(),
             kao_server_url: settings::DEFAULT_KAO_SERVER_URL.to_string(),
             api_provider: ApiProvider::default(),
             api_key: SecretInput::default(),
@@ -275,7 +325,7 @@ fn custom_networks_to_drafts(nets: Vec<settings::CustomNetwork>) -> Vec<CustomNe
         .map(|n| CustomNetworkDraft {
             name: n.name,
             chain_id: n.chain_id.to_string(),
-            rpc_url: n.rpc_url,
+            rpc_url: n.rpc_url.into(),
             symbol: n.currency_symbol,
             enabled: n.enabled,
         })
@@ -289,7 +339,8 @@ pub enum Message {
     GoToStep(WizardStep),
     SetRpcProvider(RpcProvider),
     RpcKeyInput(SecretInput),
-    CustomRpcUrlInput(String),
+    // Redacted: custom RPC URLs commonly embed a provider key in the path.
+    CustomRpcUrlInput(SecretInput),
     KaoServerUrlInput(String),
     SetApiProvider(ApiProvider),
     ApiKeyInput(SecretInput),
@@ -300,7 +351,8 @@ pub enum Message {
     ToggleProxy,
     SetProxyType(ProxyType),
     ProxyAddressInput(String),
-    ConsensusRpcInput(Chain, String),
+    // Redacted: hosted beacon endpoints commonly embed a key in the path.
+    ConsensusRpcInput(Chain, SecretInput),
     CheckpointInput(String),
     // ── Custom networks (step 6) ─────────────────────────────────────────
     /// Append a fresh blank custom-network row.
@@ -309,7 +361,8 @@ pub enum Message {
     CustomNetRemove(usize),
     CustomNetNameInput(usize, String),
     CustomNetChainIdInput(usize, String),
-    CustomNetRpcInput(usize, String),
+    // Redacted: custom RPC URLs commonly embed a provider key in the path.
+    CustomNetRpcInput(usize, SecretInput),
     CustomNetSymbolInput(usize, String),
     /// Toggle the enabled flag on the row at the given index.
     CustomNetToggle(usize),
@@ -321,7 +374,8 @@ pub enum Message {
     Continue,
     Back,
     Finish,
-    KeyboardEvent(keyboard::Event),
+    // Redacted via `KeyEvent`: raw key events echo typed characters.
+    KeyboardEvent(KeyEvent),
 }
 
 #[derive(Debug, Clone)]
@@ -329,6 +383,17 @@ pub enum Outcome {
     Completed,
     Back,
     Closed,
+}
+
+impl Outcome {
+    /// Variant name for the GUI state trace.
+    fn name(&self) -> &'static str {
+        match self {
+            Outcome::Completed => "Completed",
+            Outcome::Back => "Back",
+            Outcome::Closed => "Closed",
+        }
+    }
 }
 
 // ── Screen state ────────────────────────────────────────────────────────────
@@ -361,7 +426,7 @@ impl NetworkSetupScreen {
                 WizardDraft {
                     rpc_provider: settings::rpc_provider(),
                     rpc_key: settings::rpc_key().unwrap_or_default().into(),
-                    custom_rpc_url: settings::custom_rpc_url().unwrap_or_default(),
+                    custom_rpc_url: settings::custom_rpc_url().unwrap_or_default().into(),
                     kao_server_url: settings::kao_server_url(),
                     api_provider: settings::api_provider(),
                     api_key: settings::api_key().unwrap_or_default().into(),
@@ -392,6 +457,41 @@ impl NetworkSetupScreen {
     // ── Update ──────────────────────────────────────────────────────────
 
     pub fn update(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
+        crate::trace_msg!("network_setup", &message);
+        let step_before = self.step.name();
+        let fetching_before = self.checkpoint_fetching;
+        let error_before = self.error.is_some();
+
+        let (task, outcome) = self.update_inner(message);
+
+        let step_after = self.step.name();
+        if step_before != step_after {
+            crate::trace::state("network_setup", "step", step_before, step_after);
+        }
+        if fetching_before != self.checkpoint_fetching {
+            crate::trace::state(
+                "network_setup",
+                "checkpoint_fetching",
+                fetching_before,
+                self.checkpoint_fetching,
+            );
+        }
+        if error_before != self.error.is_some() {
+            let s = |shown: bool| if shown { "shown" } else { "none" };
+            crate::trace::state(
+                "network_setup",
+                "error",
+                s(error_before),
+                s(self.error.is_some()),
+            );
+        }
+        if let Some(o) = &outcome {
+            crate::trace::outcome("network_setup", o.name());
+        }
+        (task, outcome)
+    }
+
+    fn update_inner(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
         match message {
             Message::GoToStep(step) => {
                 self.step = step;
@@ -458,7 +558,7 @@ impl NetworkSetupScreen {
                 (Task::none(), None)
             }
             Message::ConsensusRpcInput(chain, s) => {
-                self.draft.consensus_rpcs.set(chain, s);
+                self.draft.consensus_rpcs.set(chain, s.into_inner());
                 (Task::none(), None)
             }
             Message::CheckpointInput(s) => {
@@ -577,7 +677,9 @@ impl NetworkSetupScreen {
                 self.apply_draft();
                 (Task::none(), Some(Outcome::Completed))
             }
-            Message::KeyboardEvent(keyboard::Event::KeyPressed { key, .. }) => self.handle_key(key),
+            Message::KeyboardEvent(KeyEvent(keyboard::Event::KeyPressed { key, .. })) => {
+                self.handle_key(key)
+            }
             Message::KeyboardEvent(_) => (Task::none(), None),
         }
     }
@@ -644,7 +746,7 @@ impl NetworkSetupScreen {
                 RpcProvider::Alchemy => !self.draft.rpc_key.as_str().trim().is_empty(),
                 RpcProvider::Drpc => !self.draft.rpc_key.as_str().trim().is_empty(),
                 RpcProvider::Custom => {
-                    settings::parse_rpc_input(self.draft.custom_rpc_url.trim()).is_some()
+                    settings::parse_rpc_input(self.draft.custom_rpc_url.as_str().trim()).is_some()
                 }
                 _ => true,
             },
@@ -700,7 +802,7 @@ impl NetworkSetupScreen {
                         return false;
                     };
                     if n.name.trim().is_empty()
-                        || !settings::is_http_or_https_url(n.rpc_url.trim())
+                        || !settings::is_http_or_https_url(n.rpc_url.as_str().trim())
                         || !seen.insert(id)
                     {
                         return false;
@@ -773,7 +875,7 @@ impl NetworkSetupScreen {
         settings::apply_rpc_provider(
             self.draft.rpc_provider,
             self.draft.rpc_key.as_str().trim(),
-            self.draft.custom_rpc_url.trim(),
+            self.draft.custom_rpc_url.as_str().trim(),
         );
         settings::apply_api_provider(self.draft.api_provider, self.draft.api_key.as_str().trim());
         if self.draft.api_provider == ApiProvider::Blockscout {
@@ -837,7 +939,7 @@ impl NetworkSetupScreen {
                 Some(settings::CustomNetwork {
                     chain_id,
                     name: n.name.trim().to_string(),
-                    rpc_url: n.rpc_url.trim().to_string(),
+                    rpc_url: n.rpc_url.as_str().trim().to_string(),
                     currency_symbol: symbol,
                     enabled: n.enabled,
                 })
@@ -1394,13 +1496,16 @@ impl NetworkSetupScreen {
         );
 
         let custom_body: Option<Element<'_, Message>> = if selected == RpcProvider::Custom {
-            let input = text_input("https://my-node.example:8545", &self.draft.custom_rpc_url)
-                .id(CUSTOM_RPC_URL_INPUT_ID)
-                .on_input(Message::CustomRpcUrlInput)
-                .padding(Padding::from([10, 12]))
-                .size(13)
-                .font(mono())
-                .style(move |_theme, status| text_input_style(t, status));
+            let input = text_input(
+                "https://my-node.example:8545",
+                self.draft.custom_rpc_url.as_str(),
+            )
+            .id(CUSTOM_RPC_URL_INPUT_ID)
+            .on_input(|s| Message::CustomRpcUrlInput(s.into()))
+            .padding(Padding::from([10, 12]))
+            .size(13)
+            .font(mono())
+            .style(move |_theme, status| text_input_style(t, status));
             Some(input.into())
         } else {
             None
@@ -1751,7 +1856,7 @@ impl NetworkSetupScreen {
         for chain in Chain::ALL {
             let placeholder = chain.default_consensus_url();
             let input = text_input(placeholder, self.draft.consensus_rpcs.get(chain))
-                .on_input(move |s| Message::ConsensusRpcInput(chain, s))
+                .on_input(move |s| Message::ConsensusRpcInput(chain, s.into()))
                 .padding(Padding::from([10, 12]))
                 .size(13)
                 .font(mono())
@@ -1915,8 +2020,8 @@ impl NetworkSetupScreen {
                 .size(13)
                 .font(mono())
                 .style(move |_theme, status| text_input_style(t, status));
-            let rpc_input = text_input("https://… or http://127.0.0.1:8545", &n.rpc_url)
-                .on_input(move |s| Message::CustomNetRpcInput(i, s))
+            let rpc_input = text_input("https://… or http://127.0.0.1:8545", n.rpc_url.as_str())
+                .on_input(move |s| Message::CustomNetRpcInput(i, s.into()))
                 .padding(Padding::from([10, 12]))
                 .size(13)
                 .font(mono())
@@ -1959,7 +2064,7 @@ impl NetworkSetupScreen {
             let invalid = !n.is_blank()
                 && (n.parsed_chain_id().is_none()
                     || n.name.trim().is_empty()
-                    || !settings::is_http_or_https_url(n.rpc_url.trim()));
+                    || !settings::is_http_or_https_url(n.rpc_url.as_str().trim()));
             let hint: Element<'_, Message> = if invalid {
                 column![
                     vspace(6),
@@ -2355,7 +2460,7 @@ impl NetworkSetupScreen {
     // ── Subscription ────────────────────────────────────────────────────
 
     pub fn subscription(&self) -> Subscription<Message> {
-        keyboard::listen().map(Message::KeyboardEvent)
+        keyboard::listen().map(|e| Message::KeyboardEvent(KeyEvent(e)))
     }
 }
 

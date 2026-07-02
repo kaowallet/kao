@@ -59,6 +59,18 @@ pub enum Outcome {
     Back,
 }
 
+impl Outcome {
+    /// Variant name for the GUI state trace — never the payload, which
+    /// carries the live signer.
+    fn name(&self) -> &'static str {
+        match self {
+            Outcome::SetupComplete { .. } => "SetupComplete",
+            Outcome::ReconnectComplete { .. } => "ReconnectComplete",
+            Outcome::Back => "Back",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Mode {
     Setup,
@@ -90,6 +102,17 @@ enum Stage {
         picked: u32,
     },
     Error(String),
+}
+
+impl Stage {
+    fn name(&self) -> &'static str {
+        match self {
+            Stage::Connecting => "Connecting",
+            Stage::Picking { .. } => "Picking",
+            Stage::Building { .. } => "Building",
+            Stage::Error(_) => "Error",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -127,6 +150,20 @@ impl ConnectLedgerScreen {
     }
 
     pub fn update(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
+        crate::trace_msg!("connect_ledger", &message);
+        let stage_before = self.stage.name();
+        let (task, outcome) = self.update_inner(message);
+        let stage_after = self.stage.name();
+        if stage_before != stage_after {
+            crate::trace::state("connect_ledger", "stage", stage_before, stage_after);
+        }
+        if let Some(o) = &outcome {
+            crate::trace::outcome("connect_ledger", o.name());
+        }
+        (task, outcome)
+    }
+
+    fn update_inner(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
         match message {
             Message::SetupProbed(Ok(addrs)) => {
                 let rows: Vec<PickRow> = addrs

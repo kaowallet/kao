@@ -316,7 +316,10 @@ pub enum Message {
     /// later and having it nuked at second ten).
     ClipboardClearProbe {
         generation: u64,
-        actual: Option<String>,
+        /// Live system clipboard contents — redacted because the user may
+        /// have copied anything (including a secret from another app)
+        /// since the wallet's write.
+        actual: Option<crate::trace::SecretInput>,
     },
     /// Child messages from the Apps (swap workspace) pane.
     Apps(apps::Message),
@@ -526,6 +529,24 @@ pub enum Outcome {
     PoolRevealBackup,
 }
 
+impl Outcome {
+    /// Variant name for the GUI state trace — never the payload, which can
+    /// carry a restored pool mnemonic.
+    fn name(&self) -> &'static str {
+        match self {
+            Outcome::Switch(_) => "Switch",
+            Outcome::Add => "Add",
+            Outcome::RenameActive(_) => "RenameActive",
+            Outcome::SaveContacts(_) => "SaveContacts",
+            Outcome::NeedsHardwareReconnect { .. } => "NeedsHardwareReconnect",
+            Outcome::SetSafeServiceUrl { .. } => "SetSafeServiceUrl",
+            Outcome::PoolCreateIdentity => "PoolCreateIdentity",
+            Outcome::PoolRestoreIdentity(_) => "PoolRestoreIdentity",
+            Outcome::PoolRevealBackup => "PoolRevealBackup",
+        }
+    }
+}
+
 /// Connection state of the active account's hardware device, surfaced as a
 /// status card at the bottom of the sidebar. `None` for software / view-only
 /// accounts, which have no device to connect — the card is only meaningful
@@ -557,6 +578,21 @@ enum Modal {
     SafeTxDetail(Box<SafeTxDetailPane>),
 }
 
+impl Modal {
+    /// Variant name for the GUI state trace.
+    fn name(&self) -> &'static str {
+        match self {
+            Modal::None => "None",
+            Modal::Send(_) => "Send",
+            Modal::Receive(_) => "Receive",
+            Modal::Swap(_) => "Swap",
+            Modal::AccountDropdown(_) => "AccountDropdown",
+            Modal::TxDetails(_) => "TxDetails",
+            Modal::SafeTxDetail(_) => "SafeTxDetail",
+        }
+    }
+}
+
 /// Which settings pane is currently rendered. The Settings nav slot can show
 /// either the root list of categories or one of the deeper category screens.
 #[derive(Debug)]
@@ -566,6 +602,30 @@ enum SettingsPane {
     Safes(SafesPane),
     Appearance,
     Contacts(ContactsPane),
+}
+
+impl SettingsPane {
+    /// Variant name for the GUI state trace.
+    fn name(&self) -> &'static str {
+        match self {
+            SettingsPane::Root => "Root",
+            SettingsPane::NetworkWizard(_) => "NetworkWizard",
+            SettingsPane::Safes(_) => "Safes",
+            SettingsPane::Appearance => "Appearance",
+            SettingsPane::Contacts(_) => "Contacts",
+        }
+    }
+}
+
+/// Variant name for the GUI state trace (`Nav` is defined in `nav.rs`; the
+/// helper lives here with the other trace name helpers).
+fn nav_name(nav: Nav) -> &'static str {
+    match nav {
+        Nav::Home => "Home",
+        Nav::Apps => "Apps",
+        Nav::Activity => "Activity",
+        Nav::Settings => "Settings",
+    }
 }
 
 #[derive(Debug)]
@@ -2482,6 +2542,72 @@ impl WalletScreen {
     }
 
     pub fn update(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
+        match &message {
+            // Skipped: `Tick` is the 16 ms animation-frame timer (modal
+            // chrome / clipboard chip / copy toast; see `subscription`) —
+            // tracing it would drown the stream.
+            Message::Tick => {}
+            // Redacted: the Ok payload embeds each recovered note's
+            // (nullifier, secret) spending keys, which the SDK types
+            // Debug-print — trace the variant without the payload.
+            Message::PoolSynced {
+                pool,
+                chain,
+                result,
+            } => {
+                crate::trace_msg!(
+                    "dashboard",
+                    &format_args!(
+                        "PoolSynced {{ pool: {pool}, chain: {chain:?}, ok: {} }}",
+                        result.is_ok()
+                    )
+                );
+            }
+            _ => crate::trace_msg!("dashboard", &message),
+        }
+        // Diff the coarse dashboard state across the dispatch so every
+        // transition is logged no matter which arm (or helper) performed it.
+        let nav_before = nav_name(self.nav);
+        let modal_before = self.modal.name();
+        let pane_before = self.settings_pane.name();
+        let review_before = self.sign_review.is_some();
+        let rename_before = self.rename_draft.is_some();
+
+        let (task, outcome) = self.update_inner(message);
+
+        let nav_after = nav_name(self.nav);
+        if nav_before != nav_after {
+            crate::trace::state("dashboard", "nav", nav_before, nav_after);
+        }
+        let modal_after = self.modal.name();
+        if modal_before != modal_after {
+            crate::trace::state("dashboard", "modal", modal_before, modal_after);
+        }
+        let pane_after = self.settings_pane.name();
+        if pane_before != pane_after {
+            crate::trace::state("dashboard", "settings_pane", pane_before, pane_after);
+        }
+        let review_after = self.sign_review.is_some();
+        if review_before != review_after {
+            let s = |open: bool| if open { "open" } else { "none" };
+            crate::trace::state(
+                "dashboard",
+                "sign_review",
+                s(review_before),
+                s(review_after),
+            );
+        }
+        let rename_after = self.rename_draft.is_some();
+        if rename_before != rename_after {
+            crate::trace::state("dashboard", "renaming", rename_before, rename_after);
+        }
+        if let Some(o) = &outcome {
+            crate::trace::outcome("dashboard", o.name());
+        }
+        (task, outcome)
+    }
+
+    fn update_inner(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
         match message {
             Message::VerificationRefreshed => {
                 self.verification = self.network.last_status(crate::chain::Chain::Mainnet);
@@ -3114,8 +3240,11 @@ impl WalletScreen {
                 // probe time (instead of unconditionally clearing) keeps
                 // us from clobbering content the user copied in the
                 // meantime from outside the wallet.
-                let task = iced::clipboard::read()
-                    .map(move |actual| Message::ClipboardClearProbe { generation, actual });
+                let task =
+                    iced::clipboard::read().map(move |actual| Message::ClipboardClearProbe {
+                        generation,
+                        actual: actual.map(Into::into),
+                    });
                 return (task, None);
             }
             Message::ClipboardClearProbe { generation, actual } => {
@@ -3125,7 +3254,8 @@ impl WalletScreen {
                 if state.generation != generation {
                     return (Task::none(), None);
                 }
-                let still_ours = actual.as_deref() == Some(state.expected.as_str());
+                let still_ours =
+                    actual.as_ref().map(|s| s.expose()) == Some(state.expected.as_str());
                 self.clipboard_clear = None;
                 if still_ours {
                     let clear = iced::clipboard::write(String::new())

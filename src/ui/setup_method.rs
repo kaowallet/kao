@@ -32,6 +32,19 @@ pub enum SetupMethod {
     AddSafe,
 }
 
+impl SetupMethod {
+    fn name(self) -> &'static str {
+        match self {
+            SetupMethod::ImportFromSeed => "ImportFromSeed",
+            SetupMethod::ImportFromPrivateKey => "ImportFromPrivateKey",
+            SetupMethod::CreateNewWallet => "CreateNewWallet",
+            SetupMethod::ConnectHardwareWallet => "ConnectHardwareWallet",
+            SetupMethod::WatchAddress => "WatchAddress",
+            SetupMethod::AddSafe => "AddSafe",
+        }
+    }
+}
+
 /// What happened when the user interacted with the screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -42,6 +55,16 @@ pub enum Outcome {
     Cancel,
 }
 
+impl Outcome {
+    /// Variant name for the GUI state trace.
+    fn name(&self) -> &'static str {
+        match self {
+            Outcome::Selected(_) => "Selected",
+            Outcome::Cancel => "Cancel",
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct SetupMethodScreen {
     /// The method the user selected, once they choose.
@@ -50,6 +73,25 @@ pub struct SetupMethodScreen {
 
 impl SetupMethodScreen {
     pub fn update(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
+        crate::trace_msg!("setup_method", &message);
+        let selected_before = self.selected;
+        let (task, outcome) = self.update_inner(message);
+        if selected_before != self.selected {
+            let s = |v: Option<SetupMethod>| v.map_or("none", SetupMethod::name);
+            crate::trace::state(
+                "setup_method",
+                "selected",
+                s(selected_before),
+                s(self.selected),
+            );
+        }
+        if let Some(o) = &outcome {
+            crate::trace::outcome("setup_method", o.name());
+        }
+        (task, outcome)
+    }
+
+    fn update_inner(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
         let pick = |this: &mut Self, m: SetupMethod| {
             this.selected = Some(m);
             (Task::none(), Some(Outcome::Selected(m)))

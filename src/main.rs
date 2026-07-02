@@ -14,6 +14,7 @@ mod portfolio;
 mod safe;
 mod sanitize;
 mod settings;
+mod trace;
 mod ui;
 mod wallet;
 
@@ -25,6 +26,12 @@ pub fn main() -> iced::Result {
     // stays at warn so their per-request chatter doesn't spam stderr. Override
     // via RUST_LOG, e.g. `RUST_LOG=kao=debug` to see redacted addresses or
     // `RUST_LOG=kao=trace` to see raw addresses and per-token reads.
+    //
+    // GUI state tracing (see `crate::trace`): `RUST_LOG=kao::gui=debug` logs
+    // coarse state transitions (screen/pane/modal/stage changes, outcomes);
+    // `RUST_LOG=kao::gui=trace` additionally logs every message entering
+    // every update() — the full GUI state machine, secret inputs redacted.
+    // This is the stream an AI agent should watch when debugging the GUI.
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("kao=info,warn"));
     tracing_subscriber::fmt()

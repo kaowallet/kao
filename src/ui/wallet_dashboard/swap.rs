@@ -61,6 +61,19 @@ pub enum Outcome {
     CopyText(String),
 }
 
+impl Outcome {
+    /// Variant name for the GUI state trace — never the payload.
+    fn name(&self) -> &'static str {
+        match self {
+            Outcome::Closed => "Closed",
+            Outcome::RequestQuote(_) => "RequestQuote",
+            Outcome::RequestPlace { .. } => "RequestPlace",
+            Outcome::RequestCancel { .. } => "RequestCancel",
+            Outcome::CopyText(_) => "CopyText",
+        }
+    }
+}
+
 #[derive(Debug)]
 enum Phase {
     /// Picking tokens / amount / quote.
@@ -70,6 +83,17 @@ enum Phase {
     /// Order placed; blocking on settlement. Holds the order UID; the
     /// coordinator threads the live [`TrackedOrder`] into `view`.
     Tracking(String),
+}
+
+impl Phase {
+    /// Variant name for the GUI state trace.
+    fn name(&self) -> &'static str {
+        match self {
+            Phase::Compose => "Compose",
+            Phase::Placing => "Placing",
+            Phase::Tracking(_) => "Tracking",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -102,21 +126,45 @@ impl SwapPane {
     /// The user confirmed the clear-signing review — enter the blocking
     /// "placing" phase while the coordinator signs + submits the order.
     pub fn begin_placing(&mut self) {
-        self.phase = Phase::Placing;
+        self.set_phase(Phase::Placing);
     }
 
     /// Placement succeeded — switch to blocking status tracking.
     pub fn begin_tracking(&mut self, uid: String) {
-        self.phase = Phase::Tracking(uid);
+        self.set_phase(Phase::Tracking(uid));
     }
 
     /// Placement failed — return to the composer with the error shown.
     pub fn placement_failed(&mut self, e: String) {
         self.composer.set_error(e);
-        self.phase = Phase::Compose;
+        self.set_phase(Phase::Compose);
+    }
+
+    /// Phase transitions are driven by the coordinator through the `begin_*`
+    /// setters above (never through `update`), so the state trace lives here
+    /// rather than in an update wrapper.
+    fn set_phase(&mut self, phase: Phase) {
+        let before = self.phase.name();
+        self.phase = phase;
+        if before != self.phase.name() {
+            crate::trace::state("swap", "phase", before, self.phase.name());
+        }
     }
 
     pub fn update(&mut self, msg: Message) -> (Task<Message>, Option<Outcome>) {
+        crate::trace_msg!("swap", &msg);
+        let phase_before = self.phase.name();
+        let (task, outcome) = self.update_inner(msg);
+        if phase_before != self.phase.name() {
+            crate::trace::state("swap", "phase", phase_before, self.phase.name());
+        }
+        if let Some(o) = &outcome {
+            crate::trace::outcome("swap", o.name());
+        }
+        (task, outcome)
+    }
+
+    fn update_inner(&mut self, msg: Message) -> (Task<Message>, Option<Outcome>) {
         match msg {
             Message::Composer(cm) => {
                 if !matches!(self.phase, Phase::Compose) {

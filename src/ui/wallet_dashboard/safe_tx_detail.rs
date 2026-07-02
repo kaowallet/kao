@@ -60,6 +60,34 @@ pub enum Outcome {
     RetrySims,
 }
 
+impl Outcome {
+    /// Variant name for the GUI state trace.
+    fn name(&self) -> &'static str {
+        match self {
+            Outcome::Closed => "Closed",
+            Outcome::Confirm => "Confirm",
+            Outcome::Execute => "Execute",
+            Outcome::Reject => "Reject",
+            Outcome::RetrySims => "RetrySims",
+        }
+    }
+}
+
+/// Coarse simulation-result name for the GUI state trace.
+fn sim_name(sim: &SimulationResult) -> &'static str {
+    if sim.is_success() {
+        if sim.verified {
+            "success"
+        } else {
+            "success_unverified"
+        }
+    } else if sim.is_revert() {
+        "revert"
+    } else {
+        "unavailable"
+    }
+}
+
 #[derive(Debug)]
 pub struct SafeTxDetailPane {
     safe: Address,

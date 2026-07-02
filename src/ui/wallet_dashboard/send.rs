@@ -249,6 +249,21 @@ impl Resolution {
             _ => None,
         }
     }
+
+    /// Variant name for the GUI state trace.
+    fn name(&self) -> &'static str {
+        match self {
+            Resolution::Empty => "Empty",
+            Resolution::Invalid => "Invalid",
+            Resolution::Address(_) => "Address",
+            Resolution::Resolving { .. } => "Resolving",
+            Resolution::AddressVerifying { .. } => "AddressVerifying",
+            Resolution::Resolved { .. } => "Resolved",
+            Resolution::NotFound { .. } => "NotFound",
+            Resolution::Error { .. } => "Error",
+            Resolution::EnsDivergence { .. } => "EnsDivergence",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -259,6 +274,17 @@ pub enum Outcome {
         address: Address,
         ens: Option<String>,
     },
+}
+
+impl Outcome {
+    /// Variant name for the GUI state trace — never the payload.
+    fn name(&self) -> &'static str {
+        match self {
+            Outcome::Closed => "Closed",
+            Outcome::CopyText(_) => "CopyText",
+            Outcome::SaveAsContact { .. } => "SaveAsContact",
+        }
+    }
 }
 
 // ── Mode-specific state ────────────────────────────────────────────────────
@@ -324,6 +350,22 @@ pub struct SendPane {
     error: Option<String>,
     last_tx_hash: Option<TxHash>,
     mode: SendMode,
+}
+
+/// Cheap names of the pane's coarse state, captured before/after a
+/// dispatch in the `update` wrapper so every transition is logged no
+/// matter which arm performed it.
+struct TraceSnapshot {
+    step: &'static str,
+    busy: bool,
+    error: bool,
+    resolution: &'static str,
+    quote: &'static str,
+    decoded: &'static str,
+    prepared: &'static str,
+    sim: bool,
+    proposed: bool,
+    tx_hash: bool,
 }
 
 impl SendPane {
@@ -566,6 +608,9 @@ impl SendPane {
         // Bump the seq and clear the stale quote via the shared invalidator,
         // then flip into the loading state and return the fresh seq the quote
         // task must echo back.
+        // Dashboard-driven flip (outside the update wrapper), so log the
+        // quote transition here to keep it observable in the trace.
+        let before = self.quote_state_name();
         self.invalidate_eoa_quote();
         self.error = None;
         let Some(eoa) = self.eoa_mut() else {
@@ -574,14 +619,23 @@ impl SendPane {
             return 0;
         };
         eoa.quote_loading = true;
+        if before != "loading" {
+            crate::trace::state("send", "quote", before, "loading");
+        }
         eoa.quote_seq
     }
 
     pub fn decode_started(&mut self) -> u64 {
+        // Dashboard-driven flip (outside the update wrapper), so log the
+        // decode transition here to keep it observable in the trace.
+        let before = self.decoded_state_name();
         if let Some(eoa) = self.eoa_mut() {
             eoa.decoded_seq = eoa.decoded_seq.wrapping_add(1);
             eoa.decoded_loading = true;
             eoa.decoded = None;
+            if before != "loading" {
+                crate::trace::state("send", "decoded", before, "loading");
+            }
             return eoa.decoded_seq;
         }
         0
@@ -744,11 +798,123 @@ impl SendPane {
     }
 
     pub fn mark_busy(&mut self) {
+        // Dashboard-driven flip (outside this pane's update wrapper), so
+        // log it here to keep the busy flag observable in the trace.
+        if !self.busy {
+            crate::trace::state("send", "busy", false, true);
+        }
         self.busy = true;
         self.error = None;
     }
 
+    // ── Trace helpers ────────────────────────────────────────────────────
+
+    /// Semantic step name for the GUI state trace.
+    fn step_name(&self) -> &'static str {
+        match (&self.mode, self.step) {
+            (SendMode::Eoa(_), 0) | (SendMode::Safe(_), 0) => "recipient",
+            (SendMode::Eoa(_), 1) | (SendMode::Safe(_), 1) => "amount",
+            (SendMode::Eoa(_), 2) | (SendMode::Safe(_), 2) => "review",
+            (SendMode::Eoa(_), 3) => "broadcast",
+            (SendMode::Eoa(_), _) => "success",
+            (SendMode::Safe(_), _) => "done",
+        }
+    }
+
+    /// EOA quote lifecycle name ("-" in Safe mode).
+    fn quote_state_name(&self) -> &'static str {
+        match self.eoa() {
+            Some(e) if e.quote_loading => "loading",
+            Some(e) if e.quote.is_some() => "ready",
+            Some(_) => "none",
+            None => "-",
+        }
+    }
+
+    /// EOA clear-sign decode lifecycle name ("-" in Safe mode).
+    fn decoded_state_name(&self) -> &'static str {
+        match self.eoa() {
+            Some(e) if e.decoded_loading => "loading",
+            Some(e) if e.decoded.is_some() => "ready",
+            Some(_) => "none",
+            None => "-",
+        }
+    }
+
+    /// Safe prepare lifecycle name ("-" in EOA mode).
+    fn prepared_state_name(&self) -> &'static str {
+        match self.safe() {
+            Some(s) if s.prepared.is_some() => "ready",
+            Some(s) if s.prepare_error.is_some() => "error",
+            Some(_) => "none",
+            None => "-",
+        }
+    }
+
+    fn trace_snapshot(&self) -> TraceSnapshot {
+        let (sim, proposed) = match &self.mode {
+            SendMode::Safe(s) => (s.sim.is_some(), s.proposed),
+            SendMode::Eoa(_) => (false, false),
+        };
+        TraceSnapshot {
+            step: self.step_name(),
+            busy: self.busy,
+            error: self.error.is_some(),
+            resolution: self.resolution.name(),
+            quote: self.quote_state_name(),
+            decoded: self.decoded_state_name(),
+            prepared: self.prepared_state_name(),
+            sim,
+            proposed,
+            tx_hash: self.last_tx_hash.is_some(),
+        }
+    }
+
     pub fn update(&mut self, msg: Message) -> (Task<Message>, Option<Outcome>) {
+        crate::trace_msg!("send", &msg);
+        let before = self.trace_snapshot();
+        let (task, outcome) = self.update_inner(msg);
+        let after = self.trace_snapshot();
+        if before.step != after.step {
+            crate::trace::state("send", "step", before.step, after.step);
+        }
+        if before.busy != after.busy {
+            crate::trace::state("send", "busy", before.busy, after.busy);
+        }
+        if before.error != after.error {
+            let s = |shown: bool| if shown { "shown" } else { "none" };
+            crate::trace::state("send", "error", s(before.error), s(after.error));
+        }
+        if before.resolution != after.resolution {
+            crate::trace::state("send", "resolution", before.resolution, after.resolution);
+        }
+        if before.quote != after.quote {
+            crate::trace::state("send", "quote", before.quote, after.quote);
+        }
+        if before.decoded != after.decoded {
+            crate::trace::state("send", "decoded", before.decoded, after.decoded);
+        }
+        if before.prepared != after.prepared {
+            crate::trace::state("send", "prepared", before.prepared, after.prepared);
+        }
+        if before.sim != after.sim {
+            let s = |ready: bool| if ready { "ready" } else { "none" };
+            crate::trace::state("send", "sim", s(before.sim), s(after.sim));
+        }
+        if before.proposed != after.proposed {
+            crate::trace::state("send", "proposed", before.proposed, after.proposed);
+        }
+        if before.tx_hash != after.tx_hash {
+            let s = |set: bool| if set { "set" } else { "none" };
+            crate::trace::state("send", "tx_hash", s(before.tx_hash), s(after.tx_hash));
+        }
+        if let Some(o) = &outcome {
+            crate::trace::outcome("send", o.name());
+        }
+        (task, outcome)
+    }
+
+    fn update_inner(&mut self, msg: Message) -> (Task<Message>, Option<Outcome>) {
         match msg {
             // Copy-toast kick — the widget already copied + marked the toast.
             Message::AddressCopied => (Task::none(), None),

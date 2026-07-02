@@ -25,6 +25,15 @@ pub enum Outcome {
     Closed,
 }
 
+impl Outcome {
+    /// Variant name for the GUI state trace.
+    fn name(&self) -> &'static str {
+        match self {
+            Outcome::Closed => "Closed",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ReceivePane {
     address: Address,
@@ -46,6 +55,19 @@ impl ReceivePane {
     }
 
     pub fn update(&mut self, msg: Message) -> (Task<Message>, Option<Outcome>) {
+        crate::trace_msg!("receive", &msg);
+        let copied_before = self.copied;
+        let (task, outcome) = self.update_inner(msg);
+        if copied_before != self.copied {
+            crate::trace::state("receive", "copied", copied_before, self.copied);
+        }
+        if let Some(o) = &outcome {
+            crate::trace::outcome("receive", o.name());
+        }
+        (task, outcome)
+    }
+
+    fn update_inner(&mut self, msg: Message) -> (Task<Message>, Option<Outcome>) {
         match msg {
             Message::Copy => {
                 self.copied = true;

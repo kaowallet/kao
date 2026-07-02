@@ -60,6 +60,21 @@ ignore = [
     # ship with the app.
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser 0.25.1 unmaintained (author won't ship further fixes; no known vuln). Reaches the tree via iced's text/SVG rendering (cosmic-text + usvg → fontdb). Glyph/font parsing for rendering only — disjoint from signing, storage, and chain verification. Revisit when iced/cosmic-text/usvg migrate to skrifa." },
 
+    # ── iced Wayland subtree (winit → smithay-client-toolkit →
+    #    wayland-scanner → quick-xml 0.39) ───────────────────────────────────
+    # Linux/Wayland-only and BUILD-TIME only: wayland-scanner is a proc-macro
+    # that parses the Wayland protocol XML files bundled with the crate to
+    # generate bindings at compile time. quick-xml never runs at runtime and
+    # never sees attacker-controlled input — the XML it parses ships with
+    # wayland-protocols. Both advisories are DoS on maliciously-crafted XML
+    # (quadratic attribute scan / unbounded namespace allocation), which
+    # requires hostile input that cannot reach this path. wayland-scanner
+    # 0.31.10 pins quick-xml `^0.39`, so ≥0.41 needs iced's whole winit/
+    # smithay stack to bump — no consumer-side upgrade exists. Revisit when
+    # iced upgrades winit past the smithay-client-toolkit that caps it.
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.39 quadratic duplicate-attribute scan (DoS on malicious XML). Enters via wayland-scanner, a build-time-only, Linux/Wayland-only proc-macro that parses the trusted bundled Wayland protocol XML — no runtime surface and no attacker-controlled input. Capped at ^0.39 by wayland-scanner; no consumer-side upgrade path. Revisit when iced bumps its winit/smithay stack." },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.39 unbounded namespace-declaration allocation in NsReader (memory-exhaustion DoS on malicious XML). Same build-time-only, Linux/Wayland-only wayland-scanner path parsing trusted bundled protocol XML — no runtime surface, no hostile input. Same ^0.39 cap and revisit condition as -0194." },
+
     # ── privacy-pools proving subtree (arkworks 0.5 → ark-relations →
     #    tracing-subscriber 0.2.25) ─────────────────────────────────────────
     # ark-relations pulls an ancient tracing-subscriber 0.2.25 for its optional

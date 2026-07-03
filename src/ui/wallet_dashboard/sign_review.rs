@@ -61,6 +61,10 @@ pub enum Message {
     /// Expand/collapse the "for the paranoid" decoded-calldata block on a Send
     /// review step (the only interactive control inside a reviewed step).
     ToggleCalldata,
+    /// The overlay's optional secondary action (Safe send: "Propose to
+    /// co-signers", alongside the primary "Sign & execute"). Only emitted when a
+    /// `secondary_label` is set.
+    Secondary,
 }
 
 /// A single raw transaction the user will sign, decoded for review through the
@@ -203,6 +207,11 @@ pub enum SignStep {
     /// recipient, decoded call) snapshotted for the overlay. Carries the quote +
     /// plan that drive the broadcast, so reviewed == signed.
     Send(super::send::SendReview),
+    /// A Safe send: the full Safe review (intent, revm balance-change sim,
+    /// recipient, the exact `safeTxHash` each owner signs, the signing owner set)
+    /// snapshotted for the overlay. The `SignAction::SafeSend` alongside it drives
+    /// the execute/propose ceremony against the pinned hash.
+    SafeSend(super::send::SafeSendReview),
 }
 
 /// Pins the reviewed Safe artifacts so `cow_place_order_safe` signs exactly what
@@ -252,6 +261,15 @@ pub enum SignAction {
     Send {
         plan: SendPlan,
         quote: Option<TxQuote>,
+    },
+    /// A Safe send. `req` describes the transfer; its `prepared` `(nonce,
+    /// safeTxHash)` is filled once the prepare task lands, pinning what the owners
+    /// sign. `can_execute` (the wallet holds a threshold of signable owners) picks
+    /// whether the primary action is Execute-now (Confirm) with Propose as the
+    /// secondary, or Propose-only.
+    SafeSend {
+        req: super::send::SafeSendRequest,
+        can_execute: bool,
     },
 }
 
@@ -335,6 +353,10 @@ pub struct SignReview {
     /// Blocks Confirm even once the steps are ready (e.g. a Send with too little
     /// ETH for gas). Independent of `legs_loading`.
     pub confirm_disabled: bool,
+    /// When set, an optional second primary action rendered below Cancel/Confirm
+    /// (the Safe send's "Propose to co-signers", alongside "Sign & execute").
+    /// Emits [`Message::Secondary`]. Gated on `!legs_loading` like Confirm.
+    pub secondary_label: Option<String>,
     /// Expand state for the Send step's "for the paranoid" decoded-calldata block.
     pub show_calldata: bool,
 }
@@ -376,6 +398,7 @@ impl SignReview {
             error: None,
             confirm_label: None,
             confirm_disabled: false,
+            secondary_label: None,
             show_calldata: false,
         };
         // Coordinator-driven open: every caller assigns this straight into the
@@ -485,6 +508,18 @@ pub fn view<'a>(t: KaoTheme, review: &'a SignReview, progress: f32) -> Element<'
         ]
         .width(Length::Fill);
         body = body.push(actions);
+        // Optional second primary action (Safe send: "Propose to co-signers"),
+        // full-width below the Cancel/Confirm row, gated the same as Confirm.
+        if let Some(sec) = &review.secondary_label {
+            let sec_btn = primary_button(t, sec, enabled);
+            let sec_btn = if enabled {
+                sec_btn.on_press(Message::Secondary)
+            } else {
+                sec_btn
+            };
+            body = body.push(Space::new().height(8));
+            body = body.push(sec_btn);
+        }
     }
 
     // Inset the content from the right so the scrollbar rides in its own gutter
@@ -558,6 +593,7 @@ fn step_card<'a>(t: KaoTheme, step: &'a SignStep, show_calldata: bool) -> Elemen
         SignStep::Send(r) => {
             super::send::render_send_review(t, r, show_calldata, Message::ToggleCalldata)
         }
+        SignStep::SafeSend(r) => super::send::render_safe_send_review::<Message>(t, r),
     }
 }
 

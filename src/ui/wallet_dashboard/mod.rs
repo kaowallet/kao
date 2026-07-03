@@ -1817,6 +1817,179 @@ impl WalletScreen {
         spawn_broadcast_task(self.network.clone(), handoff, desc, plan, quote)
     }
 
+    /// Open the unified sign-review overlay for a **Safe** send. Mirrors
+    /// `open_send_review` but for the Safe execTransaction ceremony: the pane
+    /// hosts recipient/amount underneath, this snapshots the request + display
+    /// metadata and spawns the combined hash-prepare + inner-sim, and the review
+    /// shows the exact `safeTxHash` once it lands. Confirm/secondary then execute
+    /// or propose against that pinned hash. `can_execute` = the wallet holds a
+    /// threshold of signable owners (so both actions are offered).
+    fn open_safe_send_review(
+        &mut self,
+        req: SafeSendRequest,
+        token_idx: usize,
+        can_execute: bool,
+        resolved_name: Option<String>,
+    ) -> Task<Message> {
+        if self.sign_review.is_some() {
+            return Task::none();
+        }
+        let Some(tk) = self.portfolio.get(token_idx) else {
+            warn!("safe-send review: refused — token index out of range");
+            return Task::none();
+        };
+        let symbol = tk.symbol.clone();
+        let token_contract = tk.contract;
+        let amount_str = alloy::primitives::utils::format_units(req.amount_units, tk.decimals)
+            .map(|v| trim_trailing_decimal_zeros(&v))
+            .unwrap_or_else(|_| "?".to_string());
+
+        let recipient = req.recipient;
+        let picker = self.recipient_picker(None, self.active_safe);
+        let contact_name = picker.name_for(recipient).map(|s| s.to_string());
+        let recipient_in_book = contact_name.is_some();
+        let recipient_name = contact_name.or(resolved_name);
+
+        // The owners that will sign now (execute path) — the first `threshold`
+        // signable, mapped to addresses for the "Signing with" card.
+        let signing_addresses: Vec<Address> = req
+            .signable_indices
+            .iter()
+            .filter_map(|&idx| self.accounts.get(idx as usize).and_then(account_address))
+            .take(req.threshold as usize)
+            .collect();
+        let owner_count = self
+            .active_safe_descriptor()
+            .map(|d| d.owners.len())
+            .unwrap_or(req.threshold as usize);
+
+        let seed = SafeReviewSeed {
+            amount_str: amount_str.clone(),
+            symbol: symbol.clone(),
+            token_contract,
+            recipient_name: recipient_name.clone(),
+            recipient_in_book,
+            owner_count,
+            signing_addresses,
+        };
+
+        self.sign_review_seq += 1;
+        let seq = self.sign_review_seq;
+        let title = format!("Send {amount_str} {symbol}");
+        let subtitle = Some(format!(
+            "from Safe {} to {}",
+            short_address(req.safe_address),
+            recipient_name.unwrap_or_else(|| short_address(recipient))
+        ));
+        let note = Some(
+            "A Safe transaction — each owner signs the safeTxHash below. Verify it on \
+             every device."
+                .to_string(),
+        );
+        let action = sign_review::SignAction::SafeSend {
+            req: req.clone(),
+            can_execute,
+        };
+        self.sign_review = Some(sign_review::SignReview::pending(
+            title,
+            subtitle,
+            Vec::new(),
+            note,
+            seq,
+            action,
+        ));
+        spawn_safe_send_prepare(self.network.clone(), seq, req, seed)
+    }
+
+    /// User confirmed a Safe send review — collect the signing owners (or the
+    /// single proposer), keep the overlay open in its waiting phase, and dispatch
+    /// the (unchanged) execute / propose task against the reviewed `(nonce,
+    /// hash)` pin. `execute` = "sign & execute now"; else "propose to co-signers".
+    /// Mirrors the pane's old Confirm/Propose intercepts.
+    fn dispatch_safe_send(&mut self, execute: bool) -> Task<Message> {
+        let (req, can_execute) = match self.sign_review.as_ref().map(|r| &r.action) {
+            Some(sign_review::SignAction::SafeSend { req, can_execute })
+                if req.prepared.is_some() =>
+            {
+                (req.clone(), *can_execute)
+            }
+            _ => {
+                warn!("safe-send: dispatch dropped — reviewed hash not ready");
+                return Task::none();
+            }
+        };
+        if self.is_signing_busy() {
+            if let Some(r) = self.sign_review.as_mut() {
+                r.error = Some(
+                    "another signing operation is in progress — try again in a moment".to_string(),
+                );
+            }
+            return Task::none();
+        }
+        // Build the dispatch task first (owner collection can fail); only commit
+        // to the waiting state once we know we can proceed.
+        let task = if execute && can_execute {
+            let signer_owners: Vec<AccountDescriptor> = req
+                .signable_indices
+                .iter()
+                .filter_map(|&idx| self.accounts.get(idx as usize).cloned())
+                .take(req.threshold as usize)
+                .collect();
+            if (signer_owners.len() as u32) < req.threshold {
+                if let Some(r) = self.sign_review.as_mut() {
+                    r.error = Some(
+                        "Not enough signable owners linked to this Safe to meet its threshold — \
+                         propose to co-signers instead."
+                            .to_string(),
+                    );
+                }
+                return Task::none();
+            }
+            let executor_key = first_local_key_of(&self.accounts);
+            info!(
+                safe = %req.safe_address,
+                to = %req.recipient,
+                threshold = req.threshold,
+                "safe-send: dispatching execute via sign_review overlay",
+            );
+            spawn_safe_broadcast_task(self.network.clone(), req, signer_owners, executor_key)
+        } else {
+            let Some(owner_desc) = req
+                .signable_indices
+                .first()
+                .and_then(|&idx| self.accounts.get(idx as usize).cloned())
+            else {
+                if let Some(r) = self.sign_review.as_mut() {
+                    r.error = Some("no signable owner linked to this Safe".to_string());
+                }
+                return Task::none();
+            };
+            info!(
+                safe = %req.safe_address,
+                to = %req.recipient,
+                "safe-send: dispatching propose via sign_review overlay",
+            );
+            spawn_safe_propose_task(self.network.clone(), owner_desc, req)
+        };
+        if let Modal::Send(p) = &mut self.modal {
+            p.mark_busy();
+        }
+        if let Some(r) = self.sign_review.as_mut() {
+            r.signing_since = Some(Instant::now());
+            r.error = None;
+        }
+        task
+    }
+
+    /// Whether the sign-review overlay currently hosts a Safe send — the
+    /// `SafeSend*Return` handlers use this to resolve the overlay (close on
+    /// success, keep-with-error on failure) instead of the legacy pane pump.
+    fn overlay_is_safe_send(&self) -> bool {
+        self.sign_review
+            .as_ref()
+            .is_some_and(|r| matches!(r.action, sign_review::SignAction::SafeSend { .. }))
+    }
+
     /// Prove + submit a withdrawal through the relayer: it POSTs the proof, the
     /// relayer submits on-chain and pays the gas — the user signs nothing.
     fn pool_submit(
@@ -2204,6 +2377,14 @@ impl WalletScreen {
         {
             return self.dispatch_send_sign();
         }
+        // Safe send: Confirm is the primary action — "sign & execute now" when the
+        // wallet can execute, else "propose to co-signers". Overlay stays open.
+        if let Some(review) = self.sign_review.as_ref()
+            && let sign_review::SignAction::SafeSend { can_execute, .. } = &review.action
+        {
+            let execute = *can_execute;
+            return self.dispatch_safe_send(execute);
+        }
         let Some(review) = self.sign_review.take() else {
             return Task::none();
         };
@@ -2229,9 +2410,10 @@ impl WalletScreen {
             // Normally handled above (overlay kept open); the take() fallback here
             // keeps the match exhaustive and still signs if the guard ever moves.
             sign_review::SignAction::PrivacyPool { sign } => self.dispatch_pool_sign(sign),
-            // Handled by the keep-open early return above; this take-path is
-            // unreachable but keeps the match exhaustive.
+            // Handled by the keep-open early returns above; these take-paths are
+            // unreachable but keep the match exhaustive.
             sign_review::SignAction::Send { .. } => Task::none(),
+            sign_review::SignAction::SafeSend { .. } => Task::none(),
         }
     }
 
@@ -2275,11 +2457,14 @@ impl WalletScreen {
                 error!(error = %e, "privacy pools: clear-sign review failed");
                 self.apps.pool_pane().set_error(Some(e));
             }
-            // Send prepare failures keep the overlay up showing the error (handled
-            // inline in the `SignReviewPrepared` handler), so this is unreachable;
-            // the already-taken review is dropped as a safe fallback.
+            // Send / SafeSend prepare failures keep the overlay up showing the
+            // error (handled inline in the `SignReviewPrepared` handler), so these
+            // are unreachable; the already-taken review is dropped as a fallback.
             sign_review::SignAction::Send { .. } => {
                 error!(error = %e, "send: clear-sign review prepare failed");
+            }
+            sign_review::SignAction::SafeSend { .. } => {
+                error!(error = %e, "safe-send: clear-sign review prepare failed");
             }
         }
     }
@@ -3230,19 +3415,16 @@ impl WalletScreen {
                     return (Task::none(), None);
                 }
 
-                // Step(2): user clicked "Review →".
-                // EOA: the review + confirm + sign now live in the unified
-                // `sign_review` overlay, which stacks over this pane — open it
-                // (it spawns the quote + decode prepare) instead of advancing the
-                // pane to its own (removed) inline review step.
-                // Safe: unchanged — advance the pane to its review step; the
-                // prepare + sim tasks fire via take_pending_prepare.
+                // Step(2): user clicked "Review →". Both modes now open the
+                // unified `sign_review` overlay (which stacks over this pane and
+                // runs the prepare) instead of advancing the pane to its own
+                // (removed) inline review step.
                 if let send::Message::Step(2) = &child_msg {
+                    let resolved_name = p.recipient_display_name();
+                    let token_idx = p.token_idx();
                     if p.is_eoa() {
                         let plan = p.build_plan(&self.portfolio);
                         let amount = p.amount_str().to_string();
-                        let token_idx = p.token_idx();
-                        let resolved_name = p.recipient_display_name();
                         return match plan {
                             Some(pl) => (
                                 self.open_send_review(pl, amount, token_idx, resolved_name),
@@ -3251,92 +3433,18 @@ impl WalletScreen {
                             None => (Task::none(), None),
                         };
                     }
-                    let (task, _outcome) = p.update(child_msg);
-                    let task = task.map(Message::Send);
-                    return (task, None);
-                }
-
-                // Confirm: mode-aware.
-                // EOA: handled by the sign-review overlay
-                // (`confirm_sign_review` → `dispatch_send_sign`), not the pane —
-                // a stray pane-level EOA Confirm is a no-op here.
-                // Safe: collect linked owner keys, spawn the Safe
-                // sign+broadcast task (executor derived inside).
-                if let send::Message::Confirm = &child_msg {
-                    if p.is_eoa() {
-                        return (Task::none(), None);
-                    }
-                    // Safe mode: solo sign-and-execute. Collect the first
-                    // `threshold` signable owners (Local or hardware) and
-                    // pick a gas-paying executor — a Local account if the
-                    // wallet holds one, otherwise the first signing owner
-                    // (a 1/1 Safe's hardware owner pays its own gas).
-                    let Some(req) = p.outgoing_request(&self.portfolio) else {
-                        warn!("safe-send: confirm dropped — form not ready");
-                        return (Task::none(), None);
+                    // Safe: build the outgoing request + capture whether the
+                    // wallet can execute now (holds a threshold of signable
+                    // owners), then open the Safe review overlay.
+                    let req = p.outgoing_request(&self.portfolio);
+                    let can_execute = p.has_enough_signable_signers();
+                    return match req {
+                        Some(req) => (
+                            self.open_safe_send_review(req, token_idx, can_execute, resolved_name),
+                            None,
+                        ),
+                        None => (Task::none(), None),
                     };
-                    let signer_owners: Vec<AccountDescriptor> = req
-                        .signable_indices
-                        .iter()
-                        .filter_map(|&idx| self.accounts.get(idx as usize).cloned())
-                        .take(req.threshold as usize)
-                        .collect();
-                    if (signer_owners.len() as u32) < req.threshold {
-                        let msg = "Not enough signable owners linked to this Safe to meet its threshold — propose to co-signers instead.".to_string();
-                        let _ = p.update(send::Message::BroadcastDone(Err(msg)));
-                        return (Task::none(), None);
-                    }
-                    let executor_key = first_local_key_of(&self.accounts);
-                    info!(
-                        chain = %req.chain.label(),
-                        chain_id = req.chain.chain_id(),
-                        safe = %req.safe_address,
-                        to = %req.recipient,
-                        value_wei = %req.amount_units,
-                        threshold = req.threshold,
-                        signers = signer_owners.len(),
-                        local_executor = executor_key.is_some(),
-                        "safe-send: spawning broadcast task",
-                    );
-                    p.mark_busy();
-                    let pre_task = spawn_safe_broadcast_task(
-                        self.network.clone(),
-                        req,
-                        signer_owners,
-                        executor_key,
-                    );
-                    return (pre_task, None);
-                }
-
-                // Propose: Safe-only. Sign once with the first signable
-                // owner and POST to the tx service for co-signers.
-                if let send::Message::Propose = &child_msg {
-                    let Some(req) = p.outgoing_request(&self.portfolio) else {
-                        warn!("safe-send: propose dropped — form not ready");
-                        return (Task::none(), None);
-                    };
-                    let Some(owner_desc) = req
-                        .signable_indices
-                        .first()
-                        .and_then(|&idx| self.accounts.get(idx as usize).cloned())
-                    else {
-                        let _ = p.update(send::Message::ProposeDone(Err(
-                            "no signable owner linked to this Safe".to_string(),
-                        )));
-                        return (Task::none(), None);
-                    };
-                    info!(
-                        chain = %req.chain.label(),
-                        safe = %req.safe_address,
-                        to = %req.recipient,
-                        value_wei = %req.amount_units,
-                        "safe-send: spawning propose task",
-                    );
-                    p.mark_busy();
-                    return (
-                        spawn_safe_propose_task(self.network.clone(), owner_desc, req),
-                        None,
-                    );
                 }
 
                 let (task, outcome) = p.update(child_msg);
@@ -3351,21 +3459,6 @@ impl WalletScreen {
                     None => Task::none(),
                 };
 
-                // Safe-only post-pump hooks: prepare+sim and sim retry.
-                let prepare_task = match p.take_pending_prepare(&self.portfolio) {
-                    Some((seq, req)) => Task::batch([
-                        spawn_safe_prepare_task(self.network.clone(), seq, req.clone()),
-                        spawn_safe_send_sim_task(self.network.clone(), seq, req, false),
-                    ]),
-                    None => Task::none(),
-                };
-                let sim_retry_task = match p.take_pending_sim_retry(&self.portfolio) {
-                    Some((seq, req, delayed)) => {
-                        spawn_safe_send_sim_task(self.network.clone(), seq, req, delayed)
-                    }
-                    None => Task::none(),
-                };
-
                 let task = task.map(Message::Send);
                 match outcome {
                     Some(send::Outcome::Closed) => {
@@ -3375,30 +3468,18 @@ impl WalletScreen {
                         } else {
                             self.chrome.start_close();
                         }
-                        return (
-                            Task::batch([task, ens_task, prepare_task, sim_retry_task]),
-                            None,
-                        );
+                        return (Task::batch([task, ens_task]), None);
                     }
                     Some(send::Outcome::CopyText(s)) => {
                         let copy_task = self.arm_clipboard_clear(s);
-                        return (
-                            Task::batch([task, copy_task, ens_task, prepare_task, sim_retry_task]),
-                            None,
-                        );
+                        return (Task::batch([task, copy_task, ens_task]), None);
                     }
                     Some(send::Outcome::SaveAsContact { address, ens }) => {
                         let open_task = Task::done(Message::OpenContactsPaneWith { address, ens });
-                        return (
-                            Task::batch([task, ens_task, prepare_task, sim_retry_task, open_task]),
-                            None,
-                        );
+                        return (Task::batch([task, ens_task, open_task]), None);
                     }
                     None => {
-                        return (
-                            Task::batch([task, ens_task, prepare_task, sim_retry_task]),
-                            None,
-                        );
+                        return (Task::batch([task, ens_task]), None);
                     }
                 }
             }
@@ -3681,6 +3762,20 @@ impl WalletScreen {
                         r.show_calldata = !r.show_calldata;
                     }
                 }
+                // The overlay's optional second action (Safe send: "Propose to
+                // co-signers"). Ignore once a signature is already in flight.
+                sign_review::Message::Secondary => {
+                    if self
+                        .sign_review
+                        .as_ref()
+                        .is_some_and(|r| r.signing_since.is_none())
+                        && self.sign_review.as_ref().is_some_and(|r| {
+                            matches!(r.action, sign_review::SignAction::SafeSend { .. })
+                        })
+                    {
+                        return (self.dispatch_safe_send(false), None);
+                    }
+                }
             },
             Message::SignReviewPrepared { seq, steps } => {
                 // Drop a decode result for a review the user has since cancelled
@@ -3723,14 +3818,71 @@ impl WalletScreen {
                                 *aq = Some(quote);
                             }
                         }
+                        // Safe send: pin the reviewed `(nonce, safeTxHash)` into the
+                        // request (so the ceremony signs exactly what was shown) and
+                        // set the execute/propose labels from the reviewed sim.
+                        let safe_info = review.steps.iter().find_map(|s| match s {
+                            sign_review::SignStep::SafeSend(sr) => {
+                                Some((sr.nonce, sr.safe_tx_hash, sr.sim_reverts()))
+                            }
+                            _ => None,
+                        });
+                        if let Some((nonce, hash, sim_revert)) = safe_info {
+                            let can_exec = matches!(
+                                &review.action,
+                                sign_review::SignAction::SafeSend {
+                                    can_execute: true,
+                                    ..
+                                }
+                            );
+                            if let sign_review::SignAction::SafeSend { req, .. } =
+                                &mut review.action
+                            {
+                                req.prepared = Some(send::PreparedSafeTx {
+                                    nonce,
+                                    safe_tx_hash: hash,
+                                });
+                            }
+                            if can_exec {
+                                review.confirm_label = Some(
+                                    if sim_revert {
+                                        "Execute anyway ⚠"
+                                    } else {
+                                        "Sign & execute now"
+                                    }
+                                    .to_string(),
+                                );
+                                review.secondary_label = Some(
+                                    if sim_revert {
+                                        "Propose anyway ⚠"
+                                    } else {
+                                        "Propose to co-signers"
+                                    }
+                                    .to_string(),
+                                );
+                            } else {
+                                review.confirm_label = Some(
+                                    if sim_revert {
+                                        "Propose anyway ⚠"
+                                    } else {
+                                        "Propose to co-signers"
+                                    }
+                                    .to_string(),
+                                );
+                            }
+                        }
                     }
                     Err(e) => {
-                        // A Send keeps its overlay up showing the failure (there's
-                        // no inline review to fall back to) so the user can cancel
-                        // back to the amount step; other flows drive the error onto
-                        // their originating pane and drop the review.
-                        let is_send = matches!(review.action, sign_review::SignAction::Send { .. });
-                        if is_send {
+                        // A Send / SafeSend keeps its overlay up showing the failure
+                        // (there's no inline review to fall back to) so the user can
+                        // cancel back to the amount step; other flows drive the error
+                        // onto their originating pane and drop the review.
+                        let keeps_overlay = matches!(
+                            review.action,
+                            sign_review::SignAction::Send { .. }
+                                | sign_review::SignAction::SafeSend { .. }
+                        );
+                        if keeps_overlay {
                             review.error = Some(e);
                             review.legs_loading = false;
                             review.confirm_disabled = true;
@@ -4357,12 +4509,42 @@ impl WalletScreen {
                 }
             }
             Message::SafeSendBroadcastReturn(result) => {
+                match &result {
+                    Ok(hash) => info!(hash = %format!("{hash:#x}"), "safe-send broadcast ok"),
+                    Err(e) => warn!(error = %e, "safe-send broadcast failed"),
+                }
+                // Overlay-driven Safe execute: resolve the still-open review.
+                if self.overlay_is_safe_send() {
+                    match result {
+                        Err(e) => {
+                            // Keep the review up so the user can read the failure
+                            // and retry; clear the pane's busy flag.
+                            if let Some(r) = self.sign_review.as_mut() {
+                                r.signing_since = None;
+                                r.error = Some(e.clone());
+                            }
+                            if let Modal::Send(p) = &mut self.modal {
+                                let _ = p.update(send::Message::BroadcastDone(Err(e)));
+                            }
+                            return (Task::none(), None);
+                        }
+                        Ok(hash) => {
+                            self.sign_review = None;
+                            if let Modal::Send(p) = &mut self.modal {
+                                let _ = p.update(send::Message::BroadcastDone(Ok(hash)));
+                            }
+                            return (
+                                Task::batch([
+                                    self.refresh_verification_task(),
+                                    self.fetch_portfolio_task(),
+                                ]),
+                                None,
+                            );
+                        }
+                    }
+                }
                 if let Modal::Send(p) = &mut self.modal {
                     let success = result.is_ok();
-                    match &result {
-                        Ok(hash) => info!(hash = %format!("{hash:#x}"), "safe-send broadcast ok"),
-                        Err(e) => warn!(error = %e, "safe-send broadcast failed"),
-                    }
                     let (task, _outcome) = p.update(send::Message::BroadcastDone(result));
                     let refresh = if success {
                         Task::batch([
@@ -4376,12 +4558,37 @@ impl WalletScreen {
                 }
             }
             Message::SafeSendProposeReturn(result) => {
+                match &result {
+                    Ok(()) => info!("safe-send propose ok"),
+                    Err(e) => warn!(error = %e, "safe-send propose failed"),
+                }
+                // Overlay-driven Safe propose: resolve the still-open review.
+                if self.overlay_is_safe_send() {
+                    match result {
+                        Err(e) => {
+                            if let Some(r) = self.sign_review.as_mut() {
+                                r.signing_since = None;
+                                r.error = Some(e.clone());
+                            }
+                            if let Modal::Send(p) = &mut self.modal {
+                                let _ = p.update(send::Message::ProposeDone(Err(e)));
+                            }
+                            return (Task::none(), None);
+                        }
+                        Ok(()) => {
+                            self.sign_review = None;
+                            if let Modal::Send(p) = &mut self.modal {
+                                let _ = p.update(send::Message::ProposeDone(Ok(())));
+                            }
+                            return (
+                                self.fetch_safe_pending_task().unwrap_or_else(Task::none),
+                                None,
+                            );
+                        }
+                    }
+                }
                 if let Modal::Send(p) = &mut self.modal {
                     let success = result.is_ok();
-                    match &result {
-                        Ok(()) => info!("safe-send propose ok"),
-                        Err(e) => warn!(error = %e, "safe-send propose failed"),
-                    }
                     let (task, _outcome) = p.update(send::Message::ProposeDone(result));
                     // On success refresh the pending queue so the new
                     // proposal shows up the moment the user closes.
@@ -5648,6 +5855,115 @@ fn spawn_send_prepare(
     )
 }
 
+/// Display metadata the coordinator knows at review-open time for a Safe send —
+/// the async prepare adds the pinned `(nonce, safeTxHash)` and the inner sim.
+struct SafeReviewSeed {
+    amount_str: String,
+    symbol: String,
+    token_contract: Option<Address>,
+    recipient_name: Option<String>,
+    recipient_in_book: bool,
+    owner_count: usize,
+    signing_addresses: Vec<Address>,
+}
+
+/// Prepare a Safe send review off-thread: build the SafeTx at the live nonce and
+/// run the on-chain hash cross-checks (domain separator + `getTransactionHash`),
+/// then run the inner-transfer revm sim (advisory, with one verified-retry), and
+/// assemble the reviewable [`send::SafeSendReview`]. A hash-prepare failure fails
+/// the whole review (surfaced on the overlay); the sim degrades to
+/// `unavailable()`. Lands via `SignReviewPrepared` — the Safe analogue of
+/// `spawn_send_prepare`.
+fn spawn_safe_send_prepare(
+    network: Arc<dyn BalanceFetcher>,
+    seq: u64,
+    req: SafeSendRequest,
+    seed: SafeReviewSeed,
+) -> Task<Message> {
+    use crate::safe::tx::{
+        build_safe_tx_with_nonce, current_safe_nonce, ensure_signable_version, safe_domain,
+        safe_tx_hash, verify_safe_tx_before_signing,
+    };
+    let chain = req.chain;
+    Task::perform(
+        async move {
+            // Pinned hash — the critical part; any failure aborts the review.
+            let hash_res: Result<(u64, B256), String> = async {
+                if let Some(reason) = req.trust.signing_block_reason() {
+                    return Err(reason.to_string());
+                }
+                ensure_signable_version(&req.version)?;
+                let nonce = current_safe_nonce(network.as_ref(), req.safe_address, chain).await?;
+                let tx = build_safe_tx_with_nonce(req.safe_tx_input(), nonce);
+                let domain = safe_domain(req.safe_address, chain);
+                let local = safe_tx_hash(&tx, &domain);
+                verify_safe_tx_before_signing(
+                    network.as_ref(),
+                    &tx,
+                    req.safe_address,
+                    chain,
+                    local,
+                )
+                .await?;
+                Ok((nonce, local))
+            }
+            .await;
+            let (nonce, hash) = match hash_res {
+                Ok(v) => v,
+                Err(e) => {
+                    return (seq, Err::<Vec<sign_review::SignStep>, String>(e));
+                }
+            };
+
+            // Advisory inner sim (nonce 0 — only reads to/value/data), with one
+            // verified-retry if the first run landed on unverified fallback state.
+            let sim = {
+                let tx = build_safe_tx_with_nonce(req.safe_tx_input(), 0);
+                let first = crate::safe::sim::simulate_safe_inner(
+                    network.clone(),
+                    req.safe_address,
+                    &tx,
+                    chain,
+                )
+                .await
+                .unwrap_or_else(|_| SimulationResult::unavailable());
+                if first.is_success() && !first.verified {
+                    tokio::time::sleep(sim_retry_delay()).await;
+                    let tx2 = build_safe_tx_with_nonce(req.safe_tx_input(), 0);
+                    crate::safe::sim::simulate_safe_inner(
+                        network.clone(),
+                        req.safe_address,
+                        &tx2,
+                        chain,
+                    )
+                    .await
+                    .unwrap_or(first)
+                } else {
+                    first
+                }
+            };
+
+            let review = send::SafeSendReview {
+                chain,
+                amount_str: seed.amount_str,
+                symbol: seed.symbol,
+                token_contract: seed.token_contract,
+                recipient: req.recipient,
+                recipient_name: seed.recipient_name,
+                recipient_in_book: seed.recipient_in_book,
+                nonce,
+                safe_tx_hash: hash,
+                threshold: req.threshold,
+                owner_count: seed.owner_count,
+                signing_addresses: seed.signing_addresses,
+                sim,
+            };
+            (seq, Ok(vec![sign_review::SignStep::SafeSend(review)]))
+        },
+        |(seq, steps)| Message::SignReviewPrepared { seq, steps },
+    )
+}
+
 /// Title / subtitle / trailing-note for a name-write review card.
 fn name_review_labels(sign: &sign_review::NameSign) -> (String, Option<String>, Option<String>) {
     // A hardware wallet can't decode registrar calldata, so the in-app decode
@@ -6128,95 +6444,12 @@ fn first_local_key_of(accounts: &[AccountDescriptor]) -> Option<B256> {
     })
 }
 
-/// Review-prep for the SafeSend modal: build the SafeTx at the live
-/// nonce, run both on-chain cross-checks (domain separator +
-/// `getTransactionHash`), and hand the pinned `(nonce, safeTxHash)`
-/// back to the pane so the review screen shows the exact hash the
-/// signer(s) will commit to. Touches no signer.
-fn spawn_safe_prepare_task(
-    network: Arc<dyn BalanceFetcher>,
-    seq: u64,
-    req: SafeSendRequest,
-) -> Task<Message> {
-    use crate::safe::tx::{
-        build_safe_tx_with_nonce, current_safe_nonce, ensure_signable_version, safe_domain,
-        safe_tx_hash, verify_safe_tx_before_signing,
-    };
-    let chain = req.chain;
-    Task::perform(
-        async move {
-            let result: Result<(u64, B256), String> = async {
-                if let Some(reason) = req.trust.signing_block_reason() {
-                    return Err(reason.to_string());
-                }
-                ensure_signable_version(&req.version)?;
-                let nonce = current_safe_nonce(network.as_ref(), req.safe_address, chain).await?;
-                let tx = build_safe_tx_with_nonce(req.safe_tx_input(), nonce);
-                let domain = safe_domain(req.safe_address, chain);
-                let local = safe_tx_hash(&tx, &domain);
-                verify_safe_tx_before_signing(
-                    network.as_ref(),
-                    &tx,
-                    req.safe_address,
-                    chain,
-                    local,
-                )
-                .await?;
-                Ok((nonce, local))
-            }
-            .await;
-            (seq, result)
-        },
-        |(seq, result)| Message::Send(send::Message::HashReady { seq, result }),
-    )
-}
-
 /// How long the automatic verified-retry waits before re-running a sim
 /// that succeeded on fallback state: the helios cooldown window plus a
 /// margin, so the re-run lands back on the verified path instead of
 /// being short-circuited by `in_cooldown` again.
 fn sim_retry_delay() -> std::time::Duration {
     crate::net::FALLBACK_COOLDOWN + std::time::Duration::from_secs(1)
-}
-
-/// Inner-call preflight for the SafeSend review: simulate the transfer
-/// the Safe would make (`from = Safe`, to/value from the form) against
-/// Helios-verified state. Runs in parallel with the prepare task — the
-/// inner call doesn't depend on the pinned nonce. Advisory: any failure
-/// degrades to `unavailable()` (same convention as the EOA quote path).
-///
-/// `delayed` waits out the helios fallback cooldown (plus a margin)
-/// before running — the automatic verified-retry path. The pane's seq
-/// guard drops the result if the user navigated away meanwhile.
-fn spawn_safe_send_sim_task(
-    network: Arc<dyn BalanceFetcher>,
-    seq: u64,
-    req: SafeSendRequest,
-    delayed: bool,
-) -> Task<Message> {
-    use crate::safe::tx::build_safe_tx_with_nonce;
-    let chain = req.chain;
-    Task::perform(
-        async move {
-            if delayed {
-                tokio::time::sleep(sim_retry_delay()).await;
-            }
-            // Nonce 0 is fine: the inner sim only reads to/value/data.
-            let tx = build_safe_tx_with_nonce(req.safe_tx_input(), 0);
-            let result =
-                match crate::safe::sim::simulate_safe_inner(network, req.safe_address, &tx, chain)
-                    .await
-                {
-                    Ok(r) => r,
-                    Err(e) => {
-                        warn!(error = %e, "safe-send: inner sim failed, marking unavailable");
-                        SimulationResult::unavailable()
-                    }
-                };
-            (seq, result)
-        },
-        |(seq, result)| Message::Send(send::Message::SimReady { seq, result }),
-    )
 }
 
 /// Rebuild the SafeTx at the `(nonce, hash)` pin the user reviewed,
@@ -8054,7 +8287,8 @@ fn cow_pin_from_steps(steps: &[sign_review::SignStep]) -> Option<sign_review::Co
             }
             sign_review::SignStep::RawTx(_)
             | sign_review::SignStep::Typed(_)
-            | sign_review::SignStep::Send(_) => {}
+            | sign_review::SignStep::Send(_)
+            | sign_review::SignStep::SafeSend(_) => {}
         }
     }
     saw_safe.then_some(pin)
@@ -9854,7 +10088,8 @@ mod tests {
                 sign_review::SignStep::RawTx(_)
                 | sign_review::SignStep::SafeExec(_)
                 | sign_review::SignStep::SafeMessage(_)
-                | sign_review::SignStep::Send(_) => None,
+                | sign_review::SignStep::Send(_)
+                | sign_review::SignStep::SafeSend(_) => None,
             })
             .expect("swap review shows the order panel");
         assert_eq!(order.receiver, me, "receiver is the active account");

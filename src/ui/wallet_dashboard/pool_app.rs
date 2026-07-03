@@ -478,6 +478,12 @@ impl PoolApp {
         self.error = e;
     }
 
+    /// The pane's current error banner text, if any. Lets the coordinator (and
+    /// tests) observe a refusal it surfaced via [`Self::set_error`].
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
     pub fn set_pools(&mut self, chain: Chain, pools: Vec<PoolInfo>, relayers: Vec<Relayer>) {
         self.pool_cache.insert(chain, pools.clone());
         if chain == self.chain {

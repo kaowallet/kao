@@ -91,6 +91,7 @@ use crate::ui::kao_theme::with_alpha;
 use crate::ui::kao_theme::{KaoTheme, ThemeKind};
 use crate::ui::kao_widgets::{bold, copy_toast_progress, fill_style, mark_copied, mono};
 use crate::ui::network_setup::{self, NetworkSetupScreen, WizardMode};
+use crate::sign::context::{SafeNeed, SignerContext};
 use crate::wallet::sim::SimulationResult;
 use crate::wallet::tx::SendPlan;
 use crate::wallet::{
@@ -1274,6 +1275,39 @@ impl WalletScreen {
         })
     }
 
+    /// Build the signer context for an EOA sign: the active account, or `Err` if
+    /// it's watch-only (which [`SignerContext`] makes unrepresentable, so no review
+    /// is ever built for a signer that can't sign).
+    fn build_eoa_context(&self) -> Result<SignerContext, String> {
+        let desc = self.active_signer_descriptor();
+        if matches!(desc, AccountDescriptor::ViewOnly { .. }) {
+            return Err("this account is watch-only and can't sign".to_string());
+        }
+        // The active EOA's address — exactly what `order_owner()` returned for the
+        // EOA case, so the decoded `from` is unchanged.
+        Ok(SignerContext::Eoa {
+            address: self.address,
+        })
+    }
+
+    /// The single decision of who authorizes a review: the active Safe (per the
+    /// flow's `need`) in Safe mode, else the active EOA. `Err` when there is no
+    /// signable context — a watch-only EOA, or a Safe that can't sign here (wrong
+    /// chain / unrecognized impl / too few signable owners). Being the one source
+    /// of the address shown as `from`, it can't diverge from who actually signs.
+    fn build_signer_context(&self, need: SafeNeed) -> Result<SignerContext, String> {
+        if self.active_safe.is_some() {
+            let safe = match need {
+                SafeNeed::Swap => self.build_safe_swap_ctx().map(|c| c.safe),
+                SafeNeed::Name => self.build_safe_name_ctx().map(|c| c.safe),
+            };
+            safe.map(|safe| SignerContext::Safe { safe })
+                .ok_or_else(|| "this Safe can't sign here".to_string())
+        } else {
+            self.build_eoa_context()
+        }
+    }
+
     /// Whether the Apps launcher should offer the Names app for the active
     /// identity. EOA: always (reads work; writes gate at sign time, matching
     /// the pre-Safe behavior). Safe: only a Mainnet Safe with a signable owner,
@@ -1585,6 +1619,18 @@ impl WalletScreen {
         if self.sign_review.is_some() {
             return Task::none();
         }
+        // A pool tx is always signed by the active EOA — its context is the single
+        // source of the decoded `from`, so the panel can't show a different address
+        // than the one that signs. Deposits/ragequits are refused in Safe mode
+        // upstream, and watch-only is unrepresentable, so a non-signing account
+        // can't open a pool review.
+        let from = match self.build_eoa_context() {
+            Ok(ctx) => ctx.display_from(),
+            Err(msg) => {
+                self.apps.pool_pane().set_error(Some(msg));
+                return Task::none();
+            }
+        };
         self.sign_review_seq += 1;
         let seq = self.sign_review_seq;
         let (title, subtitle, note) = pool_review_labels(&sign);
@@ -1597,12 +1643,6 @@ impl WalletScreen {
             seq,
             action,
         ));
-        // A pool tx is always signed by the active EOA (`send_contract_call`
-        // signs from `signer.address()`), never the Safe — decode from that exact
-        // address so the panel can't show a different `from` than the one that
-        // signs. Deposits/ragequits are refused in Safe mode above; this keeps the
-        // review honest even if a future caller reaches here another way.
-        let from = self.address;
         let local_names = build_local_names(&self.accounts, &self.safes, &self.contacts);
         spawn_pool_prepare(self.network.clone(), seq, from, sign, local_names)
     }
@@ -1833,6 +1873,26 @@ impl WalletScreen {
         if self.sign_review.is_some() {
             return Task::none();
         }
+        // The name write is authorized by the active identity's signer context (the
+        // Safe in Safe mode, else the EOA). Verify the caller's `from` is exactly
+        // that address and refuse a watch-only signer — the shown `from` can't
+        // diverge from who signs. (A non-Mainnet / unsignable Safe is already
+        // refused upstream in `handle_name_outcome`.)
+        match self.build_signer_context(SafeNeed::Name) {
+            Ok(ctx) if ctx.display_from() == from => {}
+            Ok(ctx) => {
+                warn!(
+                    shown = %from,
+                    signer = %ctx.display_from(),
+                    "name review: shown from != signer — refusing",
+                );
+                return Task::none();
+            }
+            Err(msg) => {
+                warn!(%msg, "name review: no signable context — refusing");
+                return Task::none();
+            }
+        }
         self.sign_review_seq += 1;
         let seq = self.sign_review_seq;
         let (title, subtitle, note) = name_review_labels(&sign);
@@ -1864,7 +1924,23 @@ impl WalletScreen {
         }
         self.sign_review_seq += 1;
         let seq = self.sign_review_seq;
-        let user = self.order_owner();
+        let user = match self.build_signer_context(SafeNeed::Swap) {
+            Ok(ctx) => ctx.display_from(),
+            Err(msg) => {
+                // The swap surface is gated on a signable context, so this is
+                // unreachable in practice — but refuse cleanly rather than open a
+                // review that can't be signed.
+                match host {
+                    CowHost::Modal => {
+                        if let Modal::Swap(p) = &mut self.modal {
+                            p.placement_failed(msg);
+                        }
+                    }
+                    CowHost::Apps => self.apps.placement_failed(msg),
+                }
+                return Task::none();
+            }
+        };
         let order = build_order_review(&draft, &quote, user);
         let title = format!(
             "Swap {} {} → {}",
@@ -9124,10 +9200,24 @@ mod tests {
 
     #[test]
     fn cow_place_opens_review_then_confirm_parks_signer() {
+        use crate::wallet::local_account;
+        use alloy::signers::local::PrivateKeySigner;
         // Placing a swap must open the clear-signing review (showing the EIP-712
         // order panel) *before* any signing. The signer parks only on confirm.
-        let me = addr(0xAB);
-        let mut screen = screen_for(me, new_cache());
+        // A swap review now requires a signable context, so use a Local account.
+        let pk = PrivateKeySigner::random();
+        let me = pk.address();
+        let desc = local_account(&pk);
+        let mut screen = WalletScreen::new(
+            KaoSigner::Local(pk),
+            vec![desc],
+            Vec::new(),
+            0,
+            Arc::new(MockFetcher::new()),
+            new_cache(),
+            Arc::new(RwLock::new(ContactsBook::new())),
+            None,
+        );
         assert!(screen.sign_review.is_none());
         assert!(!screen.order_op_in_flight);
 
@@ -9162,6 +9252,56 @@ mod tests {
             "confirming places the order (signer parked)"
         );
         assert!(screen.sign_review.is_none(), "confirm closes the review");
+    }
+
+    #[test]
+    fn signer_context_is_eoa_for_a_signable_account() {
+        use crate::wallet::local_account;
+        use alloy::signers::local::PrivateKeySigner;
+        let pk = PrivateKeySigner::random();
+        let me = pk.address();
+        let desc = local_account(&pk);
+        let screen = WalletScreen::new(
+            KaoSigner::Local(pk),
+            vec![desc],
+            Vec::new(),
+            0,
+            Arc::new(MockFetcher::new()),
+            new_cache(),
+            Arc::new(RwLock::new(ContactsBook::new())),
+            None,
+        );
+        let ctx = screen
+            .build_eoa_context()
+            .expect("a signable EOA has a context");
+        assert!(matches!(ctx, SignerContext::Eoa { .. }));
+        assert_eq!(ctx.display_from(), me, "from == the active EOA");
+        // Outside Safe mode both flows resolve to the same EOA context.
+        for need in [SafeNeed::Swap, SafeNeed::Name] {
+            assert_eq!(screen.build_signer_context(need).unwrap().display_from(), me);
+        }
+    }
+
+    #[test]
+    fn signer_context_refuses_watch_only() {
+        // A watch-only account is unrepresentable as a signer context — a review is
+        // never built for a signer that can't sign.
+        let screen = screen_for(addr(0xAB), new_cache());
+        assert!(screen.build_eoa_context().is_err(), "watch-only can't sign");
+        assert!(screen.build_signer_context(SafeNeed::Swap).is_err());
+    }
+
+    #[test]
+    fn signer_context_is_safe_in_safe_mode() {
+        let screen = hardware_safe_screen(); // Mainnet hardware Safe
+        let safe = screen.safes[0].address();
+        for need in [SafeNeed::Swap, SafeNeed::Name] {
+            let ctx = screen
+                .build_signer_context(need)
+                .expect("a Mainnet hardware Safe signs both swaps and names");
+            assert!(matches!(ctx, SignerContext::Safe { .. }));
+            assert_eq!(ctx.display_from(), safe, "from == the Safe");
+        }
     }
 
     #[test]

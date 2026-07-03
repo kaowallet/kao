@@ -1492,6 +1492,19 @@ impl WalletScreen {
         if self.sign_review.is_some() {
             return Task::none();
         }
+        // Privacy Pools has no Safe path: the deposit is signed and paid by the
+        // active EOA, not the Safe. Offering it in Safe mode would show the Safe
+        // as `from` (via `order_owner`) while silently spending the EOA — refuse
+        // instead of misleading the user or funding from the wrong account.
+        if self.active_safe.is_some() {
+            warn!("privacy pools: deposit blocked — Safe mode has no pool signing path");
+            self.apps.pool_pane().set_error(Some(
+                "Privacy Pools deposits are signed by your account, not a Safe — \
+                 switch to an account to deposit."
+                    .into(),
+            ));
+            return Task::none();
+        }
         let Some(account) = self.pp_account else {
             warn!("privacy pools: deposit blocked — no pool identity");
             self.apps
@@ -1579,7 +1592,12 @@ impl WalletScreen {
         self.sign_review = Some(sign_review::SignReview::pending(
             title, subtitle, None, note, seq, action,
         ));
-        let from = self.order_owner();
+        // A pool tx is always signed by the active EOA (`send_contract_call`
+        // signs from `signer.address()`), never the Safe — decode from that exact
+        // address so the panel can't show a different `from` than the one that
+        // signs. Deposits/ragequits are refused in Safe mode above; this keeps the
+        // review honest even if a future caller reaches here another way.
+        let from = self.address;
         let local_names = build_local_names(&self.accounts, &self.safes, &self.contacts);
         spawn_pool_prepare(self.network.clone(), seq, from, sign, local_names)
     }
@@ -1646,6 +1664,18 @@ impl WalletScreen {
     /// the commitment off-thread, then route the `Pool.ragequit` tx through the
     /// clear-sign gate as an EOA transaction.
     fn pool_ragequit(&mut self, info: crate::pool::PoolInfo, account: usize) -> Task<Message> {
+        // Same as deposits: the ragequit tx is signed by the active EOA, so it
+        // has no meaning in Safe mode — refuse rather than spend the EOA behind a
+        // Safe-labelled review.
+        if self.active_safe.is_some() {
+            warn!("privacy pools: ragequit blocked — Safe mode has no pool signing path");
+            self.apps.pool_pane().set_error(Some(
+                "Privacy Pools exits are signed by your account, not a Safe — \
+                 switch to an account to continue."
+                    .into(),
+            ));
+            return Task::none();
+        }
         let Some(pp) = self.pp_account else {
             self.apps
                 .pool_pane()
@@ -1830,14 +1860,34 @@ impl WalletScreen {
             "Swap {} {} → {}",
             order.sell_amount, order.sell_symbol, order.buy_symbol
         );
-        let note = Some(
+        let base_note = if draft.is_native {
+            "Selling native ETH is an on-chain order — you'll also pay gas."
+        } else {
+            "ERC-20 orders are gasless — CoW solvers pay the settlement gas."
+        };
+        // In Safe mode the legs below are the *inner* calls the Safe makes — but
+        // each owner actually signs the Safe transaction hash (an EIP-712 SafeTx),
+        // and an ERC-20 order is authorized via EIP-1271, before an owner
+        // broadcasts. Say so, so the review doesn't read as a direct EOA signature
+        // of the leg shown. (Full execTransaction/safeTxHash rendering is the
+        // unified-gate work; this at least discloses the mechanism.)
+        let note = Some(if self.active_safe.is_some() {
             if draft.is_native {
-                "Selling native ETH is an on-chain order — you'll also pay gas."
+                format!(
+                    "{base_note} Signing from your Safe: each owner signs the Safe \
+                     transaction hash for the on-chain order shown below; an owner \
+                     then broadcasts it."
+                )
             } else {
-                "ERC-20 orders are gasless — CoW solvers pay the settlement gas."
+                format!(
+                    "{base_note} Signing from your Safe: each owner signs the Safe \
+                     transaction hash for any approval and authorizes the order via \
+                     EIP-1271; an owner then broadcasts the on-chain steps."
+                )
             }
-            .to_string(),
-        );
+        } else {
+            base_note.to_string()
+        });
         let action = sign_review::SignAction::Cow {
             host,
             draft: draft.clone(),
@@ -8338,6 +8388,58 @@ mod tests {
             "PoolSubmitted clears the waiting overlay",
         );
         assert!(!s.order_op_in_flight, "in-flight flag clears on resolve");
+    }
+
+    #[test]
+    fn pool_deposit_and_ragequit_are_refused_in_safe_mode() {
+        // Regression: Privacy Pools has no Safe path — a pool tx is signed and
+        // paid by the active EOA (`send_contract_call` signs from
+        // `signer.address()`). In Safe mode the review used to show the Safe as
+        // `from` (via `order_owner`) while the EOA silently signed and funded it.
+        // Both signing entry points must refuse rather than open the gate.
+        let mut s = hardware_safe_screen(); // active_safe = Some(0), on a CoW chain
+        assert!(s.active_safe.is_some(), "precondition: in Safe mode");
+
+        let info = crate::pool::PoolInfo {
+            chain: Chain::Mainnet,
+            entrypoint: addr(0x11),
+            asset: addr(0x12),
+            pool: addr(0x13),
+            scope: privacy_pools::Field::from(1u64),
+            symbol: "ETH".into(),
+            decimals: 18,
+            is_native: true,
+            min_deposit: U256::ZERO,
+            vetting_fee_bps: U256::ZERO,
+            max_relay_fee_bps: U256::ZERO,
+            anonymity_set: 0,
+            verified: true,
+        };
+
+        let _ = s.open_pool_deposit_review(info.clone(), U256::from(1u64));
+        assert!(
+            s.sign_review.is_none(),
+            "a Safe-mode deposit must not open the clear-sign gate",
+        );
+        assert_eq!(
+            s.apps.pool_pane().error(),
+            Some(
+                "Privacy Pools deposits are signed by your account, not a Safe — \
+                 switch to an account to deposit."
+            ),
+            "the deposit refusal is surfaced on the pool pane",
+        );
+
+        // Same guard for the original-depositor exit.
+        let _ = s.pool_ragequit(info, 0);
+        assert_eq!(
+            s.apps.pool_pane().error(),
+            Some(
+                "Privacy Pools exits are signed by your account, not a Safe — \
+                 switch to an account to continue."
+            ),
+            "the ragequit refusal is surfaced on the pool pane",
+        );
     }
 
     #[test]

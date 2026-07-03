@@ -14,6 +14,7 @@ mod portfolio;
 mod safe;
 mod sanitize;
 mod settings;
+mod sign;
 mod trace;
 mod ui;
 mod wallet;

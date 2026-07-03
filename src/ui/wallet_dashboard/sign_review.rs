@@ -42,6 +42,7 @@ use crate::ui::kao_widgets::{
     bold, bullet_wave, colored_address, kao_scrollable_style, modal_wrapper, mono, mono_bold,
     primary_button, secondary_button,
 };
+use crate::wallet::tx::{SendPlan, TxQuote};
 
 use super::CowHost;
 
@@ -57,6 +58,9 @@ pub enum Message {
     /// No-op published by a copyable address click so the dashboard's "Copied!"
     /// toast animation starts (a click changes no state otherwise). Ignored.
     AddressCopied,
+    /// Expand/collapse the "for the paranoid" decoded-calldata block on a Send
+    /// review step (the only interactive control inside a reviewed step).
+    ToggleCalldata,
 }
 
 /// A single raw transaction the user will sign, decoded for review through the
@@ -195,6 +199,10 @@ pub enum SignStep {
     /// A CoW order authorized via EIP-1271 from a Safe: the order plus the
     /// `SafeMessage` hash each owner signs.
     SafeMessage(SafeMessageReview),
+    /// An EOA send: the full inline review (intent, revm balance-change sim, gas,
+    /// recipient, decoded call) snapshotted for the overlay. Carries the quote +
+    /// plan that drive the broadcast, so reviewed == signed.
+    Send(super::send::SendReview),
 }
 
 /// Pins the reviewed Safe artifacts so `cow_place_order_safe` signs exactly what
@@ -237,6 +245,13 @@ pub enum SignAction {
     },
     PrivacyPool {
         sign: PoolSign,
+    },
+    /// An EOA send. `plan` is known when the review opens; `quote` is filled once
+    /// the prepare task lands (gas / nonce / fees), and the two together drive the
+    /// broadcast at confirm — the same numbers the `SignStep::Send` step displays.
+    Send {
+        plan: SendPlan,
+        quote: Option<TxQuote>,
     },
 }
 
@@ -309,6 +324,19 @@ pub struct SignReview {
     /// wallet prompt isn't left facing a blank screen) until the broadcast
     /// resolves. `None` before confirm; the elapsed time drives the animation.
     pub signing_since: Option<Instant>,
+    /// A broadcast error surfaced back onto the still-open overlay (the Send flow
+    /// keeps its review up so the user can read the failure and retry Confirm,
+    /// rather than dropping them onto a blank host pane). `None` unless a dispatch
+    /// resolved with an error.
+    pub error: Option<String>,
+    /// Overrides the "Confirm & sign" button label (e.g. the Send flow's
+    /// "Sign & Send" / "Sign anyway ⚠" / "Need ETH for gas"). `None` → default.
+    pub confirm_label: Option<String>,
+    /// Blocks Confirm even once the steps are ready (e.g. a Send with too little
+    /// ETH for gas). Independent of `legs_loading`.
+    pub confirm_disabled: bool,
+    /// Expand state for the Send step's "for the paranoid" decoded-calldata block.
+    pub show_calldata: bool,
 }
 
 impl SignReview {
@@ -345,6 +373,10 @@ impl SignReview {
             seq,
             action,
             signing_since: None,
+            error: None,
+            confirm_label: None,
+            confirm_disabled: false,
+            show_calldata: false,
         };
         // Coordinator-driven open: every caller assigns this straight into the
         // overlay slot (guarded by an is-already-open early return), so the
@@ -385,7 +417,7 @@ pub fn view<'a>(t: KaoTheme, review: &'a SignReview, progress: f32) -> Element<'
             };
             body = body.push(Space::new().height(gap));
         }
-        body = body.push(step_card(t, step));
+        body = body.push(step_card(t, step, review.show_calldata));
     }
 
     if review.legs_loading {
@@ -413,6 +445,17 @@ pub fn view<'a>(t: KaoTheme, review: &'a SignReview, progress: f32) -> Element<'
         body = body.push(text(note).size(11).color(t.sub).font(mono()));
     }
 
+    // A broadcast error surfaced back onto the still-open review (Send retry path).
+    if let Some(err) = &review.error {
+        body = body.push(Space::new().height(12));
+        body = body.push(
+            text(format!("(╥﹏╥) {err}"))
+                .size(12)
+                .color(t.down)
+                .font(bold()),
+        );
+    }
+
     // ── Actions ───────────────────────────────────────────────────────────
     // Once confirmed, the overlay swaps its buttons for a live "waiting for a
     // signature" notice and stays open until the signing task resolves — so a
@@ -423,12 +466,16 @@ pub fn view<'a>(t: KaoTheme, review: &'a SignReview, progress: f32) -> Element<'
         body = body.push(waiting_card(t, since.elapsed().as_secs_f32()));
     } else {
         // Confirm stays disabled while legs are still decoding so the user can't
-        // approve bytes they haven't been shown yet.
-        let confirm = primary_button(t, "Confirm & sign", !review.legs_loading);
-        let confirm = if review.legs_loading {
-            confirm
-        } else {
+        // approve bytes they haven't been shown yet, and while a step-level guard
+        // blocks it (a Send with too little ETH for gas). The label can be
+        // overridden per-flow (Send's "Sign & Send" / "Sign anyway ⚠").
+        let label = review.confirm_label.as_deref().unwrap_or("Confirm & sign");
+        let enabled = !review.legs_loading && !review.confirm_disabled;
+        let confirm = primary_button(t, label, enabled);
+        let confirm = if enabled {
             confirm.on_press(Message::Confirm)
+        } else {
+            confirm
         };
         let actions = row![
             container(secondary_button(t, "Cancel").on_press(Message::Cancel))
@@ -502,12 +549,15 @@ fn waiting_card<'a>(t: KaoTheme, elapsed: f32) -> Element<'a, Message> {
 
 /// Render one reviewed step: a raw-tx leg through `function_panel`, or an EIP-712
 /// typed-data step through `typed_panel`.
-fn step_card<'a>(t: KaoTheme, step: &'a SignStep) -> Element<'a, Message> {
+fn step_card<'a>(t: KaoTheme, step: &'a SignStep, show_calldata: bool) -> Element<'a, Message> {
     match step {
         SignStep::RawTx(leg) => leg_card(t, leg),
         SignStep::Typed(order) => order_panel(t, order),
         SignStep::SafeExec(x) => safe_exec_panel(t, x),
         SignStep::SafeMessage(m) => safe_message_panel(t, m),
+        SignStep::Send(r) => {
+            super::send::render_send_review(t, r, show_calldata, Message::ToggleCalldata)
+        }
     }
 }
 
@@ -521,10 +571,13 @@ fn safe_exec_panel<'a>(t: KaoTheme, x: &'a SafeExecReview) -> Element<'a, Messag
             .color(t.sub)
             .font(bold()),
         Space::new().height(2),
-        text(format!("{}-of-{} owners must sign", x.threshold, x.owner_count))
-            .size(13)
-            .color(t.text)
-            .font(bold()),
+        text(format!(
+            "{}-of-{} owners must sign",
+            x.threshold, x.owner_count
+        ))
+        .size(13)
+        .color(t.text)
+        .font(bold()),
         Space::new().height(8),
     ]
     .spacing(0)
@@ -536,7 +589,11 @@ fn safe_exec_panel<'a>(t: KaoTheme, x: &'a SafeExecReview) -> Element<'a, Messag
     col = col.push(Space::new().height(4));
     col = col.push(leg_card(t, x.inner.as_ref()));
     col = col.push(Space::new().height(8));
-    col = col.push(hash_row(t, "Each owner signs (SafeTx hash)", x.safe_tx_hash));
+    col = col.push(hash_row(
+        t,
+        "Each owner signs (SafeTx hash)",
+        x.safe_tx_hash,
+    ));
     card(t, col.into())
 }
 
@@ -572,7 +629,11 @@ fn safe_message_panel<'a>(t: KaoTheme, m: &'a SafeMessageReview) -> Element<'a, 
     col = col.push(Space::new().height(4));
     col = col.push(addr_kv(t, "Authorizing Safe", m.safe));
     col = col.push(hash_row(t, "Order digest (CoW EIP-712)", m.order_digest));
-    col = col.push(hash_row(t, "Each owner signs (SafeMessage hash)", m.message_hash));
+    col = col.push(hash_row(
+        t,
+        "Each owner signs (SafeMessage hash)",
+        m.message_hash,
+    ));
     card(t, col.into())
 }
 

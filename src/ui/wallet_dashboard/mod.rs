@@ -87,11 +87,11 @@ use crate::names::registrar::{Namespace, RegisterPlan};
 use crate::net::{BalanceFetcher, VerificationStatus};
 use crate::portfolio::{DiscoveredToken, LiveToken, PortfolioCache};
 use crate::settings::{self, IndexerProvider};
+use crate::sign::context::{SafeNeed, SignerContext};
 use crate::ui::kao_theme::with_alpha;
 use crate::ui::kao_theme::{KaoTheme, ThemeKind};
 use crate::ui::kao_widgets::{bold, copy_toast_progress, fill_style, mark_copied, mono};
 use crate::ui::network_setup::{self, NetworkSetupScreen, WizardMode};
-use crate::sign::context::{SafeNeed, SignerContext};
 use crate::wallet::sim::SimulationResult;
 use crate::wallet::tx::SendPlan;
 use crate::wallet::{
@@ -1685,6 +1685,138 @@ impl WalletScreen {
         spawn_pool_send(self.network.clone(), handoff, desc, sign)
     }
 
+    /// Open the unified sign-review overlay for an EOA send. The pane keeps
+    /// collecting recipient/amount underneath; this snapshots the plan + recipient
+    /// display metadata, spawns the quote + decode prepare, and shows the full
+    /// review once it lands. Confirm dispatches the broadcast with the overlay
+    /// kept open in its waiting phase (like Privacy Pools). Reviewed == signed:
+    /// the prepared quote is exactly what the broadcast signs.
+    fn open_send_review(
+        &mut self,
+        plan: SendPlan,
+        amount: String,
+        token_idx: usize,
+        resolved_name: Option<String>,
+    ) -> Task<Message> {
+        if self.sign_review.is_some() {
+            return Task::none();
+        }
+        // Only a signable EOA can open a send review — Send is gated on this
+        // upstream, so this is a fail-closed backstop, not a reachable path.
+        if let Err(e) = self.build_eoa_context() {
+            warn!(error = %e, "send review: refused — active account can't sign");
+            return Task::none();
+        }
+        let Some(tk) = self.portfolio.get(token_idx) else {
+            warn!("send review: refused — token index out of range");
+            return Task::none();
+        };
+        let symbol = tk.symbol.clone();
+        let recipient = plan.recipient;
+        let picker = self.recipient_picker(Some(self.active_index), None);
+        let contact_name = picker.name_for(recipient).map(|s| s.to_string());
+        let recipient_in_book = contact_name.is_some();
+        let entry = picker.entries.iter().find(|e| e.address == recipient);
+        let recipient_kao = entry
+            .map(|e| e.kaomoji.clone())
+            .unwrap_or_else(|| "(◕‿◕)".to_string());
+        let recipient_chip = entry.and_then(|e| e.chip);
+        // Prefer a saved-contact name; else the ENS name the pane resolved.
+        let recipient_name = contact_name.or(resolved_name);
+
+        let eth_balance_wei = self
+            .portfolio
+            .iter()
+            .find(|p| p.chain == plan.chain && p.contract.is_none())
+            .map(|p| p.balance_raw);
+        let eth_usd_price = self.portfolio.first().map(|p| p.usd_price).unwrap_or(0.0);
+
+        let seed = SendReviewSeed {
+            recipient,
+            recipient_name: recipient_name.clone(),
+            recipient_in_book,
+            recipient_kao,
+            recipient_chip,
+            amount: amount.clone(),
+            token_symbol: symbol.clone(),
+            token_contract: tk.contract,
+            token_decimals: tk.decimals,
+            token_balance_before: tk.balance_f64,
+            usd_price: tk.usd_price,
+            eth_usd_price,
+            eth_balance_wei,
+            plan: plan.clone(),
+        };
+        // `tk`'s borrow of `self.portfolio` ends here (last use above), so the
+        // mutable overlay assignment below is free of it.
+
+        self.sign_review_seq += 1;
+        let seq = self.sign_review_seq;
+        let title = format!("Send {amount} {symbol}");
+        let subtitle = Some(format!(
+            "to {}",
+            recipient_name.unwrap_or_else(|| short_address(recipient))
+        ));
+        let action = sign_review::SignAction::Send { plan, quote: None };
+        self.sign_review = Some(sign_review::SignReview::pending(
+            title,
+            subtitle,
+            Vec::new(),
+            None,
+            seq,
+            action,
+        ));
+        let local_names = build_local_names(&self.accounts, &self.safes, &self.contacts);
+        spawn_send_prepare(self.network.clone(), seq, seed, local_names)
+    }
+
+    /// User confirmed an EOA send review — park the signer, mark the host pane
+    /// busy (so the dashboard-leave / concurrent-signing gates see it), keep the
+    /// overlay up in its "waiting for a signature" phase, and broadcast. The
+    /// `SendBroadcastReturn` handler resolves the overlay (success closes it and
+    /// drives the pane to its success screen; a failure keeps it up with the
+    /// error so the user can retry Confirm). Mirrors `dispatch_pool_sign`.
+    fn dispatch_send_sign(&mut self) -> Task<Message> {
+        let (plan, quote) = match self.sign_review.as_ref().map(|r| &r.action) {
+            Some(sign_review::SignAction::Send {
+                plan,
+                quote: Some(q),
+            }) => (plan.clone(), q.clone()),
+            _ => {
+                warn!("send: confirm dropped — quote not prepared yet");
+                return Task::none();
+            }
+        };
+        if self.is_signing_busy() {
+            warn!("send: sign dispatch blocked — another signing op in progress");
+            if let Some(r) = self.sign_review.as_mut() {
+                r.error = Some(
+                    "another signing operation is in progress — try again in a moment".to_string(),
+                );
+            }
+            return Task::none();
+        }
+        // Mark the host pane busy (drives `is_send_busy`) and keep the overlay in
+        // its waiting phase for the duration of the sign + broadcast.
+        if let Modal::Send(p) = &mut self.modal {
+            p.mark_busy();
+        }
+        if let Some(r) = self.sign_review.as_mut() {
+            r.signing_since = Some(Instant::now());
+            r.error = None;
+        }
+        info!(
+            chain_id = plan.chain.chain_id(),
+            from = %plan.from,
+            recipient = %plan.recipient,
+            "send: dispatching broadcast via sign_review overlay",
+        );
+        let desc = self.active_signer_descriptor();
+        let signer = mem::replace(&mut self.signer, KaoSigner::ViewOnly(self.address));
+        let handoff = handoff_with(signer);
+        spawn_broadcast_task(self.network.clone(), handoff, desc, plan, quote)
+    }
+
     /// Prove + submit a withdrawal through the relayer: it POSTs the proof, the
     /// relayer submits on-chain and pays the gas — the user signs nothing.
     fn pool_submit(
@@ -2063,6 +2195,15 @@ impl WalletScreen {
             let sign = sign.clone();
             return self.dispatch_pool_sign(sign);
         }
+        // The EOA send does too — the review stays up in its waiting phase and is
+        // resolved by `SendBroadcastReturn`, so don't take() it here.
+        if self
+            .sign_review
+            .as_ref()
+            .is_some_and(|r| matches!(r.action, sign_review::SignAction::Send { .. }))
+        {
+            return self.dispatch_send_sign();
+        }
         let Some(review) = self.sign_review.take() else {
             return Task::none();
         };
@@ -2088,6 +2229,9 @@ impl WalletScreen {
             // Normally handled above (overlay kept open); the take() fallback here
             // keeps the match exhaustive and still signs if the guard ever moves.
             sign_review::SignAction::PrivacyPool { sign } => self.dispatch_pool_sign(sign),
+            // Handled by the keep-open early return above; this take-path is
+            // unreachable but keeps the match exhaustive.
+            sign_review::SignAction::Send { .. } => Task::none(),
         }
     }
 
@@ -2130,6 +2274,12 @@ impl WalletScreen {
             sign_review::SignAction::PrivacyPool { .. } => {
                 error!(error = %e, "privacy pools: clear-sign review failed");
                 self.apps.pool_pane().set_error(Some(e));
+            }
+            // Send prepare failures keep the overlay up showing the error (handled
+            // inline in the `SignReviewPrepared` handler), so this is unreachable;
+            // the already-taken review is dropped as a safe fallback.
+            sign_review::SignAction::Send { .. } => {
+                error!(error = %e, "send: clear-sign review prepare failed");
             }
         }
     }
@@ -3080,91 +3230,40 @@ impl WalletScreen {
                     return (Task::none(), None);
                 }
 
-                // Step(2): user clicked "Review →". EOA spawns a quote
-                // task (gas + 1559 fees + nonce) AND a clear-signing
-                // decode task. Safe is a no-op here — the prepare and
-                // sim tasks fire via take_pending_prepare after the
-                // pane's update.
+                // Step(2): user clicked "Review →".
+                // EOA: the review + confirm + sign now live in the unified
+                // `sign_review` overlay, which stacks over this pane — open it
+                // (it spawns the quote + decode prepare) instead of advancing the
+                // pane to its own (removed) inline review step.
+                // Safe: unchanged — advance the pane to its review step; the
+                // prepare + sim tasks fire via take_pending_prepare.
                 if let send::Message::Step(2) = &child_msg {
-                    let pre_task = if p.is_eoa() {
+                    if p.is_eoa() {
                         let plan = p.build_plan(&self.portfolio);
-                        match plan {
-                            Some(pl) => {
-                                let quote_seq = p.quote_started();
-                                let decode_seq = p.decode_started();
-                                let quote_task =
-                                    spawn_quote_task(self.network.clone(), quote_seq, pl.clone());
-                                let local_names =
-                                    build_local_names(&self.accounts, &self.safes, &self.contacts);
-                                let decode_task = spawn_decode_task(
-                                    self.network.clone(),
-                                    decode_seq,
-                                    pl,
-                                    local_names,
-                                );
-                                Task::batch([quote_task, decode_task])
-                            }
-                            None => Task::none(),
-                        }
-                    } else {
-                        Task::none()
-                    };
+                        let amount = p.amount_str().to_string();
+                        let token_idx = p.token_idx();
+                        let resolved_name = p.recipient_display_name();
+                        return match plan {
+                            Some(pl) => (
+                                self.open_send_review(pl, amount, token_idx, resolved_name),
+                                None,
+                            ),
+                            None => (Task::none(), None),
+                        };
+                    }
                     let (task, _outcome) = p.update(child_msg);
                     let task = task.map(Message::Send);
-                    return (Task::batch([pre_task, task]), None);
+                    return (task, None);
                 }
 
                 // Confirm: mode-aware.
-                // EOA: move the signer out of the dashboard, run
-                // sign+broadcast in a task, route the signer back via
-                // `SignerHandoff`.
+                // EOA: handled by the sign-review overlay
+                // (`confirm_sign_review` → `dispatch_send_sign`), not the pane —
+                // a stray pane-level EOA Confirm is a no-op here.
                 // Safe: collect linked owner keys, spawn the Safe
                 // sign+broadcast task (executor derived inside).
                 if let send::Message::Confirm = &child_msg {
                     if p.is_eoa() {
-                        let plan = p.build_plan(&self.portfolio);
-                        let quote = plan.as_ref().and_then(|pl| p.quote_for_plan(pl)).cloned();
-                        info!(
-                            has_plan = plan.is_some(),
-                            has_quote = quote.is_some(),
-                            "send: confirm clicked",
-                        );
-                        if let (Some(plan), Some(quote)) = (plan, quote) {
-                            info!(
-                                chain_id = plan.chain.chain_id(),
-                                custom = plan.chain.is_custom(),
-                                from = %plan.from,
-                                recipient = %plan.recipient,
-                                amount_units = %plan.amount_units,
-                                erc20 = matches!(plan.token, crate::wallet::tx::SendToken::Erc20 { .. }),
-                                gas_limit = quote.gas_limit,
-                                nonce = quote.nonce,
-                                "send: spawning broadcast task",
-                            );
-                            // Disjoint-field access (not `active_signer_descriptor`,
-                            // which borrows all of `self`) because the Send pane
-                            // `p` still holds `&mut self.modal` here.
-                            let desc = self.accounts.get(self.active_index).cloned().unwrap_or(
-                                AccountDescriptor::ViewOnly {
-                                    name: None,
-                                    address: self.address.into_array(),
-                                },
-                            );
-                            let signer =
-                                mem::replace(&mut self.signer, KaoSigner::ViewOnly(self.address));
-                            let handoff = handoff_with(signer);
-                            let pre_task = spawn_broadcast_task(
-                                self.network.clone(),
-                                handoff,
-                                desc,
-                                plan,
-                                quote,
-                            );
-                            let (task, _outcome) = p.update(child_msg);
-                            let task = task.map(Message::Send);
-                            return (Task::batch([pre_task, task]), None);
-                        }
-                        warn!("send: confirm dropped — no current plan/quote pair");
                         return (Task::none(), None);
                     }
                     // Safe mode: solo sign-and-execute. Collect the first
@@ -3304,46 +3403,69 @@ impl WalletScreen {
                 }
             }
             Message::SendBroadcastReturn { result, signer } => {
-                // Reclaim the signer regardless of pane state — the dashboard
-                // must end up holding it again (and only if it's the real signer
-                // for the current account; see `install_reclaimed_signer`).
+                // Reclaim the signer regardless of pane/overlay state — the
+                // dashboard must end up holding it again (and only if it's the
+                // real signer for the current account; see
+                // `install_reclaimed_signer`).
                 self.install_reclaimed_signer(&signer);
-                // Pump the result into the pane if it's still open. If
-                // the user closed the modal mid-broadcast we silently
-                // drop the result — the tx was still sent and a future
-                // balance refresh will surface it.
+                match &result {
+                    Ok(hash) => info!(hash = %format!("{hash:#x}"), "broadcast ok"),
+                    Err(e) => warn!(error = %e, "broadcast failed"),
+                }
+                // Refresh balance + portfolio + history after a successful send so
+                // the dashboard reflects the new state. History is gated on
+                // `history_loaded` — no point fetching a tab the user never opened.
+                let refresh_on_success = |s: &mut Self| -> Task<Message> {
+                    let mut tasks = vec![s.refresh_verification_task(), s.fetch_portfolio_task()];
+                    if s.history_loaded {
+                        s.history_loading = true;
+                        s.reset_history_pending();
+                        tasks.push(s.fetch_history_task());
+                    }
+                    Task::batch(tasks)
+                };
+
+                // Overlay-driven EOA send: the review was kept open in its waiting
+                // phase across the sign + broadcast.
+                let overlay_send = self
+                    .sign_review
+                    .as_ref()
+                    .is_some_and(|r| matches!(r.action, sign_review::SignAction::Send { .. }));
+                if overlay_send {
+                    match result {
+                        Err(e) => {
+                            // Keep the review up so the user can read the failure
+                            // and retry Confirm; clear the pane's busy flag so the
+                            // retry can dispatch.
+                            if let Some(r) = self.sign_review.as_mut() {
+                                r.signing_since = None;
+                                r.error = Some(e.clone());
+                            }
+                            if let Modal::Send(p) = &mut self.modal {
+                                let _ = p.update(send::Message::BroadcastDone(Err(e)));
+                            }
+                            return (Task::none(), None);
+                        }
+                        Ok(hash) => {
+                            // Close the overlay and drive the host pane straight to
+                            // its success screen — the overlay already provided the
+                            // waiting feedback, so no separate "broadcasting" beat.
+                            self.sign_review = None;
+                            if let Modal::Send(p) = &mut self.modal {
+                                let _ = p.update(send::Message::BroadcastDone(Ok(hash)));
+                                let _ = p.update(send::Message::AdvanceToDone);
+                            }
+                            return (refresh_on_success(self), None);
+                        }
+                    }
+                }
+
+                // No overlay (modal closed mid-broadcast, or a legacy path): pump
+                // the pane if it's still open, else drop the result — the tx was
+                // still sent and a future balance refresh will surface it.
                 if let Modal::Send(p) = &mut self.modal {
                     let success = result.is_ok();
-                    match &result {
-                        Ok(hash) => info!(hash = %format!("{hash:#x}"), "broadcast ok"),
-                        Err(e) => warn!(error = %e, "broadcast failed"),
-                    }
                     let (task, _outcome) = p.update(send::Message::BroadcastDone(result));
-                    // Refresh balance + portfolio + history on success so
-                    // the dashboard reflects the new state (the hero
-                    // balance, held-token list, and activity feed all
-                    // shift). History is gated on `history_loaded`: if
-                    // the user never opened the Activity tab there's no
-                    // point paying for a fetch they won't see.
-                    let refresh = if success {
-                        let mut tasks = vec![
-                            self.refresh_verification_task(),
-                            self.fetch_portfolio_task(),
-                        ];
-                        if self.history_loaded {
-                            self.history_loading = true;
-                            self.reset_history_pending();
-                            tasks.push(self.fetch_history_task());
-                        }
-                        Task::batch(tasks)
-                    } else {
-                        Task::none()
-                    };
-                    // Delayed step 3 → 4 transition: after broadcast
-                    // succeeds, wait a beat then advance to the success
-                    // screen. The pane's `AdvanceToDone` handler guards on
-                    // `broadcast_done`, so a stale timer (user closed the
-                    // modal) is a safe no-op.
                     let advance_task = if success {
                         Task::perform(
                             async {
@@ -3351,6 +3473,11 @@ impl WalletScreen {
                             },
                             |_| Message::Send(send::Message::AdvanceToDone),
                         )
+                    } else {
+                        Task::none()
+                    };
+                    let refresh = if success {
+                        refresh_on_success(self)
                     } else {
                         Task::none()
                     };
@@ -3548,6 +3675,12 @@ impl WalletScreen {
                 // Copy-toast kick — the widget already copied + marked the toast;
                 // processing this message is enough to start its animation tick.
                 sign_review::Message::AddressCopied => {}
+                // Expand/collapse the Send step's decoded-calldata block.
+                sign_review::Message::ToggleCalldata => {
+                    if let Some(r) = self.sign_review.as_mut() {
+                        r.show_calldata = !r.show_calldata;
+                    }
+                }
             },
             Message::SignReviewPrepared { seq, steps } => {
                 // Drop a decode result for a review the user has since cancelled
@@ -3569,12 +3702,41 @@ impl WalletScreen {
                         if let sign_review::SignAction::Cow { prepared, .. } = &mut review.action {
                             *prepared = cow_pin_from_steps(&review.steps);
                         }
+                        // Send: pin the quote that drives the broadcast (reviewed ==
+                        // signed) and derive the button label / disabled state from
+                        // the reviewed figures (insufficient-ETH / unverified reads).
+                        if let Some((label, disabled, quote)) =
+                            review.steps.iter().find_map(|s| match s {
+                                sign_review::SignStep::Send(sr) => Some((
+                                    sr.confirm_label(),
+                                    sr.confirm_disabled(),
+                                    sr.quote.clone(),
+                                )),
+                                _ => None,
+                            })
+                        {
+                            review.confirm_label = Some(label);
+                            review.confirm_disabled = disabled;
+                            if let sign_review::SignAction::Send { quote: aq, .. } =
+                                &mut review.action
+                            {
+                                *aq = Some(quote);
+                            }
+                        }
                     }
                     Err(e) => {
-                        // Couldn't build/decode the transaction — abandon the
-                        // review and surface the error on the originating pane
-                        // rather than letting the user confirm a blank gate.
-                        self.fail_sign_review(e);
+                        // A Send keeps its overlay up showing the failure (there's
+                        // no inline review to fall back to) so the user can cancel
+                        // back to the amount step; other flows drive the error onto
+                        // their originating pane and drop the review.
+                        let is_send = matches!(review.action, sign_review::SignAction::Send { .. });
+                        if is_send {
+                            review.error = Some(e);
+                            review.legs_loading = false;
+                            review.confirm_disabled = true;
+                        } else {
+                            self.fail_sign_review(e);
+                        }
                     }
                 }
             }
@@ -5227,21 +5389,14 @@ fn clipboard_clear_chip<'a>(t: KaoTheme, state: &'a ClipboardClearState) -> Elem
 
 // ── Send-flow helpers ──────────────────────────────────────────────────────
 
-/// Format the largest amount the user can send for `tk`. For native ETH, if
-/// the pane already has a quote loaded we subtract the gas cost so the
-/// transaction won't bounce on insufficient-funds at broadcast time.
-fn compute_max_amount(tk: &LiveToken, p: &SendPane) -> String {
+/// Format the largest amount the user can send for `tk` — the full held
+/// balance. Native-ETH gas headroom isn't reserved here: the send review's
+/// insufficient-ETH guard (which sees the actual quote) blocks a Max-everything
+/// native send that can't cover gas, so Max can safely offer the whole balance.
+fn compute_max_amount(tk: &LiveToken, _p: &SendPane) -> String {
     use alloy::primitives::utils::format_units;
     let raw = tk.balance_raw;
-    let max_raw = if tk.contract.is_none() {
-        // Native ETH: leave room for gas if we already have a quote.
-        match p.quote() {
-            Some(q) if raw > q.eth_cost_wei => raw - q.eth_cost_wei,
-            _ => raw,
-        }
-    } else {
-        raw
-    };
+    let max_raw = raw;
     let raw_str =
         format_units(max_raw, tk.decimals).unwrap_or_else(|_| tk.balance.replace(',', ""));
     trim_trailing_decimal_zeros(&raw_str)
@@ -5384,32 +5539,70 @@ fn build_local_names(
     map
 }
 
-/// Spawn a clear-signing decode task. Tries ERC-7730 descriptor-based
-/// formatting first; falls back to the heuristic pipeline (evmole +
-/// 4byte + matcher) when no descriptor matches. Result message carries
-/// `seq` so the SendPane can drop stale completions if the user backed
-/// out of review and built a different plan.
-fn spawn_decode_task(
+// ── Sign-review prepare helpers ───────────────────────────────────────────────
+
+/// Everything the coordinator knows at review-open time for an EOA send —
+/// recipient display metadata, token figures, and the plan. The async prepare
+/// fills the quote (gas / fees / nonce / sim), the decoded call, and the
+/// insufficient-ETH flag to produce the final [`send::SendReview`].
+struct SendReviewSeed {
+    recipient: Address,
+    recipient_name: Option<String>,
+    recipient_in_book: bool,
+    recipient_kao: String,
+    recipient_chip: Option<&'static str>,
+    amount: String,
+    token_symbol: String,
+    token_contract: Option<Address>,
+    token_decimals: u8,
+    token_balance_before: f64,
+    usd_price: f64,
+    eth_usd_price: f64,
+    eth_balance_wei: Option<alloy::primitives::U256>,
+    plan: SendPlan,
+}
+
+/// Prepare an EOA send review off-thread: quote (gas / 1559 fees / nonce / revm
+/// sim) + clear-signing decode, then assemble the reviewable [`send::SendReview`]
+/// — the quote inside drives the broadcast, so reviewed == signed. Lands via
+/// `SignReviewPrepared`, exactly like the CoW / Names / Pool prepares.
+fn spawn_send_prepare(
     network: Arc<dyn BalanceFetcher>,
     seq: u64,
-    plan: SendPlan,
+    seed: SendReviewSeed,
     local_names: std::collections::HashMap<Address, String>,
 ) -> Task<Message> {
-    let (to, value, calldata) = plan.tx_target();
-    let network_id = plan.chain;
-    let from = plan.from;
     Task::perform(
         async move {
-            // Custom networks have no clear-signing (ERC-7730) registry and
-            // only ever carry native, empty-calldata sends — nothing to
-            // decode, so short-circuit to the native-transfer result rather
-            // than routing an unverified chain through the decode pipeline.
-            let decoded = match network_id.builtin() {
-                Some(chain) => {
+            let chain = seed.plan.chain;
+            let provider = match provider_for(&network, chain).await {
+                Some(p) => p,
+                None => {
+                    warn!(
+                        chain_id = chain.chain_id(),
+                        "send prepare: no execution RPC configured"
+                    );
+                    return (
+                        seq,
+                        Err::<Vec<sign_review::SignStep>, String>(
+                            "no execution RPCs configured".to_string(),
+                        ),
+                    );
+                }
+            };
+            let quote = match crate::wallet::tx::build_quote(&provider, network.clone(), &seed.plan)
+                .await
+            {
+                Ok(q) => q,
+                Err(e) => return (seq, Err(e)),
+            };
+            let (to, value, calldata) = seed.plan.tx_target();
+            let decoded = match chain.builtin() {
+                Some(c) => {
                     crate::decode::clear_sign::decode_transaction(
                         network.as_ref(),
-                        chain,
-                        from,
+                        c,
+                        seed.plan.from,
                         to,
                         calldata,
                         value,
@@ -5419,18 +5612,41 @@ fn spawn_decode_task(
                 }
                 None => crate::decode::clear_sign::DecodeResult::Empty,
             };
-            (seq, decoded)
-        },
-        |(seq, decoded)| {
-            Message::Send(send::Message::DecodedReady {
-                seq,
+            // Insufficient-ETH: a native send needs amount + gas; an ERC-20 send
+            // just the gas. Mirrors the old inline review's guard.
+            let needed = if seed.token_contract.is_none() {
+                crate::wallet::tx::parse_amount_units(&seed.amount, seed.token_decimals)
+                    .ok()
+                    .map(|amt| amt.saturating_add(quote.eth_cost_wei))
+            } else {
+                Some(quote.eth_cost_wei)
+            };
+            let has_insufficient_eth = matches!(
+                (seed.eth_balance_wei, needed),
+                (Some(bal), Some(need)) if need > bal
+            );
+            let review = send::SendReview {
+                chain,
+                recipient: seed.recipient,
+                recipient_name: seed.recipient_name,
+                recipient_in_book: seed.recipient_in_book,
+                recipient_kao: seed.recipient_kao,
+                recipient_chip: seed.recipient_chip,
+                amount: seed.amount,
+                token_symbol: seed.token_symbol,
+                token_contract: seed.token_contract,
+                token_balance_before: seed.token_balance_before,
+                usd_price: seed.usd_price,
+                eth_usd_price: seed.eth_usd_price,
+                has_insufficient_eth,
+                quote,
                 decoded: Box::new(decoded),
-            })
+            };
+            (seq, Ok(vec![sign_review::SignStep::Send(review)]))
         },
+        |(seq, steps)| Message::SignReviewPrepared { seq, steps },
     )
 }
-
-// ── Sign-review prepare helpers ───────────────────────────────────────────────
 
 /// Title / subtitle / trailing-note for a name-write review card.
 fn name_review_labels(sign: &sign_review::NameSign) -> (String, Option<String>, Option<String>) {
@@ -5703,10 +5919,7 @@ fn spawn_cow_prepare(
                         )
                         .await;
                         steps.push(sign_review::SignStep::RawTx(sign_review::ReviewLeg {
-                            title: format!(
-                                "Approve {} for CoW (vault relayer)",
-                                draft.sell_symbol
-                            ),
+                            title: format!("Approve {} for CoW (vault relayer)", draft.sell_symbol),
                             to: draft.sell_token,
                             value: U256::ZERO,
                             chain,
@@ -5757,20 +5970,22 @@ fn spawn_cow_prepare(
                     local_names,
                 )
                 .await;
-                steps.push(sign_review::SignStep::SafeExec(sign_review::SafeExecReview {
-                    safe,
-                    nonce,
-                    threshold: ctx.threshold,
-                    owner_count: ctx.owner_count,
-                    safe_tx_hash: hash,
-                    inner: Box::new(sign_review::ReviewLeg {
-                        title: "Place on-chain order — EthFlow createOrder".to_string(),
-                        to: cow::ETHFLOW,
-                        value,
-                        chain,
-                        decoded: Box::new(decoded),
-                    }),
-                }));
+                steps.push(sign_review::SignStep::SafeExec(
+                    sign_review::SafeExecReview {
+                        safe,
+                        nonce,
+                        threshold: ctx.threshold,
+                        owner_count: ctx.owner_count,
+                        safe_tx_hash: hash,
+                        inner: Box::new(sign_review::ReviewLeg {
+                            title: "Place on-chain order — EthFlow createOrder".to_string(),
+                            to: cow::ETHFLOW,
+                            value,
+                            chain,
+                            decoded: Box::new(decoded),
+                        }),
+                    },
+                ));
             } else {
                 let provider =
                     match provider_for(&network, crate::chain::NetworkId::Builtin(chain)).await {
@@ -5804,20 +6019,25 @@ fn spawn_cow_prepare(
                         local_names,
                     )
                     .await;
-                    steps.push(sign_review::SignStep::SafeExec(sign_review::SafeExecReview {
-                        safe,
-                        nonce,
-                        threshold: ctx.threshold,
-                        owner_count: ctx.owner_count,
-                        safe_tx_hash: hash,
-                        inner: Box::new(sign_review::ReviewLeg {
-                            title: format!("Approve {} for CoW (vault relayer)", draft.sell_symbol),
-                            to: draft.sell_token,
-                            value: U256::ZERO,
-                            chain,
-                            decoded: Box::new(decoded),
-                        }),
-                    }));
+                    steps.push(sign_review::SignStep::SafeExec(
+                        sign_review::SafeExecReview {
+                            safe,
+                            nonce,
+                            threshold: ctx.threshold,
+                            owner_count: ctx.owner_count,
+                            safe_tx_hash: hash,
+                            inner: Box::new(sign_review::ReviewLeg {
+                                title: format!(
+                                    "Approve {} for CoW (vault relayer)",
+                                    draft.sell_symbol
+                                ),
+                                to: draft.sell_token,
+                                value: U256::ZERO,
+                                chain,
+                                decoded: Box::new(decoded),
+                            }),
+                        },
+                    ));
                 }
                 // The order itself is authorized via EIP-1271 (nonce-free, pure).
                 let order = cow::order::build_sell_order(
@@ -5832,14 +6052,16 @@ fn spawn_cow_prepare(
                 );
                 let order_digest = cow::order::order_digest(&order, &cow::order::cow_domain(chain));
                 let message_hash = cow::safe_sig::safe_message_hash(order_digest, safe, chain);
-                steps.push(sign_review::SignStep::SafeMessage(sign_review::SafeMessageReview {
-                    order: build_order_review(&draft, &quote, safe),
-                    safe,
-                    threshold: ctx.threshold,
-                    owner_count: ctx.owner_count,
-                    order_digest,
-                    message_hash,
-                }));
+                steps.push(sign_review::SignStep::SafeMessage(
+                    sign_review::SafeMessageReview {
+                        order: build_order_review(&draft, &quote, safe),
+                        safe,
+                        threshold: ctx.threshold,
+                        owner_count: ctx.owner_count,
+                        order_digest,
+                        message_hash,
+                    },
+                ));
             }
             Ok(steps)
         },
@@ -5864,30 +6086,6 @@ async fn provider_for(
             network.custom_provider(chain_id, &cfg.rpc_url).await
         }
     }
-}
-
-/// Spawn a quote task using a provider resolved from `plan.chain` — the L2 RPC
-/// for an L2 send, the user's raw RPC for a custom network. The same provider
-/// later serves the broadcast.
-fn spawn_quote_task(network: Arc<dyn BalanceFetcher>, seq: u64, plan: SendPlan) -> Task<Message> {
-    let chain = plan.chain;
-    Task::perform(
-        async move {
-            match provider_for(&network, chain).await {
-                Some(provider) => {
-                    crate::wallet::tx::build_quote(&provider, network.clone(), &plan).await
-                }
-                None => {
-                    warn!(
-                        chain_id = chain.chain_id(),
-                        "quote: no execution RPC configured"
-                    );
-                    Err("no execution RPCs configured".into())
-                }
-            }
-        },
-        move |result| Message::Send(send::Message::QuoteFetched { seq, result }),
-    )
 }
 
 /// `(address, descriptor)` for every linked owner that can sign — Local
@@ -7854,7 +8052,9 @@ fn cow_pin_from_steps(steps: &[sign_review::SignStep]) -> Option<sign_review::Co
                 pin.msg_hash = Some(m.message_hash);
                 saw_safe = true;
             }
-            sign_review::SignStep::RawTx(_) | sign_review::SignStep::Typed(_) => {}
+            sign_review::SignStep::RawTx(_)
+            | sign_review::SignStep::Typed(_)
+            | sign_review::SignStep::Send(_) => {}
         }
     }
     saw_safe.then_some(pin)
@@ -9653,7 +9853,8 @@ mod tests {
                 sign_review::SignStep::Typed(o) => Some(o),
                 sign_review::SignStep::RawTx(_)
                 | sign_review::SignStep::SafeExec(_)
-                | sign_review::SignStep::SafeMessage(_) => None,
+                | sign_review::SignStep::SafeMessage(_)
+                | sign_review::SignStep::Send(_) => None,
             })
             .expect("swap review shows the order panel");
         assert_eq!(order.receiver, me, "receiver is the active account");
@@ -9703,7 +9904,10 @@ mod tests {
         assert_eq!(ctx.display_from(), me, "from == the active EOA");
         // Outside Safe mode both flows resolve to the same EOA context.
         for need in [SafeNeed::Swap, SafeNeed::Name] {
-            assert_eq!(screen.build_signer_context(need).unwrap().display_from(), me);
+            assert_eq!(
+                screen.build_signer_context(need).unwrap().display_from(),
+                me
+            );
         }
     }
 

@@ -1330,6 +1330,7 @@ impl WalletScreen {
         host: CowHost,
         draft: SwapDraft,
         quote: crate::cow::api::QuoteResponse,
+        pin: Option<sign_review::CowSafePin>,
     ) -> Task<Message> {
         if self.active_safe.is_some() {
             let Some(ctx) = self.build_safe_swap_ctx() else {
@@ -1347,7 +1348,7 @@ impl WalletScreen {
                 return Task::none();
             };
             let handoff = self.park_signer_for_order();
-            spawn_cow_place_safe(self.network.clone(), host, handoff, draft, quote, ctx)
+            spawn_cow_place_safe(self.network.clone(), host, handoff, draft, quote, ctx, pin)
         } else {
             let desc = self.active_signer_descriptor();
             let handoff = self.park_signer_for_order();
@@ -1988,6 +1989,7 @@ impl WalletScreen {
             host,
             draft: draft.clone(),
             quote: quote.clone(),
+            prepared: None,
         };
         self.sign_review = Some(sign_review::SignReview::pending(
             title,
@@ -2065,7 +2067,12 @@ impl WalletScreen {
             return Task::none();
         };
         match review.action {
-            sign_review::SignAction::Cow { host, draft, quote } => {
+            sign_review::SignAction::Cow {
+                host,
+                draft,
+                quote,
+                prepared,
+            } => {
                 // Drive the blocking Swap modal into its "placing" phase now that
                 // signing actually starts; the Apps composer stays put and resets
                 // itself when placement completes.
@@ -2074,7 +2081,7 @@ impl WalletScreen {
                 {
                     p.begin_placing();
                 }
-                self.place_order_task(host, draft, quote)
+                self.place_order_task(host, draft, quote, prepared)
             }
             sign_review::SignAction::CowCancel { host, uid } => self.cancel_order_task(host, uid),
             sign_review::SignAction::Name { sign } => self.dispatch_name_sign(sign),
@@ -3557,6 +3564,11 @@ impl WalletScreen {
                         // (an EOA swap's order); the reviewed set == the signed set.
                         review.steps.extend(new_steps);
                         review.legs_loading = false;
+                        // Pin the reviewed Safe artifacts so the sign path signs
+                        // exactly what was shown (see `cow_place_order_safe`).
+                        if let sign_review::SignAction::Cow { prepared, .. } = &mut review.action {
+                            *prepared = cow_pin_from_steps(&review.steps);
+                        }
                     }
                     Err(e) => {
                         // Couldn't build/decode the transaction — abandon the
@@ -7740,6 +7752,7 @@ fn spawn_name_set_recipient_safe(
 /// Reuses the `CowPlaced` result message — the `handoff` carries the parked
 /// active signer straight back through untouched (the Safe path signs with
 /// freshly-built owner signers, not the active one).
+#[allow(clippy::too_many_arguments)]
 fn spawn_cow_place_safe(
     network: Arc<dyn BalanceFetcher>,
     host: CowHost,
@@ -7747,6 +7760,7 @@ fn spawn_cow_place_safe(
     draft: SwapDraft,
     quote: crate::cow::api::QuoteResponse,
     ctx: SafeSwapCtx,
+    pin: Option<sign_review::CowSafePin>,
 ) -> Task<Message> {
     Task::perform(
         async move {
@@ -7779,7 +7793,10 @@ fn spawn_cow_place_safe(
                 }
                 None => &owners[0],
             };
-            cow_place_order_safe(&network, &provider, &owners, executor, &draft, &quote, &ctx).await
+            cow_place_order_safe(
+                &network, &provider, &owners, executor, &draft, &quote, &ctx, pin,
+            )
+            .await
         },
         move |result| Message::CowPlaced {
             host,
@@ -7815,6 +7832,67 @@ fn ethflow_safe_tx(data: &cow::ethflow::EthFlowData, nonce: u64) -> crate::safe:
     )
 }
 
+/// Scan the prepared review steps for the Safe artifacts to pin — the
+/// `execTransaction` nonce + hash and the EIP-1271 message hash — so the sign
+/// path can refuse to sign anything the review didn't show. `None` for an EOA
+/// swap (no Safe steps).
+fn cow_pin_from_steps(steps: &[sign_review::SignStep]) -> Option<sign_review::CowSafePin> {
+    let mut pin = sign_review::CowSafePin {
+        exec_nonce: 0,
+        exec_hash: None,
+        msg_hash: None,
+    };
+    let mut saw_safe = false;
+    for s in steps {
+        match s {
+            sign_review::SignStep::SafeExec(x) => {
+                pin.exec_nonce = x.nonce;
+                pin.exec_hash = Some(x.safe_tx_hash);
+                saw_safe = true;
+            }
+            sign_review::SignStep::SafeMessage(m) => {
+                pin.msg_hash = Some(m.message_hash);
+                saw_safe = true;
+            }
+            sign_review::SignStep::RawTx(_) | sign_review::SignStep::Typed(_) => {}
+        }
+    }
+    saw_safe.then_some(pin)
+}
+
+/// Refuse if the Safe's live nonce moved past the one the review pinned — so we
+/// never sign a `SafeTx` at a nonce that would revert on execution (or, worse,
+/// sign a hash the user never saw).
+fn check_pinned_nonce(live: u64, pinned: u64) -> Result<(), String> {
+    if live != pinned {
+        return Err(format!(
+            "Safe nonce advanced since review ({pinned} → {live}) — go back and review again"
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse unless the rebuilt Safe-tx hash equals the one shown at review.
+fn check_pinned_exec_hash(rebuilt: B256, pinned: Option<B256>) -> Result<(), String> {
+    match pinned {
+        Some(p) if p == rebuilt => Ok(()),
+        Some(_) => Err("safe-tx differs from the reviewed hash — refusing to sign".to_string()),
+        None => Err("internal: Safe swap missing its reviewed hash".to_string()),
+    }
+}
+
+/// Refuse unless the rebuilt EIP-1271 message hash equals the reviewed one.
+fn check_pinned_msg_hash(rebuilt: B256, pinned: Option<B256>) -> Result<(), String> {
+    match pinned {
+        Some(p) if p == rebuilt => Ok(()),
+        Some(_) => {
+            Err("order differs from the reviewed EIP-1271 hash — refusing to sign".to_string())
+        }
+        None => Err("internal: Safe order missing its reviewed message hash".to_string()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn cow_place_order_safe(
     network: &Arc<dyn BalanceFetcher>,
     provider: &alloy::providers::RootProvider<alloy::network::Ethereum>,
@@ -7823,6 +7901,7 @@ async fn cow_place_order_safe(
     draft: &SwapDraft,
     quote: &crate::cow::api::QuoteResponse,
     ctx: &SafeSwapCtx,
+    pin: Option<sign_review::CowSafePin>,
 ) -> Result<TrackedOrder, String> {
     use crate::safe::tx::{
         Operation, SafeTxInput, assemble_signatures, build_safe_tx_with_nonce, current_safe_nonce,
@@ -7833,6 +7912,8 @@ async fn cow_place_order_safe(
         return Err(reason.to_string());
     }
     ensure_signable_version(&ctx.version)?;
+    // Every Safe swap is reviewed before it's signed, so the pin must be present.
+    let pin = pin.ok_or("internal: Safe swap confirmed before its review pin was ready")?;
 
     let chain = ctx.chain;
     let safe = ctx.safe;
@@ -7864,14 +7945,18 @@ async fn cow_place_order_safe(
         if let Err(e) = cow::api::upload_app_data(chain, &app_data_hex, &full_app_data).await {
             warn!(error = %e, "cow(safe): appData upload failed (native order may book as limit)");
         }
-        let nonce = current_safe_nonce(network.as_ref(), safe, chain).await?;
-        let tx = ethflow_safe_tx(&data, nonce);
+        // Sign at the reviewed nonce (refuse if it moved) and assert the hash
+        // equals what the review displayed — sign exactly what was shown.
+        let live_nonce = current_safe_nonce(network.as_ref(), safe, chain).await?;
+        check_pinned_nonce(live_nonce, pin.exec_nonce)?;
+        let tx = ethflow_safe_tx(&data, pin.exec_nonce);
         // revm-preflight the inner `createOrder` the Safe will make — native gas
         // is real ETH, so catch a revert (wrong params, underfunded) before
         // spending it. Advisory: an unrunnable sim doesn't block.
         cow_preflight_sim(network, chain, safe, tx.to, tx.value, tx.data.clone()).await?;
         let domain = safe_tx_domain(safe, chain);
         let local_hash = safe_tx_hash(&tx, &domain);
+        check_pinned_exec_hash(local_hash, pin.exec_hash)?;
         verify_safe_tx_before_signing(network.as_ref(), &tx, safe, chain, local_hash).await?;
         let mut sigs = Vec::with_capacity(owners.len());
         for owner in owners {
@@ -7916,8 +8001,13 @@ async fn cow_place_order_safe(
         needs_approve,
         "cow(safe): erc20 allowance check",
     );
+    // The reviewed set must still match: an approve was shown iff one is needed now.
+    if needs_approve != pin.exec_hash.is_some() {
+        return Err("token allowance changed since review — go back and review again".to_string());
+    }
     if needs_approve {
-        let nonce = current_safe_nonce(network.as_ref(), safe, chain).await?;
+        let live_nonce = current_safe_nonce(network.as_ref(), safe, chain).await?;
+        check_pinned_nonce(live_nonce, pin.exec_nonce)?;
         let approve_tx = build_safe_tx_with_nonce(
             SafeTxInput {
                 to: draft.sell_token,
@@ -7925,10 +8015,11 @@ async fn cow_place_order_safe(
                 data: cow::onchain::approve_calldata(U256::MAX),
                 operation: Operation::Call,
             },
-            nonce,
+            pin.exec_nonce,
         );
         let domain = safe_tx_domain(safe, chain);
         let local_hash = safe_tx_hash(&approve_tx, &domain);
+        check_pinned_exec_hash(local_hash, pin.exec_hash)?;
         verify_safe_tx_before_signing(network.as_ref(), &approve_tx, safe, chain, local_hash)
             .await?;
         let mut sigs = Vec::with_capacity(owners.len());
@@ -7954,6 +8045,11 @@ async fn cow_place_order_safe(
     );
     let order_domain = cow::order::cow_domain(chain);
     let order_digest = cow::order::order_digest(&order, &order_domain);
+    // Assert the EIP-1271 message hash matches what was reviewed before signing.
+    check_pinned_msg_hash(
+        cow::safe_sig::safe_message_hash(order_digest, safe, chain),
+        pin.msg_hash,
+    )?;
     let signature = cow::safe_sig::sign_eip1271_digest(owners, order_digest, safe, chain).await?;
     cow::safe_sig::verify_eip1271_on_chain(network.as_ref(), safe, chain, order_digest, &signature)
         .await?;
@@ -9429,6 +9525,100 @@ mod tests {
         );
         // The displayed order's receiver is the Safe (matches the signed order).
         assert_eq!(build_order_review(&draft, &quote, safe).receiver, safe);
+    }
+
+    #[test]
+    fn pinned_nonce_check_refuses_advance() {
+        assert!(check_pinned_nonce(5, 5).is_ok());
+        let e = check_pinned_nonce(6, 5).unwrap_err();
+        assert!(e.contains("nonce advanced"), "{e}");
+    }
+
+    #[test]
+    fn pinned_exec_hash_check_enforces_reviewed_hash() {
+        use alloy::primitives::B256;
+        let h = B256::repeat_byte(0xAB);
+        assert!(check_pinned_exec_hash(h, Some(h)).is_ok());
+        assert!(
+            check_pinned_exec_hash(h, Some(B256::repeat_byte(0xCD)))
+                .unwrap_err()
+                .contains("differs from the reviewed hash")
+        );
+        assert!(
+            check_pinned_exec_hash(h, None)
+                .unwrap_err()
+                .contains("missing its reviewed hash")
+        );
+    }
+
+    #[test]
+    fn pinned_msg_hash_check_enforces_reviewed_hash() {
+        use alloy::primitives::B256;
+        let h = B256::repeat_byte(0x11);
+        assert!(check_pinned_msg_hash(h, Some(h)).is_ok());
+        assert!(
+            check_pinned_msg_hash(h, Some(B256::repeat_byte(0x22)))
+                .unwrap_err()
+                .contains("EIP-1271")
+        );
+        assert!(
+            check_pinned_msg_hash(h, None)
+                .unwrap_err()
+                .contains("missing its reviewed message hash")
+        );
+    }
+
+    #[test]
+    fn cow_pin_from_steps_pins_safe_artifacts() {
+        use alloy::primitives::B256;
+        let leg = || {
+            Box::new(sign_review::ReviewLeg {
+                title: "x".into(),
+                to: addr(2),
+                value: U256::ZERO,
+                chain: Chain::Mainnet,
+                decoded: Box::new(crate::decode::clear_sign::DecodeResult::Empty),
+            })
+        };
+        // EOA-shaped steps → no pin.
+        assert!(cow_pin_from_steps(&[]).is_none());
+        assert!(cow_pin_from_steps(&[sign_review::SignStep::RawTx(*leg())]).is_none());
+
+        // A SafeExec (approve) + SafeMessage (order) → both hashes + nonce pinned.
+        let steps = vec![
+            sign_review::SignStep::SafeExec(sign_review::SafeExecReview {
+                safe: addr(0x5A),
+                nonce: 9,
+                threshold: 2,
+                owner_count: 3,
+                safe_tx_hash: B256::repeat_byte(0xAA),
+                inner: leg(),
+            }),
+            sign_review::SignStep::SafeMessage(sign_review::SafeMessageReview {
+                order: sign_review::OrderReview {
+                    chain: Chain::Mainnet,
+                    sell_amount: "1".into(),
+                    sell_symbol: "A".into(),
+                    buy_amount: "2".into(),
+                    buy_symbol: "B".into(),
+                    min_received: "2".into(),
+                    receiver: addr(0x5A),
+                    valid_to: 1_900_000_000,
+                    slippage_bps: 50,
+                    settlement: addr(3),
+                    native: false,
+                },
+                safe: addr(0x5A),
+                threshold: 2,
+                owner_count: 3,
+                order_digest: B256::repeat_byte(0xBB),
+                message_hash: B256::repeat_byte(0xCC),
+            }),
+        ];
+        let pin = cow_pin_from_steps(&steps).expect("safe steps yield a pin");
+        assert_eq!(pin.exec_nonce, 9);
+        assert_eq!(pin.exec_hash, Some(B256::repeat_byte(0xAA)));
+        assert_eq!(pin.msg_hash, Some(B256::repeat_byte(0xCC)));
     }
 
     #[test]

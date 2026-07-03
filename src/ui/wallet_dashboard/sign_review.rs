@@ -197,6 +197,23 @@ pub enum SignStep {
     SafeMessage(SafeMessageReview),
 }
 
+/// Pins the reviewed Safe artifacts so `cow_place_order_safe` signs exactly what
+/// the review displayed. `SafeTx` isn't `Clone`, so we pin the `nonce` (the tx
+/// rebuild is pure + deterministic) plus the hashes for an equality assert. Copy
+/// — plain scalars/hashes, no key material.
+#[derive(Debug, Clone, Copy)]
+pub struct CowSafePin {
+    /// Nonce the reviewed `execTransaction` was built at (native `createOrder` or
+    /// ERC-20 approve). Unused when `exec_hash` is `None`.
+    pub exec_nonce: u64,
+    /// safeTxHash shown for the `execTransaction`, if the review had one (native,
+    /// or ERC-20 with a short allowance). `None` for an ERC-20 swap needing no
+    /// approval.
+    pub exec_hash: Option<B256>,
+    /// `safe_message_hash` shown for the EIP-1271 order, if any (ERC-20 path).
+    pub msg_hash: Option<B256>,
+}
+
 /// What the coordinator runs when the user confirms. Holds the fully-prepared
 /// action (commit secret already minted, draft+quote captured) so the signed
 /// transaction is exactly what was reviewed.
@@ -207,6 +224,9 @@ pub enum SignAction {
         host: CowHost,
         draft: SwapDraft,
         quote: QuoteResponse,
+        /// Filled once a Safe prepare task lands (scanned from the steps in the
+        /// `SignReviewPrepared` handler). `None` for an EOA swap (nothing to pin).
+        prepared: Option<CowSafePin>,
     },
     CowCancel {
         host: CowHost,

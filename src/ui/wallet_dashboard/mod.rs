@@ -1590,7 +1590,12 @@ impl WalletScreen {
         let (title, subtitle, note) = pool_review_labels(&sign);
         let action = sign_review::SignAction::PrivacyPool { sign: sign.clone() };
         self.sign_review = Some(sign_review::SignReview::pending(
-            title, subtitle, None, note, seq, action,
+            title,
+            subtitle,
+            Vec::new(),
+            note,
+            seq,
+            action,
         ));
         // A pool tx is always signed by the active EOA (`send_contract_call`
         // signs from `signer.address()`), never the Safe — decode from that exact
@@ -1833,7 +1838,12 @@ impl WalletScreen {
         let (title, subtitle, note) = name_review_labels(&sign);
         let action = sign_review::SignAction::Name { sign: sign.clone() };
         self.sign_review = Some(sign_review::SignReview::pending(
-            title, subtitle, None, note, seq, action,
+            title,
+            subtitle,
+            Vec::new(),
+            note,
+            seq,
+            action,
         ));
         let local_names = build_local_names(&self.accounts, &self.safes, &self.contacts);
         spawn_name_prepare(self.network.clone(), seq, from, sign, local_names)
@@ -1896,7 +1906,7 @@ impl WalletScreen {
         self.sign_review = Some(sign_review::SignReview::pending(
             title,
             None,
-            Some(order),
+            vec![sign_review::SignStep::Typed(order)],
             note,
             seq,
             action,
@@ -1928,7 +1938,8 @@ impl WalletScreen {
                 .to_string(),
         );
         let action = sign_review::SignAction::CowCancel { host, uid };
-        let mut review = sign_review::SignReview::pending(title, subtitle, None, note, seq, action);
+        let mut review =
+            sign_review::SignReview::pending(title, subtitle, Vec::new(), note, seq, action);
         // Nothing to prepare/decode — enable Confirm immediately.
         review.legs_loading = false;
         self.sign_review = Some(review);
@@ -3448,7 +3459,11 @@ impl WalletScreen {
                 }
                 match legs {
                     Ok(legs) => {
-                        review.legs = legs;
+                        // Append the decoded raw-tx legs after any leading typed
+                        // step (a swap's order); the reviewed set == the signed set.
+                        review
+                            .steps
+                            .extend(legs.into_iter().map(sign_review::SignStep::RawTx));
                         review.legs_loading = false;
                     }
                     Err(e) => {
@@ -8346,7 +8361,7 @@ mod tests {
         s.sign_review = Some(sign_review::SignReview::pending(
             "Deposit".into(),
             None,
-            None,
+            Vec::new(),
             None,
             1,
             sign_review::SignAction::PrivacyPool { sign },
@@ -9119,8 +9134,12 @@ mod tests {
         let _ = screen.open_cow_review(CowHost::Apps, sample_swap_draft(), sample_quote());
         let review = screen.sign_review.as_ref().expect("place opens a review");
         let order = review
-            .order
-            .as_ref()
+            .steps
+            .iter()
+            .find_map(|s| match s {
+                sign_review::SignStep::Typed(o) => Some(o),
+                sign_review::SignStep::RawTx(_) => None,
+            })
             .expect("swap review shows the order panel");
         assert_eq!(order.receiver, me, "receiver is the active account");
         assert_eq!(order.sell_symbol, "USDC");
@@ -9172,7 +9191,10 @@ mod tests {
         let uid = screen.tracked_orders[0].uid.clone();
         let _ = screen.open_cow_cancel_review(CowHost::Modal, uid);
         let review = screen.sign_review.as_ref().expect("cancel opens a review");
-        assert!(review.order.is_none(), "a cancellation has no order panel");
+        assert!(
+            review.steps.is_empty(),
+            "a cancellation has no order panel and nothing to decode"
+        );
         assert!(
             !review.legs_loading,
             "a cancellation has nothing to decode — Confirm is enabled immediately"

@@ -140,6 +140,20 @@ impl IntoTypedModel for OrderReview {
     }
 }
 
+/// One reviewable step in a signature. A review is an ordered list of these: a
+/// swap is `[Typed(order), RawTx(approve)…]`; a name/pool write is just raw-tx
+/// steps. `RawTx` renders through `function_panel` (like the Send screen), `Typed`
+/// through the generic `typed_panel`.
+#[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
+pub enum SignStep {
+    /// A raw transaction the user signs (approval, EthFlow `createOrder`, a
+    /// registrar call, a pool deposit), decoded for review.
+    RawTx(ReviewLeg),
+    /// EIP-712 typed data the user signs (the CoW GPv2 order).
+    Typed(OrderReview),
+}
+
 /// What the coordinator runs when the user confirms. Holds the fully-prepared
 /// action (commit secret already minted, draft+quote captured) so the signed
 /// transaction is exactly what was reviewed.
@@ -216,12 +230,11 @@ pub enum NameSign {
 pub struct SignReview {
     pub title: String,
     pub subtitle: Option<String>,
-    /// The CoW EIP-712 order panel, when this review covers a swap.
-    pub order: Option<OrderReview>,
-    /// Decoded raw-transaction legs. Empty + `legs_loading` while the coordinator
-    /// is still building/decoding them.
-    pub legs: Vec<ReviewLeg>,
-    /// True until the prepare task lands the decoded legs.
+    /// The reviewed steps, rendered top-to-bottom: an optional leading EIP-712
+    /// typed-data step (a swap's order), then the decoded raw-tx legs. The order
+    /// is known at open; the raw legs are appended when the prepare task lands.
+    pub steps: Vec<SignStep>,
+    /// True until the prepare task lands the decoded raw-tx legs.
     pub legs_loading: bool,
     /// A trailing context note (e.g. "gasless off-chain signature").
     pub note: Option<String>,
@@ -255,7 +268,7 @@ impl SignReview {
     pub fn pending(
         title: String,
         subtitle: Option<String>,
-        order: Option<OrderReview>,
+        steps: Vec<SignStep>,
         note: Option<String>,
         seq: u64,
         action: SignAction,
@@ -263,8 +276,7 @@ impl SignReview {
         let review = Self {
             title,
             subtitle,
-            order,
-            legs: Vec::new(),
+            steps,
             legs_loading: true,
             note,
             seq,
@@ -298,14 +310,27 @@ pub fn view<'a>(t: KaoTheme, review: &'a SignReview, progress: f32) -> Element<'
     }
     body = body.push(Space::new().height(16));
 
-    // ── CoW order panel (EIP-712 typed data) ──────────────────────────────
-    if let Some(order) = &review.order {
-        body = body.push(order_panel(t, order));
-        body = body.push(Space::new().height(12));
+    // ── Reviewed steps: the EIP-712 order (if any) then the decoded raw-tx legs ──
+    // Spacing preserves the original layout: 12px after a typed-data step, 10px
+    // between raw-tx legs.
+    for (i, step) in review.steps.iter().enumerate() {
+        if i > 0 {
+            let gap = if matches!(review.steps[i - 1], SignStep::Typed(_)) {
+                12
+            } else {
+                10
+            };
+            body = body.push(Space::new().height(gap));
+        }
+        body = body.push(step_card(t, step));
     }
 
-    // ── Decoded raw-transaction legs ──────────────────────────────────────
     if review.legs_loading {
+        // A leading typed step (a swap's order) keeps its 12px gap before the
+        // "preparing" card, matching the old order→legs spacing.
+        if matches!(review.steps.last(), Some(SignStep::Typed(_))) {
+            body = body.push(Space::new().height(12));
+        }
         body = body.push(card(
             t,
             column![
@@ -318,13 +343,6 @@ pub fn view<'a>(t: KaoTheme, review: &'a SignReview, progress: f32) -> Element<'
             ]
             .into(),
         ));
-    } else {
-        for (i, leg) in review.legs.iter().enumerate() {
-            if i > 0 {
-                body = body.push(Space::new().height(10));
-            }
-            body = body.push(leg_card(t, leg));
-        }
     }
 
     if let Some(note) = &review.note {
@@ -417,6 +435,15 @@ fn waiting_card<'a>(t: KaoTheme, elapsed: f32) -> Element<'a, Message> {
         .width(Length::Fill)
         .into(),
     )
+}
+
+/// Render one reviewed step: a raw-tx leg through `function_panel`, or an EIP-712
+/// typed-data step through `typed_panel`.
+fn step_card<'a>(t: KaoTheme, step: &'a SignStep) -> Element<'a, Message> {
+    match step {
+        SignStep::RawTx(leg) => leg_card(t, leg),
+        SignStep::Typed(order) => order_panel(t, order),
+    }
 }
 
 /// The CoW order review panel. Maps the [`OrderReview`] into a generic

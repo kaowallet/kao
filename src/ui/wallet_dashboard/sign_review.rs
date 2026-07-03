@@ -25,8 +25,9 @@
 
 use std::time::Instant;
 
-use alloy::primitives::{Address, Bytes, U256};
+use alloy::primitives::{Address, B256, Bytes, U256};
 use iced::keyboard;
+use iced::widget::text::Wrapping;
 use iced::widget::{Space, column, container, row, scrollable, text};
 use iced::{Alignment, Element, Length, Padding};
 
@@ -140,18 +141,60 @@ impl IntoTypedModel for OrderReview {
     }
 }
 
-/// One reviewable step in a signature. A review is an ordered list of these: a
-/// swap is `[Typed(order), RawTx(approve)…]`; a name/pool write is just raw-tx
-/// steps. `RawTx` renders through `function_panel` (like the Send screen), `Typed`
-/// through the generic `typed_panel`.
+/// A Safe `execTransaction` the owners sign as EIP-712 (`SafeTx`). Wraps the
+/// decoded **inner** call (EthFlow `createOrder` for a native swap, or the ERC-20
+/// vault-relayer approve) plus the exact 32-byte `safeTxHash` each owner signs,
+/// pinned at the nonce read when the review was prepared. Carries only public tx
+/// fields + hashes — no key material.
+#[derive(Debug, Clone)]
+pub struct SafeExecReview {
+    pub safe: Address,
+    pub nonce: u64,
+    pub threshold: u8,
+    pub owner_count: u8,
+    /// The exact 32 bytes each owner signs — identical to what `sign_owner` will
+    /// consume at dispatch (nonce-pinned).
+    pub safe_tx_hash: B256,
+    /// The decoded inner call the Safe will `execTransaction`. Always a raw tx, so
+    /// it reuses [`ReviewLeg`] and its `leg_card` renderer verbatim.
+    pub inner: Box<ReviewLeg>,
+}
+
+/// A CoW ERC-20 order authorized via EIP-1271 (a Safe `SafeMessage`). The order
+/// rows plus the exact `safe_message_hash(order_digest, safe, chain)` each owner
+/// signs over the order digest. Nonce-free (a message hash, not a `SafeTx`).
+#[derive(Debug, Clone)]
+pub struct SafeMessageReview {
+    pub order: OrderReview,
+    pub safe: Address,
+    pub threshold: u8,
+    pub owner_count: u8,
+    /// CoW EIP-712 order hash — what the orderbook validates the signature against.
+    pub order_digest: B256,
+    /// `safe_message_hash(order_digest, safe, chain)` — the 32 bytes each owner
+    /// signs. A pure function of `(order_digest, safe, chain)`, so no pin needed.
+    pub message_hash: B256,
+}
+
+/// One reviewable step in a signature. A review is an ordered list of these: an
+/// EOA swap is `[Typed(order), RawTx(approve)…]`; a Safe swap is
+/// `[SafeExec(approve)?, SafeMessage(order)]` or `[SafeExec(createOrder)]`; a
+/// name/pool write is just raw-tx steps. Every step carries the exact artifact
+/// (calldata or 32-byte hash) the user authorizes, so reviewed == signed.
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum SignStep {
     /// A raw transaction the user signs (approval, EthFlow `createOrder`, a
     /// registrar call, a pool deposit), decoded for review.
     RawTx(ReviewLeg),
-    /// EIP-712 typed data the user signs (the CoW GPv2 order).
+    /// EIP-712 typed data the user signs (the CoW GPv2 order, EOA path).
     Typed(OrderReview),
+    /// A Safe `execTransaction` (native `createOrder` / ERC-20 approve): the inner
+    /// call plus the `safeTxHash` each owner signs.
+    SafeExec(SafeExecReview),
+    /// A CoW order authorized via EIP-1271 from a Safe: the order plus the
+    /// `SafeMessage` hash each owner signs.
+    SafeMessage(SafeMessageReview),
 }
 
 /// What the coordinator runs when the user confirms. Holds the fully-prepared
@@ -443,7 +486,108 @@ fn step_card<'a>(t: KaoTheme, step: &'a SignStep) -> Element<'a, Message> {
     match step {
         SignStep::RawTx(leg) => leg_card(t, leg),
         SignStep::Typed(order) => order_panel(t, order),
+        SignStep::SafeExec(x) => safe_exec_panel(t, x),
+        SignStep::SafeMessage(m) => safe_message_panel(t, m),
     }
+}
+
+/// A Safe `execTransaction` step: the ceremony header (N-of-M owners, Safe
+/// address, nonce), the decoded inner call (via the shared `leg_card`), and the
+/// exact `safeTxHash` each owner signs on their device.
+fn safe_exec_panel<'a>(t: KaoTheme, x: &'a SafeExecReview) -> Element<'a, Message> {
+    let mut col = column![
+        text("Safe transaction — execTransaction")
+            .size(11)
+            .color(t.sub)
+            .font(bold()),
+        Space::new().height(2),
+        text(format!("{}-of-{} owners must sign", x.threshold, x.owner_count))
+            .size(13)
+            .color(t.text)
+            .font(bold()),
+        Space::new().height(8),
+    ]
+    .spacing(0)
+    .width(Length::Fill);
+    col = col.push(addr_kv(t, "Safe", x.safe));
+    col = col.push(kv(t, "Nonce", x.nonce.to_string()));
+    col = col.push(Space::new().height(8));
+    col = col.push(text("Safe will execute").size(11).color(t.sub).font(bold()));
+    col = col.push(Space::new().height(4));
+    col = col.push(leg_card(t, x.inner.as_ref()));
+    col = col.push(Space::new().height(8));
+    col = col.push(hash_row(t, "Each owner signs (SafeTx hash)", x.safe_tx_hash));
+    card(t, col.into())
+}
+
+/// A CoW order authorized via EIP-1271 from a Safe: the order rows (same as the
+/// EOA `typed_panel`) plus the order digest and the `SafeMessage` hash each owner
+/// signs.
+fn safe_message_panel<'a>(t: KaoTheme, m: &'a SafeMessageReview) -> Element<'a, Message> {
+    let model = m.order.to_typed_model();
+    let mut col = column![text(model.type_name).size(11).color(t.sub).font(bold())]
+        .spacing(0)
+        .width(Length::Fill);
+    if let Some(headline) = model.headline {
+        col = col.push(Space::new().height(2));
+        col = col.push(text(headline).size(13).color(t.text).font(bold()));
+    }
+    col = col.push(Space::new().height(8));
+    for TypedRow { label, value } in model.rows {
+        col = match value {
+            TypedValue::Text(v) => col.push(kv(t, label, v)),
+            TypedValue::Addr(a) => col.push(addr_kv(t, label, a)),
+        };
+    }
+    col = col.push(Space::new().height(10));
+    col = col.push(
+        text(format!(
+            "Authorized via EIP-1271 — {}-of-{} owners sign",
+            m.threshold, m.owner_count
+        ))
+        .size(11)
+        .color(t.sub)
+        .font(bold()),
+    );
+    col = col.push(Space::new().height(4));
+    col = col.push(addr_kv(t, "Authorizing Safe", m.safe));
+    col = col.push(hash_row(t, "Order digest (CoW EIP-712)", m.order_digest));
+    col = col.push(hash_row(t, "Each owner signs (SafeMessage hash)", m.message_hash));
+    card(t, col.into())
+}
+
+/// A 32-byte hash field: label on top, the full lowercase `0x…` value in its own
+/// bordered box below, glyph-wrapped so a 66-char hash never overflows the panel.
+/// Like [`addr_kv`], but hashes aren't addresses so they render as plain mono.
+fn hash_row<'a>(t: KaoTheme, label: impl Into<String>, hash: B256) -> Element<'a, Message> {
+    let inner = container(
+        text(format!("{hash:#x}"))
+            .size(11)
+            .font(mono_bold())
+            .color(t.text)
+            .wrapping(Wrapping::Glyph),
+    )
+    .width(Length::Fill)
+    .padding(Padding::from([6, 8]))
+    .style(move |_| container::Style {
+        background: Some(iced::Background::Color(t.card)),
+        border: iced::Border {
+            color: t.border,
+            width: 1.0,
+            radius: iced::border::Radius::from(8),
+        },
+        text_color: Some(t.text),
+        ..container::Style::default()
+    });
+    column![
+        text(label.into()).size(12).color(t.sub),
+        Space::new().height(4),
+        inner,
+    ]
+    .spacing(0)
+    .padding(Padding::from([2, 0]))
+    .width(Length::Fill)
+    .into()
 }
 
 /// The CoW order review panel. Maps the [`OrderReview`] into a generic

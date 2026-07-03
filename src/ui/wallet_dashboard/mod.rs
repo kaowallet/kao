@@ -326,12 +326,13 @@ pub enum Message {
     Apps(apps::Message),
     /// User interacted with the clear-signing review overlay (confirm/cancel/esc).
     SignReview(sign_review::Message),
-    /// A sign-review prepare task finished decoding its raw-transaction legs.
-    /// `seq` round-trips so a result for a review the user cancelled or replaced
-    /// is dropped. `Err` carries a build/decode failure to surface to the user.
+    /// A sign-review prepare task finished building its review steps (decoded
+    /// raw-tx legs, or Safe `execTransaction` / EIP-1271 steps). `seq` round-trips
+    /// so a result for a review the user cancelled or replaced is dropped. `Err`
+    /// carries a build/decode failure to surface to the user.
     SignReviewPrepared {
         seq: u64,
-        legs: Result<Vec<sign_review::ReviewLeg>, String>,
+        steps: Result<Vec<sign_review::SignStep>, String>,
     },
     /// Names app: reverse-lookup discovery finished. `owner` is the account the
     /// scan was spawned for — the handler drops it if the active account changed.
@@ -1946,34 +1947,43 @@ impl WalletScreen {
             "Swap {} {} → {}",
             order.sell_amount, order.sell_symbol, order.buy_symbol
         );
-        let base_note = if draft.is_native {
-            "Selling native ETH is an on-chain order — you'll also pay gas."
-        } else {
-            "ERC-20 orders are gasless — CoW solvers pay the settlement gas."
-        };
-        // In Safe mode the legs below are the *inner* calls the Safe makes — but
-        // each owner actually signs the Safe transaction hash (an EIP-712 SafeTx),
-        // and an ERC-20 order is authorized via EIP-1271, before an owner
-        // broadcasts. Say so, so the review doesn't read as a direct EOA signature
-        // of the leg shown. (Full execTransaction/safeTxHash rendering is the
-        // unified-gate work; this at least discloses the mechanism.)
-        let note = Some(if self.active_safe.is_some() {
+        // The Safe signing mechanism is now shown *visually* by the SafeExec /
+        // SafeMessage steps, so the note is just the gasless/gas disclosure.
+        let note = Some(
             if draft.is_native {
-                format!(
-                    "{base_note} Signing from your Safe: each owner signs the Safe \
-                     transaction hash for the on-chain order shown below; an owner \
-                     then broadcasts it."
-                )
+                "Selling native ETH is an on-chain order — you'll also pay gas."
             } else {
-                format!(
-                    "{base_note} Signing from your Safe: each owner signs the Safe \
-                     transaction hash for any approval and authorizes the order via \
-                     EIP-1271; an owner then broadcasts the on-chain steps."
-                )
+                "ERC-20 orders are gasless — CoW solvers pay the settlement gas."
             }
+            .to_string(),
+        );
+        // In Safe mode the prepare task emits SafeExec / SafeMessage steps that
+        // render the real execTransaction + safeTxHash (and the EIP-1271 order), so
+        // it needs the Safe's public context. `build_signer_context` above already
+        // proved this is a signable Safe swap.
+        let safe_prep = if self.active_safe.is_some() {
+            self.active_safe_descriptor().and_then(|d| {
+                let chain = crate::chain::Chain::ALL
+                    .into_iter()
+                    .find(|c| c.chain_id() == d.chain_id)?;
+                Some(SafePrepCtx {
+                    safe: d.address(),
+                    chain,
+                    version: d.version.clone(),
+                    threshold: d.threshold as u8,
+                    owner_count: d.owners.len() as u8,
+                })
+            })
         } else {
-            base_note.to_string()
-        });
+            None
+        };
+        // EOA: the order is the leading typed step. Safe: the SafeExec/SafeMessage
+        // steps (built in prepare) carry the order, so there's no separate step.
+        let initial_steps = if safe_prep.is_some() {
+            Vec::new()
+        } else {
+            vec![sign_review::SignStep::Typed(order)]
+        };
         let action = sign_review::SignAction::Cow {
             host,
             draft: draft.clone(),
@@ -1982,13 +1992,21 @@ impl WalletScreen {
         self.sign_review = Some(sign_review::SignReview::pending(
             title,
             None,
-            vec![sign_review::SignStep::Typed(order)],
+            initial_steps,
             note,
             seq,
             action,
         ));
         let local_names = build_local_names(&self.accounts, &self.safes, &self.contacts);
-        spawn_cow_prepare(self.network.clone(), seq, draft, quote, user, local_names)
+        spawn_cow_prepare(
+            self.network.clone(),
+            seq,
+            draft,
+            quote,
+            user,
+            local_names,
+            safe_prep,
+        )
     }
 
     /// Open a confirm gate for an off-chain order cancellation. It's an EIP-712
@@ -3524,7 +3542,7 @@ impl WalletScreen {
                 // processing this message is enough to start its animation tick.
                 sign_review::Message::AddressCopied => {}
             },
-            Message::SignReviewPrepared { seq, legs } => {
+            Message::SignReviewPrepared { seq, steps } => {
                 // Drop a decode result for a review the user has since cancelled
                 // or replaced (the seq guard mirrors the Send decode pipeline).
                 let Some(review) = self.sign_review.as_mut() else {
@@ -3533,13 +3551,11 @@ impl WalletScreen {
                 if review.seq != seq {
                     return (Task::none(), None);
                 }
-                match legs {
-                    Ok(legs) => {
-                        // Append the decoded raw-tx legs after any leading typed
-                        // step (a swap's order); the reviewed set == the signed set.
-                        review
-                            .steps
-                            .extend(legs.into_iter().map(sign_review::SignStep::RawTx));
+                match steps {
+                    Ok(new_steps) => {
+                        // Append the prepared steps after any leading typed step
+                        // (an EOA swap's order); the reviewed set == the signed set.
+                        review.steps.extend(new_steps);
                         review.legs_loading = false;
                     }
                     Err(e) => {
@@ -5524,7 +5540,10 @@ fn spawn_name_prepare(
                 decoded: Box::new(decoded),
             }])
         },
-        move |legs| Message::SignReviewPrepared { seq, legs },
+        move |legs| Message::SignReviewPrepared {
+            seq,
+            steps: legs.map(|v| v.into_iter().map(sign_review::SignStep::RawTx).collect()),
+        },
     )
 }
 
@@ -5588,6 +5607,19 @@ async fn build_name_call(
 /// or the native EthFlow `createOrder`) for review, then route them into the open
 /// review. An ERC-20 sell with sufficient allowance has no legs — only the
 /// EIP-712 order panel is shown.
+/// The minimal, public-data-only Safe context [`spawn_cow_prepare`] needs to
+/// build the real `execTransaction` + `safeTxHash` for the review — unlike
+/// [`SafeSwapCtx`], which holds signer descriptors we don't put in a prepare
+/// closure. `Clone` so it rides the async task.
+#[derive(Debug, Clone)]
+struct SafePrepCtx {
+    safe: Address,
+    chain: crate::chain::Chain,
+    version: String,
+    threshold: u8,
+    owner_count: u8,
+}
+
 fn spawn_cow_prepare(
     network: Arc<dyn BalanceFetcher>,
     seq: u64,
@@ -5595,19 +5627,100 @@ fn spawn_cow_prepare(
     quote: crate::cow::api::QuoteResponse,
     user: Address,
     local_names: std::collections::HashMap<Address, String>,
+    safe_prep: Option<SafePrepCtx>,
 ) -> Task<Message> {
     Task::perform(
         async move {
             let chain = draft.chain;
             let q = &quote.quote;
             let full_sell = q.sell_amount.saturating_add(q.fee_amount);
-            let mut legs: Vec<sign_review::ReviewLeg> = Vec::new();
+            let (_, app_data_hash) = cow::market_app_data(draft.slippage_bps);
+            let mut steps: Vec<sign_review::SignStep> = Vec::new();
+
+            let Some(ctx) = safe_prep else {
+                // ── EOA path: sign the raw createOrder / approve directly. ──
+                if draft.is_native {
+                    let data = cow::ethflow::build_ethflow_data(
+                        draft.buy_token,
+                        user,
+                        full_sell,
+                        q.buy_amount,
+                        q.valid_to,
+                        quote.id.unwrap_or_default(),
+                        draft.slippage_bps,
+                        app_data_hash,
+                    );
+                    let calldata = cow::ethflow::create_order_calldata(&data);
+                    let value = cow::ethflow::msg_value(&data);
+                    let decoded = crate::decode::clear_sign::decode_transaction(
+                        network.as_ref(),
+                        chain,
+                        user,
+                        cow::ETHFLOW,
+                        calldata,
+                        value,
+                        local_names,
+                    )
+                    .await;
+                    steps.push(sign_review::SignStep::RawTx(sign_review::ReviewLeg {
+                        title: "Place on-chain order — EthFlow createOrder".to_string(),
+                        to: cow::ETHFLOW,
+                        value,
+                        chain,
+                        decoded: Box::new(decoded),
+                    }));
+                } else {
+                    let provider =
+                        match provider_for(&network, crate::chain::NetworkId::Builtin(chain)).await
+                        {
+                            Some(p) => p,
+                            None => return Err("no execution RPC configured".to_string()),
+                        };
+                    let allowance =
+                        cow::onchain::read_allowance(&provider, draft.sell_token, user).await?;
+                    if allowance < full_sell {
+                        let calldata = cow::onchain::approve_calldata(U256::MAX);
+                        let decoded = crate::decode::clear_sign::decode_transaction(
+                            network.as_ref(),
+                            chain,
+                            user,
+                            draft.sell_token,
+                            calldata,
+                            U256::ZERO,
+                            local_names,
+                        )
+                        .await;
+                        steps.push(sign_review::SignStep::RawTx(sign_review::ReviewLeg {
+                            title: format!(
+                                "Approve {} for CoW (vault relayer)",
+                                draft.sell_symbol
+                            ),
+                            to: draft.sell_token,
+                            value: U256::ZERO,
+                            chain,
+                            decoded: Box::new(decoded),
+                        }));
+                    }
+                }
+                return Ok(steps);
+            };
+
+            // ── Safe path: build the REAL execTransaction(s) + EIP-1271 message and
+            //    show the exact safeTxHash / SafeMessage hash each owner signs.
+            //    `receiver = safe` matches what `cow_place_order_safe` signs. ──
+            use crate::safe::tx::{
+                Operation, SafeTxInput, build_safe_tx_with_nonce, current_safe_nonce,
+                ensure_signable_version, safe_domain, safe_tx_hash, verify_safe_tx_before_signing,
+            };
+            // Fail-closed at review: a Safe we can't sign shouldn't render a gate.
+            ensure_signable_version(&ctx.version)?;
+            let safe = ctx.safe;
+            let domain = safe_domain(safe, ctx.chain);
+
             if draft.is_native {
-                // Native ETH → on-chain EthFlow createOrder (value = full sell).
-                let (_, app_data_hash) = cow::market_app_data(draft.slippage_bps);
                 let data = cow::ethflow::build_ethflow_data(
                     draft.buy_token,
-                    user,
+                    safe,
                     full_sell,
                     q.buy_amount,
                     q.valid_to,
@@ -5617,57 +5730,108 @@ fn spawn_cow_prepare(
                 );
                 let calldata = cow::ethflow::create_order_calldata(&data);
                 let value = cow::ethflow::msg_value(&data);
+                // Pin the nonce read here; cow_place_order_safe (P3b) signs at it.
+                let nonce = current_safe_nonce(network.as_ref(), safe, ctx.chain).await?;
+                let tx = ethflow_safe_tx(&data, nonce);
+                let hash = safe_tx_hash(&tx, &domain);
+                verify_safe_tx_before_signing(network.as_ref(), &tx, safe, ctx.chain, hash).await?;
                 let decoded = crate::decode::clear_sign::decode_transaction(
                     network.as_ref(),
                     chain,
-                    user,
+                    safe,
                     cow::ETHFLOW,
                     calldata,
                     value,
                     local_names,
                 )
                 .await;
-                legs.push(sign_review::ReviewLeg {
-                    title: "Place on-chain order — EthFlow createOrder".to_string(),
-                    to: cow::ETHFLOW,
-                    value,
-                    chain,
-                    decoded: Box::new(decoded),
-                });
+                steps.push(sign_review::SignStep::SafeExec(sign_review::SafeExecReview {
+                    safe,
+                    nonce,
+                    threshold: ctx.threshold,
+                    owner_count: ctx.owner_count,
+                    safe_tx_hash: hash,
+                    inner: Box::new(sign_review::ReviewLeg {
+                        title: "Place on-chain order — EthFlow createOrder".to_string(),
+                        to: cow::ETHFLOW,
+                        value,
+                        chain,
+                        decoded: Box::new(decoded),
+                    }),
+                }));
             } else {
-                // ERC-20 → only sign the EIP-712 order, unless the vault relayer
-                // still needs an allowance bump first.
                 let provider =
                     match provider_for(&network, crate::chain::NetworkId::Builtin(chain)).await {
                         Some(p) => p,
                         None => return Err("no execution RPC configured".to_string()),
                     };
                 let allowance =
-                    cow::onchain::read_allowance(&provider, draft.sell_token, user).await?;
+                    cow::onchain::read_allowance(&provider, draft.sell_token, safe).await?;
                 if allowance < full_sell {
                     let calldata = cow::onchain::approve_calldata(U256::MAX);
+                    let nonce = current_safe_nonce(network.as_ref(), safe, ctx.chain).await?;
+                    let tx = build_safe_tx_with_nonce(
+                        SafeTxInput {
+                            to: draft.sell_token,
+                            value: U256::ZERO,
+                            data: calldata.clone(),
+                            operation: Operation::Call,
+                        },
+                        nonce,
+                    );
+                    let hash = safe_tx_hash(&tx, &domain);
+                    verify_safe_tx_before_signing(network.as_ref(), &tx, safe, ctx.chain, hash)
+                        .await?;
                     let decoded = crate::decode::clear_sign::decode_transaction(
                         network.as_ref(),
                         chain,
-                        user,
+                        safe,
                         draft.sell_token,
                         calldata,
                         U256::ZERO,
                         local_names,
                     )
                     .await;
-                    legs.push(sign_review::ReviewLeg {
-                        title: format!("Approve {} for CoW (vault relayer)", draft.sell_symbol),
-                        to: draft.sell_token,
-                        value: U256::ZERO,
-                        chain,
-                        decoded: Box::new(decoded),
-                    });
+                    steps.push(sign_review::SignStep::SafeExec(sign_review::SafeExecReview {
+                        safe,
+                        nonce,
+                        threshold: ctx.threshold,
+                        owner_count: ctx.owner_count,
+                        safe_tx_hash: hash,
+                        inner: Box::new(sign_review::ReviewLeg {
+                            title: format!("Approve {} for CoW (vault relayer)", draft.sell_symbol),
+                            to: draft.sell_token,
+                            value: U256::ZERO,
+                            chain,
+                            decoded: Box::new(decoded),
+                        }),
+                    }));
                 }
+                // The order itself is authorized via EIP-1271 (nonce-free, pure).
+                let order = cow::order::build_sell_order(
+                    draft.sell_token,
+                    draft.buy_token,
+                    safe,
+                    full_sell,
+                    q.buy_amount,
+                    q.valid_to,
+                    draft.slippage_bps,
+                    app_data_hash,
+                );
+                let order_digest = cow::order::order_digest(&order, &cow::order::cow_domain(chain));
+                let message_hash = cow::safe_sig::safe_message_hash(order_digest, safe, chain);
+                steps.push(sign_review::SignStep::SafeMessage(sign_review::SafeMessageReview {
+                    order: build_order_review(&draft, &quote, safe),
+                    safe,
+                    threshold: ctx.threshold,
+                    owner_count: ctx.owner_count,
+                    order_digest,
+                    message_hash,
+                }));
             }
-            Ok(legs)
+            Ok(steps)
         },
-        move |legs| Message::SignReviewPrepared { seq, legs },
+        move |steps| Message::SignReviewPrepared { seq, steps },
     )
 }
 
@@ -6808,7 +6972,10 @@ fn spawn_pool_prepare(
                 }
             }
         },
-        move |legs| Message::SignReviewPrepared { seq, legs },
+        move |legs| Message::SignReviewPrepared {
+            seq,
+            steps: legs.map(|v| v.into_iter().map(sign_review::SignStep::RawTx).collect()),
+        },
     )
 }
 
@@ -9199,6 +9366,72 @@ mod tests {
     }
 
     #[test]
+    fn cow_native_safe_exec_hash_pins_the_signed_hash() {
+        // The safeTxHash shown in a native Safe-swap review is computed with the
+        // exact expression `cow_place_order_safe` signs:
+        // safe_tx_hash(ethflow_safe_tx(data, nonce), safe_domain(safe, chain)).
+        use crate::safe::tx::{safe_domain, safe_tx_hash};
+        let safe = addr(0x5A);
+        let chain = Chain::Mainnet;
+        let draft = sample_swap_draft();
+        let quote = sample_quote();
+        let q = &quote.quote;
+        let full_sell = q.sell_amount.saturating_add(q.fee_amount);
+        let (_, app_data_hash) = cow::market_app_data(draft.slippage_bps);
+        let data = cow::ethflow::build_ethflow_data(
+            draft.buy_token,
+            safe,
+            full_sell,
+            q.buy_amount,
+            q.valid_to,
+            quote.id.unwrap_or_default(),
+            draft.slippage_bps,
+            app_data_hash,
+        );
+        let hash = safe_tx_hash(&ethflow_safe_tx(&data, 7), &safe_domain(safe, chain));
+        assert_ne!(hash, alloy::primitives::B256::ZERO);
+        // Nonce-bound: the pin matters — a different nonce yields a different hash.
+        assert_ne!(
+            hash,
+            safe_tx_hash(&ethflow_safe_tx(&data, 8), &safe_domain(safe, chain))
+        );
+    }
+
+    #[test]
+    fn cow_safe_message_hash_is_what_owners_sign() {
+        // The EIP-1271 message hash shown in a Safe ERC-20 review equals what
+        // `sign_eip1271_digest` signs: safe_message_hash over the order digest of
+        // an order whose receiver is the Safe.
+        let safe = addr(0x5A);
+        let chain = Chain::Mainnet;
+        let draft = sample_swap_draft();
+        let quote = sample_quote();
+        let q = &quote.quote;
+        let full_sell = q.sell_amount.saturating_add(q.fee_amount);
+        let (_, app_data_hash) = cow::market_app_data(draft.slippage_bps);
+        let order = cow::order::build_sell_order(
+            draft.sell_token,
+            draft.buy_token,
+            safe,
+            full_sell,
+            q.buy_amount,
+            q.valid_to,
+            draft.slippage_bps,
+            app_data_hash,
+        );
+        let digest = cow::order::order_digest(&order, &cow::order::cow_domain(chain));
+        let message_hash = cow::safe_sig::safe_message_hash(digest, safe, chain);
+        assert_ne!(message_hash, alloy::primitives::B256::ZERO);
+        // Binds to the Safe: a different Safe → a different message hash.
+        assert_ne!(
+            message_hash,
+            cow::safe_sig::safe_message_hash(digest, addr(0x5B), chain)
+        );
+        // The displayed order's receiver is the Safe (matches the signed order).
+        assert_eq!(build_order_review(&draft, &quote, safe).receiver, safe);
+    }
+
+    #[test]
     fn cow_place_opens_review_then_confirm_parks_signer() {
         use crate::wallet::local_account;
         use alloy::signers::local::PrivateKeySigner;
@@ -9228,7 +9461,9 @@ mod tests {
             .iter()
             .find_map(|s| match s {
                 sign_review::SignStep::Typed(o) => Some(o),
-                sign_review::SignStep::RawTx(_) => None,
+                sign_review::SignStep::RawTx(_)
+                | sign_review::SignStep::SafeExec(_)
+                | sign_review::SignStep::SafeMessage(_) => None,
             })
             .expect("swap review shows the order panel");
         assert_eq!(order.receiver, me, "receiver is the active account");

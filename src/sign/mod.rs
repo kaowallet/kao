@@ -8,3 +8,4 @@
 //! EIP-712 renderer, and the Safe owner-ceremony arm on top of it.
 
 pub mod broadcast;
+pub mod typed;

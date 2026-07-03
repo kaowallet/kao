@@ -35,6 +35,7 @@ use crate::cow::api::QuoteResponse;
 use crate::cow::composer::SwapDraft;
 use crate::decode::clear_sign::DecodeResult;
 use crate::names::registrar::{Namespace, RegisterPlan};
+use crate::sign::typed::{IntoTypedModel, TypedDataModel, TypedRow, TypedValue};
 use crate::ui::kao_theme::KaoTheme;
 use crate::ui::kao_widgets::{
     bold, bullet_wave, colored_address, kao_scrollable_style, modal_wrapper, mono, mono_bold,
@@ -88,6 +89,55 @@ pub struct OrderReview {
     /// Native-ETH (EthFlow) order — settles on-chain and costs gas, vs. a gasless
     /// off-chain ERC-20 order.
     pub native: bool,
+}
+
+impl IntoTypedModel for OrderReview {
+    /// The exact rows the CoW order panel has always shown — now expressed as a
+    /// generic [`TypedDataModel`] so `typed_panel` can render it (and any future
+    /// EIP-712 message) uniformly. All unit/precision/relative-time formatting is
+    /// done here, so the model stays render-only.
+    fn to_typed_model(&self) -> TypedDataModel {
+        TypedDataModel {
+            type_name: "CoW order — EIP-712 signature".to_string(),
+            headline: Some(format!(
+                "Sell {} {} for at least {} {}",
+                self.sell_amount, self.sell_symbol, self.min_received, self.buy_symbol
+            )),
+            rows: vec![
+                TypedRow::text(
+                    "You sell",
+                    format!("{} {}", self.sell_amount, self.sell_symbol),
+                ),
+                TypedRow::text(
+                    "Receive (est.)",
+                    format!("{} {}", self.buy_amount, self.buy_symbol),
+                ),
+                TypedRow::text(
+                    "Min received",
+                    format!(
+                        "{} {} · {} slippage",
+                        self.min_received,
+                        self.buy_symbol,
+                        slippage_label(self.slippage_bps)
+                    ),
+                ),
+                TypedRow::addr("Receiver", self.receiver),
+                TypedRow::text("Order type", "Sell · fill-or-kill"),
+                TypedRow::text("Solver fee", "taken from price (signed fee 0)"),
+                TypedRow::text("Expires", format_expiry(self.valid_to)),
+                TypedRow::addr("Settlement", self.settlement),
+                TypedRow::text("Network", self.chain.display_name()),
+                TypedRow::text(
+                    "Settles",
+                    if self.native {
+                        "on-chain (native ETH) · costs gas"
+                    } else {
+                        "off-chain via solvers · gasless"
+                    },
+                ),
+            ],
+        }
+    }
 }
 
 /// What the coordinator runs when the user confirms. Holds the fully-prepared
@@ -369,63 +419,35 @@ fn waiting_card<'a>(t: KaoTheme, elapsed: f32) -> Element<'a, Message> {
     )
 }
 
-/// The CoW order review panel — one row per signed field. This is the typed-data
-/// analogue of `function_panel`: it has no calldata to decode, so it spells out
-/// the GPv2 order the orderbook and solvers recover the signature against.
-fn order_panel<'a>(t: KaoTheme, o: &'a OrderReview) -> Element<'a, Message> {
-    let mut col = column![
-        text("CoW order — EIP-712 signature")
-            .size(11)
-            .color(t.sub)
-            .font(bold()),
-        Space::new().height(2),
-        text(format!(
-            "Sell {} {} for at least {} {}",
-            o.sell_amount, o.sell_symbol, o.min_received, o.buy_symbol
-        ))
-        .size(13)
-        .color(t.text)
-        .font(bold()),
-        Space::new().height(8),
-    ]
-    .spacing(0)
-    .width(Length::Fill);
+/// The CoW order review panel. Maps the [`OrderReview`] into a generic
+/// [`TypedDataModel`] and hands it to [`typed_panel`] — so the order and any
+/// future EIP-712 message share one renderer instead of a bespoke panel each.
+fn order_panel<'a>(t: KaoTheme, o: &OrderReview) -> Element<'a, Message> {
+    typed_panel(t, o.to_typed_model())
+}
 
-    col = col.push(kv(
-        t,
-        "You sell",
-        &format!("{} {}", o.sell_amount, o.sell_symbol),
-    ));
-    col = col.push(kv(
-        t,
-        "Receive (est.)",
-        &format!("{} {}", o.buy_amount, o.buy_symbol),
-    ));
-    col = col.push(kv(
-        t,
-        "Min received",
-        &format!(
-            "{} {} · {} slippage",
-            o.min_received,
-            o.buy_symbol,
-            slippage_label(o.slippage_bps)
-        ),
-    ));
-    col = col.push(addr_kv(t, "Receiver", o.receiver));
-    col = col.push(kv(t, "Order type", "Sell · fill-or-kill"));
-    col = col.push(kv(t, "Solver fee", "taken from price (signed fee 0)"));
-    col = col.push(kv(t, "Expires", &format_expiry(o.valid_to)));
-    col = col.push(addr_kv(t, "Settlement", o.settlement));
-    col = col.push(kv(t, "Network", o.chain.display_name()));
-    col = col.push(kv(
-        t,
-        "Settles",
-        if o.native {
-            "on-chain (native ETH) · costs gas"
-        } else {
-            "off-chain via solvers · gasless"
-        },
-    ));
+/// Render a [`TypedDataModel`] as a single card — header, optional headline, then
+/// one row per field. The typed-data analogue of `function_panel`: no calldata to
+/// decode, so it spells out the signed fields the orderbook/contract recovers the
+/// signature against. Consumes the model so its owned strings move straight into
+/// the widgets.
+fn typed_panel<'a>(t: KaoTheme, model: TypedDataModel) -> Element<'a, Message> {
+    let mut col = column![text(model.type_name).size(11).color(t.sub).font(bold())]
+        .spacing(0)
+        .width(Length::Fill);
+
+    if let Some(headline) = model.headline {
+        col = col.push(Space::new().height(2));
+        col = col.push(text(headline).size(13).color(t.text).font(bold()));
+    }
+    col = col.push(Space::new().height(8));
+
+    for TypedRow { label, value } in model.rows {
+        col = match value {
+            TypedValue::Text(v) => col.push(kv(t, label, v)),
+            TypedValue::Addr(a) => col.push(addr_kv(t, label, a)),
+        };
+    }
 
     card(t, col.into())
 }
@@ -442,7 +464,7 @@ fn leg_card<'a>(t: KaoTheme, leg: &'a ReviewLeg) -> Element<'a, Message> {
 
     col = col.push(addr_kv(t, "To", leg.to));
     col = col.push(kv(t, "Network", leg.chain.display_name()));
-    col = col.push(kv(t, "Value", &format!("{} ETH", format_eth(leg.value))));
+    col = col.push(kv(t, "Value", format!("{} ETH", format_eth(leg.value))));
 
     if let Some(panel) =
         super::function_panel::view::<Message>(t, Some(leg.decoded.as_ref()), false)
@@ -454,14 +476,11 @@ fn leg_card<'a>(t: KaoTheme, leg: &'a ReviewLeg) -> Element<'a, Message> {
     card(t, col.into())
 }
 
-fn kv<'a>(t: KaoTheme, label: &'a str, value: &str) -> Element<'a, Message> {
+fn kv<'a>(t: KaoTheme, label: impl Into<String>, value: impl Into<String>) -> Element<'a, Message> {
     row![
-        text(label).size(12).color(t.sub),
+        text(label.into()).size(12).color(t.sub),
         Space::new().width(Length::Fill),
-        text(value.to_string())
-            .size(12)
-            .color(t.text)
-            .font(mono_bold()),
+        text(value.into()).size(12).color(t.text).font(mono_bold()),
     ]
     .align_y(Alignment::Center)
     .padding(Padding::from([2, 0]))
@@ -473,7 +492,7 @@ fn kv<'a>(t: KaoTheme, label: &'a str, value: &str) -> Element<'a, Message> {
 /// full-width card below. Stacking (rather than right-aligning on the label row)
 /// is what gives the 42-char address the room to render in full instead of being
 /// clipped at the panel edge.
-fn addr_kv<'a>(t: KaoTheme, label: &'a str, addr: Address) -> Element<'a, Message> {
+fn addr_kv<'a>(t: KaoTheme, label: impl Into<String>, addr: Address) -> Element<'a, Message> {
     let inner = container(colored_address(t, addr))
         .width(Length::Fill)
         .padding(Padding::from([6, 8]))
@@ -488,7 +507,7 @@ fn addr_kv<'a>(t: KaoTheme, label: &'a str, addr: Address) -> Element<'a, Messag
             ..container::Style::default()
         });
     column![
-        text(label).size(12).color(t.sub),
+        text(label.into()).size(12).color(t.sub),
         Space::new().height(4),
         inner,
     ]
@@ -607,5 +626,60 @@ mod tests {
     #[test]
     fn format_iso_utc_epoch() {
         assert_eq!(format_iso_utc(0), "1970-01-01 00:00 UTC");
+    }
+
+    #[test]
+    fn cow_order_maps_to_the_expected_typed_rows() {
+        // Pins the CoW order review content: a dropped/renamed row fails here, and
+        // this mapping is exactly what `typed_panel` renders — so it doubles as the
+        // pixel-identical guard for the panel refactor.
+        let o = OrderReview {
+            chain: Chain::Mainnet,
+            sell_amount: "1.5".into(),
+            sell_symbol: "WETH".into(),
+            buy_amount: "4200".into(),
+            buy_symbol: "USDC".into(),
+            min_received: "4158".into(),
+            receiver: Address::repeat_byte(0xAA),
+            valid_to: 1_600_000_000, // 2020 — always past, so `Expires` is deterministic
+            slippage_bps: 50,
+            settlement: Address::repeat_byte(0x55),
+            native: false,
+        };
+        let m = o.to_typed_model();
+
+        assert_eq!(m.type_name, "CoW order — EIP-712 signature");
+        assert_eq!(
+            m.headline.as_deref(),
+            Some("Sell 1.5 WETH for at least 4158 USDC")
+        );
+        let labels: Vec<&str> = m.rows.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "You sell",
+                "Receive (est.)",
+                "Min received",
+                "Receiver",
+                "Order type",
+                "Solver fee",
+                "Expires",
+                "Settlement",
+                "Network",
+                "Settles",
+            ],
+        );
+        assert_eq!(m.rows[0].value, TypedValue::Text("1.5 WETH".into()));
+        assert_eq!(m.rows[1].value, TypedValue::Text("4200 USDC".into()));
+        assert_eq!(
+            m.rows[2].value,
+            TypedValue::Text("4158 USDC · 0.5% slippage".into())
+        );
+        assert_eq!(m.rows[3].value, TypedValue::Addr(o.receiver));
+        assert_eq!(m.rows[7].value, TypedValue::Addr(o.settlement));
+        assert_eq!(
+            m.rows[9].value,
+            TypedValue::Text("off-chain via solvers · gasless".into())
+        );
     }
 }

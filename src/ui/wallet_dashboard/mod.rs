@@ -1349,6 +1349,26 @@ impl WalletScreen {
     /// parking keeps `order_op_in_flight` / the Apps reprieve consistent and
     /// the same `CowPlaced` handler restores it). Surfaces a clear error on the
     /// host pane if a Safe swap is somehow no longer placeable.
+    /// Surface a CoW placement error. The place overlay is kept open across the
+    /// async sign + submit, so put the error on the overlay — clearing the
+    /// waiting phase so Confirm re-enables for a retry (e.g. after reconnecting a
+    /// device). Falls back to the host pane if the overlay was already dismissed.
+    fn resolve_cow_error(&mut self, host: CowHost, msg: String) {
+        if let Some(r) = self.sign_review.as_mut() {
+            r.signing_since = None;
+            r.error = Some(msg);
+        } else {
+            match host {
+                CowHost::Modal => {
+                    if let Modal::Swap(p) = &mut self.modal {
+                        p.placement_failed(msg);
+                    }
+                }
+                CowHost::Apps => self.apps.placement_failed(msg),
+            }
+        }
+    }
+
     fn place_order_task(
         &mut self,
         host: CowHost,
@@ -1361,14 +1381,10 @@ impl WalletScreen {
                 let msg = "This Safe can't place swaps — it needs a recognized \
                            implementation, a signable owner, and a CoW-supported chain."
                     .to_string();
-                match host {
-                    CowHost::Modal => {
-                        if let Modal::Swap(p) = &mut self.modal {
-                            p.placement_failed(msg);
-                        }
-                    }
-                    CowHost::Apps => self.apps.placement_failed(msg),
-                }
+                // The overlay is kept open across placement, so resolve it here
+                // (no result message is coming); fall back to the host pane if it
+                // was already dismissed.
+                self.resolve_cow_error(host, msg);
                 return Task::none();
             };
             let handoff = self.park_signer_for_order();
@@ -2426,26 +2442,35 @@ impl WalletScreen {
             let execute = *can_execute;
             return self.dispatch_safe_send(execute);
         }
-        let Some(review) = self.sign_review.take() else {
-            return Task::none();
-        };
-        match review.action {
-            sign_review::SignAction::Cow {
+        // CoW placement keeps its overlay open across the sign + submit too (like
+        // the EOA send): a slow hardware sign shows the "waiting" card, and a
+        // connect/sign failure surfaces on the overlay with a retry instead of the
+        // window just closing and the error landing on a pane the user isn't
+        // looking at. Resolved by the `SignTag::Cow` result arm.
+        let cow = match self.sign_review.as_ref().map(|r| &r.action) {
+            Some(sign_review::SignAction::Cow {
                 host,
                 draft,
                 quote,
                 prepared,
-            } => {
-                // Drive the blocking Swap modal into its "placing" phase now that
-                // signing actually starts; the Apps composer stays put and resets
-                // itself when placement completes.
-                if let CowHost::Modal = host
-                    && let Modal::Swap(p) = &mut self.modal
-                {
-                    p.begin_placing();
-                }
-                self.place_order_task(host, draft, quote, prepared)
+            }) => Some((*host, draft.clone(), quote.clone(), *prepared)),
+            _ => None,
+        };
+        if let Some((host, draft, quote, prepared)) = cow {
+            if let Some(r) = self.sign_review.as_mut() {
+                r.signing_since = Some(Instant::now());
+                r.error = None;
             }
+            return self.place_order_task(host, draft, quote, prepared);
+        }
+        let Some(review) = self.sign_review.take() else {
+            return Task::none();
+        };
+        match review.action {
+            // Handled by the keep-open early return above (the overlay stays open
+            // across placement); this take-path is unreachable but keeps the match
+            // exhaustive.
+            sign_review::SignAction::Cow { .. } => Task::none(),
             sign_review::SignAction::CowCancel { host, uid } => self.cancel_order_task(host, uid),
             sign_review::SignAction::Name { sign } => self.dispatch_name_sign(sign),
             // Normally handled above (overlay kept open); the take() fallback here
@@ -3711,6 +3736,9 @@ impl WalletScreen {
                     SignTag::Cow { host } => {
                         match result.and_then(SignOutcome::order) {
                             Ok(order) => {
+                                // Close the overlay kept open across placement, then
+                                // drive the host pane to its tracking / done state.
+                                self.sign_review = None;
                                 let order = *order;
                                 let uid = order.uid.clone();
                                 let chain = order.chain;
@@ -3731,14 +3759,9 @@ impl WalletScreen {
                             }
                             Err(e) => {
                                 warn!(error = %e, "cow: order placement failed");
-                                match host {
-                                    CowHost::Modal => {
-                                        if let Modal::Swap(p) = &mut self.modal {
-                                            p.placement_failed(e);
-                                        }
-                                    }
-                                    CowHost::Apps => self.apps.placement_failed(e),
-                                }
+                                // Keep the overlay open showing the error so the user
+                                // can reconnect a device and retry Confirm.
+                                self.resolve_cow_error(host, e);
                             }
                         }
                     }
@@ -10202,14 +10225,24 @@ mod tests {
         assert!(screen.sign_review.is_none());
         assert!(!screen.order_op_in_flight);
 
-        // Re-open and confirm → places the order, parking the signer.
+        // Re-open and confirm → places the order, parking the signer. The review
+        // stays open in its waiting phase (resolved by the `Cow` result) so a
+        // connect/sign failure surfaces on the overlay for a retry instead of the
+        // window silently closing.
         let _ = screen.open_cow_review(CowHost::Apps, sample_swap_draft(), sample_quote());
         let _ = screen.confirm_sign_review();
         assert!(
             screen.order_op_in_flight,
             "confirming places the order (signer parked)"
         );
-        assert!(screen.sign_review.is_none(), "confirm closes the review");
+        let review = screen
+            .sign_review
+            .as_ref()
+            .expect("confirm keeps the review open across placement");
+        assert!(
+            review.signing_since.is_some(),
+            "the review is in its waiting phase while placement is in flight"
+        );
     }
 
     #[test]

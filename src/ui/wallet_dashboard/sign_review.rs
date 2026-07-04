@@ -27,7 +27,6 @@ use std::time::Instant;
 
 use alloy::primitives::{Address, B256, Bytes, U256};
 use iced::keyboard;
-use iced::widget::text::Wrapping;
 use iced::widget::{Space, column, container, row, scrollable, text};
 use iced::{Alignment, Element, Length, Padding};
 
@@ -39,8 +38,8 @@ use crate::names::registrar::{Namespace, RegisterPlan};
 use crate::sign::typed::{IntoTypedModel, TypedDataModel, TypedRow, TypedValue};
 use crate::ui::kao_theme::KaoTheme;
 use crate::ui::kao_widgets::{
-    bold, bullet_wave, colored_address, kao_scrollable_style, modal_wrapper, mono, mono_bold,
-    primary_button, secondary_button,
+    bold, bullet_wave, colored_address, colored_hash_copyable, kao_scrollable_style, modal_wrapper,
+    mono, mono_bold, primary_button, secondary_button,
 };
 use crate::wallet::tx::{SendPlan, TxQuote};
 
@@ -811,29 +810,23 @@ fn safe_message_panel<'a>(t: KaoTheme, m: &'a SafeMessageReview) -> Element<'a, 
     card(t, col.into())
 }
 
-/// A 32-byte hash field: label on top, the full lowercase `0x…` value in its own
-/// bordered box below, glyph-wrapped so a 66-char hash never overflows the panel.
-/// Like [`addr_kv`], but hashes aren't addresses so they render as plain mono.
+/// A 32-byte hash field: label on top, the full `0x…` value in its own bordered
+/// box below, rendered as click-to-copy coloured chunks (like [`addr_kv`]) so a
+/// signer can verify it against their device and copy it to co-signers.
 fn hash_row<'a>(t: KaoTheme, label: impl Into<String>, hash: B256) -> Element<'a, Message> {
-    let inner = container(
-        text(format!("{hash:#x}"))
-            .size(11)
-            .font(mono_bold())
-            .color(t.text)
-            .wrapping(Wrapping::Glyph),
-    )
-    .width(Length::Fill)
-    .padding(Padding::from([6, 8]))
-    .style(move |_| container::Style {
-        background: Some(iced::Background::Color(t.card)),
-        border: iced::Border {
-            color: t.border,
-            width: 1.0,
-            radius: iced::border::Radius::from(8),
-        },
-        text_color: Some(t.text),
-        ..container::Style::default()
-    });
+    let inner = container(colored_hash_copyable::<Message>(t, hash))
+        .width(Length::Fill)
+        .padding(Padding::from([6, 8]))
+        .style(move |_| container::Style {
+            background: Some(iced::Background::Color(t.card)),
+            border: iced::Border {
+                color: t.border,
+                width: 1.0,
+                radius: iced::border::Radius::from(8),
+            },
+            text_color: Some(t.text),
+            ..container::Style::default()
+        });
     column![
         text(label.into()).size(12).color(t.sub),
         Space::new().height(4),

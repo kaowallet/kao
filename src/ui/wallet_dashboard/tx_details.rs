@@ -45,6 +45,16 @@ pub enum Outcome {
     CopyText(String),
 }
 
+impl Outcome {
+    /// Variant name for the GUI state trace.
+    fn name(&self) -> &'static str {
+        match self {
+            Outcome::Closed => "Closed",
+            Outcome::CopyText(_) => "CopyText",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct TxDetailsPane {
     tx: IndexedTx,
@@ -72,7 +82,8 @@ impl TxDetailsPane {
     }
 
     pub fn update(&mut self, msg: Message) -> (Task<Message>, Option<Outcome>) {
-        match msg {
+        crate::trace_msg!("tx_details", &msg);
+        let (task, outcome) = match msg {
             // Copy-toast kick — the widget already copied + marked the toast.
             Message::AddressCopied => (Task::none(), None),
             Message::CopyHash => (
@@ -111,7 +122,11 @@ impl TxDetailsPane {
                 }
             }
             Message::Key(_) => (Task::none(), None),
+        };
+        if let Some(o) = &outcome {
+            crate::trace::outcome("tx_details", o.name());
         }
+        (task, outcome)
     }
 
     pub fn subscription(&self) -> Subscription<Message> {

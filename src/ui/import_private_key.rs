@@ -1,3 +1,5 @@
+use std::fmt;
+
 use alloy::primitives::B256;
 use iced::keyboard;
 use iced::widget::{Space, column, container, row, text, text_input};
@@ -14,12 +16,47 @@ use crate::wallet;
 
 pub const KEY_INPUT_ID: &str = "private_key_input";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Message {
-    KeyInput(String),
+    // The key is secret text the user typed — `SecretInput` redacts it
+    // from the derived-Debug trace stream.
+    KeyInput(crate::trace::SecretInput),
     ImportPressed,
     BackPressed,
     KeyboardEvent(keyboard::Event),
+}
+
+// Manual Debug: the keyboard subscription receives every key event the
+// focused key input ignores (all `KeyReleased`s in particular), so a
+// derived impl would leak typed key characters into the trace stream —
+// character keys are redacted, named keys (Enter, Escape, …) stay legible.
+impl fmt::Debug for Message {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Message::KeyInput(s) => f.debug_tuple("KeyInput").field(s).finish(),
+            Message::ImportPressed => f.write_str("ImportPressed"),
+            Message::BackPressed => f.write_str("BackPressed"),
+            Message::KeyboardEvent(e) => {
+                f.write_str("KeyboardEvent(")?;
+                match e {
+                    keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(n),
+                        ..
+                    } => write!(f, "KeyPressed({n:?})")?,
+                    keyboard::Event::KeyPressed { .. } => f.write_str("KeyPressed(<redacted>)")?,
+                    keyboard::Event::KeyReleased {
+                        key: keyboard::Key::Named(n),
+                        ..
+                    } => write!(f, "KeyReleased({n:?})")?,
+                    keyboard::Event::KeyReleased { .. } => {
+                        f.write_str("KeyReleased(<redacted>)")?
+                    }
+                    keyboard::Event::ModifiersChanged(m) => write!(f, "ModifiersChanged({m:?})")?,
+                }
+                f.write_str(")")
+            }
+        }
+    }
 }
 
 /// Outcome signals emitted by this screen to its parent.
@@ -27,6 +64,17 @@ pub enum Message {
 pub enum Outcome {
     Imported { key_bytes: Zeroizing<[u8; 32]> },
     Back,
+}
+
+impl Outcome {
+    /// Variant name for the GUI state trace — never the payload, which
+    /// carries the raw key bytes.
+    fn name(&self) -> &'static str {
+        match self {
+            Outcome::Imported { .. } => "Imported",
+            Outcome::Back => "Back",
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -39,9 +87,18 @@ pub struct ImportPrivateKeyScreen {
 
 impl ImportPrivateKeyScreen {
     pub fn update(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
+        crate::trace_msg!("import_key", &message);
+        let (task, outcome) = self.update_inner(message);
+        if let Some(o) = &outcome {
+            crate::trace::outcome("import_key", o.name());
+        }
+        (task, outcome)
+    }
+
+    fn update_inner(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
         match message {
             Message::KeyInput(s) => {
-                self.key_input = Zeroizing::new(s);
+                self.key_input = s.take();
                 (Task::none(), None)
             }
             Message::ImportPressed => (Task::none(), self.try_import()),
@@ -94,7 +151,7 @@ impl ImportPrivateKeyScreen {
 
         let key_input = text_input("0x…", self.key_input.as_str())
             .id(KEY_INPUT_ID)
-            .on_input(Message::KeyInput)
+            .on_input(|s| Message::KeyInput(s.into()))
             .on_submit(Message::ImportPressed)
             .padding(Padding::from([12, 14]))
             .size(14)

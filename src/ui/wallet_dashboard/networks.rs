@@ -37,8 +37,11 @@ use crate::ui::kao_widgets::{
 #[derive(Debug, Clone)]
 pub enum Message {
     Back,
-    ExecChanged(Chain, String),
-    ConsensusChanged(Chain, String),
+    // RPC URLs are credential-bearing (a dRPC/Alchemy key rides inside the
+    // key-synthesized endpoints this form seeds from), so the input is
+    // redacted at the type level. Mirrors `network_setup`'s treatment.
+    ExecChanged(Chain, crate::trace::SecretInput),
+    ConsensusChanged(Chain, crate::trace::SecretInput),
     CheckpointChanged(String),
     Save,
     Saved,
@@ -50,6 +53,15 @@ pub enum Outcome {
     /// User backed out (or save completed) — coordinator should return to the
     /// settings root pane.
     Closed,
+}
+
+impl Outcome {
+    /// Variant name for the GUI state trace.
+    fn name(&self) -> &'static str {
+        match self {
+            Outcome::Closed => "Closed",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -106,14 +118,29 @@ impl NetworksPane {
     }
 
     pub fn update(&mut self, msg: Message) -> (Task<Message>, Option<Outcome>) {
+        crate::trace_msg!("networks", &msg);
+        let saving_before = self.saving;
+        let (task, outcome) = self.update_inner(msg);
+        if saving_before != self.saving {
+            crate::trace::state("networks", "saving", saving_before, self.saving);
+        }
+        if let Some(o) = &outcome {
+            crate::trace::outcome("networks", o.name());
+        }
+        (task, outcome)
+    }
+
+    fn update_inner(&mut self, msg: Message) -> (Task<Message>, Option<Outcome>) {
         match msg {
             Message::Back => (Task::none(), Some(Outcome::Closed)),
             Message::ExecChanged(chain, s) => {
-                self.draft.exec.set(chain, s);
+                // URL-tier credential: persists plaintext in settings.toml,
+                // so a plain-String copy into the draft is acceptable.
+                self.draft.exec.set(chain, s.expose().to_string());
                 (Task::none(), None)
             }
             Message::ConsensusChanged(chain, s) => {
-                self.draft.consensus.set(chain, s);
+                self.draft.consensus.set(chain, s.expose().to_string());
                 (Task::none(), None)
             }
             Message::CheckpointChanged(s) => {
@@ -178,7 +205,7 @@ impl NetworksPane {
         let mut exec_rows = column![].spacing(6).width(Length::Fill);
         for chain in Chain::ALL {
             let input = text_input("https://…", self.draft.exec.get(chain))
-                .on_input(move |s| Message::ExecChanged(chain, s))
+                .on_input(move |s| Message::ExecChanged(chain, s.into()))
                 .padding(Padding::from([6, 10]))
                 .style(move |_theme, status| text_input_style(t, status));
             exec_rows = exec_rows.push(labeled_row(t, chain.label(), input.into()));
@@ -194,7 +221,7 @@ impl NetworksPane {
         let mut consensus_rows = column![].spacing(6).width(Length::Fill);
         for chain in Chain::ALL {
             let input = text_input("https://…", self.draft.consensus.get(chain))
-                .on_input(move |s| Message::ConsensusChanged(chain, s))
+                .on_input(move |s| Message::ConsensusChanged(chain, s.into()))
                 .padding(Padding::from([6, 10]))
                 .style(move |_theme, status| text_input_style(t, status));
             consensus_rows = consensus_rows.push(labeled_row(t, chain.label(), input.into()));

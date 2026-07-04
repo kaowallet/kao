@@ -34,6 +34,16 @@ pub enum Outcome {
     Back,
 }
 
+impl Outcome {
+    /// Variant name for the GUI state trace.
+    fn name(&self) -> &'static str {
+        match self {
+            Outcome::Continue => "Continue",
+            Outcome::Back => "Back",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ShowSeedScreen {
     seed_phrase: SecretString,
@@ -107,6 +117,19 @@ impl ShowSeedScreen {
     }
 
     pub fn update(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
+        crate::trace_msg!("show_seed", &message);
+        let copied_before = self.did_copy;
+        let (task, outcome) = self.update_inner(message);
+        if copied_before != self.did_copy {
+            crate::trace::state("show_seed", "did_copy", copied_before, self.did_copy);
+        }
+        if let Some(o) = &outcome {
+            crate::trace::outcome("show_seed", o.name());
+        }
+        (task, outcome)
+    }
+
+    fn update_inner(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
         match message {
             Message::CopySeed => {
                 // Clipboard write requires an owned String — the one

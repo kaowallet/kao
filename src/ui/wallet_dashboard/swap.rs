@@ -61,15 +61,36 @@ pub enum Outcome {
     CopyText(String),
 }
 
+impl Outcome {
+    /// Variant name for the GUI state trace — never the payload.
+    fn name(&self) -> &'static str {
+        match self {
+            Outcome::Closed => "Closed",
+            Outcome::RequestQuote(_) => "RequestQuote",
+            Outcome::RequestPlace { .. } => "RequestPlace",
+            Outcome::RequestCancel { .. } => "RequestCancel",
+            Outcome::CopyText(_) => "CopyText",
+        }
+    }
+}
+
 #[derive(Debug)]
 enum Phase {
     /// Picking tokens / amount / quote.
     Compose,
-    /// Placement in flight (approval + signing + submission).
-    Placing,
     /// Order placed; blocking on settlement. Holds the order UID; the
     /// coordinator threads the live [`TrackedOrder`] into `view`.
     Tracking(String),
+}
+
+impl Phase {
+    /// Variant name for the GUI state trace.
+    fn name(&self) -> &'static str {
+        match self {
+            Phase::Compose => "Compose",
+            Phase::Tracking(_) => "Tracking",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -99,24 +120,42 @@ impl SwapPane {
         self.composer.update(composer::Message::QuoteResult(result));
     }
 
-    /// The user confirmed the clear-signing review — enter the blocking
-    /// "placing" phase while the coordinator signs + submits the order.
-    pub fn begin_placing(&mut self) {
-        self.phase = Phase::Placing;
-    }
-
     /// Placement succeeded — switch to blocking status tracking.
     pub fn begin_tracking(&mut self, uid: String) {
-        self.phase = Phase::Tracking(uid);
+        self.set_phase(Phase::Tracking(uid));
     }
 
     /// Placement failed — return to the composer with the error shown.
     pub fn placement_failed(&mut self, e: String) {
         self.composer.set_error(e);
-        self.phase = Phase::Compose;
+        self.set_phase(Phase::Compose);
+    }
+
+    /// Phase transitions are driven by the coordinator through the `begin_*`
+    /// setters above (never through `update`), so the state trace lives here
+    /// rather than in an update wrapper.
+    fn set_phase(&mut self, phase: Phase) {
+        let before = self.phase.name();
+        self.phase = phase;
+        if before != self.phase.name() {
+            crate::trace::state("swap", "phase", before, self.phase.name());
+        }
     }
 
     pub fn update(&mut self, msg: Message) -> (Task<Message>, Option<Outcome>) {
+        crate::trace_msg!("swap", &msg);
+        let phase_before = self.phase.name();
+        let (task, outcome) = self.update_inner(msg);
+        if phase_before != self.phase.name() {
+            crate::trace::state("swap", "phase", phase_before, self.phase.name());
+        }
+        if let Some(o) = &outcome {
+            crate::trace::outcome("swap", o.name());
+        }
+        (task, outcome)
+    }
+
+    fn update_inner(&mut self, msg: Message) -> (Task<Message>, Option<Outcome>) {
         match msg {
             Message::Composer(cm) => {
                 if !matches!(self.phase, Phase::Compose) {
@@ -128,9 +167,10 @@ impl SwapPane {
                     }
                     Some(composer::Outcome::RequestPlace { draft, quote }) => {
                         // Stay in Compose: the coordinator opens the clear-signing
-                        // review first, and only drives us into `Placing` (via
-                        // `begin_placing`) once the user confirms the order. A
-                        // cancel leaves the composer untouched.
+                        // review, which stays up (in its waiting phase) across the
+                        // sign + submit and resolves the order itself. On success
+                        // it drives us to `Tracking`; a cancel/failure leaves the
+                        // composer untouched.
                         (Task::none(), Some(Outcome::RequestPlace { draft, quote }))
                     }
                     None => (Task::none(), None),
@@ -164,7 +204,6 @@ impl SwapPane {
     ) -> Element<'a, Message> {
         let (content, dismissable): (Element<'a, Message>, bool) = match &self.phase {
             Phase::Compose => (self.compose_view(t, portfolio), true),
-            Phase::Placing => (placing_view(t), false),
             Phase::Tracking(_) => tracking_view(t, tracked),
         };
 
@@ -232,35 +271,6 @@ impl SwapPane {
         .width(Length::Fill)
         .into()
     }
-}
-
-fn placing_view<'a>(t: KaoTheme) -> Element<'a, Message> {
-    let step = |s: &'static str| text(s).size(12).color(t.sub).center();
-    column![
-        text("(づ｡◕‿‿◕｡)づ").size(34).color(t.a1).center(),
-        Space::new().height(12),
-        text("Placing your order…")
-            .size(16)
-            .color(t.text)
-            .font(bold())
-            .center(),
-        Space::new().height(10),
-        // Spell out the on-chain/off-chain steps so it's clear where approval
-        // and signing happen — they run automatically here (your device will
-        // prompt for hardware wallets).
-        step("1. Approve token for the CoW vault relayer (first time only)"),
-        step("2. Sign your order (EIP-712)"),
-        step("3. Submit to CoW — solvers settle it on-chain"),
-        Space::new().height(8),
-        text("Confirm on your device if prompted.")
-            .size(11)
-            .color(t.sub)
-            .center(),
-    ]
-    .spacing(3)
-    .width(Length::Fill)
-    .align_x(Alignment::Center)
-    .into()
 }
 
 /// Returns the tracking content and whether the modal is dismissable (true only

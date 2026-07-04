@@ -141,6 +141,18 @@ pub enum Outcome {
     },
 }
 
+impl Outcome {
+    /// Variant name for the GUI state trace — the payloads (descriptors,
+    /// owner lists) stay out of the log.
+    fn name(&self) -> &'static str {
+        match self {
+            Outcome::Done { .. } => "Done",
+            Outcome::Back => "Back",
+            Outcome::RequestAddSigner { .. } => "RequestAddSigner",
+        }
+    }
+}
+
 /// Import method the user picked for the add-signer sub-flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignerMethod {
@@ -259,6 +271,21 @@ enum Step {
     },
 }
 
+impl Step {
+    fn name(&self) -> &'static str {
+        match self {
+            Step::AddressInput { .. } => "AddressInput",
+            Step::Scanning { .. } => "Scanning",
+            Step::ChainChooser { .. } => "ChainChooser",
+            Step::NoChain { .. } => "NoChain",
+            Step::Inspect { .. } => "Inspect",
+            Step::RoleSelection { .. } => "RoleSelection",
+            Step::PickSignerMethod { .. } => "PickSignerMethod",
+            Step::Label { .. } => "Label",
+        }
+    }
+}
+
 pub struct SafeOnboardingScreen {
     network: Arc<dyn BalanceFetcher>,
     /// Snapshot of every account in the wallet right before the screen
@@ -302,6 +329,20 @@ impl SafeOnboardingScreen {
     }
 
     pub fn update(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
+        crate::trace_msg!("safe_onboarding", &message);
+        let step_before = self.step.name();
+        let (task, outcome) = self.update_inner(message);
+        let step_after = self.step.name();
+        if step_before != step_after {
+            crate::trace::state("safe_onboarding", "step", step_before, step_after);
+        }
+        if let Some(o) = &outcome {
+            crate::trace::outcome("safe_onboarding", o.name());
+        }
+        (task, outcome)
+    }
+
+    fn update_inner(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
         match message {
             Message::BackPressed => self.handle_back(),
             Message::KeyboardEvent(keyboard::Event::KeyPressed { key, .. }) => {
@@ -738,6 +779,7 @@ impl SafeOnboardingScreen {
     /// snapshot (so subsequent picker entries treat it as already
     /// claimed) and the RoleSelection's matched/selected lists.
     pub fn apply_added_signer(&mut self, new_account: ExistingAccount) {
+        let step_before = self.step.name();
         if !self
             .existing
             .iter()
@@ -754,6 +796,9 @@ impl SafeOnboardingScreen {
             }
             selected.insert(new_account.account_idx);
         });
+        if step_before != self.step.name() {
+            crate::trace::state("safe_onboarding", "step", step_before, self.step.name());
+        }
     }
 
     /// Called by the parent after a nested-Safe sub-flow finished and
@@ -761,18 +806,26 @@ impl SafeOnboardingScreen {
     /// Safe's address as a linked owner so the RoleSelection view can
     /// surface it as a sign-capable owner.
     pub fn apply_added_nested_safe(&mut self, address: Address) {
+        let step_before = self.step.name();
         self.rewind_picker_to_role(None, |_, _, linked| {
             if !linked.contains(&address) {
                 linked.push(address);
             }
         });
+        if step_before != self.step.name() {
+            crate::trace::state("safe_onboarding", "step", step_before, self.step.name());
+        }
     }
 
     /// Called by the parent when an import attempt failed validation
     /// (e.g., the derived address wasn't an owner of this Safe). Bounce
     /// the user back to RoleSelection with the error displayed.
     pub fn apply_signer_import_error(&mut self, message: String) {
+        let step_before = self.step.name();
         self.rewind_picker_to_role(Some(message), |_, _, _| {});
+        if step_before != self.step.name() {
+            crate::trace::state("safe_onboarding", "step", step_before, self.step.name());
+        }
     }
 
     /// Common rewind from `PickSignerMethod` to `RoleSelection`. Moves

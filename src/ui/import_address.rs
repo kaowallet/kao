@@ -45,6 +45,16 @@ pub enum Outcome {
     Back,
 }
 
+impl Outcome {
+    /// Variant name for the GUI state trace.
+    fn name(&self) -> &'static str {
+        match self {
+            Outcome::Imported { .. } => "Imported",
+            Outcome::Back => "Back",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ImportAddressScreen {
     address_input: String,
@@ -71,6 +81,24 @@ impl ImportAddressScreen {
     }
 
     pub fn update(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
+        crate::trace_msg!("import_address", &message);
+        let busy_before = self.resolving.is_some();
+        let (task, outcome) = self.update_inner(message);
+        if busy_before != self.resolving.is_some() {
+            crate::trace::state(
+                "import_address",
+                "busy",
+                busy_before,
+                self.resolving.is_some(),
+            );
+        }
+        if let Some(o) = &outcome {
+            crate::trace::outcome("import_address", o.name());
+        }
+        (task, outcome)
+    }
+
+    fn update_inner(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
         match message {
             Message::AddressInput(s) => {
                 self.address_input = s;

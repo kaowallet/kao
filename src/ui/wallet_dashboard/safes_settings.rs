@@ -44,6 +44,16 @@ pub enum Outcome {
     SetServiceUrl { index: usize, url: Option<String> },
 }
 
+impl Outcome {
+    /// Variant name for the GUI state trace.
+    fn name(&self) -> &'static str {
+        match self {
+            Outcome::Closed => "Closed",
+            Outcome::SetServiceUrl { .. } => "SetServiceUrl",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct RowState {
     /// Raw input — seeded from the stored override ("" for default).
@@ -72,6 +82,27 @@ impl SafesPane {
     }
 
     pub fn update(&mut self, msg: Message) -> (Task<Message>, Option<Outcome>) {
+        crate::trace_msg!("safes_settings", &msg);
+        let errors_before = self.error_rows();
+        let (task, outcome) = self.update_inner(msg);
+        let errors_after = self.error_rows();
+        if errors_before != errors_after {
+            crate::trace::state("safes_settings", "error_rows", errors_before, errors_after);
+        }
+        if let Some(o) = &outcome {
+            crate::trace::outcome("safes_settings", o.name());
+        }
+        (task, outcome)
+    }
+
+    /// Count of rows currently showing a validation error — the pane's
+    /// only coarse state worth diffing in the GUI trace (no mode enum,
+    /// no busy flag).
+    fn error_rows(&self) -> usize {
+        self.rows.iter().filter(|r| r.error.is_some()).count()
+    }
+
+    fn update_inner(&mut self, msg: Message) -> (Task<Message>, Option<Outcome>) {
         match msg {
             // Copy-toast kick — the widget already copied + marked the toast.
             Message::AddressCopied => (Task::none(), None),

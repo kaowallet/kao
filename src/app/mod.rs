@@ -137,6 +137,29 @@ pub enum Screen {
     Wallet(Box<WalletScreen>),
 }
 
+impl Screen {
+    /// Stable short name for the GUI state trace (see `crate::trace`).
+    fn name(&self) -> &'static str {
+        match self {
+            Screen::CreatePassword(_) => "CreatePassword",
+            Screen::Unlock(_) => "Unlock",
+            Screen::NetworkSetup(_) => "NetworkSetup",
+            Screen::SetupMethod(_) => "SetupMethod",
+            Screen::SelectHardwareWallet(_) => "SelectHardwareWallet",
+            Screen::ShowSeed(_) => "ShowSeed",
+            Screen::VerifySeed(_) => "VerifySeed",
+            Screen::ImportAddress(_) => "ImportAddress",
+            Screen::ImportPrivateKey(_) => "ImportPrivateKey",
+            Screen::ImportSeedPhrase(_) => "ImportSeedPhrase",
+            Screen::SafeOnboarding(_) => "SafeOnboarding",
+            Screen::SelectHdAccount(_) => "SelectHdAccount",
+            Screen::ConnectLedger(_) => "ConnectLedger",
+            Screen::ConnectTrezor(_) => "ConnectTrezor",
+            Screen::Wallet(_) => "Wallet",
+        }
+    }
+}
+
 // ── App ──────────────────────────────────────────────────────────────────────
 
 /// Why the setup screens are on screen. `FreshWallet` means we're creating
@@ -247,7 +270,14 @@ impl App {
         let portfolio_cache = portfolio::new_cache();
 
         let contacts = Arc::new(RwLock::new(ContactsBook::new()));
-        if wallet::wallet_exists() {
+        let exists = wallet::wallet_exists();
+        crate::trace::state(
+            "app",
+            "screen",
+            "startup",
+            if exists { "Unlock" } else { "CreatePassword" },
+        );
+        if exists {
             let app = App {
                 screen: Screen::Unlock(UnlockScreen::default()),
                 passphrase: None,
@@ -1131,6 +1161,47 @@ impl App {
     }
 
     pub fn update(&mut self, message: Message) -> iced::Task<Message> {
+        crate::trace_msg!("app", &message);
+        // Diff the coarse app state across the dispatch so every transition
+        // is logged no matter which arm (or helper) performed it.
+        let screen_before = self.screen.name();
+        let toast_before = self.toast.is_some();
+        let active_before = self.wallet.as_ref().map(|w| w.active_index);
+        let accounts_before = self.wallet.as_ref().map(|w| w.accounts.len());
+
+        let task = self.update_inner(message);
+
+        let screen_after = self.screen.name();
+        if screen_before != screen_after {
+            crate::trace::state("app", "screen", screen_before, screen_after);
+        }
+        if toast_before != self.toast.is_some() {
+            let s = |shown: bool| if shown { "shown" } else { "none" };
+            crate::trace::state("app", "toast", s(toast_before), s(self.toast.is_some()));
+        }
+        let fmt_opt = |v: Option<usize>| v.map_or("none".to_string(), |i| i.to_string());
+        let active_after = self.wallet.as_ref().map(|w| w.active_index);
+        if active_before != active_after {
+            crate::trace::state(
+                "app",
+                "active_account",
+                fmt_opt(active_before),
+                fmt_opt(active_after),
+            );
+        }
+        let accounts_after = self.wallet.as_ref().map(|w| w.accounts.len());
+        if accounts_before != accounts_after {
+            crate::trace::state(
+                "app",
+                "accounts",
+                fmt_opt(accounts_before),
+                fmt_opt(accounts_after),
+            );
+        }
+        task
+    }
+
+    fn update_inner(&mut self, message: Message) -> iced::Task<Message> {
         match message {
             // ── CreatePassword ──────────────────────────────────────
             Message::CreatePassword(msg) => {

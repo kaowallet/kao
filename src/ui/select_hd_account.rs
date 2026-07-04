@@ -1,3 +1,4 @@
+use std::fmt;
 use std::sync::Arc;
 
 use alloy::primitives::Address;
@@ -20,14 +21,26 @@ use crate::wallet::{self, HdParentKey};
 
 const PAGE_SIZE: u32 = 5;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DerivedAccount {
     hd_index: u32,
     address: Address,
     key_bytes: Zeroizing<[u8; 32]>,
 }
 
-#[derive(Debug, Clone)]
+// Manual Debug: `key_bytes` is a freshly derived private key whose
+// `Zeroizing` Debug would print the raw bytes — redacted.
+impl fmt::Debug for DerivedAccount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DerivedAccount")
+            .field("hd_index", &self.hd_index)
+            .field("address", &self.address)
+            .field("key_bytes", &format_args!("<redacted>"))
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 pub enum Message {
     Select(u32),
     LoadMore,
@@ -41,6 +54,53 @@ pub enum Message {
     KeyboardEvent(keyboard::Event),
 }
 
+// Manual Debug: `InitialReady` carries the HD parent key, whose Debug
+// prints the BIP32 chain code — redacted. `KeyboardEvent` can carry
+// trailing phrase keystrokes from the previous screen, so character keys
+// are redacted too; everything else mirrors the derived output.
+impl fmt::Debug for Message {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Message::Select(i) => f.debug_tuple("Select").field(i).finish(),
+            Message::LoadMore => f.write_str("LoadMore"),
+            Message::BackPressed => f.write_str("BackPressed"),
+            Message::BalanceFetched { hd_index, balance } => f
+                .debug_struct("BalanceFetched")
+                .field("hd_index", hd_index)
+                .field("balance", balance)
+                .finish(),
+            Message::InitialReady(Ok((_parent, accounts))) => f
+                .debug_tuple("InitialReady")
+                .field(&format_args!("Ok(<parent key redacted>, {accounts:?})"))
+                .finish(),
+            Message::InitialReady(Err(e)) => f
+                .debug_tuple("InitialReady")
+                .field(&format_args!("Err({e:?})"))
+                .finish(),
+            Message::MoreReady(r) => f.debug_tuple("MoreReady").field(r).finish(),
+            Message::KeyboardEvent(e) => {
+                f.write_str("KeyboardEvent(")?;
+                match e {
+                    keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(n),
+                        ..
+                    } => write!(f, "KeyPressed({n:?})")?,
+                    keyboard::Event::KeyPressed { .. } => f.write_str("KeyPressed(<redacted>)")?,
+                    keyboard::Event::KeyReleased {
+                        key: keyboard::Key::Named(n),
+                        ..
+                    } => write!(f, "KeyReleased({n:?})")?,
+                    keyboard::Event::KeyReleased { .. } => {
+                        f.write_str("KeyReleased(<redacted>)")?
+                    }
+                    keyboard::Event::ModifiersChanged(m) => write!(f, "ModifiersChanged({m:?})")?,
+                }
+                f.write_str(")")
+            }
+        }
+    }
+}
+
 /// Outcome signals emitted by this screen to its parent.
 #[derive(Debug, Clone)]
 pub enum Outcome {
@@ -51,6 +111,17 @@ pub enum Outcome {
     Back {
         phrase: SecretString,
     },
+}
+
+impl Outcome {
+    /// Variant name for the GUI state trace — never the payload, which
+    /// carries the selected key bytes or the seed phrase.
+    fn name(&self) -> &'static str {
+        match self {
+            Outcome::Selected { .. } => "Selected",
+            Outcome::Back { .. } => "Back",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -121,6 +192,28 @@ impl SelectHdAccountScreen {
     }
 
     pub fn update(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
+        crate::trace_msg!("select_hd", &message);
+        let busy_before = self.deriving;
+        let accounts_before = self.accounts.len();
+        let (task, outcome) = self.update_inner(message);
+        if busy_before != self.deriving {
+            crate::trace::state("select_hd", "busy", busy_before, self.deriving);
+        }
+        if accounts_before != self.accounts.len() {
+            crate::trace::state(
+                "select_hd",
+                "accounts",
+                accounts_before,
+                self.accounts.len(),
+            );
+        }
+        if let Some(o) = &outcome {
+            crate::trace::outcome("select_hd", o.name());
+        }
+        (task, outcome)
+    }
+
+    fn update_inner(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
         match message {
             Message::Select(hd_index) => {
                 let outcome = self

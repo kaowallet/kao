@@ -8,16 +8,15 @@
 
 use std::sync::Arc;
 
-use alloy::consensus::{SignableTransaction, TxEip1559, TxEnvelope};
-use alloy::eips::eip2718::Encodable2718;
 use alloy::network::Ethereum;
 use alloy::primitives::utils::parse_units;
-use alloy::primitives::{Address, Bytes, TxHash, TxKind, U256};
+use alloy::primitives::{Address, Bytes, TxHash, U256};
 use alloy::providers::{Provider, RootProvider};
 use tracing::{debug, info, warn};
 
 use crate::chain::NetworkId;
 use crate::net::BalanceFetcher;
+use crate::sign::broadcast::{BroadcastCall, Fees, Guards, LiveSigners, broadcast};
 use crate::wallet::KaoSigner;
 use crate::wallet::sim::{self, SimulationResult};
 
@@ -261,27 +260,26 @@ pub async fn build_quote(
     })
 }
 
-/// Sign a `TxEip1559` with `signer` and broadcast it.
+/// Sign the reviewed `SendPlan`/`TxQuote` and broadcast it.
 ///
-/// Manual encode (vs. an `EthereumWallet`-wrapped `FillProvider`) keeps one
-/// code path across `KaoSigner::Local | Ledger | Trezor`.
+/// A thin shim over the unified [`crate::sign::broadcast::broadcast`] primitive:
+/// it keeps the Send-specific stale-quote guard (a full structural `SendPlan`
+/// comparison), then delegates the fill/sign/assert/broadcast tail. The quote's
+/// nonce/gas/fees are passed as [`Fees::Quoted`] so the user signs exactly the
+/// numbers they reviewed — no re-estimation. The zero-address recipient guard
+/// (which must inspect `plan.recipient`, not the tx `to`, because an ERC-20's
+/// recipient lives in the calldata) and the `from == signer` wall both live in
+/// the primitive.
 pub async fn sign_and_send(
     provider: &RootProvider<Ethereum>,
     signer: &KaoSigner,
     plan: SendPlan,
     quote: TxQuote,
 ) -> Result<TxHash, String> {
-    // Never sign a transfer to the zero address. For a native send that
-    // burns the ETH irrecoverably; many ERC-20s also permit transfer-to-zero.
-    // `plan.recipient` is the *actual* destination in both cases — for an
-    // ERC-20 the tx `to` is the contract and the recipient lives in the
-    // transfer calldata — so this single check covers native and token sends.
-    // The Send UI rejects it earlier; this is the last-line guard for any
-    // path that reaches the signer.
-    if plan.recipient.is_zero() {
-        warn!(from = %plan.from, "sign+send: refusing zero-address recipient");
-        return Err("refusing to send to the zero address".to_string());
-    }
+    // Send-specific stale-quote guard: the reviewed quote must still describe
+    // the exact plan being signed. Kept here (rather than the primitive's
+    // hash-based `stale_terms`) so the message and full-struct equality are
+    // preserved byte-for-byte during the migration.
     if !quote.matches_plan(&plan) {
         warn!(
             from = %plan.from,
@@ -294,61 +292,40 @@ pub async fn sign_and_send(
         return Err("quote no longer matches the reviewed send — review again".to_string());
     }
     let (to, value, input) = plan.tx_target();
-    let token_kind = match &plan.token {
-        SendToken::Native => "native",
-        SendToken::Erc20 { .. } => "erc20",
-    };
     info!(
         chain_id = plan.chain.chain_id(),
         custom = plan.chain.is_custom(),
-        token = token_kind,
+        token = match &plan.token {
+            SendToken::Native => "native",
+            SendToken::Erc20 { .. } => "erc20",
+        },
         from = %plan.from,
         to = %to,
-        value_wei = %value,
-        input_len = input.len(),
-        nonce = quote.nonce,
-        gas_limit = quote.gas_limit,
-        max_fee_per_gas = quote.max_fee_per_gas,
-        max_priority_fee_per_gas = quote.max_priority_fee_per_gas,
-        "sign+send: signing tx",
+        "sign+send: dispatching via unified broadcast",
     );
 
-    let mut tx = TxEip1559 {
-        chain_id: plan.chain.chain_id(),
-        nonce: quote.nonce,
-        gas_limit: quote.gas_limit,
-        max_fee_per_gas: quote.max_fee_per_gas,
-        max_priority_fee_per_gas: quote.max_priority_fee_per_gas,
-        to: TxKind::Call(to),
-        value,
-        access_list: Default::default(),
-        input,
-    };
-
-    let sig = match signer.sign_tx(&mut tx).await {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(error = %e, "sign+send: sign failed");
-            return Err(crate::wallet::friendly_signer_error(&e));
-        }
-    };
-    debug!("sign+send: signed");
-
-    let envelope: TxEnvelope = tx.into_signed(sig).into();
-    let raw = envelope.encoded_2718();
-    debug!(raw_len = raw.len(), "sign+send: broadcasting raw envelope");
-
-    let pending = match provider.send_raw_transaction(&raw).await {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(error = %e, "sign+send: broadcast failed");
-            return Err(format!("broadcast failed: {e}"));
-        }
-    };
-
-    let hash = *pending.tx_hash();
-    info!(hash = %format!("{hash:#x}"), "sign+send: broadcast ok");
-    Ok(hash)
+    broadcast(
+        provider,
+        LiveSigners::One(signer),
+        plan.from,
+        Fees::Quoted {
+            nonce: quote.nonce,
+            gas_limit: quote.gas_limit,
+            max_fee_per_gas: quote.max_fee_per_gas,
+            max_priority_fee_per_gas: quote.max_priority_fee_per_gas,
+        },
+        BroadcastCall {
+            to,
+            value,
+            calldata: input,
+            chain_id: plan.chain.chain_id(),
+        },
+        Guards {
+            zero_recipient: Some(plan.recipient),
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 #[cfg(test)]

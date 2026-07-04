@@ -23,8 +23,9 @@ use crate::safe::SafeTx;
 use crate::safe::service::{PendingSafeTx, SafeTxDetail, SafeTxState};
 use crate::ui::kao_theme::{KaoTheme, with_alpha};
 use crate::ui::kao_widgets::{
-    bold, colored_address, colored_hash, kao_fit, kao_scrollable_style, modal_wrapper, mono,
-    mono_black, mono_bold, primary_button, secondary_button, section_card, small_secondary_button,
+    bold, colored_address, colored_hash_copyable, kao_fit, kao_scrollable_style, modal_wrapper,
+    mono, mono_black, mono_bold, primary_button, secondary_button, section_card,
+    small_secondary_button,
 };
 use crate::ui::wallet_dashboard::sim_view;
 use crate::wallet::sim::SimulationResult;
@@ -58,6 +59,34 @@ pub enum Outcome {
     /// Re-spawn the inner/exec preflight tasks for the loaded detail.
     /// The pane already cleared its sim state (back to "simulating…").
     RetrySims,
+}
+
+impl Outcome {
+    /// Variant name for the GUI state trace.
+    fn name(&self) -> &'static str {
+        match self {
+            Outcome::Closed => "Closed",
+            Outcome::Confirm => "Confirm",
+            Outcome::Execute => "Execute",
+            Outcome::Reject => "Reject",
+            Outcome::RetrySims => "RetrySims",
+        }
+    }
+}
+
+/// Coarse simulation-result name for the GUI state trace.
+fn sim_name(sim: &SimulationResult) -> &'static str {
+    if sim.is_success() {
+        if sim.verified {
+            "success"
+        } else {
+            "success_unverified"
+        }
+    } else if sim.is_revert() {
+        "revert"
+    } else {
+        "unavailable"
+    }
 }
 
 #[derive(Debug)]
@@ -254,6 +283,7 @@ impl SafeTxDetailPane {
         if auto {
             self.inner_sim_auto_retried = true;
         }
+        crate::trace::state("safe_tx_detail", "inner_sim", "…", sim_name(&result));
         self.inner_sim = Some(result);
         auto
     }
@@ -264,6 +294,7 @@ impl SafeTxDetailPane {
         if auto {
             self.exec_sim_auto_retried = true;
         }
+        crate::trace::state("safe_tx_detail", "exec_sim", "…", sim_name(&result));
         self.exec_sim = Some(result);
         auto
     }
@@ -297,6 +328,19 @@ impl SafeTxDetailPane {
     }
 
     pub fn update(&mut self, msg: Message) -> (Task<Message>, Option<Outcome>) {
+        crate::trace_msg!("safe_tx_detail", &msg);
+        let busy_before = self.busy;
+        let (task, outcome) = self.update_inner(msg);
+        if busy_before != self.busy {
+            crate::trace::state("safe_tx_detail", "busy", busy_before, self.busy);
+        }
+        if let Some(o) = &outcome {
+            crate::trace::outcome("safe_tx_detail", o.name());
+        }
+        (task, outcome)
+    }
+
+    fn update_inner(&mut self, msg: Message) -> (Task<Message>, Option<Outcome>) {
         match msg {
             // Copy-toast kick — the widget already copied + marked the toast.
             Message::AddressCopied => (Task::none(), None),
@@ -458,8 +502,13 @@ impl SafeTxDetailPane {
             t,
             "VERIFY BEFORE SIGNING",
             column![
-                colored_hash(t, self.pending.safe_tx_hash),
-                Space::new().height(4),
+                text("SafeTx hash · click to copy")
+                    .size(12)
+                    .color(t.text)
+                    .font(bold()),
+                Space::new().height(6),
+                colored_hash_copyable(t, self.pending.safe_tx_hash),
+                Space::new().height(6),
                 text("Verify this exact hash on your signing device and with co-signers.")
                     .size(11)
                     .color(t.sub),

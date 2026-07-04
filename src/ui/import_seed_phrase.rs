@@ -1,3 +1,5 @@
+use std::fmt;
+
 use iced::keyboard;
 use iced::widget::{Space, column, container, row, text, text_input};
 use iced::{Alignment, Element, Length, Padding, Subscription, Task};
@@ -14,12 +16,47 @@ use crate::wallet;
 
 pub const PHRASE_INPUT_ID: &str = "seed_phrase_input";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Message {
-    PhraseInput(String),
+    // The phrase is secret text the user typed — `SecretInput` redacts it
+    // from the derived-Debug trace stream.
+    PhraseInput(crate::trace::SecretInput),
     ConfirmPressed,
     BackPressed,
     KeyboardEvent(keyboard::Event),
+}
+
+// Manual Debug: the keyboard subscription receives every key event the
+// focused phrase input ignores (all `KeyReleased`s in particular), so a
+// derived impl would leak typed phrase characters into the trace stream —
+// character keys are redacted, named keys (Enter, Escape, …) stay legible.
+impl fmt::Debug for Message {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Message::PhraseInput(s) => f.debug_tuple("PhraseInput").field(s).finish(),
+            Message::ConfirmPressed => f.write_str("ConfirmPressed"),
+            Message::BackPressed => f.write_str("BackPressed"),
+            Message::KeyboardEvent(e) => {
+                f.write_str("KeyboardEvent(")?;
+                match e {
+                    keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(n),
+                        ..
+                    } => write!(f, "KeyPressed({n:?})")?,
+                    keyboard::Event::KeyPressed { .. } => f.write_str("KeyPressed(<redacted>)")?,
+                    keyboard::Event::KeyReleased {
+                        key: keyboard::Key::Named(n),
+                        ..
+                    } => write!(f, "KeyReleased({n:?})")?,
+                    keyboard::Event::KeyReleased { .. } => {
+                        f.write_str("KeyReleased(<redacted>)")?
+                    }
+                    keyboard::Event::ModifiersChanged(m) => write!(f, "ModifiersChanged({m:?})")?,
+                }
+                f.write_str(")")
+            }
+        }
+    }
 }
 
 /// Outcome signals emitted by this screen to its parent.
@@ -27,6 +64,17 @@ pub enum Message {
 pub enum Outcome {
     Confirmed { phrase: SecretString },
     Back,
+}
+
+impl Outcome {
+    /// Variant name for the GUI state trace — never the payload, which
+    /// carries the seed phrase.
+    fn name(&self) -> &'static str {
+        match self {
+            Outcome::Confirmed { .. } => "Confirmed",
+            Outcome::Back => "Back",
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -47,9 +95,18 @@ impl ImportSeedPhraseScreen {
     }
 
     pub fn update(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
+        crate::trace_msg!("import_seed", &message);
+        let (task, outcome) = self.update_inner(message);
+        if let Some(o) = &outcome {
+            crate::trace::outcome("import_seed", o.name());
+        }
+        (task, outcome)
+    }
+
+    fn update_inner(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
         match message {
             Message::PhraseInput(s) => {
-                self.phrase_input = Zeroizing::new(s);
+                self.phrase_input = s.take();
                 (Task::none(), None)
             }
             Message::ConfirmPressed => (Task::none(), self.try_confirm()),
@@ -111,7 +168,7 @@ impl ImportSeedPhraseScreen {
 
         let phrase_input = text_input("word1 word2 word3 …", self.phrase_input.as_str())
             .id(PHRASE_INPUT_ID)
-            .on_input(Message::PhraseInput)
+            .on_input(|s| Message::PhraseInput(s.into()))
             .on_submit(Message::ConfirmPressed)
             .padding(Padding::from([12, 14]))
             .size(14)

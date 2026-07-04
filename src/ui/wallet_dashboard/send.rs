@@ -27,10 +27,10 @@ use crate::portfolio::LiveToken;
 use crate::safe::tx::{Operation, SafeTxInput};
 use crate::ui::kao_theme::{KaoTheme, with_alpha};
 use crate::ui::kao_widgets::{
-    avatar, black, bold, colored_address, colored_hash, ghost_button, hint_pill, hover_tint,
-    kao_fit, kao_fit_size, kao_scrollable_style, kao_text, kaomoji_for_account, kaomoji_for_index,
-    modal_wrapper, mono, mono_black, mono_bold, primary_button, secondary_button,
-    small_secondary_button, text_input_style, token_avatar, vspace,
+    CopyKick, avatar, black, bold, colored_address, colored_hash_copyable, ghost_button, hint_pill,
+    hover_tint, kao_fit, kao_fit_size, kao_scrollable_style, kao_text, kaomoji_for_account,
+    kaomoji_for_index, modal_wrapper, mono, mono_black, mono_bold, primary_button,
+    secondary_button, text_input_style, token_avatar, vspace,
 };
 use crate::ui::wallet_dashboard::function_panel;
 use crate::ui::wallet_dashboard::sim_view;
@@ -170,22 +170,12 @@ pub enum Message {
     SetToken(usize),
     Max,
     Step(u8),
-    Confirm,
-    QuoteFetched {
-        seq: u64,
-        result: Result<TxQuote, String>,
-    },
     BroadcastDone(Result<TxHash, String>),
-    DecodedReady {
-        seq: u64,
-        decoded: Box<DecodeResult>,
-    },
     EnsResolved {
         seq: u64,
         name: String,
         result: Result<Option<Address>, String>,
     },
-    ToggleCalldata,
     AdvanceToDone,
     SendAnother,
     CopyHash,
@@ -195,17 +185,6 @@ pub enum Message {
     BoxClickIgnored,
     SaveAsContactClicked,
     AcceptEnsDivergence,
-    HashReady {
-        seq: u64,
-        result: Result<(u64, B256), String>,
-    },
-    SimReady {
-        seq: u64,
-        result: SimulationResult,
-    },
-    RetrySim,
-    RetryPrepare,
-    Propose,
     ProposeDone(Result<(), String>),
     Key(keyboard::Event),
 }
@@ -249,6 +228,21 @@ impl Resolution {
             _ => None,
         }
     }
+
+    /// Variant name for the GUI state trace.
+    fn name(&self) -> &'static str {
+        match self {
+            Resolution::Empty => "Empty",
+            Resolution::Invalid => "Invalid",
+            Resolution::Address(_) => "Address",
+            Resolution::Resolving { .. } => "Resolving",
+            Resolution::AddressVerifying { .. } => "AddressVerifying",
+            Resolution::Resolved { .. } => "Resolved",
+            Resolution::NotFound { .. } => "NotFound",
+            Resolution::Error { .. } => "Error",
+            Resolution::EnsDivergence { .. } => "EnsDivergence",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -261,18 +255,22 @@ pub enum Outcome {
     },
 }
 
+impl Outcome {
+    /// Variant name for the GUI state trace — never the payload.
+    fn name(&self) -> &'static str {
+        match self {
+            Outcome::Closed => "Closed",
+            Outcome::CopyText(_) => "CopyText",
+            Outcome::SaveAsContact { .. } => "SaveAsContact",
+        }
+    }
+}
+
 // ── Mode-specific state ────────────────────────────────────────────────────
 
 #[derive(Debug)]
 struct EoaState {
     from: Address,
-    quote: Option<TxQuote>,
-    quote_loading: bool,
-    quote_seq: u64,
-    decoded: Option<Box<DecodeResult>>,
-    decoded_loading: bool,
-    decoded_seq: u64,
-    show_calldata: bool,
     broadcast_done: bool,
 }
 
@@ -288,20 +286,17 @@ struct SafeState {
     threshold: u32,
     linked_local_indices: Vec<u32>,
     signable_indices: Vec<u32>,
-    signable_addresses: Vec<Address>,
     unsupported_owner_kinds: Vec<&'static str>,
-    owner_count: usize,
+    /// Set once a propose succeeds — drives the success screen's copy.
     proposed: bool,
-    prepared: Option<(u64, B256)>,
-    prepare_error: Option<String>,
-    prepare_seq: u64,
-    prepare_dispatched: Option<u64>,
-    sim: Option<SimulationResult>,
-    pending_sim_retry: Option<bool>,
-    sim_auto_retried: bool,
 }
 
+// The Safe arm carries a lot more state (owner set, simulation, tx-service
+// context) than the EOA arm, and there's only ever one live `SendMode` per open
+// modal — boxing it would just add an indirection to every field access for no
+// real gain. Same call as the other single-instance sign enums in this crate.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 enum SendMode {
     Eoa(EoaState),
     Safe(SafeState),
@@ -326,6 +321,18 @@ pub struct SendPane {
     mode: SendMode,
 }
 
+/// Cheap names of the pane's coarse state, captured before/after a
+/// dispatch in the `update` wrapper so every transition is logged no
+/// matter which arm performed it.
+struct TraceSnapshot {
+    step: &'static str,
+    busy: bool,
+    error: bool,
+    resolution: &'static str,
+    proposed: bool,
+    tx_hash: bool,
+}
+
 impl SendPane {
     pub fn new_eoa(from: Address) -> Self {
         Self {
@@ -341,13 +348,6 @@ impl SendPane {
             last_tx_hash: None,
             mode: SendMode::Eoa(EoaState {
                 from,
-                quote: None,
-                quote_loading: false,
-                quote_seq: 0,
-                decoded: None,
-                decoded_loading: false,
-                decoded_seq: 0,
-                show_calldata: false,
                 broadcast_done: false,
             }),
         }
@@ -356,7 +356,6 @@ impl SendPane {
     pub fn new_safe(safe: &SafeDescriptor, accounts: &[AccountDescriptor]) -> Self {
         let mut linked_local_indices = Vec::new();
         let mut signable_indices = Vec::new();
-        let mut signable_addresses = Vec::new();
         let mut unsupported_owner_kinds = Vec::new();
         for &idx in &safe.linked_signer_indices {
             match accounts.get(idx as usize) {
@@ -371,9 +370,6 @@ impl SendPane {
                     signable_indices.push(idx);
                     if matches!(acc, AccountDescriptor::Local { .. }) {
                         linked_local_indices.push(idx);
-                    }
-                    if let Some(addr) = account_address(acc) {
-                        signable_addresses.push(addr);
                     }
                 }
                 Some(AccountDescriptor::ViewOnly { .. }) => {
@@ -408,17 +404,8 @@ impl SendPane {
                 threshold: safe.threshold,
                 linked_local_indices,
                 signable_indices,
-                signable_addresses,
                 unsupported_owner_kinds,
-                owner_count: safe.owners.len(),
                 proposed: false,
-                prepared: None,
-                prepare_error: None,
-                prepare_seq: 0,
-                prepare_dispatched: None,
-                sim: None,
-                pending_sim_retry: None,
-                sim_auto_retried: false,
             }),
         }
     }
@@ -429,20 +416,8 @@ impl SendPane {
             _ => None,
         }
     }
-    fn eoa_mut(&mut self) -> Option<&mut EoaState> {
-        match &mut self.mode {
-            SendMode::Eoa(s) => Some(s),
-            _ => None,
-        }
-    }
     fn safe(&self) -> Option<&SafeState> {
         match &self.mode {
-            SendMode::Safe(s) => Some(s),
-            _ => None,
-        }
-    }
-    fn safe_mut(&mut self) -> Option<&mut SafeState> {
-        match &mut self.mode {
             SendMode::Safe(s) => Some(s),
             _ => None,
         }
@@ -460,27 +435,21 @@ impl SendPane {
     pub fn token_idx(&self) -> usize {
         self.token_idx
     }
-    pub fn quote(&self) -> Option<&TxQuote> {
-        self.eoa().and_then(|e| e.quote.as_ref())
+    /// The raw amount string the user typed (e.g. `"1.5"`), snapshotted into the
+    /// sign-review overlay so the review shows exactly what was entered.
+    pub fn amount_str(&self) -> &str {
+        &self.amount
     }
-
-    pub fn quote_for_plan(&self, plan: &SendPlan) -> Option<&TxQuote> {
-        self.eoa()
-            .and_then(|e| e.quote.as_ref())
-            .filter(|q| q.matches_plan(plan))
+    /// The ENS/name the recipient resolved to, if any — used as the review's
+    /// recipient label when the address isn't a saved contact.
+    pub fn recipient_display_name(&self) -> Option<String> {
+        match &self.resolution {
+            Resolution::Resolved { name, .. } => Some(name.clone()),
+            _ => None,
+        }
     }
-
-    pub fn quote_for_current_plan(&self, portfolio: &[LiveToken]) -> Option<&TxQuote> {
-        let plan = self.build_plan(portfolio)?;
-        self.quote_for_plan(&plan)
-    }
-
     pub fn apply_max(&mut self, amount_str: String) {
         self.amount = amount_str;
-        // Max changes the amount, so any prior EOA quote no longer matches the
-        // plan — invalidate here too, keeping the rule uniform across every
-        // amount mutation (no-op for Safe mode).
-        self.invalidate_eoa_quote();
     }
 
     pub fn take_pending_ens(&mut self) -> Option<(u64, String)> {
@@ -554,39 +523,6 @@ impl SendPane {
         })
     }
 
-    fn invalidate_eoa_quote(&mut self) {
-        if let Some(eoa) = self.eoa_mut() {
-            eoa.quote_seq = eoa.quote_seq.wrapping_add(1);
-            eoa.quote = None;
-            eoa.quote_loading = false;
-        }
-    }
-
-    pub fn quote_started(&mut self) -> u64 {
-        // Bump the seq and clear the stale quote via the shared invalidator,
-        // then flip into the loading state and return the fresh seq the quote
-        // task must echo back.
-        self.invalidate_eoa_quote();
-        self.error = None;
-        let Some(eoa) = self.eoa_mut() else {
-            // Non-EOA modes never quote; this sentinel is unused (real seqs
-            // start at 1 after the first bump above).
-            return 0;
-        };
-        eoa.quote_loading = true;
-        eoa.quote_seq
-    }
-
-    pub fn decode_started(&mut self) -> u64 {
-        if let Some(eoa) = self.eoa_mut() {
-            eoa.decoded_seq = eoa.decoded_seq.wrapping_add(1);
-            eoa.decoded_loading = true;
-            eoa.decoded = None;
-            return eoa.decoded_seq;
-        }
-        0
-    }
-
     /// True when this wallet holds at least `threshold` *signable* linked
     /// owners (Local or hardware) — enough to sign and broadcast the Safe
     /// transaction directly, rather than proposing to remote co-signers.
@@ -614,94 +550,6 @@ impl SendPane {
                     && !matches!(self.resolution, Resolution::EnsDivergence { .. })
             }
         }
-    }
-
-    fn threshold_label(&self) -> String {
-        match &self.mode {
-            SendMode::Safe(s) => format!("{} of {}", s.threshold, s.owner_count),
-            _ => String::new(),
-        }
-    }
-
-    fn settled(&self) -> bool {
-        match &self.mode {
-            SendMode::Safe(s) => self.last_tx_hash.is_some() || s.proposed,
-            _ => false,
-        }
-    }
-
-    pub fn can_execute_now(&self) -> bool {
-        match &self.mode {
-            SendMode::Safe(s) => {
-                !self.busy
-                    && !self.settled()
-                    && self.has_enough_signable_signers()
-                    && self.can_continue_recipient()
-                    && s.prepared.is_some()
-            }
-            _ => false,
-        }
-    }
-
-    pub fn can_propose(&self) -> bool {
-        match &self.mode {
-            SendMode::Safe(s) => {
-                !self.busy
-                    && !self.settled()
-                    && self.can_continue_recipient()
-                    && s.prepared.is_some()
-            }
-            _ => false,
-        }
-    }
-
-    fn begin_prepare(&mut self) {
-        if let Some(s) = self.safe_mut() {
-            s.prepared = None;
-            s.prepare_error = None;
-            s.sim = None;
-            s.pending_sim_retry = None;
-            s.sim_auto_retried = false;
-            s.prepare_seq = s.prepare_seq.wrapping_add(1);
-        }
-    }
-
-    pub fn take_pending_sim_retry(
-        &mut self,
-        portfolio: &[LiveToken],
-    ) -> Option<(u64, SafeSendRequest, bool)> {
-        let SendMode::Safe(s) = &mut self.mode else {
-            return None;
-        };
-        if self.step != 2 {
-            s.pending_sim_retry = None;
-            return None;
-        }
-        let delayed = s.pending_sim_retry.take()?;
-        let seq = s.prepare_seq;
-        // NB: borrow on `s` ends here; `outgoing_request` re-borrows `self`.
-        let req = self.outgoing_request(portfolio)?;
-        Some((seq, req, delayed))
-    }
-
-    pub fn take_pending_prepare(
-        &mut self,
-        portfolio: &[LiveToken],
-    ) -> Option<(u64, SafeSendRequest)> {
-        let s = self.safe()?;
-        if self.step != 2
-            || s.prepared.is_some()
-            || s.prepare_error.is_some()
-            || s.prepare_dispatched == Some(s.prepare_seq)
-        {
-            return None;
-        }
-        let seq = s.prepare_seq;
-        let req = self.outgoing_request(portfolio)?;
-        if let Some(s) = self.safe_mut() {
-            s.prepare_dispatched = Some(seq);
-        }
-        Some((seq, req))
     }
 
     pub fn outgoing_request(&self, portfolio: &[LiveToken]) -> Option<SafeSendRequest> {
@@ -736,25 +584,86 @@ impl SendPane {
             token: send_token,
             threshold: s.threshold,
             signable_indices: s.signable_indices.clone(),
-            prepared: s.prepared.map(|(nonce, safe_tx_hash)| PreparedSafeTx {
-                nonce,
-                safe_tx_hash,
-            }),
+            // The reviewed `(nonce, safeTxHash)` pin is computed by the overlay's
+            // prepare and stitched into the request there (`SignReviewPrepared`),
+            // so the request built here for opening the review carries none yet.
+            prepared: None,
         })
     }
 
     pub fn mark_busy(&mut self) {
+        // Dashboard-driven flip (outside this pane's update wrapper), so
+        // log it here to keep the busy flag observable in the trace.
+        if !self.busy {
+            crate::trace::state("send", "busy", false, true);
+        }
         self.busy = true;
         self.error = None;
     }
 
+    // ── Trace helpers ────────────────────────────────────────────────────
+
+    /// Semantic step name for the GUI state trace.
+    fn step_name(&self) -> &'static str {
+        match (&self.mode, self.step) {
+            (SendMode::Eoa(_), 0) | (SendMode::Safe(_), 0) => "recipient",
+            (SendMode::Eoa(_), 1) | (SendMode::Safe(_), 1) => "amount",
+            (SendMode::Eoa(_), 2) | (SendMode::Safe(_), 2) => "review",
+            (SendMode::Eoa(_), 3) => "broadcast",
+            (SendMode::Eoa(_), _) => "success",
+            (SendMode::Safe(_), _) => "done",
+        }
+    }
+
+    fn trace_snapshot(&self) -> TraceSnapshot {
+        let proposed = matches!(&self.mode, SendMode::Safe(s) if s.proposed);
+        TraceSnapshot {
+            step: self.step_name(),
+            busy: self.busy,
+            error: self.error.is_some(),
+            resolution: self.resolution.name(),
+            proposed,
+            tx_hash: self.last_tx_hash.is_some(),
+        }
+    }
+
     pub fn update(&mut self, msg: Message) -> (Task<Message>, Option<Outcome>) {
+        crate::trace_msg!("send", &msg);
+        let before = self.trace_snapshot();
+        let (task, outcome) = self.update_inner(msg);
+        let after = self.trace_snapshot();
+        if before.step != after.step {
+            crate::trace::state("send", "step", before.step, after.step);
+        }
+        if before.busy != after.busy {
+            crate::trace::state("send", "busy", before.busy, after.busy);
+        }
+        if before.error != after.error {
+            let s = |shown: bool| if shown { "shown" } else { "none" };
+            crate::trace::state("send", "error", s(before.error), s(after.error));
+        }
+        if before.resolution != after.resolution {
+            crate::trace::state("send", "resolution", before.resolution, after.resolution);
+        }
+        if before.proposed != after.proposed {
+            crate::trace::state("send", "proposed", before.proposed, after.proposed);
+        }
+        if before.tx_hash != after.tx_hash {
+            let s = |set: bool| if set { "set" } else { "none" };
+            crate::trace::state("send", "tx_hash", s(before.tx_hash), s(after.tx_hash));
+        }
+        if let Some(o) = &outcome {
+            crate::trace::outcome("send", o.name());
+        }
+        (task, outcome)
+    }
+
+    fn update_inner(&mut self, msg: Message) -> (Task<Message>, Option<Outcome>) {
         match msg {
             // Copy-toast kick — the widget already copied + marked the toast.
             Message::AddressCopied => (Task::none(), None),
             Message::SetTo(s) => {
                 self.set_to(s);
-                self.invalidate_eoa_quote();
                 self.error = None;
                 (Task::none(), None)
             }
@@ -768,14 +677,12 @@ impl SendPane {
                     },
                     None => Resolution::Address(address),
                 };
-                self.invalidate_eoa_quote();
                 (Task::none(), None)
             }
             Message::EnsResolved { seq, name, result } => {
                 if seq != self.resolution_seq {
                     return (Task::none(), None);
                 }
-                let before = self.resolution.recipient();
                 match &self.resolution {
                     Resolution::Resolving { name: pending } if pending == &name => {
                         self.resolution = match result {
@@ -801,15 +708,11 @@ impl SendPane {
                     }
                     _ => {}
                 }
-                if before != self.resolution.recipient() {
-                    self.invalidate_eoa_quote();
-                }
                 (Task::none(), None)
             }
             Message::AcceptEnsDivergence => {
                 if let Resolution::EnsDivergence { fresh, .. } = self.resolution.clone() {
                     self.resolution = Resolution::Address(fresh);
-                    self.invalidate_eoa_quote();
                 }
                 (Task::none(), None)
             }
@@ -826,7 +729,6 @@ impl SendPane {
             }
             Message::SetAmount(s) => {
                 self.amount = s;
-                self.invalidate_eoa_quote();
                 self.error = None;
                 (Task::none(), None)
             }
@@ -835,9 +737,6 @@ impl SendPane {
                 if let SendMode::Safe(_) = &self.mode {
                     self.amount.clear();
                 }
-                // EOA: token (and thus chain) changed — the prior quote is
-                // stale. No-op for Safe mode.
-                self.invalidate_eoa_quote();
                 self.error = None;
                 (Task::none(), None)
             }
@@ -849,56 +748,15 @@ impl SendPane {
                             self.step = s;
                         }
                     }
+                    // Safe collects recipient (0) + amount (1); "Review →" is
+                    // intercepted by the dashboard to open the sign-review overlay
+                    // (Step(2) never reaches the pane), and the success screen (3)
+                    // is reached from the overlay's result. Only 0/1 land here.
                     SendMode::Safe(_) => match s {
-                        0 => {
-                            self.step = 0;
-                            self.begin_prepare();
-                        }
-                        1 if self.can_continue_recipient() => {
-                            self.step = 1;
-                        }
-                        // Same guard as step 1: never advance to the review/
-                        // sign screen without a valid recipient + signer, or
-                        // the review would render (and prepare) a transaction
-                        // with no real destination.
-                        2 if self.can_continue_recipient() => {
-                            self.step = 2;
-                            self.begin_prepare();
-                        }
+                        0 => self.step = 0,
+                        1 if self.can_continue_recipient() => self.step = 1,
                         _ => {}
                     },
-                }
-                (Task::none(), None)
-            }
-            Message::Confirm => {
-                match &mut self.mode {
-                    SendMode::Eoa(eoa) => {
-                        if !self.busy && eoa.quote.is_some() {
-                            self.busy = true;
-                            self.error = None;
-                            self.step = 3;
-                        }
-                    }
-                    SendMode::Safe(_) => {} // Dashboard intercepts
-                }
-                (Task::none(), None)
-            }
-            Message::Propose => (Task::none(), None), // Dashboard intercepts
-            Message::QuoteFetched { seq, result } => {
-                if let Some(eoa) = self.eoa_mut() {
-                    if seq != eoa.quote_seq {
-                        return (Task::none(), None);
-                    }
-                    eoa.quote_loading = false;
-                    match result {
-                        Ok(q) => {
-                            eoa.quote = Some(q);
-                            self.error = None;
-                        }
-                        Err(e) => {
-                            self.error = Some(e);
-                        }
-                    }
                 }
                 (Task::none(), None)
             }
@@ -911,8 +769,10 @@ impl SendPane {
                             eoa.broadcast_done = true;
                             self.error = None;
                         }
+                        // The overlay stays up showing the failure (see the
+                        // coordinator's `SendBroadcastReturn`); the pane just
+                        // records the error and clears busy for the retry.
                         Err(e) => {
-                            self.step = 2;
                             self.error = Some(e);
                         }
                     },
@@ -926,21 +786,6 @@ impl SendPane {
                             self.error = Some(e);
                         }
                     },
-                }
-                (Task::none(), None)
-            }
-            Message::DecodedReady { seq, decoded } => {
-                if let Some(eoa) = self.eoa_mut()
-                    && seq == eoa.decoded_seq
-                {
-                    eoa.decoded_loading = false;
-                    eoa.decoded = Some(decoded);
-                }
-                (Task::none(), None)
-            }
-            Message::ToggleCalldata => {
-                if let Some(eoa) = self.eoa_mut() {
-                    eoa.show_calldata = !eoa.show_calldata;
                 }
                 (Task::none(), None)
             }
@@ -978,54 +823,6 @@ impl SendPane {
                     }
                     _ => (Task::none(), None),
                 }
-            }
-            Message::HashReady { seq, result } => {
-                if let SendMode::Safe(s) = &mut self.mode
-                    && seq == s.prepare_seq
-                    && self.step == 2
-                {
-                    match result {
-                        Ok((nonce, hash)) => {
-                            s.prepared = Some((nonce, hash));
-                            s.prepare_error = None;
-                        }
-                        Err(e) => {
-                            s.prepared = None;
-                            s.prepare_error = Some(e);
-                        }
-                    }
-                }
-                (Task::none(), None)
-            }
-            Message::SimReady { seq, result } => {
-                if let SendMode::Safe(s) = &mut self.mode
-                    && seq == s.prepare_seq
-                    && self.step == 2
-                {
-                    if result.is_success() && !result.verified && !s.sim_auto_retried {
-                        s.sim_auto_retried = true;
-                        s.pending_sim_retry = Some(true);
-                    }
-                    s.sim = Some(result);
-                }
-                (Task::none(), None)
-            }
-            Message::RetrySim => {
-                if let SendMode::Safe(s) = &mut self.mode
-                    && self.step == 2
-                    && s.sim.is_some()
-                {
-                    s.sim = None;
-                    s.sim_auto_retried = false;
-                    s.pending_sim_retry = Some(false);
-                }
-                (Task::none(), None)
-            }
-            Message::RetryPrepare => {
-                if self.step == 2 {
-                    self.begin_prepare();
-                }
-                (Task::none(), None)
             }
             Message::ProposeDone(Ok(())) => {
                 if let SendMode::Safe(s) = &mut self.mode {
@@ -1148,22 +945,9 @@ impl SendPane {
 
         match &self.mode {
             SendMode::Eoa(_) => {
-                let recipient_kao: Option<String> = self.resolution.recipient().and_then(|a| {
-                    contacts
-                        .entries
-                        .iter()
-                        .find(|e| e.address == a)
-                        .map(|e| e.kaomoji.clone())
-                });
-                let recipient_chip: Option<&'static str> =
-                    self.resolution.recipient().and_then(|a| {
-                        contacts
-                            .entries
-                            .iter()
-                            .find(|e| e.address == a)
-                            .and_then(|e| e.chip)
-                    });
-
+                // Review (step 2) and broadcast/waiting (step 3) now live in the
+                // unified `sign_review` overlay, which stacks over this pane; the
+                // pane hosts recipient (0) / amount (1) and the success screen (4).
                 let inner: Element<'_, Message> = match self.step {
                     0 => self.step_recipient(
                         t,
@@ -1172,15 +956,6 @@ impl SendPane {
                         recipient_in_book,
                     ),
                     1 => self.step_amount(t, portfolio, recipient_name.clone()),
-                    2 => self.step_review_eoa(
-                        t,
-                        portfolio,
-                        recipient_name.clone(),
-                        recipient_in_book,
-                        recipient_kao,
-                        recipient_chip,
-                    ),
-                    3 => self.step_broadcast_eoa(t, portfolio, recipient_name.clone()),
                     _ => self.step_success_eoa(t, portfolio, recipient_name),
                 };
 
@@ -1230,10 +1005,12 @@ impl SendPane {
                 )
             }
             SendMode::Safe(_) => {
+                // Review (step 2) now lives in the unified sign-review overlay,
+                // which stacks over this pane; the pane hosts recipient (0),
+                // amount (1), and the success screen (3).
                 let body: Element<'_, Message> = match self.step {
                     0 => self.view_recipient_safe(t, contacts.entries, recipient_in_book),
                     1 => self.step_amount(t, portfolio, recipient_name.clone()),
-                    2 => self.view_review_safe(t, recipient_name, portfolio),
                     _ => self.view_success_safe(t, recipient_name, portfolio),
                 };
                 wrap_safe_modal(t, progress, body)
@@ -1693,640 +1470,6 @@ impl SendPane {
 
     // ── EOA-specific view steps ─────────────────────────────────────────
 
-    fn step_review_eoa<'a>(
-        &'a self,
-        t: KaoTheme,
-        portfolio: &'a [LiveToken],
-        recipient_name: Option<String>,
-        recipient_in_book: bool,
-        recipient_kao: Option<String>,
-        recipient_chip: Option<&'static str>,
-    ) -> Element<'a, Message> {
-        let Some(eoa) = self.eoa() else {
-            return text("Account state unavailable.")
-                .size(13)
-                .color(t.down)
-                .into();
-        };
-        let token = portfolio.get(self.token_idx);
-        let token_sym = token.map(|t| t.symbol.as_str()).unwrap_or("ETH");
-        let recipient = self.resolution.recipient();
-        let chain = token.map(|t| t.chain).unwrap_or_default();
-        let current_quote = self.quote_for_current_plan(portfolio);
-
-        let has_insufficient_eth = match (token, current_quote) {
-            (Some(tk), Some(q)) => {
-                let eth_balance = portfolio
-                    .iter()
-                    .find(|p| p.chain == tk.chain && p.contract.is_none())
-                    .map(|p| p.balance_raw);
-                let needed = if tk.contract.is_none() {
-                    parse_amount_units(&self.amount, tk.decimals)
-                        .ok()
-                        .map(|amt| amt.saturating_add(q.eth_cost_wei))
-                } else {
-                    Some(q.eth_cost_wei)
-                };
-                matches!((eth_balance, needed), (Some(bal), Some(need)) if need > bal)
-            }
-            _ => false,
-        };
-        let sim_reverted = current_quote.map(|q| q.sim.is_revert()).unwrap_or(false);
-
-        let recipient_short = recipient_name.clone().unwrap_or_else(|| {
-            recipient
-                .map(|a| short_address_str(&format!("{a:#x}")))
-                .unwrap_or_else(|| self.to.clone())
-        });
-        let usd_price = token.map(|tk| tk.usd_price).unwrap_or(0.0);
-        let amount_f = self.amount.parse::<f64>().unwrap_or(0.0);
-        let usd_value = amount_f * usd_price;
-        let intent_kao = if has_insufficient_eth {
-            "(・_・;)"
-        } else {
-            "( ◜◡◝ )"
-        };
-        let intent_text = container(
-            row![
-                text("You're sending ").size(15).color(t.text).font(bold()),
-                text(format!("{} {}", self.amount, token_sym))
-                    .size(15)
-                    .color(t.a1)
-                    .font(bold()),
-                text(" to ").size(15).color(t.text).font(bold()),
-                text(format!("{}.", recipient_short.clone()))
-                    .size(15)
-                    .color(t.a1)
-                    .font(bold()),
-            ]
-            .align_y(Alignment::Center),
-        )
-        .clip(true)
-        .width(Length::Fill);
-        let usd_sub = if usd_price > 0.0 {
-            format!("on {} · ≈ ${usd_value:.2}", network_display_name(chain))
-        } else {
-            format!("on {}", network_display_name(chain))
-        };
-
-        let intent_banner = container(
-            row![
-                kao_text(t, intent_kao, 22.0),
-                Space::new().width(12),
-                column![
-                    intent_text,
-                    text(usd_sub).size(12).color(t.sub).font(bold())
-                ]
-                .spacing(3),
-            ]
-            .align_y(Alignment::Center)
-            .width(Length::Fill),
-        )
-        .padding(Padding::from([15, 17]))
-        .width(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(Background::Color(t.ab1)),
-            border: Border {
-                color: with_alpha(t.a1, 0.27),
-                width: 1.0,
-                radius: Radius::from(15),
-            },
-            text_color: Some(t.text),
-            ..container::Style::default()
-        });
-
-        // Simulated balance changes
-        let sim_unavailable = current_quote
-            .map(|q| matches!(q.sim.outcome, SimOutcome::Unavailable))
-            .unwrap_or(true);
-
-        let balance_changes_card: Element<'_, Message> = if sim_reverted || sim_unavailable {
-            match current_quote.map(|q| &q.sim) {
-                Some(sim) => simulation_block(t, sim, chain, portfolio),
-                None => Space::new().height(0).into(),
-            }
-        } else {
-            let mut changes_col = column![].spacing(0).width(Length::Fill);
-            let balance_before = token.map(|tk| tk.balance_f64).unwrap_or(0.0);
-            let balance_after = balance_before - amount_f;
-            changes_col = changes_col.push(sim_row(
-                t,
-                chain,
-                token.and_then(|tk| tk.contract),
-                format!("Your {token_sym}"),
-                Some(format!("{:.2} → {:.2}", balance_before, balance_after)),
-                format!("− {} {token_sym}", self.amount),
-                t.down,
-            ));
-            changes_col = changes_col.push(divider_line(t));
-            if let Some(q) = current_quote {
-                let eth_str = format_units(q.eth_cost_wei, 18u8).unwrap_or_else(|_| "0".into());
-                let eth_short = trim_eth_display(&eth_str);
-                let eth_usd = portfolio.first().map(|p| p.usd_price).unwrap_or(0.0);
-                let gas_usd = eth_str.parse::<f64>().unwrap_or(0.0) * eth_usd;
-                let gas_sub = if eth_usd > 0.0 {
-                    format!("≈ ${gas_usd:.2} · paid in ETH")
-                } else {
-                    "paid in ETH".into()
-                };
-                changes_col = changes_col.push(sim_row(
-                    t,
-                    chain,
-                    None,
-                    "Network fee".into(),
-                    Some(gas_sub),
-                    format!("− {eth_short} ETH"),
-                    t.down,
-                ));
-                changes_col = changes_col.push(divider_line(t));
-            }
-            changes_col = changes_col.push(sim_row(
-                t,
-                chain,
-                token.and_then(|tk| tk.contract),
-                format!("{recipient_short} receives"),
-                None,
-                format!("+ {} {token_sym}", self.amount),
-                t.up,
-            ));
-
-            let header_row = row![
-                text("AFTER THIS TRANSACTION")
-                    .size(10)
-                    .color(t.sub)
-                    .font(mono_bold()),
-                Space::new().width(Length::Fill),
-                hint_pill(t, "⟁ simulated · revm"),
-            ]
-            .align_y(Alignment::Center)
-            .width(Length::Fill);
-
-            container(column![header_row, Space::new().height(2), changes_col].width(Length::Fill))
-                .padding(
-                    Padding::new(4.0)
-                        .top(12.0)
-                        .left(16.0)
-                        .right(16.0)
-                        .bottom(13.0),
-                )
-                .width(Length::Fill)
-                .style(move |_| container::Style {
-                    background: Some(Background::Color(t.card_alt)),
-                    border: Border {
-                        color: t.border,
-                        width: 1.0,
-                        radius: Radius::from(15),
-                    },
-                    text_color: Some(t.text),
-                    ..container::Style::default()
-                })
-                .into()
-        };
-
-        // Recipient card
-        let recipient_card: Element<'_, Message> = match recipient {
-            Some(addr) => {
-                let kao = recipient_kao.unwrap_or_else(|| "(◕‿◕)".to_string());
-                let mut header_row =
-                    row![text("RECIPIENT").size(10).color(t.sub).font(mono_bold())]
-                        .align_y(Alignment::Center);
-                if recipient_in_book {
-                    header_row = header_row.push(Space::new().width(Length::Fill));
-                    header_row = header_row.push(
-                        container(
-                            text("✓ matches saved contact")
-                                .size(10)
-                                .color(t.up)
-                                .font(mono_bold()),
-                        )
-                        .padding(Padding::from([3, 8]))
-                        .style(move |_| container::Style {
-                            background: Some(Background::Color(with_alpha(t.up, 0.08))),
-                            border: Border {
-                                color: with_alpha(t.up, 0.22),
-                                width: 1.0,
-                                radius: Radius::from(6),
-                            },
-                            ..container::Style::default()
-                        }),
-                    );
-                }
-                let display_name = recipient_name.clone().unwrap_or_else(|| {
-                    if let Resolution::Resolved { name, .. } = &self.resolution {
-                        name.clone()
-                    } else {
-                        short_address_str(&format!("{addr:#x}"))
-                    }
-                });
-                let mut name_col =
-                    column![text(display_name).size(14).color(t.text).font(bold())].spacing(1);
-                if let Some(chip) = recipient_chip {
-                    name_col = name_col.push(text(chip).size(11).color(t.sub).font(bold()));
-                }
-                let name_row = row![avatar_owned(t, kao, 30.0), Space::new().width(10), name_col]
-                    .align_y(Alignment::Center);
-                let addr_container = container(colored_address_compact(t, addr))
-                    .padding(Padding::from([10, 12]))
-                    .width(Length::Fill)
-                    .style(move |_| container::Style {
-                        background: Some(Background::Color(with_alpha(t.bg, 0.5))),
-                        border: Border {
-                            color: t.border,
-                            width: 1.0,
-                            radius: Radius::from(10),
-                        },
-                        ..container::Style::default()
-                    });
-                container(
-                    column![
-                        header_row,
-                        Space::new().height(8),
-                        name_row,
-                        Space::new().height(10),
-                        addr_container
-                    ]
-                    .width(Length::Fill),
-                )
-                .padding(Padding::from([13, 16]))
-                .width(Length::Fill)
-                .style(move |_| container::Style {
-                    background: Some(Background::Color(t.card_alt)),
-                    border: Border {
-                        color: t.border,
-                        width: 1.0,
-                        radius: Radius::from(15),
-                    },
-                    text_color: Some(t.text),
-                    ..container::Style::default()
-                })
-                .into()
-            }
-            None => container(
-                text("(invalid recipient)")
-                    .size(13)
-                    .color(t.down)
-                    .font(bold()),
-            )
-            .into(),
-        };
-
-        // Decoded calldata block
-        let calldata_block: Element<'_, Message> =
-            if function_panel::view::<Message>(t, eoa.decoded.as_deref(), eoa.decoded_loading)
-                .is_some()
-                || eoa.decoded_loading
-            {
-                let fn_name: Option<String> = eoa.decoded.as_deref().and_then(|d| match d {
-                    DecodeResult::ClearSigned { model, .. }
-                    | DecodeResult::Fallback { model, .. } => Some(model.intent.clone()),
-                    DecodeResult::Heuristic(decoded) => decoded.function_name.clone(),
-                    DecodeResult::Empty => None,
-                });
-                let pill_label: Option<String> = fn_name.map(|name| {
-                    if name.len() > 30 {
-                        format!("{}…", &name[..28])
-                    } else {
-                        name
-                    }
-                });
-                let caret = if eoa.show_calldata { "▾" } else { "▸" };
-                let mut toggle_row = row![
-                    text(caret).size(12).color(t.sub).font(mono()),
-                    Space::new().width(6),
-                    text("Decoded call data")
-                        .size(13)
-                        .color(t.text)
-                        .font(bold()),
-                ]
-                .align_y(Alignment::Center)
-                .spacing(0);
-                if let Some(label) = pill_label {
-                    toggle_row = toggle_row.push(Space::new().width(8));
-                    toggle_row = toggle_row.push(
-                        container(text(format!("{label}()")).size(10).color(t.a1).font(mono()))
-                            .padding(Padding::from([2, 7]))
-                            .style(move |_| container::Style {
-                                border: Border {
-                                    color: with_alpha(t.a1, 0.22),
-                                    width: 1.0,
-                                    radius: Radius::from(6),
-                                },
-                                ..container::Style::default()
-                            }),
-                    );
-                }
-                toggle_row = toggle_row.push(Space::new().width(Length::Fill));
-                toggle_row = toggle_row.push(
-                    text(if eoa.show_calldata {
-                        "hide"
-                    } else {
-                        "for the paranoid"
-                    })
-                    .size(11)
-                    .color(t.sub)
-                    .font(mono()),
-                );
-
-                let toggle_btn: Element<'_, Message> = button(toggle_row.width(Length::Fill))
-                    .width(Length::Fill)
-                    .padding(Padding::from([13, 16]))
-                    .on_press(Message::ToggleCalldata)
-                    .style(move |_theme, _status| button::Style {
-                        background: Some(Background::Color(Color::TRANSPARENT)),
-                        text_color: t.text,
-                        ..button::Style::default()
-                    })
-                    .into();
-
-                let expanded: Element<'_, Message> = if eoa.show_calldata {
-                    match function_panel::view::<Message>(
-                        t,
-                        eoa.decoded.as_deref(),
-                        eoa.decoded_loading,
-                    ) {
-                        Some(panel) => container(panel)
-                            .padding(Padding::from([0, 13]).bottom(13.0))
-                            .width(Length::Fill)
-                            .style(move |_| container::Style {
-                                background: Some(Background::Color(t.bg)),
-                                border: Border {
-                                    color: t.border,
-                                    width: 1.0,
-                                    radius: Radius::from(11),
-                                },
-                                ..container::Style::default()
-                            })
-                            .into(),
-                        None => Space::new().height(0).into(),
-                    }
-                } else {
-                    Space::new().height(0).into()
-                };
-
-                container(column![toggle_btn, expanded].spacing(0).width(Length::Fill))
-                    .width(Length::Fill)
-                    .style(move |_| container::Style {
-                        background: Some(Background::Color(t.card_alt)),
-                        border: Border {
-                            color: t.border,
-                            width: 1.0,
-                            radius: Radius::from(15),
-                        },
-                        ..container::Style::default()
-                    })
-                    .into()
-            } else {
-                Space::new().height(0).into()
-            };
-
-        // Verification badges
-        let good_badge = |label: &'a str| -> Element<'a, Message> {
-            container(text(label).size(10).color(t.up).font(mono_bold()))
-                .padding(Padding::from([3, 7]))
-                .style(move |_| container::Style {
-                    background: Some(Background::Color(with_alpha(t.up, 0.06))),
-                    border: Border {
-                        color: with_alpha(t.up, 0.22),
-                        width: 1.0,
-                        radius: Radius::from(6),
-                    },
-                    ..container::Style::default()
-                })
-                .into()
-        };
-        let warn_badge = |label: &'a str| -> Element<'a, Message> {
-            container(text(label).size(10).color(t.down).font(mono_bold()))
-                .padding(Padding::from([3, 7]))
-                .style(move |_| container::Style {
-                    background: Some(Background::Color(with_alpha(t.down, 0.08))),
-                    border: Border {
-                        color: with_alpha(t.down, 0.30),
-                        width: 1.0,
-                        radius: Radius::from(6),
-                    },
-                    ..container::Style::default()
-                })
-                .into()
-        };
-        // Only claim "simulated/verified" when the sim actually succeeded, and
-        // gate the Helios badge on whether the reads were verified — a sim that
-        // ran on fallback state must not display as Helios-verified.
-        let sim_ok = !sim_reverted && !sim_unavailable;
-        let sim_verified = current_quote.map(|q| q.sim.verified).unwrap_or(false);
-        let badges_row: Element<'_, Message> = if sim_ok {
-            let helios = if sim_verified {
-                good_badge("✓ Verified by Helios")
-            } else {
-                warn_badge("⚠ Unverified · fallback RPC")
-            };
-            row![
-                good_badge("✓ Simulated locally · revm"),
-                Space::new().width(7),
-                helios
-            ]
-            .align_y(Alignment::Center)
-            .into()
-        } else {
-            // Reverted/unavailable: the balance-changes card already explains
-            // the state; don't show badges that would overclaim.
-            Space::new().height(0).into()
-        };
-
-        // Gas warning
-        let gas_warning: Element<'_, Message> = if has_insufficient_eth {
-            let gas_eth_str = current_quote
-                .map(|q| {
-                    let s = format_units(q.eth_cost_wei, 18u8).unwrap_or_else(|_| "0".into());
-                    trim_eth_display(&s).to_string()
-                })
-                .unwrap_or_else(|| "—".into());
-            container(
-                row![kao_text(t, "(；・_・)", 20.0), Space::new().width(11),
-                    column![
-                        text("Can't sign yet — not enough ETH for gas").size(13).color(t.down).font(bold()),
-                        Space::new().height(3),
-                        text(format!("This network fee is paid in ETH. You need ≈ {} ETH on {}, but your ETH balance on this chain is 0.", gas_eth_str, network_display_name(chain))).size(12).color(t.sub),
-                    ].width(Length::Fill),
-                ].align_y(Alignment::Center).width(Length::Fill),
-            ).padding(Padding::from([13, 15])).width(Length::Fill)
-            .style(move |_| container::Style {
-                background: Some(Background::Color(with_alpha(t.down, 0.08))),
-                border: Border { color: with_alpha(t.down, 0.35), width: 1.0, radius: Radius::from(14) },
-                ..container::Style::default()
-            }).into()
-        } else {
-            Space::new().height(0).into()
-        };
-
-        let error_block: Element<'_, Message> = match &self.error {
-            Some(msg) => container(
-                text(format!("(╥﹏╥) {msg}"))
-                    .size(12)
-                    .color(t.down)
-                    .font(bold()),
-            )
-            .padding(Padding::from([10, 4]))
-            .into(),
-            None => Space::new().height(0).into(),
-        };
-
-        let back_btn = secondary_button(t, "← Back").on_press(Message::Step(1));
-        let confirm_enabled = !self.busy && current_quote.is_some() && !has_insufficient_eth;
-        // Soften the primary action whenever any read is unverified — either
-        // the calldata decode fell back to unverified RPC, or the local sim
-        // wasn't Helios-verified — matching the reverting-sim treatment so
-        // every unverified sign is a deliberate, acknowledged choice.
-        let decode_unverified = match eoa.decoded.as_deref() {
-            Some(DecodeResult::ClearSigned { all_verified, .. }) => !all_verified,
-            Some(DecodeResult::Fallback {
-                all_verified,
-                heuristic,
-                ..
-            }) => !(*all_verified && heuristic.all_verified),
-            Some(DecodeResult::Heuristic(c)) => !c.all_verified,
-            Some(DecodeResult::Empty) | None => false,
-        };
-        let reads_unverified = decode_unverified || (sim_ok && !sim_verified);
-        let confirm_label = if has_insufficient_eth {
-            "Need ETH for gas"
-        } else if sim_reverted || reads_unverified {
-            "Sign anyway ⚠"
-        } else {
-            "Sign & Send"
-        };
-        let confirm_btn =
-            primary_button(t, confirm_label, confirm_enabled).on_press_maybe(if confirm_enabled {
-                Some(Message::Confirm)
-            } else {
-                None
-            });
-        let action_row = row![
-            container(back_btn).width(Length::FillPortion(1)),
-            Space::new().width(9),
-            container(confirm_btn).width(Length::FillPortion(2)),
-        ]
-        .width(Length::Fill);
-
-        let content = column![
-            intent_banner,
-            Space::new().height(13),
-            balance_changes_card,
-            Space::new().height(13),
-            recipient_card,
-            Space::new().height(13),
-            calldata_block,
-            Space::new().height(10),
-            badges_row,
-            Space::new().height(13),
-            gas_warning,
-            error_block,
-            Space::new().height(14),
-            action_row,
-        ]
-        .width(Length::Fill)
-        .padding(Padding::ZERO.right(12));
-
-        scrollable(content)
-            .width(Length::Fill)
-            .style(move |_, status| kao_scrollable_style(t, status))
-            .into()
-    }
-
-    fn step_broadcast_eoa<'a>(
-        &'a self,
-        t: KaoTheme,
-        portfolio: &'a [LiveToken],
-        recipient_name: Option<String>,
-    ) -> Element<'a, Message> {
-        let Some(eoa) = self.eoa() else {
-            return text("Account state unavailable.")
-                .size(13)
-                .color(t.down)
-                .into();
-        };
-        let token_sym = portfolio
-            .get(self.token_idx)
-            .map(|t| t.symbol.as_str())
-            .unwrap_or("ETH");
-        let recipient_short = recipient_name.unwrap_or_else(|| {
-            self.resolution
-                .recipient()
-                .map(|a| short_address_str(&format!("{a:#x}")))
-                .unwrap_or_else(|| self.to.clone())
-        });
-        let big_kao = container(kao_fit(t, "( ˙▿˙ )", 280.0, 64.0))
-            .width(Length::Fill)
-            .center_x(Length::Fill);
-        let title_str = if eoa.broadcast_done {
-            "On its way!"
-        } else if self.busy {
-            "Broadcasting…"
-        } else {
-            "Signing…"
-        };
-        let title = container(text(title_str).size(22).color(t.text).font(black()))
-            .width(Length::Fill)
-            .center_x(Length::Fill);
-        let summary = container(
-            text(format!(
-                "{} {} → {}",
-                self.amount, token_sym, recipient_short
-            ))
-            .size(14)
-            .color(t.sub),
-        )
-        .width(Length::Fill)
-        .center_x(Length::Fill);
-        let checklist = container(
-            column![
-                progress_check_row(t, "Signed locally", true),
-                progress_check_row(t, "Broadcast to network", eoa.broadcast_done),
-                progress_check_row(t, "Waiting for confirmation", false),
-            ]
-            .spacing(6)
-            .width(Length::Fill),
-        )
-        .padding(Padding::from([14, 16]))
-        .width(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(Background::Color(t.card_alt)),
-            border: Border {
-                color: t.border,
-                width: 1.0,
-                radius: Radius::from(12),
-            },
-            text_color: Some(t.text),
-            ..container::Style::default()
-        });
-        let hash_block: Element<'_, Message> = match self.last_tx_hash {
-            Some(h) => container(
-                text(format!("tx: {}", short_address_str(&format!("{h:#x}"))))
-                    .size(11)
-                    .color(t.sub)
-                    .font(mono()),
-            )
-            .width(Length::Fill)
-            .center_x(Length::Fill)
-            .padding(Padding::from([6, 0]))
-            .into(),
-            None => Space::new().height(0).into(),
-        };
-        column![
-            Space::new().height(16),
-            big_kao,
-            Space::new().height(16),
-            title,
-            Space::new().height(6),
-            summary,
-            Space::new().height(16),
-            checklist,
-            Space::new().height(8),
-            hash_block,
-        ]
-        .width(Length::Fill)
-        .into()
-    }
-
     fn step_success_eoa<'a>(
         &'a self,
         t: KaoTheme,
@@ -2444,390 +1587,6 @@ impl SendPane {
 
     // ── Safe-specific view steps ────────────────────────────────────────
 
-    fn view_review_safe<'a>(
-        &'a self,
-        t: KaoTheme,
-        recipient_name: Option<String>,
-        portfolio: &'a [LiveToken],
-    ) -> Element<'a, Message> {
-        let s = self.safe().unwrap();
-        // Never render/sign a transfer to a defaulted zero address: if there's
-        // no resolved recipient we shouldn't be on this screen (the step-2
-        // transition is guarded), so fail closed with a visible error.
-        let Some(recipient) = self.resolution.recipient() else {
-            return text("No valid recipient — go back and re-enter the address.")
-                .size(13)
-                .color(t.down)
-                .into();
-        };
-        let token = portfolio.get(self.token_idx);
-        let decimals = token.map(|tk| tk.decimals).unwrap_or(18);
-        let symbol = token.map(|tk| tk.symbol.as_str()).unwrap_or("ETH");
-        let contract = token.and_then(|tk| tk.contract);
-        let amount_wei = self.parsed_amount(decimals).unwrap_or(U256::ZERO);
-        let amount_str = format_units(amount_wei, decimals)
-            .map(|v| sim_view::trim_trailing_decimal_zeros(&v))
-            .unwrap_or_else(|_| "?".into());
-        let chain = s.safe_chain.expect("safe_chain gated by view()");
-        let chain_sub = format!("on {}", chain.display_name());
-
-        // Intent banner
-        let intent_banner = container(
-            column![
-                row![
-                    kao_text(t, "(•̀ᴗ•́)و", 16.0),
-                    Space::new().width(8),
-                    text(format!("Sending {amount_str} {symbol}"))
-                        .size(14)
-                        .color(t.a1)
-                        .font(bold()),
-                ]
-                .align_y(Alignment::Center),
-                text(chain_sub.clone()).size(11).color(t.sub).font(mono()),
-            ]
-            .spacing(2),
-        )
-        .clip(true)
-        .padding(Padding::from([12, 14]))
-        .width(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(Background::Color(t.ab1)),
-            border: Border {
-                color: with_alpha(t.a1, 0.27),
-                width: 1.0,
-                radius: Radius::from(12),
-            },
-            text_color: Some(t.text),
-            ..container::Style::default()
-        });
-
-        // Balance changes card
-        let balance_card: Element<'_, Message> = match &s.sim {
-            Some(sim) => {
-                let header_row = row![
-                    text("AFTER THIS TRANSACTION")
-                        .size(10)
-                        .color(t.sub)
-                        .font(mono_bold()),
-                    Space::new().width(8),
-                    hint_pill(t, "⟁ simulated · revm"),
-                ]
-                .align_y(Alignment::Center);
-                let mut col = column![header_row, vspace(6)]
-                    .spacing(0)
-                    .width(Length::Fill);
-                col = col.push(sim_row(
-                    t,
-                    chain.into(),
-                    contract,
-                    symbol.to_string(),
-                    None,
-                    format!("-{amount_str}"),
-                    t.down,
-                ));
-                col = col.push(divider_line(t));
-                let gas_str = sim_view::format_gas_fee_eth(sim.gas_used, sim.base_fee_per_gas)
-                    .unwrap_or_else(|| "?".into());
-                col = col.push(sim_row(
-                    t,
-                    chain.into(),
-                    None,
-                    "Gas".to_string(),
-                    None,
-                    format!("-{gas_str}"),
-                    t.down,
-                ));
-                col = col.push(divider_line(t));
-                let recip_label = recipient_name
-                    .clone()
-                    .unwrap_or_else(|| short_address(recipient));
-                col = col.push(sim_row(
-                    t,
-                    chain.into(),
-                    contract,
-                    recip_label,
-                    None,
-                    format!("+{amount_str}"),
-                    t.up,
-                ));
-                if !(sim.is_success() && sim.verified) {
-                    col = col.push(vspace(6));
-                    col = col.push(
-                        container(
-                            small_secondary_button(t, "↻ Re-simulate").on_press(Message::RetrySim),
-                        )
-                        .width(Length::Fill)
-                        .align_x(Alignment::End),
-                    );
-                }
-                if sim.is_revert() {
-                    col = col.push(vspace(6)).push(sim_view::simulation_block(
-                        t,
-                        sim,
-                        chain.into(),
-                        portfolio,
-                    ));
-                }
-                review_card(t, col.into())
-            }
-            None => review_card(
-                t,
-                column![
-                    text("AFTER THIS TRANSACTION")
-                        .size(10)
-                        .color(t.sub)
-                        .font(mono_bold()),
-                    vspace(8),
-                    text("(；・∀・) simulating…")
-                        .size(11)
-                        .color(t.sub)
-                        .font(mono()),
-                ]
-                .width(Length::Fill)
-                .into(),
-            ),
-        };
-
-        // Recipient card
-        let header_label: Option<String> = recipient_name.clone().or_else(|| {
-            if let Resolution::Resolved { name, .. } = &self.resolution {
-                Some(name.clone())
-            } else {
-                None
-            }
-        });
-        let recipient_in_book = recipient_name.is_some();
-        let mut recip_col = column![
-            row![
-                text("RECIPIENT").size(10).color(t.sub).font(mono_bold()),
-                Space::new().width(Length::Fill)
-            ]
-            .align_y(Alignment::Center),
-            vspace(8),
-        ]
-        .width(Length::Fill);
-        if recipient_in_book {
-            recip_col = recip_col.push(hint_pill(t, "✓ matches saved contact"));
-            recip_col = recip_col.push(vspace(6));
-        }
-        let mut recip_inner = column![].spacing(4).width(Length::Fill);
-        if let Some(name) = header_label {
-            recip_inner = recip_inner.push(
-                row![
-                    avatar(t, "(￣ω￣)", 30.0, t.ab2),
-                    Space::new().width(10),
-                    text(name).size(14).color(t.text).font(bold())
-                ]
-                .align_y(Alignment::Center),
-            );
-        }
-        let addr_sub = container(colored_address_compact(t, recipient))
-            .padding(Padding::from([6, 10]))
-            .width(Length::Fill)
-            .style(move |_| container::Style {
-                background: Some(Background::Color(with_alpha(t.card, 0.5))),
-                border: Border {
-                    color: Color::TRANSPARENT,
-                    width: 0.0,
-                    radius: Radius::from(8),
-                },
-                ..container::Style::default()
-            });
-        recip_inner = recip_inner.push(addr_sub);
-        recip_col = recip_col.push(recip_inner);
-        let recipient_card = review_card(t, recip_col.into());
-
-        // Safe TX hash card
-        let hash_block: Element<'_, Message> = match (&s.prepared, &s.prepare_error) {
-            (Some((_, hash)), _) => column![
-                colored_hash(t, *hash),
-                vspace(4),
-                text("Verify this exact hash on your signing device and with co-signers.")
-                    .size(10)
-                    .color(t.sub),
-            ]
-            .width(Length::Fill)
-            .into(),
-            (None, Some(e)) => column![
-                error_banner(t, e),
-                vspace(6),
-                secondary_button(t, "Retry").on_press(Message::RetryPrepare),
-            ]
-            .width(Length::Fill)
-            .into(),
-            (None, None) => column![
-                text("Computing — verifying against the Safe on-chain…")
-                    .size(11)
-                    .color(t.sub)
-                    .font(mono()),
-            ]
-            .width(Length::Fill)
-            .into(),
-        };
-        let hash_card = review_card(
-            t,
-            column![
-                text("VERIFY BEFORE SIGNING")
-                    .size(10)
-                    .color(t.sub)
-                    .font(mono_bold()),
-                vspace(8),
-                hash_block,
-            ]
-            .width(Length::Fill)
-            .into(),
-        );
-
-        // Signing card
-        let threshold_label = self.threshold_label();
-        let mut owners_col = column![].spacing(4);
-        let signing = s.signable_addresses.iter().take(s.threshold as usize);
-        for (i, addr) in signing.enumerate() {
-            let kao = kaomoji_for_index(i);
-            owners_col = owners_col.push(
-                row![
-                    avatar(t, kao, 26.0, t.ab1),
-                    Space::new().width(8),
-                    text(short_address(*addr))
-                        .size(12)
-                        .color(t.text)
-                        .font(mono())
-                ]
-                .align_y(Alignment::Center),
-            );
-        }
-        let signing_card = review_card(
-            t,
-            column![
-                text("SIGNING").size(10).color(t.sub).font(mono_bold()),
-                vspace(8),
-                text(format!("Threshold: {threshold_label}"))
-                    .size(13)
-                    .color(t.text)
-                    .font(bold()),
-                vspace(6),
-                text("Signing with").size(11).color(t.sub).font(mono_bold()),
-                vspace(4),
-                owners_col,
-            ]
-            .width(Length::Fill)
-            .into(),
-        );
-
-        // Verification badges
-        let mut badges = row![].spacing(6);
-        if s.prepared.is_some() {
-            badges = badges.push(hint_pill(t, "✓ Hash verified on-chain"));
-        }
-        if s.sim
-            .as_ref()
-            .is_some_and(|si| si.is_success() && si.verified)
-        {
-            badges = badges.push(hint_pill(t, "✓ Simulation passed"));
-        }
-        let badges_row: Element<'_, Message> =
-            if s.prepared.is_some() || s.sim.as_ref().is_some_and(|si| si.is_success()) {
-                container(badges)
-                    .padding(Padding::from([4, 0]))
-                    .width(Length::Fill)
-                    .into()
-            } else {
-                Space::new().height(0).into()
-            };
-
-        // Action buttons
-        let back_btn = secondary_button(t, "← Back").on_press(Message::Step(1));
-        let sim_revert = s.sim.as_ref().is_some_and(|si| si.is_revert());
-        let can_propose = self.can_propose();
-        let mut propose_btn = primary_button(
-            t,
-            if self.busy && !self.has_enough_signable_signers() {
-                "Proposing…"
-            } else if sim_revert {
-                "Propose anyway ⚠"
-            } else {
-                "Propose to co-signers"
-            },
-            can_propose,
-        );
-        if can_propose {
-            propose_btn = propose_btn.on_press(Message::Propose);
-        }
-
-        let action_row: Element<'_, Message> = if self.has_enough_signable_signers() {
-            let can_exec = self.can_execute_now();
-            let mut exec_btn = primary_button(
-                t,
-                if self.busy {
-                    "Signing & sending…"
-                } else if sim_revert {
-                    "Execute anyway ⚠"
-                } else {
-                    "Sign & execute now"
-                },
-                can_exec,
-            );
-            if can_exec {
-                exec_btn = exec_btn.on_press(Message::Confirm);
-            }
-            column![
-                row![
-                    container(back_btn).width(Length::FillPortion(1)),
-                    Space::new().width(9),
-                    container(exec_btn).width(Length::FillPortion(3))
-                ]
-                .align_y(Alignment::Center),
-                vspace(8),
-                propose_btn,
-            ]
-            .width(Length::Fill)
-            .into()
-        } else {
-            row![
-                container(back_btn).width(Length::FillPortion(1)),
-                Space::new().width(9),
-                container(propose_btn).width(Length::FillPortion(3))
-            ]
-            .align_y(Alignment::Center)
-            .into()
-        };
-
-        let mut review_body = column![
-            intent_banner,
-            vspace(10),
-            balance_card,
-            vspace(10),
-            recipient_card,
-            vspace(10),
-            hash_card,
-            vspace(10),
-            signing_card,
-            vspace(6),
-            badges_row,
-        ]
-        .width(Length::Fill);
-        if let Some(e) = &self.error {
-            review_body = review_body.push(vspace(10)).push(error_banner(t, e));
-        }
-        review_body = review_body.push(vspace(14)).push(action_row);
-
-        let padded_body = container(review_body)
-            .padding(Padding::ZERO.right(10))
-            .width(Length::Fill);
-        let scrollable_review = scrollable(padded_body)
-            .width(Length::Fill)
-            .style(move |_, status| kao_scrollable_style(t, status));
-
-        column![
-            safe_step_header(t, 2),
-            safe_progress_bar(t, 2),
-            vspace(10),
-            scrollable_review,
-        ]
-        .width(Length::Fill)
-        .into()
-    }
-
     fn view_success_safe<'a>(
         &'a self,
         t: KaoTheme,
@@ -2925,24 +1684,6 @@ impl SendPane {
 
 // ── Free helpers ────────────────────────────────────────────────────────────
 
-pub(crate) fn colored_address_compact<'a, M: 'a>(t: KaoTheme, addr: Address) -> Element<'a, M> {
-    use crate::ui::kao_widgets::chunk_palette;
-    let checksum = addr.to_checksum(None);
-    let body = &checksum[2..];
-    let chunk_colors = chunk_palette(t);
-    let mut spans = row![text("0x").size(12).color(t.sub).font(mono_bold())].spacing(0);
-    for (i, color) in chunk_colors.iter().enumerate() {
-        let start = i * 4;
-        let chunk = body[start..start + 4].to_string();
-        spans = spans.push(text(chunk).size(12).color(*color).font(mono_bold()));
-    }
-    container(spans)
-        .width(Length::Fill)
-        .center_x(Length::Fill)
-        .padding(Padding::from([2, 0]))
-        .into()
-}
-
 pub(crate) fn sim_row<'a, M: 'a>(
     t: KaoTheme,
     chain: crate::chain::NetworkId,
@@ -2988,20 +1729,792 @@ pub(crate) fn divider_line<'a, M: 'a>(t: KaoTheme) -> Element<'a, M> {
         .into()
 }
 
-pub(crate) fn progress_check_row<'a, M: 'a>(
+// ── Sign-review overlay: EOA send step ───────────────────────────────────────
+
+/// A fully-prepared EOA send, snapshotted for review inside the unified
+/// `sign_review` overlay. Carries every value the review renders — the quote
+/// (gas / nonce / fees / revm sim), the decoded call, the recipient's display
+/// metadata, and the token figures — so the overlay reproduces the old inline
+/// review without needing live pane/portfolio state. Built by the coordinator's
+/// `spawn_send_prepare`; the `quote` inside (with its `plan`) drives the
+/// broadcast, so reviewed == signed.
+#[derive(Debug, Clone)]
+pub struct SendReview {
+    pub chain: crate::chain::NetworkId,
+    pub recipient: Address,
+    pub recipient_name: Option<String>,
+    pub recipient_in_book: bool,
+    pub recipient_kao: String,
+    pub recipient_chip: Option<&'static str>,
+    pub amount: String,
+    pub token_symbol: String,
+    pub token_contract: Option<Address>,
+    pub token_balance_before: f64,
+    pub usd_price: f64,
+    pub eth_usd_price: f64,
+    /// `true` when the sender lacks the ETH to cover gas (+ the amount, for a
+    /// native send). Precomputed against the reviewed quote + on-chain balance;
+    /// disables Confirm and shows the "need ETH for gas" banner.
+    pub has_insufficient_eth: bool,
+    pub quote: TxQuote,
+    pub decoded: Box<DecodeResult>,
+}
+
+impl SendReview {
+    /// Whether any read backing this review is unverified — the decode fell back
+    /// to an unverified RPC, or the local sim ran on unverified state. Mirrors the
+    /// old inline review so the primary action softens to "Sign anyway ⚠".
+    fn reads_unverified(&self) -> bool {
+        let decode_unverified = match self.decoded.as_ref() {
+            DecodeResult::ClearSigned { all_verified, .. } => !all_verified,
+            DecodeResult::Fallback {
+                all_verified,
+                heuristic,
+                ..
+            } => !(*all_verified && heuristic.all_verified),
+            DecodeResult::Heuristic(c) => !c.all_verified,
+            DecodeResult::Empty => false,
+        };
+        let sim_ok = !self.quote.sim.is_revert()
+            && !matches!(self.quote.sim.outcome, SimOutcome::Unavailable);
+        decode_unverified || (sim_ok && !self.quote.sim.verified)
+    }
+
+    /// The primary-button label for this review (matches the old inline review).
+    pub fn confirm_label(&self) -> String {
+        if self.has_insufficient_eth {
+            "Need ETH for gas".to_string()
+        } else if self.quote.sim.is_revert() || self.reads_unverified() {
+            "Sign anyway ⚠".to_string()
+        } else {
+            "Sign & Send".to_string()
+        }
+    }
+
+    /// Whether Confirm must be blocked — only when there isn't enough ETH for gas
+    /// (an unverified/reverting sim is a deliberate "sign anyway", not a block).
+    pub fn confirm_disabled(&self) -> bool {
+        self.has_insufficient_eth
+    }
+}
+
+/// Render the EOA send review body inside the `sign_review` overlay — the intent
+/// banner, the revm balance-change card, the recipient card, the (collapsible)
+/// decoded call data, the verification badges, and the insufficient-ETH banner.
+/// Generic over the host message type so the overlay owns the calldata toggle;
+/// everything else is display-only. The simulation-block fallback is only used
+/// for the revert/unavailable case (which never renders per-transfer rows), so
+/// it needs no portfolio.
+pub(crate) fn render_send_review<'a, M: 'a + Clone + CopyKick>(
     t: KaoTheme,
-    label: &'a str,
-    done: bool,
+    r: &'a SendReview,
+    show_calldata: bool,
+    toggle_msg: M,
 ) -> Element<'a, M> {
-    let marker = if done { "✓" } else { "–" };
-    let marker_color = if done { t.up } else { t.sub };
-    let label_color = if done { t.text } else { t.sub };
-    row![
-        text(marker).size(14).color(marker_color).font(bold()),
-        Space::new().width(8),
-        text(label).size(13).color(label_color)
+    let token_sym = r.token_symbol.as_str();
+    let chain = r.chain;
+    let amount_f = r.amount.parse::<f64>().unwrap_or(0.0);
+    let usd_value = amount_f * r.usd_price;
+    let sim_reverted = r.quote.sim.is_revert();
+    let sim_unavailable = matches!(r.quote.sim.outcome, SimOutcome::Unavailable);
+
+    let recipient_short = r
+        .recipient_name
+        .clone()
+        .unwrap_or_else(|| short_address_str(&format!("{:#x}", r.recipient)));
+
+    // ── Intent banner ──
+    let intent_kao = if r.has_insufficient_eth {
+        "(・_・;)"
+    } else {
+        "( ◜◡◝ )"
+    };
+    let intent_text = container(
+        row![
+            text("You're sending ").size(15).color(t.text).font(bold()),
+            text(format!("{} {}", r.amount, token_sym))
+                .size(15)
+                .color(t.a1)
+                .font(bold()),
+            text(" to ").size(15).color(t.text).font(bold()),
+            text(format!("{}.", recipient_short.clone()))
+                .size(15)
+                .color(t.a1)
+                .font(bold()),
+        ]
+        .align_y(Alignment::Center),
+    )
+    .clip(true)
+    .width(Length::Fill);
+    let usd_sub = if r.usd_price > 0.0 {
+        format!("on {} · ≈ ${usd_value:.2}", network_display_name(chain))
+    } else {
+        format!("on {}", network_display_name(chain))
+    };
+    let intent_banner = container(
+        row![
+            kao_text(t, intent_kao, 22.0),
+            Space::new().width(12),
+            column![
+                intent_text,
+                text(usd_sub).size(12).color(t.sub).font(bold())
+            ]
+            .spacing(3),
+        ]
+        .align_y(Alignment::Center)
+        .width(Length::Fill),
+    )
+    .padding(Padding::from([15, 17]))
+    .width(Length::Fill)
+    .style(move |_| container::Style {
+        background: Some(Background::Color(t.ab1)),
+        border: Border {
+            color: with_alpha(t.a1, 0.27),
+            width: 1.0,
+            radius: Radius::from(15),
+        },
+        text_color: Some(t.text),
+        ..container::Style::default()
+    });
+
+    // ── Balance-change card ──
+    let balance_changes_card: Element<'_, M> = if sim_reverted || sim_unavailable {
+        simulation_block(t, &r.quote.sim, chain, &[])
+    } else {
+        let mut changes_col = column![].spacing(0).width(Length::Fill);
+        let balance_before = r.token_balance_before;
+        let balance_after = balance_before - amount_f;
+        changes_col = changes_col.push(sim_row(
+            t,
+            chain,
+            r.token_contract,
+            format!("Your {token_sym}"),
+            Some(format!("{:.2} → {:.2}", balance_before, balance_after)),
+            format!("− {} {token_sym}", r.amount),
+            t.down,
+        ));
+        changes_col = changes_col.push(divider_line(t));
+        let eth_str = format_units(r.quote.eth_cost_wei, 18u8).unwrap_or_else(|_| "0".into());
+        let eth_short = trim_eth_display(&eth_str);
+        let gas_usd = eth_str.parse::<f64>().unwrap_or(0.0) * r.eth_usd_price;
+        let gas_sub = if r.eth_usd_price > 0.0 {
+            format!("≈ ${gas_usd:.2} · paid in ETH")
+        } else {
+            "paid in ETH".into()
+        };
+        changes_col = changes_col.push(sim_row(
+            t,
+            chain,
+            None,
+            "Network fee".into(),
+            Some(gas_sub),
+            format!("− {eth_short} ETH"),
+            t.down,
+        ));
+        changes_col = changes_col.push(divider_line(t));
+        changes_col = changes_col.push(sim_row(
+            t,
+            chain,
+            r.token_contract,
+            format!("{recipient_short} receives"),
+            None,
+            format!("+ {} {token_sym}", r.amount),
+            t.up,
+        ));
+        let header_row = row![
+            text("AFTER THIS TRANSACTION")
+                .size(10)
+                .color(t.sub)
+                .font(mono_bold()),
+            Space::new().width(Length::Fill),
+            hint_pill(t, "⟁ simulated · revm"),
+        ]
+        .align_y(Alignment::Center)
+        .width(Length::Fill);
+        container(column![header_row, Space::new().height(2), changes_col].width(Length::Fill))
+            .padding(
+                Padding::new(4.0)
+                    .top(12.0)
+                    .left(16.0)
+                    .right(16.0)
+                    .bottom(13.0),
+            )
+            .width(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(Background::Color(t.card_alt)),
+                border: Border {
+                    color: t.border,
+                    width: 1.0,
+                    radius: Radius::from(15),
+                },
+                text_color: Some(t.text),
+                ..container::Style::default()
+            })
+            .into()
+    };
+
+    // ── Recipient card ──
+    let recipient_card: Element<'_, M> = {
+        let addr = r.recipient;
+        let kao = r.recipient_kao.clone();
+        let mut header_row = row![text("RECIPIENT").size(10).color(t.sub).font(mono_bold())]
+            .align_y(Alignment::Center);
+        if r.recipient_in_book {
+            header_row = header_row.push(Space::new().width(Length::Fill));
+            header_row = header_row.push(
+                container(
+                    text("✓ matches saved contact")
+                        .size(10)
+                        .color(t.up)
+                        .font(mono_bold()),
+                )
+                .padding(Padding::from([3, 8]))
+                .style(move |_| container::Style {
+                    background: Some(Background::Color(with_alpha(t.up, 0.08))),
+                    border: Border {
+                        color: with_alpha(t.up, 0.22),
+                        width: 1.0,
+                        radius: Radius::from(6),
+                    },
+                    ..container::Style::default()
+                }),
+            );
+        }
+        let display_name = r
+            .recipient_name
+            .clone()
+            .unwrap_or_else(|| short_address_str(&format!("{addr:#x}")));
+        let mut name_col =
+            column![text(display_name).size(14).color(t.text).font(bold())].spacing(1);
+        if let Some(chip) = r.recipient_chip {
+            name_col = name_col.push(text(chip).size(11).color(t.sub).font(bold()));
+        }
+        let name_row = row![
+            avatar_owned::<M>(t, kao, 30.0),
+            Space::new().width(10),
+            name_col
+        ]
+        .align_y(Alignment::Center);
+        let addr_container = container(colored_address::<M>(t, addr))
+            .padding(Padding::from([10, 12]))
+            .width(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(Background::Color(with_alpha(t.bg, 0.5))),
+                border: Border {
+                    color: t.border,
+                    width: 1.0,
+                    radius: Radius::from(10),
+                },
+                ..container::Style::default()
+            });
+        container(
+            column![
+                header_row,
+                Space::new().height(8),
+                name_row,
+                Space::new().height(10),
+                addr_container
+            ]
+            .width(Length::Fill),
+        )
+        .padding(Padding::from([13, 16]))
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(t.card_alt)),
+            border: Border {
+                color: t.border,
+                width: 1.0,
+                radius: Radius::from(15),
+            },
+            text_color: Some(t.text),
+            ..container::Style::default()
+        })
+        .into()
+    };
+
+    // ── Decoded call data (collapsible) ──
+    let calldata_block: Element<'_, M> =
+        if function_panel::view::<M>(t, Some(r.decoded.as_ref()), false).is_some() {
+            let fn_name: Option<String> = match r.decoded.as_ref() {
+                DecodeResult::ClearSigned { model, .. } | DecodeResult::Fallback { model, .. } => {
+                    Some(model.intent.clone())
+                }
+                DecodeResult::Heuristic(decoded) => decoded.function_name.clone(),
+                DecodeResult::Empty => None,
+            };
+            let pill_label: Option<String> = fn_name.map(|name| {
+                // Truncate by *chars*, not bytes: a decoded intent/function name
+                // can carry attacker-controlled token metadata (e.g. a multibyte
+                // symbol), and a byte slice landing mid-codepoint would panic the
+                // review render.
+                if name.chars().count() > 30 {
+                    format!("{}…", name.chars().take(28).collect::<String>())
+                } else {
+                    name
+                }
+            });
+            let caret = if show_calldata { "▾" } else { "▸" };
+            let mut toggle_row = row![
+                text(caret).size(12).color(t.sub).font(mono()),
+                Space::new().width(6),
+                text("Decoded call data")
+                    .size(13)
+                    .color(t.text)
+                    .font(bold()),
+            ]
+            .align_y(Alignment::Center)
+            .spacing(0);
+            if let Some(label) = pill_label {
+                toggle_row = toggle_row.push(Space::new().width(8));
+                toggle_row = toggle_row.push(
+                    container(text(format!("{label}()")).size(10).color(t.a1).font(mono()))
+                        .padding(Padding::from([2, 7]))
+                        .style(move |_| container::Style {
+                            border: Border {
+                                color: with_alpha(t.a1, 0.22),
+                                width: 1.0,
+                                radius: Radius::from(6),
+                            },
+                            ..container::Style::default()
+                        }),
+                );
+            }
+            toggle_row = toggle_row.push(Space::new().width(Length::Fill));
+            toggle_row = toggle_row.push(
+                text(if show_calldata {
+                    "hide"
+                } else {
+                    "for the paranoid"
+                })
+                .size(11)
+                .color(t.sub)
+                .font(mono()),
+            );
+            let toggle_btn: Element<'_, M> = button(toggle_row.width(Length::Fill))
+                .width(Length::Fill)
+                .padding(Padding::from([13, 16]))
+                .on_press(toggle_msg)
+                .style(move |_theme, _status| button::Style {
+                    background: Some(Background::Color(Color::TRANSPARENT)),
+                    text_color: t.text,
+                    ..button::Style::default()
+                })
+                .into();
+            let expanded: Element<'_, M> = if show_calldata {
+                match function_panel::view::<M>(t, Some(r.decoded.as_ref()), false) {
+                    Some(panel) => container(panel)
+                        .padding(Padding::from([0, 13]).bottom(13.0))
+                        .width(Length::Fill)
+                        .style(move |_| container::Style {
+                            background: Some(Background::Color(t.bg)),
+                            border: Border {
+                                color: t.border,
+                                width: 1.0,
+                                radius: Radius::from(11),
+                            },
+                            ..container::Style::default()
+                        })
+                        .into(),
+                    None => Space::new().height(0).into(),
+                }
+            } else {
+                Space::new().height(0).into()
+            };
+            container(column![toggle_btn, expanded].spacing(0).width(Length::Fill))
+                .width(Length::Fill)
+                .style(move |_| container::Style {
+                    background: Some(Background::Color(t.card_alt)),
+                    border: Border {
+                        color: t.border,
+                        width: 1.0,
+                        radius: Radius::from(15),
+                    },
+                    ..container::Style::default()
+                })
+                .into()
+        } else {
+            Space::new().height(0).into()
+        };
+
+    // ── Verification badges ──
+    let good_badge = |label: &'a str| -> Element<'a, M> {
+        container(text(label).size(10).color(t.up).font(mono_bold()))
+            .padding(Padding::from([3, 7]))
+            .style(move |_| container::Style {
+                background: Some(Background::Color(with_alpha(t.up, 0.06))),
+                border: Border {
+                    color: with_alpha(t.up, 0.22),
+                    width: 1.0,
+                    radius: Radius::from(6),
+                },
+                ..container::Style::default()
+            })
+            .into()
+    };
+    let warn_badge = |label: &'a str| -> Element<'a, M> {
+        container(text(label).size(10).color(t.down).font(mono_bold()))
+            .padding(Padding::from([3, 7]))
+            .style(move |_| container::Style {
+                background: Some(Background::Color(with_alpha(t.down, 0.08))),
+                border: Border {
+                    color: with_alpha(t.down, 0.30),
+                    width: 1.0,
+                    radius: Radius::from(6),
+                },
+                ..container::Style::default()
+            })
+            .into()
+    };
+    let sim_ok = !sim_reverted && !sim_unavailable;
+    let sim_verified = r.quote.sim.verified;
+    let badges_row: Element<'_, M> = if sim_ok {
+        let helios = if sim_verified {
+            good_badge("✓ Verified by Helios")
+        } else {
+            warn_badge("⚠ Unverified · fallback RPC")
+        };
+        row![
+            good_badge("✓ Simulated locally · revm"),
+            Space::new().width(7),
+            helios
+        ]
+        .align_y(Alignment::Center)
+        .into()
+    } else {
+        Space::new().height(0).into()
+    };
+
+    // ── Insufficient-ETH banner ──
+    let gas_warning: Element<'_, M> = if r.has_insufficient_eth {
+        let gas_eth_str = {
+            let s = format_units(r.quote.eth_cost_wei, 18u8).unwrap_or_else(|_| "0".into());
+            trim_eth_display(&s)
+        };
+        container(
+            row![
+                kao_text(t, "(；・_・)", 20.0),
+                Space::new().width(11),
+                column![
+                    text("Can't sign yet — not enough ETH for gas")
+                        .size(13)
+                        .color(t.down)
+                        .font(bold()),
+                    Space::new().height(3),
+                    text(format!(
+                        "This network fee is paid in ETH. You need ≈ {} ETH on {}, but your ETH balance on this chain is 0.",
+                        gas_eth_str,
+                        network_display_name(chain)
+                    ))
+                    .size(12)
+                    .color(t.sub),
+                ]
+                .width(Length::Fill),
+            ]
+            .align_y(Alignment::Center)
+            .width(Length::Fill),
+        )
+        .padding(Padding::from([13, 15]))
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(with_alpha(t.down, 0.08))),
+            border: Border {
+                color: with_alpha(t.down, 0.35),
+                width: 1.0,
+                radius: Radius::from(14),
+            },
+            ..container::Style::default()
+        })
+        .into()
+    } else {
+        Space::new().height(0).into()
+    };
+
+    column![
+        intent_banner,
+        Space::new().height(13),
+        balance_changes_card,
+        Space::new().height(13),
+        recipient_card,
+        Space::new().height(13),
+        calldata_block,
+        Space::new().height(10),
+        badges_row,
+        Space::new().height(13),
+        gas_warning,
     ]
-    .align_y(Alignment::Center)
+    .width(Length::Fill)
+    .into()
+}
+
+// ── Sign-review overlay: Safe send step ──────────────────────────────────────
+
+/// A fully-prepared Safe send, snapshotted for review inside the unified
+/// `sign_review` overlay. Carries the reviewed figures (intent, the revm inner
+/// sim, recipient) plus the exact `safeTxHash` the owners sign and the signing
+/// owner set. The `SignAction::SafeSend` alongside pins the same `(nonce, hash)`,
+/// so the execute/propose ceremony signs exactly what's shown.
+#[derive(Debug, Clone)]
+pub struct SafeSendReview {
+    pub chain: Chain,
+    pub amount_str: String,
+    pub symbol: String,
+    pub token_contract: Option<Address>,
+    pub recipient: Address,
+    pub recipient_name: Option<String>,
+    pub recipient_in_book: bool,
+    pub nonce: u64,
+    pub safe_tx_hash: B256,
+    pub threshold: u32,
+    pub owner_count: usize,
+    /// The signable owner addresses that will sign now (execute path). Fewer than
+    /// `threshold` in the propose-only case; display-only.
+    pub signing_addresses: Vec<Address>,
+    pub sim: SimulationResult,
+}
+
+impl SafeSendReview {
+    /// Whether the revm inner-sim predicts a revert — softens the overlay's
+    /// action labels to "… anyway ⚠", mirroring the old inline Safe review.
+    pub fn sim_reverts(&self) -> bool {
+        self.sim.is_revert()
+    }
+}
+
+/// Render the Safe send review body inside the `sign_review` overlay — intent
+/// banner, revm balance-change card, recipient card, the exact `safeTxHash` the
+/// owners commit to, the signing owner set, and verification badges. Purely
+/// display (the execute/propose actions live in the overlay's action row), so it
+/// is generic over the host message type.
+pub(crate) fn render_safe_send_review<'a, M: 'a + CopyKick>(
+    t: KaoTheme,
+    r: &'a SafeSendReview,
+) -> Element<'a, M> {
+    let chain = r.chain;
+    let amount_str = r.amount_str.as_str();
+    let symbol = r.symbol.as_str();
+    let recip_label = r
+        .recipient_name
+        .clone()
+        .unwrap_or_else(|| short_address(r.recipient));
+
+    // Intent banner
+    let intent_banner = container(
+        column![
+            row![
+                kao_text(t, "(•̀ᴗ•́)و", 16.0),
+                Space::new().width(8),
+                text(format!("Sending {amount_str} {symbol}"))
+                    .size(14)
+                    .color(t.a1)
+                    .font(bold()),
+            ]
+            .align_y(Alignment::Center),
+            text(format!("on {}", chain.display_name()))
+                .size(11)
+                .color(t.sub)
+                .font(mono()),
+        ]
+        .spacing(2),
+    )
+    .clip(true)
+    .padding(Padding::from([12, 14]))
+    .width(Length::Fill)
+    .style(move |_| container::Style {
+        background: Some(Background::Color(t.ab1)),
+        border: Border {
+            color: with_alpha(t.a1, 0.27),
+            width: 1.0,
+            radius: Radius::from(12),
+        },
+        text_color: Some(t.text),
+        ..container::Style::default()
+    });
+
+    // Balance-change card
+    let balance_card: Element<'_, M> = {
+        let header_row = row![
+            text("AFTER THIS TRANSACTION")
+                .size(10)
+                .color(t.sub)
+                .font(mono_bold()),
+            Space::new().width(8),
+            hint_pill(t, "⟁ simulated · revm"),
+        ]
+        .align_y(Alignment::Center);
+        let mut col = column![header_row, vspace(6)]
+            .spacing(0)
+            .width(Length::Fill);
+        col = col.push(sim_row(
+            t,
+            chain.into(),
+            r.token_contract,
+            symbol.to_string(),
+            None,
+            format!("-{amount_str}"),
+            t.down,
+        ));
+        col = col.push(divider_line(t));
+        let gas_str = sim_view::format_gas_fee_eth(r.sim.gas_used, r.sim.base_fee_per_gas)
+            .unwrap_or_else(|| "?".into());
+        col = col.push(sim_row(
+            t,
+            chain.into(),
+            None,
+            "Gas".to_string(),
+            None,
+            format!("-{gas_str}"),
+            t.down,
+        ));
+        col = col.push(divider_line(t));
+        col = col.push(sim_row(
+            t,
+            chain.into(),
+            r.token_contract,
+            recip_label.clone(),
+            None,
+            format!("+{amount_str}"),
+            t.up,
+        ));
+        if r.sim.is_revert() {
+            col =
+                col.push(vspace(6))
+                    .push(sim_view::simulation_block(t, &r.sim, chain.into(), &[]));
+        }
+        review_card(t, col.into())
+    };
+
+    // Recipient card
+    let mut recip_col = column![
+        row![
+            text("RECIPIENT").size(10).color(t.sub).font(mono_bold()),
+            Space::new().width(Length::Fill)
+        ]
+        .align_y(Alignment::Center),
+        vspace(8),
+    ]
+    .width(Length::Fill);
+    if r.recipient_in_book {
+        recip_col = recip_col.push(hint_pill(t, "✓ matches saved contact"));
+        recip_col = recip_col.push(vspace(6));
+    }
+    let mut recip_inner = column![].spacing(4).width(Length::Fill);
+    if let Some(name) = &r.recipient_name {
+        recip_inner = recip_inner.push(
+            row![
+                avatar(t, "(￣ω￣)", 30.0, t.ab2),
+                Space::new().width(10),
+                text(name.clone()).size(14).color(t.text).font(bold())
+            ]
+            .align_y(Alignment::Center),
+        );
+    }
+    let addr_sub = container(colored_address::<M>(t, r.recipient))
+        .padding(Padding::from([6, 10]))
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(with_alpha(t.card, 0.5))),
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: Radius::from(8),
+            },
+            ..container::Style::default()
+        });
+    recip_inner = recip_inner.push(addr_sub);
+    recip_col = recip_col.push(recip_inner);
+    let recipient_card = review_card(t, recip_col.into());
+
+    // Safe-tx hash card — the exact bytes every owner commits to. Named and
+    // click-to-copy: for a first-time signer it isn't obvious what this string
+    // is or that it's actionable, so spell out both.
+    let hash_card = review_card(
+        t,
+        column![
+            text("VERIFY BEFORE SIGNING")
+                .size(10)
+                .color(t.sub)
+                .font(mono_bold()),
+            vspace(2),
+            text("SafeTx hash · click to copy")
+                .size(12)
+                .color(t.text)
+                .font(bold()),
+            vspace(6),
+            colored_hash_copyable::<M>(t, r.safe_tx_hash),
+            vspace(6),
+            text(
+                "This is the fingerprint of this exact transaction — every owner signs it. \
+                 It must match on your signing device and your co-signers' before you approve."
+            )
+            .size(10)
+            .color(t.sub),
+            vspace(4),
+            text(format!("Safe nonce {}", r.nonce))
+                .size(10)
+                .color(t.sub)
+                .font(mono()),
+        ]
+        .width(Length::Fill)
+        .into(),
+    );
+
+    // Signing card
+    let threshold_label = format!("{} of {}", r.threshold, r.owner_count);
+    let mut owners_col = column![].spacing(4);
+    for (i, addr) in r.signing_addresses.iter().enumerate() {
+        let kao = kaomoji_for_index(i);
+        owners_col = owners_col.push(
+            row![
+                avatar(t, kao, 26.0, t.ab1),
+                Space::new().width(8),
+                text(short_address(*addr))
+                    .size(12)
+                    .color(t.text)
+                    .font(mono())
+            ]
+            .align_y(Alignment::Center),
+        );
+    }
+    let signing_card = review_card(
+        t,
+        column![
+            text("SIGNING").size(10).color(t.sub).font(mono_bold()),
+            vspace(8),
+            text(format!("Threshold: {threshold_label}"))
+                .size(13)
+                .color(t.text)
+                .font(bold()),
+            vspace(6),
+            text("Signing with").size(11).color(t.sub).font(mono_bold()),
+            vspace(4),
+            owners_col,
+        ]
+        .width(Length::Fill)
+        .into(),
+    );
+
+    // Verification badges
+    let mut badges = row![hint_pill(t, "✓ Hash verified on-chain")].spacing(6);
+    if r.sim.is_success() && r.sim.verified {
+        badges = badges.push(hint_pill(t, "✓ Simulation passed"));
+    }
+    let badges_row = container(badges)
+        .padding(Padding::from([4, 0]))
+        .width(Length::Fill);
+
+    column![
+        intent_banner,
+        vspace(10),
+        balance_card,
+        vspace(10),
+        recipient_card,
+        vspace(10),
+        hash_card,
+        vspace(10),
+        signing_card,
+        vspace(6),
+        badges_row,
+    ]
     .width(Length::Fill)
     .into()
 }
@@ -3058,7 +2571,7 @@ fn picker_row<'a>(t: KaoTheme, entry: PickerEntry, current_input: &str) -> Eleme
         .into()
 }
 
-fn avatar_owned<'a>(t: KaoTheme, kao: String, size: f32) -> Element<'a, Message> {
+pub(crate) fn avatar_owned<'a, M: 'a>(t: KaoTheme, kao: String, size: f32) -> Element<'a, M> {
     let inner_pad: f32 = 4.0;
     let budget = (size - 2.0 * inner_pad).max(8.0);
     let max_font = (size * 0.40).max(10.0);
@@ -3104,27 +2617,6 @@ pub(crate) fn trim_eth_display(s: &str) -> String {
     } else {
         format!("{int_part}.{final_frac}")
     }
-}
-
-fn error_banner<'a>(t: KaoTheme, msg: &str) -> Element<'a, Message> {
-    container(
-        text(format!("(╥﹏╥) {msg}"))
-            .size(12)
-            .color(t.down)
-            .font(bold()),
-    )
-    .padding(Padding::from([10, 12]))
-    .width(Length::Fill)
-    .style(move |_| container::Style {
-        background: Some(Background::Color(with_alpha(t.down, 0.08))),
-        border: Border {
-            color: with_alpha(t.down, 0.35),
-            width: 1.0,
-            radius: Radius::from(10),
-        },
-        ..container::Style::default()
-    })
-    .into()
 }
 
 fn banner<'a>(t: KaoTheme, title: &'a str, body: String) -> Element<'a, Message> {
@@ -3233,7 +2725,7 @@ fn wrap_safe_modal<'a>(
     )
 }
 
-fn review_card<'a>(t: KaoTheme, content: Element<'a, Message>) -> Element<'a, Message> {
+fn review_card<'a, M: 'a>(t: KaoTheme, content: Element<'a, M>) -> Element<'a, M> {
     container(content)
         .padding(Padding::from([12, 14]))
         .width(Length::Fill)
@@ -3568,37 +3060,6 @@ mod tests {
         }]
     }
 
-    fn quote_for_plan(plan: &SendPlan) -> TxQuote {
-        TxQuote {
-            plan: plan.clone(),
-            gas_limit: 21_000,
-            max_fee_per_gas: 1,
-            max_priority_fee_per_gas: 1,
-            nonce: 0,
-            eth_cost_wei: U256::from(21_000u64),
-            sim: SimulationResult::unavailable(),
-        }
-    }
-
-    fn eoa_pane(amount: &str) -> SendPane {
-        let mut pane = SendPane::new_eoa(Address::repeat_byte(0xab));
-        pane.amount = amount.to_string();
-        let _ = pane.update(Message::PickRecipient {
-            address: Address::repeat_byte(0xcd),
-            ens: None,
-        });
-        pane
-    }
-
-    #[test]
-    fn threshold_label_shows_total_owners() {
-        let pane = SendPane::new_safe(
-            &safe_only(2, vec![0, 1]),
-            &[local_account_simple(1), local_account_simple(2)],
-        );
-        assert_eq!(pane.threshold_label(), "2 of 2");
-    }
-
     #[test]
     fn unknown_chain_blocks_outgoing_request() {
         let mut desc = safe_only(1, vec![0]);
@@ -3647,51 +3108,55 @@ mod tests {
     }
 
     #[test]
-    fn eoa_amount_change_clears_review_quote() {
-        let portfolio = test_portfolio();
-        let mut pane = eoa_pane("0.1");
-        let plan = pane.build_plan(&portfolio).unwrap();
-        pane.eoa_mut().unwrap().quote = Some(quote_for_plan(&plan));
-        assert!(pane.quote_for_current_plan(&portfolio).is_some());
+    fn send_review_confirm_gate_blocks_when_eth_insufficient() {
+        // The sign-review overlay derives its Confirm button state from the
+        // reviewed figures. A send that can't cover its own gas must be *blocked*
+        // (not merely softened), so a user can never sign it — the fund-safety
+        // invariant the old inline review enforced, now on the overlay.
+        use crate::wallet::sim::SimulationResult;
+        let plan = SendPlan {
+            from: Address::repeat_byte(0xAB),
+            recipient: Address::repeat_byte(0xCD),
+            token: SendToken::Native,
+            amount_units: U256::from(1u64),
+            chain: Chain::Mainnet.into(),
+        };
+        let make = |has_insufficient_eth: bool| SendReview {
+            chain: plan.chain,
+            recipient: plan.recipient,
+            recipient_name: None,
+            recipient_in_book: false,
+            recipient_kao: "(・_・)".to_string(),
+            recipient_chip: None,
+            amount: "1".to_string(),
+            token_symbol: "ETH".to_string(),
+            token_contract: None,
+            token_balance_before: 1.0,
+            usd_price: 0.0,
+            eth_usd_price: 0.0,
+            has_insufficient_eth,
+            quote: TxQuote {
+                plan: plan.clone(),
+                gas_limit: 21_000,
+                max_fee_per_gas: 1,
+                max_priority_fee_per_gas: 1,
+                nonce: 0,
+                eth_cost_wei: U256::from(21_000u64),
+                sim: SimulationResult::unavailable(),
+            },
+            decoded: Box::new(DecodeResult::Empty),
+        };
 
-        let _ = pane.update(Message::SetAmount("0.2".to_string()));
+        let funded = make(false);
+        assert!(!funded.confirm_disabled(), "a funded send must be signable");
+        assert_eq!(funded.confirm_label(), "Sign & Send");
 
-        assert!(pane.quote().is_none());
-        assert!(pane.quote_for_current_plan(&portfolio).is_none());
-    }
-
-    #[test]
-    fn eoa_late_quote_after_input_change_is_dropped() {
-        let portfolio = test_portfolio();
-        let mut pane = eoa_pane("0.1");
-        let reviewed_plan = pane.build_plan(&portfolio).unwrap();
-        let quote_seq = pane.quote_started();
-
-        let _ = pane.update(Message::SetAmount("0.2".to_string()));
-        let _ = pane.update(Message::QuoteFetched {
-            seq: quote_seq,
-            result: Ok(quote_for_plan(&reviewed_plan)),
-        });
-
-        assert!(pane.quote().is_none());
-        assert!(!pane.eoa().unwrap().quote_loading);
-    }
-
-    #[test]
-    fn eoa_current_quote_requires_current_plan() {
-        let portfolio = test_portfolio();
-        let mut pane = eoa_pane("0.1");
-        let old_plan = pane.build_plan(&portfolio).unwrap();
-
-        // Direct field mutation simulates the pre-fix broken state: the form
-        // now describes a different transaction while an old quote remains.
-        pane.amount = "0.2".to_string();
-        let current_plan = pane.build_plan(&portfolio).unwrap();
-        assert_ne!(old_plan, current_plan);
-        pane.eoa_mut().unwrap().quote = Some(quote_for_plan(&old_plan));
-
-        assert!(pane.quote_for_plan(&old_plan).is_some());
-        assert!(pane.quote_for_current_plan(&portfolio).is_none());
+        let broke = make(true);
+        assert!(
+            broke.confirm_disabled(),
+            "a send that can't cover gas must be blocked from signing",
+        );
+        assert_eq!(broke.confirm_label(), "Need ETH for gas");
     }
 
     #[test]

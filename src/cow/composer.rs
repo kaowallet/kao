@@ -118,6 +118,16 @@ pub enum Outcome {
     },
 }
 
+impl Outcome {
+    /// Variant name for the GUI state trace — never the payload.
+    fn name(&self) -> &'static str {
+        match self {
+            Outcome::RequestQuote(_) => "RequestQuote",
+            Outcome::RequestPlace { .. } => "RequestPlace",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct SwapComposer {
     /// The CoW network the swap runs on — chosen explicitly via the switch.
@@ -163,6 +173,17 @@ impl SwapComposer {
     /// Reset to a blank slate (used by the Apps pane after a successful place,
     /// keeping the chosen slippage).
     pub fn reset(&mut self) {
+        // Called by the host outside `update`, so the wrapper diff can't see
+        // these transitions — log the coarse ones here.
+        if self.quote.is_some() {
+            crate::trace::state("composer", "quote", "some", "none");
+        }
+        if self.quoting {
+            crate::trace::state("composer", "quoting", true, false);
+        }
+        if self.error.is_some() {
+            crate::trace::state("composer", "error", "some", "none");
+        }
         self.sell = None;
         self.buy = None;
         self.sell_filter.clear();
@@ -175,6 +196,47 @@ impl SwapComposer {
     }
 
     pub fn update(&mut self, msg: Message) -> Option<Outcome> {
+        crate::trace_msg!("composer", &msg);
+        let chain_before = self.chain;
+        let quoting_before = self.quoting;
+        let quote_before = self.quote.is_some();
+        let error_before = self.error.is_some();
+        let outcome = self.update_inner(msg);
+        if chain_before != self.chain {
+            crate::trace::state(
+                "composer",
+                "chain",
+                chain_before.label(),
+                self.chain.label(),
+            );
+        }
+        if quoting_before != self.quoting {
+            crate::trace::state("composer", "quoting", quoting_before, self.quoting);
+        }
+        let p = |present: bool| if present { "some" } else { "none" };
+        if quote_before != self.quote.is_some() {
+            crate::trace::state(
+                "composer",
+                "quote",
+                p(quote_before),
+                p(self.quote.is_some()),
+            );
+        }
+        if error_before != self.error.is_some() {
+            crate::trace::state(
+                "composer",
+                "error",
+                p(error_before),
+                p(self.error.is_some()),
+            );
+        }
+        if let Some(o) = &outcome {
+            crate::trace::outcome("composer", o.name());
+        }
+        outcome
+    }
+
+    fn update_inner(&mut self, msg: Message) -> Option<Outcome> {
         match msg {
             Message::SetChain(chain) => {
                 if self.chain != chain {
@@ -246,11 +308,9 @@ impl SwapComposer {
                             );
                             return None;
                         }
-                        let (s, _) = format_token_balance(max_raw, sell.decimals);
-                        self.amount = s;
+                        self.amount = exact_amount_string(max_raw, sell.decimals);
                     } else {
-                        let (s, _) = format_token_balance(sell.balance_raw, sell.decimals);
-                        self.amount = s;
+                        self.amount = exact_amount_string(sell.balance_raw, sell.decimals);
                     }
                     self.invalidate_quote();
                 }
@@ -299,6 +359,10 @@ impl SwapComposer {
     /// Surface an error from the coordinator (e.g. a failed placement) into the
     /// composer so it renders inline.
     pub fn set_error(&mut self, e: String) {
+        // Called by the host outside `update` — log the appearance here.
+        if self.error.is_none() {
+            crate::trace::state("composer", "error", "none", "some");
+        }
         self.error = Some(e);
     }
 
@@ -896,6 +960,22 @@ fn pill_chip<'a>(t: KaoTheme, label: &str, selected: bool, msg: Message) -> Elem
         .into()
 }
 
+/// Exact decimal string for `raw` base-units — round-trips through
+/// [`parse_amount_units`] back to `raw`. The "Max" fill needs this: the f64
+/// display formatter (`format_token_balance`) rounds to 4 dp and can round
+/// *up*, producing a string that re-parses to *more* than the balance, which
+/// trips `parsed_amount`'s `amt > balance_raw` guard and silently disables
+/// "Get quote". An exact string is always `<= balance`, so the quote stays live.
+fn exact_amount_string(raw: U256, decimals: u8) -> String {
+    let s =
+        alloy::primitives::utils::format_units(raw, decimals).unwrap_or_else(|_| raw.to_string());
+    if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        s
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -916,6 +996,33 @@ mod tests {
             address: address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
             decimals: 6,
         }
+    }
+
+    /// A DAI balance whose 4-dp display rounds *up* — `1.00366` shows as
+    /// "1.0037". The old Max fill stored that rounded string, which re-parsed to
+    /// `1.0037e18` > the real balance and disabled "Get quote".
+    fn dai_pick_rounds_up() -> SellPick {
+        SellPick {
+            symbol: "DAI".into(),
+            contract: Some(address!("0x6B175474E89094C44Da98b954EedeAC495271d0F")),
+            decimals: 18,
+            balance_raw: U256::from(1_003_660_000_000_000_000u64), // 1.00366 DAI
+        }
+    }
+
+    #[test]
+    fn max_on_round_up_balance_keeps_quote_enabled() {
+        // Regression: Max on a balance whose display rounds up must still leave a
+        // valid, quotable draft (the "Get quote" button gates on `draft()`).
+        let mut c = SwapComposer::new();
+        c.update(Message::SelectSell(dai_pick_rounds_up()));
+        c.update(Message::SelectBuy(usdc_buy()));
+        c.update(Message::MaxAmount);
+        let d = c
+            .draft()
+            .expect("Max must leave a valid draft (Get quote enabled)");
+        // Exactly the full balance, never over it.
+        assert_eq!(d.sell_amount, U256::from(1_003_660_000_000_000_000u64));
     }
 
     #[test]

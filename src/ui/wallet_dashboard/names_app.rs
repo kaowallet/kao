@@ -21,7 +21,7 @@
 
 use std::time::Duration;
 
-use alloy::primitives::{Address, TxHash, U256};
+use alloy::primitives::{Address, U256};
 use iced::border::Radius;
 use iced::widget::{Space, button, column, container, row, text, text_input};
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Subscription};
@@ -136,12 +136,41 @@ pub enum Outcome {
     },
 }
 
+impl Outcome {
+    /// Variant name for the GUI state trace — never the payload (`Register`
+    /// carries the commit/reveal secret inside its plan).
+    fn name(&self) -> &'static str {
+        match self {
+            Outcome::ReverseScan => "ReverseScan",
+            Outcome::Search { .. } => "Search",
+            Outcome::Quote { .. } => "Quote",
+            Outcome::Status { .. } => "Status",
+            Outcome::Commit { .. } => "Commit",
+            Outcome::Register { .. } => "Register",
+            Outcome::RegisterXns { .. } => "RegisterXns",
+            Outcome::Renew { .. } => "Renew",
+            Outcome::SetRecipient { .. } => "SetRecipient",
+        }
+    }
+}
+
 /// Which sub-view is showing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum View {
     Home,
     Register,
     Manage(usize),
+}
+
+impl View {
+    /// Variant name for the GUI state trace.
+    fn name(&self) -> &'static str {
+        match self {
+            View::Home => "Home",
+            View::Register => "Register",
+            View::Manage(_) => "Manage",
+        }
+    }
 }
 
 /// The registration flow's state machine. XNS skips `Committing`/`Waiting`.
@@ -161,6 +190,20 @@ enum RegPhase {
     Done,
     /// A step failed.
     Failed(String),
+}
+
+impl RegPhase {
+    /// Variant name for the GUI state trace.
+    fn name(&self) -> &'static str {
+        match self {
+            RegPhase::Ready { .. } => "Ready",
+            RegPhase::Committing => "Committing",
+            RegPhase::Waiting { .. } => "Waiting",
+            RegPhase::Registering => "Registering",
+            RegPhase::Done => "Done",
+            RegPhase::Failed(_) => "Failed",
+        }
+    }
 }
 
 /// The focused registration panel's target + state.
@@ -214,6 +257,33 @@ pub struct NamesApp {
     manage_notice: Option<(bool, String)>,
 }
 
+/// Cheap coarse-state names captured before dispatch and diffed after, so
+/// every transition is logged no matter which arm (or coordinator callback)
+/// performed it.
+struct TraceSnapshot {
+    view: &'static str,
+    reg_phase: &'static str,
+    quoting: bool,
+    searching: bool,
+    pending_search: bool,
+    scanning: bool,
+    adding: bool,
+    manage_busy: bool,
+    notice: &'static str,
+    manage_notice: &'static str,
+    results: usize,
+    owned: usize,
+}
+
+/// "error" / "info" / "none" for a notice slot (never the text itself).
+fn notice_name(n: &Option<(bool, String)>) -> &'static str {
+    match n {
+        Some((true, _)) => "error",
+        Some((false, _)) => "info",
+        None => "none",
+    }
+}
+
 impl NamesApp {
     pub fn new(owner: Address) -> Self {
         Self {
@@ -245,9 +315,14 @@ impl NamesApp {
         if self.loaded {
             return None;
         }
+        // Coordinator-driven entry (outside the update wrapper) — trace here.
+        let before = self.trace_snapshot();
         self.loaded = true;
         self.scanning = true;
-        Some(Outcome::ReverseScan)
+        self.trace_delta(&before);
+        let out = Outcome::ReverseScan;
+        crate::trace::outcome("names", out.name());
+        Some(out)
     }
 
     /// Two independent timers, each subscribed only while it's needed: a 1-second
@@ -268,7 +343,97 @@ impl NamesApp {
         Subscription::batch(subs)
     }
 
+    fn trace_snapshot(&self) -> TraceSnapshot {
+        TraceSnapshot {
+            view: self.view.name(),
+            reg_phase: self.reg.as_ref().map_or("none", |r| r.phase.name()),
+            quoting: self.reg.as_ref().is_some_and(|r| r.quoting),
+            searching: self.searching,
+            pending_search: self.pending_search,
+            scanning: self.scanning,
+            adding: self.adding,
+            manage_busy: self.manage_busy,
+            notice: notice_name(&self.notice),
+            manage_notice: notice_name(&self.manage_notice),
+            results: self.results.len(),
+            owned: self.owned.len(),
+        }
+    }
+
+    /// Diff the coarse state against `before` and log every change. Shared by
+    /// the `update` wrapper and the coordinator-called `begin_*` / `on_*`
+    /// entry points, which mutate flow state outside `update`.
+    fn trace_delta(&self, before: &TraceSnapshot) {
+        let after = self.trace_snapshot();
+        if before.view != after.view {
+            crate::trace::state("names", "view", before.view, after.view);
+        }
+        if before.reg_phase != after.reg_phase {
+            crate::trace::state("names", "reg_phase", before.reg_phase, after.reg_phase);
+        }
+        if before.quoting != after.quoting {
+            crate::trace::state("names", "quoting", before.quoting, after.quoting);
+        }
+        if before.searching != after.searching {
+            crate::trace::state("names", "searching", before.searching, after.searching);
+        }
+        if before.pending_search != after.pending_search {
+            crate::trace::state(
+                "names",
+                "pending_search",
+                before.pending_search,
+                after.pending_search,
+            );
+        }
+        if before.scanning != after.scanning {
+            crate::trace::state("names", "scanning", before.scanning, after.scanning);
+        }
+        if before.adding != after.adding {
+            crate::trace::state("names", "adding", before.adding, after.adding);
+        }
+        if before.manage_busy != after.manage_busy {
+            crate::trace::state(
+                "names",
+                "manage_busy",
+                before.manage_busy,
+                after.manage_busy,
+            );
+        }
+        if before.notice != after.notice {
+            crate::trace::state("names", "notice", before.notice, after.notice);
+        }
+        if before.manage_notice != after.manage_notice {
+            crate::trace::state(
+                "names",
+                "manage_notice",
+                before.manage_notice,
+                after.manage_notice,
+            );
+        }
+        if before.results != after.results {
+            crate::trace::state("names", "results", before.results, after.results);
+        }
+        if before.owned != after.owned {
+            crate::trace::state("names", "owned", before.owned, after.owned);
+        }
+    }
+
     pub fn update(&mut self, msg: Message) -> Option<Outcome> {
+        // `Tick` is skipped: it fires every second for the whole commit→reveal
+        // wait purely to repaint the countdown (the handler is a no-op).
+        if !matches!(msg, Message::Tick) {
+            crate::trace_msg!("names", &msg);
+        }
+        let before = self.trace_snapshot();
+        let out = self.update_inner(msg);
+        self.trace_delta(&before);
+        if let Some(o) = &out {
+            crate::trace::outcome("names", o.name());
+        }
+        out
+    }
+
+    fn update_inner(&mut self, msg: Message) -> Option<Outcome> {
         match msg {
             Message::Tick => None,
             // Copy-toast kick — the widget already copied + marked the toast.
@@ -567,26 +732,33 @@ impl NamesApp {
 
     /// Commit-reveal step 1 confirmed — broadcast in flight.
     pub fn begin_commit(&mut self) {
+        let before = self.trace_snapshot();
         if let Some(r) = &mut self.reg {
             r.phase = RegPhase::Committing;
         }
+        self.trace_delta(&before);
     }
 
     /// Reveal (or XNS one-shot) confirmed — broadcast in flight.
     pub fn begin_reveal(&mut self) {
+        let before = self.trace_snapshot();
         if let Some(r) = &mut self.reg {
             r.phase = RegPhase::Registering;
         }
+        self.trace_delta(&before);
     }
 
     /// A manage write (renew / set-recipient) confirmed — mark the card busy.
     pub fn begin_manage(&mut self) {
+        let before = self.trace_snapshot();
         self.manage_busy = true;
+        self.trace_delta(&before);
     }
 
     // ── result callbacks (coordinator → pane) ─────────────────────────────────
 
     pub fn on_reverse_scan(&mut self, result: Result<Vec<NameStatus>, String>) {
+        let before = self.trace_snapshot();
         self.scanning = false;
         match result {
             Ok(found) => {
@@ -603,6 +775,7 @@ impl NamesApp {
             }
             Err(e) => self.notice = Some((true, format!("Scan failed: {e}"))),
         }
+        self.trace_delta(&before);
     }
 
     pub fn on_search(&mut self, seq: u64, result: Result<Vec<SearchHit>, String>) {
@@ -612,6 +785,7 @@ impl NamesApp {
         if seq != self.search_seq {
             return;
         }
+        let before = self.trace_snapshot();
         self.searching = false;
         match result {
             Ok(hits) => self.results = hits,
@@ -620,6 +794,7 @@ impl NamesApp {
                 self.notice = Some((true, e));
             }
         }
+        self.trace_delta(&before);
     }
 
     /// Result of a duration-change re-quote (ENS). Refreshes the panel's price.
@@ -630,6 +805,7 @@ impl NamesApp {
         years: u32,
         result: Result<crate::names::manage::RegisterQuote, String>,
     ) {
+        let before = self.trace_snapshot();
         let Some(r) = &mut self.reg else { return };
         if r.years != years {
             return;
@@ -638,9 +814,11 @@ impl NamesApp {
         if let RegPhase::Ready { quote } = &mut r.phase {
             *quote = result.ok();
         }
+        self.trace_delta(&before);
     }
 
     pub fn on_status(&mut self, result: Result<NameStatus, String>) {
+        let before = self.trace_snapshot();
         self.adding = false;
         match result {
             Ok(status) => {
@@ -655,12 +833,14 @@ impl NamesApp {
             }
             Err(e) => self.notice = Some((true, e)),
         }
+        self.trace_delta(&before);
     }
 
-    pub fn on_commit(&mut self, result: Result<(RegisterPlan, TxHash), String>) {
+    pub fn on_commit(&mut self, result: Result<RegisterPlan, String>) {
+        let before = self.trace_snapshot();
         let Some(r) = &mut self.reg else { return };
         match result {
-            Ok((plan, _hash)) => {
+            Ok(plan) => {
                 r.phase = RegPhase::Waiting {
                     plan,
                     since: crate::names::manage::now_secs(),
@@ -668,9 +848,11 @@ impl NamesApp {
             }
             Err(e) => r.phase = RegPhase::Failed(e),
         }
+        self.trace_delta(&before);
     }
 
-    pub fn on_register(&mut self, result: Result<(String, TxHash), String>) {
+    pub fn on_register(&mut self, result: Result<(), String>) {
+        let before = self.trace_snapshot();
         // Pull the registered target out of the flow (and flip its phase) before
         // touching the rest of `self`, so the success path can update the search
         // row and owned list without holding the `self.reg` borrow.
@@ -690,6 +872,7 @@ impl NamesApp {
         if let Some((registry, label, full, years)) = registered {
             self.register_succeeded(&registry, &label, &full, years);
         }
+        self.trace_delta(&before);
     }
 
     /// Reflect a just-broadcast registration locally — without a read-back, since
@@ -727,23 +910,27 @@ impl NamesApp {
         }]);
     }
 
-    pub fn on_renew(&mut self, result: Result<(String, TxHash), String>) {
+    pub fn on_renew(&mut self, result: Result<String, String>) {
+        let before = self.trace_snapshot();
         self.manage_busy = false;
         match result {
-            Ok((name, _)) => self.manage_notice = Some((false, format!("Renewed {name}."))),
+            Ok(name) => self.manage_notice = Some((false, format!("Renewed {name}."))),
             Err(e) => self.manage_notice = Some((true, e)),
         }
+        self.trace_delta(&before);
     }
 
-    pub fn on_set_recipient(&mut self, result: Result<(String, TxHash), String>) {
+    pub fn on_set_recipient(&mut self, result: Result<String, String>) {
+        let before = self.trace_snapshot();
         self.manage_busy = false;
         match result {
-            Ok((name, _)) => {
+            Ok(name) => {
                 self.manage_recipient.clear();
                 self.manage_notice = Some((false, format!("Updated {name}'s recipient.")));
             }
             Err(e) => self.manage_notice = Some((true, e)),
         }
+        self.trace_delta(&before);
     }
 
     /// Upsert by (registry, label) so a re-scan or manual re-add refreshes a row
@@ -1822,7 +2009,7 @@ mod tests {
             duration_secs: registrar::YEAR_SECONDS,
             secret: alloy::primitives::B256::repeat_byte(7),
         };
-        a.on_commit(Ok((plan, TxHash::ZERO)));
+        a.on_commit(Ok(plan));
         // Too early → no reveal.
         assert!(a.update(Message::CompleteRegister).is_none());
         // Backdate past the 60s window → reveal allowed.
@@ -2070,7 +2257,7 @@ mod tests {
         }];
         a.update(Message::PickResult(0));
         a.update(Message::StartRegister); // XNS one-shot → Registering
-        a.on_register(Ok(("cow.crops".to_string(), TxHash::ZERO)));
+        a.on_register(Ok(()));
 
         assert!(matches!(a.reg.as_ref().unwrap().phase, RegPhase::Done));
         // The search row no longer offers Register — it reads as ours now.
@@ -2096,7 +2283,7 @@ mod tests {
             status: HitStatus::Available { quote: None },
         }];
         a.update(Message::PickResult(0)); // years defaults to 1
-        a.on_register(Ok(("vitalik.eth".to_string(), TxHash::ZERO)));
+        a.on_register(Ok(()));
         // A commit-reveal name lands in the owned list with a future expiry.
         assert_eq!(a.owned.len(), 1);
         let exp = a.owned[0]

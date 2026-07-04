@@ -12,8 +12,10 @@
 //! refusal before the transaction leaves the wallet, rather than a silent
 //! spend from the wrong account.
 //!
-//! Phase 0 covers the single-EOA case only. The Safe owner-ceremony arm (many
-//! owner signatures + an executor envelope) lands in a later phase.
+//! This primitive models the single-EOA broadcast only. The Safe owner
+//! ceremony (many owner signatures packed into one `execTransaction`, then an
+//! executor envelope) is broadcast by its own primitive,
+//! [`crate::safe::tx::execute_safe_tx`], not through here.
 
 use alloy::consensus::{SignableTransaction, TxEip1559, TxEnvelope};
 use alloy::eips::eip2718::Encodable2718;
@@ -25,8 +27,9 @@ use tracing::{debug, info, warn};
 
 use crate::wallet::KaoSigner;
 
-/// The live signer(s) authorizing a broadcast. Phase 0 only models a single
-/// EOA; the `Owners { .. }` Safe-ceremony variant arrives with the Safe arm.
+/// The live signer authorizing a broadcast — a single EOA. There is no
+/// multi-owner variant: the Safe owner ceremony broadcasts through
+/// [`crate::safe::tx::execute_safe_tx`] instead, so it never reaches here.
 pub enum LiveSigners<'a> {
     One(&'a KaoSigner),
 }

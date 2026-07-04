@@ -2061,8 +2061,12 @@ pub(crate) fn render_send_review<'a, M: 'a + Clone>(
                 DecodeResult::Empty => None,
             };
             let pill_label: Option<String> = fn_name.map(|name| {
-                if name.len() > 30 {
-                    format!("{}…", &name[..28])
+                // Truncate by *chars*, not bytes: a decoded intent/function name
+                // can carry attacker-controlled token metadata (e.g. a multibyte
+                // symbol), and a byte slice landing mid-codepoint would panic the
+                // review render.
+                if name.chars().count() > 30 {
+                    format!("{}…", name.chars().take(28).collect::<String>())
                 } else {
                     name
                 }

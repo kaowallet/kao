@@ -2284,6 +2284,29 @@ mod pure_tests {
         assert_eq!(redact_urls(""), "");
     }
 
+    /// The provider-error sinks in `wallet::tx::build_quote`,
+    /// `sign::broadcast::broadcast`, and `safe::tx::execute_safe_tx` route
+    /// alloy transport errors through `redact_urls` before logging/returning
+    /// them (findings #21/#26). Cover the exact `format!("<op>: {redacted}")`
+    /// shape those sites now emit, for every key placement a configured RPC
+    /// uses: Alchemy path key, dRPC path key, and dRPC query key.
+    #[test]
+    fn redact_urls_scrubs_provider_keys_in_op_error_strings() {
+        let cases = [
+            "estimate_gas: error sending request for url (https://eth-mainnet.g.alchemy.com/v2/ALCHEMY_KEY)",
+            "broadcast failed: error sending request for url (https://lb.drpc.org/ogrpc/eth/DRPC_KEY)",
+            "get_transaction_count: HTTP error for https://lb.drpc.org/ogrpc?network=ethereum&dkey=DRPC_KEY",
+        ];
+        for raw in cases {
+            let r = redact_urls(raw);
+            for secret in ["ALCHEMY_KEY", "DRPC_KEY"] {
+                assert!(!r.contains(secret), "key leaked through redaction: {r}");
+            }
+            // The operation prefix (the useful signal) must survive.
+            assert!(r.contains(':'), "op prefix lost: {r}");
+        }
+    }
+
     #[test]
     fn is_loopback_host_matches_every_loopback_spelling() {
         // The three forms a local-node RPC URL realistically uses, plus the

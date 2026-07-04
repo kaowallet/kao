@@ -121,19 +121,30 @@ pub async fn broadcast(
                 .to(call.to)
                 .value(call.value)
                 .input(TransactionInput::new(call.calldata.clone()));
+            // Alloy transport errors `Display` the full request URL, which for
+            // the execution RPC embeds the API key (Alchemy, dRPC). These
+            // strings reach warn! logs and the sign-review overlay, so scrub
+            // URLs to the host first (see `net::redact_urls`).
             let gas_limit = provider
                 .estimate_gas(req)
                 .await
-                .map_err(|e| format!("estimate_gas: {e}"))?;
-            let f = provider
-                .estimate_eip1559_fees()
-                .await
-                .map_err(|e| format!("estimate_eip1559_fees: {e}"))?;
+                .map_err(|e| format!("estimate_gas: {}", crate::net::redact_urls(&e.to_string())))?;
+            let f = provider.estimate_eip1559_fees().await.map_err(|e| {
+                format!(
+                    "estimate_eip1559_fees: {}",
+                    crate::net::redact_urls(&e.to_string())
+                )
+            })?;
             let nonce = provider
                 .get_transaction_count(expected_from)
                 .pending()
                 .await
-                .map_err(|e| format!("get_transaction_count: {e}"))?;
+                .map_err(|e| {
+                    format!(
+                        "get_transaction_count: {}",
+                        crate::net::redact_urls(&e.to_string())
+                    )
+                })?;
             (
                 nonce,
                 gas_limit,
@@ -148,7 +159,7 @@ pub async fn broadcast(
         let balance = provider
             .get_balance(expected_from)
             .await
-            .map_err(|e| format!("get_balance: {e}"))?;
+            .map_err(|e| format!("get_balance: {}", crate::net::redact_urls(&e.to_string())))?;
         let max_gas_cost = U256::from(gas_limit).saturating_mul(U256::from(max_fee_per_gas));
         let required = call.value.saturating_add(max_gas_cost);
         if balance < required {
@@ -210,8 +221,11 @@ pub async fn broadcast(
     debug!(raw_len = raw.len(), "broadcast: broadcasting raw envelope");
 
     let pending = provider.send_raw_transaction(&raw).await.map_err(|e| {
-        warn!(error = %e, "broadcast: broadcast failed");
-        let msg = e.to_string();
+        // Scrub the key-bearing RPC URL before this hits the warn log or the
+        // returned (UI-visible) error; the "insufficient funds" massage below
+        // still matches because redaction only removes URLs.
+        let msg = crate::net::redact_urls(&e.to_string());
+        warn!(error = %msg, "broadcast: broadcast failed");
         if guards.insufficient_funds_massage && msg.to_lowercase().contains("insufficient funds") {
             // Belt-and-suspenders: the balance pre-flight should catch this, but a
             // gas-price spike between estimate and broadcast can still trip it.

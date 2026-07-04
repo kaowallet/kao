@@ -177,6 +177,11 @@ pub async fn build_quote(
             g
         }
         Err(e) => {
+            // Alloy transport errors `Display` the full request URL, which for
+            // the execution RPC embeds the API key (Alchemy, dRPC). This string
+            // reaches both the warn log and the sign-review overlay error, so
+            // scrub URLs to the host first (see `net::redact_urls`).
+            let e = crate::net::redact_urls(&e.to_string());
             warn!(error = %e, "quote: estimate_gas failed");
             return Err(format!("estimate_gas: {e}"));
         }
@@ -192,6 +197,7 @@ pub async fn build_quote(
             f
         }
         Err(e) => {
+            let e = crate::net::redact_urls(&e.to_string());
             warn!(error = %e, "quote: estimate_eip1559_fees failed");
             return Err(format!("estimate_eip1559_fees: {e}"));
         }
@@ -203,6 +209,7 @@ pub async fn build_quote(
             n
         }
         Err(e) => {
+            let e = crate::net::redact_urls(&e.to_string());
             warn!(error = %e, "quote: get_transaction_count failed");
             return Err(format!("get_transaction_count: {e}"));
         }
@@ -225,7 +232,7 @@ pub async fn build_quote(
             Err(e) => {
                 // Advisory: degrade to "unavailable" rather than fail the
                 // quote — the user can still review and send.
-                warn!(error = %e, "quote: simulate_tx failed, marking sim unavailable");
+                warn!(error = %crate::net::redact_urls(&e.to_string()), "quote: simulate_tx failed, marking sim unavailable");
                 SimulationResult::unavailable()
             }
         }

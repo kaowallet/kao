@@ -440,15 +440,22 @@ fn network_footer<'a>(
         VerificationStatus::Connecting => t.sub,
     };
 
-    // Honest privacy posture: the wallet only hides the user's IP when a
-    // proxy is actually installed (see `proxy_env::set_all_proxy`). The
-    // cool-shades kaomoji is the "you're covered" affordance; without a
-    // proxy we say so plainly rather than implying protection.
-    let privacy_line = if settings::proxy_enabled() {
+    // Honest privacy posture: the wallet only hides the user's IP when a proxy
+    // was actually installed at startup (`proxy_env::installed()`), NOT merely
+    // when the setting is enabled. The proxy can only be installed once,
+    // single-threaded, at launch, so a mid-session toggle changes stored intent
+    // but leaves traffic going direct until a restart — claiming "IP hidden"
+    // off the setting alone would over-claim protection in that window. The
+    // cool-shades kaomoji is the "you're covered" affordance; otherwise we say
+    // plainly that the IP is exposed, and flag when a restart is pending.
+    let privacy_line = if proxy_env::installed() {
         match settings::proxy_type() {
             ProxyType::Tor => "via Tor · IP hidden (⌐■_■)",
             ProxyType::Socks => "via SOCKS proxy · IP hidden (⌐■_■)",
         }
+    } else if settings::proxy_enabled() {
+        // Enabled in settings but not routing this session — restart to apply.
+        "IP exposed · restart to route via proxy"
     } else {
         "direct connection · IP exposed"
     };

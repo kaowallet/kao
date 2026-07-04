@@ -374,6 +374,10 @@ pub enum Message {
     Continue,
     Back,
     Finish,
+    /// Settings mode only: persist the whole draft and close, from any step, so
+    /// changing one setting doesn't require walking every section. Gated on the
+    /// entire draft being valid (the same check as Review).
+    Save,
     // Redacted via `KeyEvent`: raw key events echo typed characters.
     KeyboardEvent(KeyEvent),
 }
@@ -677,6 +681,17 @@ impl NetworkSetupScreen {
                 self.apply_draft();
                 (Task::none(), Some(Outcome::Completed))
             }
+            Message::Save => {
+                // Persist the whole draft from wherever the user is. Requires
+                // the entire draft to be valid (same gate as Review) because
+                // `apply_draft` writes every section, not just the current step.
+                if !self.step_valid(WizardStep::Review) {
+                    return (Task::none(), None);
+                }
+                self.error = None;
+                self.apply_draft();
+                (Task::none(), Some(Outcome::Completed))
+            }
             Message::KeyboardEvent(KeyEvent(keyboard::Event::KeyPressed { key, .. })) => {
                 self.handle_key(key)
             }
@@ -687,6 +702,16 @@ impl NetworkSetupScreen {
     fn handle_key(&mut self, key: keyboard::Key) -> (Task<Message>, Option<Outcome>) {
         match key {
             keyboard::Key::Named(keyboard::key::Named::Enter) => {
+                // Settings mode: Enter mirrors the "Save" footer button — persist
+                // the whole (valid) draft and close from wherever the user is.
+                if matches!(self.mode, WizardMode::Settings) {
+                    if self.step_valid(WizardStep::Review) {
+                        self.error = None;
+                        self.apply_draft();
+                        return (Task::none(), Some(Outcome::Completed));
+                    }
+                    return (Task::none(), None);
+                }
                 if self.step == WizardStep::Review {
                     if self.can_advance() {
                         self.apply_draft();
@@ -1342,12 +1367,17 @@ impl NetworkSetupScreen {
             Space::new().into()
         };
 
-        let (right_label, right_msg): (&str, Message) = if self.step == WizardStep::Review {
-            ("Connect & Finish", Message::Finish)
-        } else {
-            ("Continue \u{2192}", Message::Continue)
+        // Settings mode: a single "Save" persists the whole draft from any step
+        // (navigation between sections is via the left rail), so fixing one
+        // setting doesn't mean clicking through every section. Onboarding keeps
+        // the linear Continue → … → Connect & Finish flow.
+        let (right_label, right_msg, can_go): (&str, Message, bool) = match self.mode {
+            WizardMode::Settings => ("Save", Message::Save, self.step_valid(WizardStep::Review)),
+            WizardMode::Onboarding if self.step == WizardStep::Review => {
+                ("Connect & Finish", Message::Finish, self.can_advance())
+            }
+            WizardMode::Onboarding => ("Continue \u{2192}", Message::Continue, self.can_advance()),
         };
-        let can_go = self.can_advance();
         let mut right_btn = primary_button(t, right_label, can_go).width(Length::Fixed(180.0));
         if can_go {
             right_btn = right_btn.on_press(right_msg);
@@ -1834,16 +1864,65 @@ impl NetworkSetupScreen {
                 .push(vspace(12))
                 .push(tor_card)
                 .push(vspace(8))
-                .push(socks_card)
-                .push(vspace(10))
-                .push(
-                    text(
-                        "Applies on next launch — restart Kao after finishing setup for the \
-                         proxy to take effect for all traffic.",
-                    )
-                    .size(11)
-                    .color(t.sub),
-                );
+                .push(socks_card);
+        }
+
+        // Honest restart notice. A proxy can only be installed once, at startup
+        // (`proxy_env::set_all_proxy`), so any change to whether traffic is
+        // actually routed takes effect on the next launch — not when saved. We
+        // compare the draft's intent against what is really installed THIS
+        // session (`proxy_env::installed()`) and tell the user plainly whether
+        // a relaunch is needed and what their exposure is until then.
+        let notice = |accent: Color, title: &str, body: String| -> Element<'_, Message> {
+            container(
+                column![
+                    text(title.to_string()).size(12).color(accent).font(bold()),
+                    vspace(3),
+                    text(body).size(11).color(t.sub),
+                ]
+                .width(Length::Fill),
+            )
+            .padding(Padding::from([10, 12]))
+            .width(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(Background::Color(with_alpha(accent, 0.08))),
+                border: Border {
+                    color: with_alpha(accent, 0.30),
+                    width: 1.0,
+                    radius: Radius::from(10),
+                },
+                ..container::Style::default()
+            })
+            .into()
+        };
+        let installed = proxy_env::installed();
+        let restart_note: Option<Element<'_, Message>> = match (self.draft.proxy_enabled, installed)
+        {
+            (true, false) => Some(notice(
+                t.down,
+                "\u{27f3} Restart required to apply",
+                "The proxy is installed once, at launch. Save this, then relaunch Kao — your IP \
+                 stays exposed until you do."
+                    .to_string(),
+            )),
+            (false, true) => Some(notice(
+                t.down,
+                "\u{27f3} Restart required to apply",
+                "A proxy is still routing this session's traffic. Save this, then relaunch Kao — \
+                 it won't turn off until you do."
+                    .to_string(),
+            )),
+            (true, true) => Some(notice(
+                t.sub,
+                "Applies on next launch",
+                "The proxy is active this session. Changes to the address or type take effect \
+                 after you relaunch Kao."
+                    .to_string(),
+            )),
+            (false, false) => None,
+        };
+        if let Some(note) = restart_note {
+            content = content.push(vspace(10)).push(note);
         }
 
         content.into()
@@ -2536,6 +2615,26 @@ mod tests {
         assert!(!s.checkpoint_fetching);
         assert!(s.draft.checkpoint_override.is_empty());
         assert!(s.error.as_deref().unwrap_or_default().contains("tor down"));
+    }
+
+    /// Settings-mode "Save" persists the whole draft from any step, so it is
+    /// gated on the entire draft being valid (the same check as Review) — a
+    /// half-typed section elsewhere can't be silently written by saving from a
+    /// different step. When invalid, Save is a no-op (no `Completed`, and it
+    /// must not apply). Uses an invalid custom Safe TX URL to force the gate.
+    #[test]
+    fn save_refuses_invalid_draft() {
+        let mut s = NetworkSetupScreen::new(WizardMode::Onboarding);
+        let _ = s.update(Message::SetSafeTxService(SafeTxService::Custom));
+        assert!(
+            !s.step_valid(WizardStep::Review),
+            "an empty custom Safe TX URL must leave the draft invalid",
+        );
+        let (_, outcome) = s.update(Message::Save);
+        assert!(
+            outcome.is_none(),
+            "Save must not complete while any section is invalid",
+        );
     }
 
     /// The checkpoint fetch routes through the *draft* proxy (what the user is

@@ -65,6 +65,26 @@ impl Chain {
         }
     }
 
+    /// Ticker of the chain's native gas coin. All three built-ins are ETH
+    /// today (Base/OP settle in ETH). This is the *authoritative* symbol for a
+    /// native (`contract: None`) balance/send row — an indexer's reported
+    /// symbol for the native coin is untrusted and must never override it, or
+    /// a hostile indexer could label a native-ETH transfer as some ERC-20 the
+    /// user thinks they are sending (see `into_live_tokens`).
+    pub fn native_symbol(self) -> &'static str {
+        match self {
+            Chain::Mainnet | Chain::Base | Chain::Optimism => "ETH",
+        }
+    }
+
+    /// Full name of the chain's native gas coin. Companion to
+    /// [`Chain::native_symbol`] — same chain-authoritative-not-indexer rule.
+    pub fn native_name(self) -> &'static str {
+        match self {
+            Chain::Mainnet | Chain::Base | Chain::Optimism => "Ethereum",
+        }
+    }
+
     /// Pre-typed default execution-RPC URL shown in the Custom-RPC inputs.
     /// The Mainnet entry mirrors `settings::DEFAULT_RPCS[0]` so the Custom
     /// flow defaults to the same upstream as the "Use Defaults" path.
@@ -277,6 +297,14 @@ mod tests {
         assert_eq!(Chain::Mainnet.display_name(), "Ethereum Mainnet");
         assert_eq!(Chain::Base.display_name(), "Base");
         assert_eq!(Chain::Optimism.display_name(), "OP Mainnet");
+    }
+
+    #[test]
+    fn native_currency_is_eth_on_every_chain() {
+        for c in Chain::ALL {
+            assert_eq!(c.native_symbol(), "ETH");
+            assert_eq!(c.native_name(), "Ethereum");
+        }
     }
 
     #[test]

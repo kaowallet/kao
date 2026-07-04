@@ -4068,12 +4068,21 @@ impl WalletScreen {
                         // request (so the ceremony signs exactly what was shown) and
                         // set the execute/propose labels from the reviewed sim.
                         let safe_info = review.steps.iter().find_map(|s| match s {
-                            sign_review::SignStep::SafeSend(sr) => {
-                                Some((sr.nonce, sr.safe_tx_hash, sr.sim_reverts()))
-                            }
+                            sign_review::SignStep::SafeSend(sr) => Some((
+                                sr.nonce,
+                                sr.safe_tx_hash,
+                                // Soften on a reverting sim OR an unverifiable
+                                // amount (untrusted indexer decimals) — see #16.
+                                sr.needs_confirm_override(),
+                                format!("Send {} {}", sr.amount_str, sr.symbol),
+                            )),
                             _ => None,
                         });
-                        if let Some((nonce, hash, sim_revert)) = safe_info {
+                        if let Some((nonce, hash, soften, title)) = safe_info {
+                            // The reviewed amount may have been re-derived from a
+                            // verified read after the pending title was set, so
+                            // keep the header in sync with the body.
+                            review.title = title;
                             let can_exec = matches!(
                                 &review.action,
                                 sign_review::SignAction::SafeSend {
@@ -4091,7 +4100,7 @@ impl WalletScreen {
                             }
                             if can_exec {
                                 review.confirm_label = Some(
-                                    if sim_revert {
+                                    if soften {
                                         "Execute anyway ⚠"
                                     } else {
                                         "Sign & execute now"
@@ -4099,7 +4108,7 @@ impl WalletScreen {
                                     .to_string(),
                                 );
                                 review.secondary_label = Some(
-                                    if sim_revert {
+                                    if soften {
                                         "Propose anyway ⚠"
                                     } else {
                                         "Propose to co-signers"
@@ -4108,7 +4117,7 @@ impl WalletScreen {
                                 );
                             } else {
                                 review.confirm_label = Some(
-                                    if sim_revert {
+                                    if soften {
                                         "Propose anyway ⚠"
                                     } else {
                                         "Propose to co-signers"
@@ -5995,10 +6004,31 @@ fn spawn_safe_send_prepare(
                     .unwrap_or_else(|_| SimulationResult::unavailable())
             };
 
+            // Re-derive the reviewed amount from a Helios-verified `decimals()`
+            // read rather than the untrusted indexer decimals that scaled it
+            // (finding #16). For an ERC-20 send this makes a lying/stale indexer
+            // visible: an honest one yields the same figure, a dishonest one the
+            // true on-chain figure, and an unverifiable read tags the amount and
+            // softens the action. Native sends carry no ERC-20 decimals risk.
+            let verified_meta = match seed.token_contract {
+                Some(contract) => {
+                    crate::decode::render::read_token_meta(network.as_ref(), chain, contract).await
+                }
+                None => None,
+            };
+            let (amount_str, symbol, amount_verified) = send::resolve_safe_amount_display(
+                req.amount_units,
+                &req.token,
+                verified_meta,
+                seed.amount_str,
+                seed.symbol,
+            );
+
             let review = send::SafeSendReview {
                 chain,
-                amount_str: seed.amount_str,
-                symbol: seed.symbol,
+                amount_str,
+                symbol,
+                amount_verified,
                 token_contract: seed.token_contract,
                 recipient: req.recipient,
                 recipient_name: seed.recipient_name,

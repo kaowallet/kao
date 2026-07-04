@@ -1222,8 +1222,8 @@ async fn fetch_portfolio_for_tokens(
     if has_eth {
         let (eth_bal_str, eth_bal_f64) = format_eth_balance(eth_balance_raw);
         tokens.push(LiveToken {
-            symbol: "ETH".into(),
-            name: "Ethereum".into(),
+            symbol: chain.native_symbol().into(),
+            name: chain.native_name().into(),
             balance: eth_bal_str,
             balance_f64: eth_bal_f64,
             balance_raw: eth_balance_raw,

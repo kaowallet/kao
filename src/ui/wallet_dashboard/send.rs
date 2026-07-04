@@ -2258,6 +2258,14 @@ pub struct SafeSendReview {
     pub chain: Chain,
     pub amount_str: String,
     pub symbol: String,
+    /// `false` when the reviewed amount/symbol could NOT be re-derived from a
+    /// Helios-verified on-chain `decimals()`/`symbol()` read and fell back to
+    /// the untrusted indexer's metadata. A lying indexer's `decimals` scales
+    /// both the raw `amount_units` being signed and (previously) this display,
+    /// so when it can't be verified the amount is tagged "(unverified)" and the
+    /// execute/propose action softens to "… anyway ⚠". Mirrors the EOA path's
+    /// verified-decimals rendering.
+    pub amount_verified: bool,
     pub token_contract: Option<Address>,
     pub recipient: Address,
     pub recipient_name: Option<String>,
@@ -2278,6 +2286,47 @@ impl SafeSendReview {
     pub fn sim_reverts(&self) -> bool {
         self.sim.is_revert()
     }
+
+    /// Whether the reviewed action must be softened to "… anyway ⚠": either the
+    /// inner sim reverts, or the amount/symbol couldn't be verified on-chain.
+    pub fn needs_confirm_override(&self) -> bool {
+        self.sim_reverts() || !self.amount_verified
+    }
+}
+
+/// Decide the reviewed amount string, symbol, and verification flag for a Safe
+/// send, preferring a Helios-verified on-chain read over the untrusted indexer.
+///
+/// The raw `amount_units` that will be signed was scaled by the indexer's
+/// `decimals` at plan time, and the Safe review formatted its display with the
+/// same untrusted `decimals` — so a lying/stale indexer could mis-scale the
+/// transfer while the review stayed internally consistent (finding #16). Here
+/// we reformat the amount from a Helios-verified `decimals()` read: an honest
+/// indexer yields the same figure, a dishonest one yields the true (often
+/// wildly different) on-chain figure. When no verified read is available
+/// (`verified_meta` is `None`, or `verified` is `false`), we keep a
+/// best-effort display but return `amount_verified = false` so the UI tags it
+/// and softens the action. Native sends carry no ERC-20 decimals risk (the
+/// native row's identity is chain-pinned at ingestion), so they pass through.
+pub(crate) fn resolve_safe_amount_display(
+    amount_units: U256,
+    token: &SendToken,
+    verified_meta: Option<(crate::decode::render::TokenInfo, bool)>,
+    indexer_amount_str: String,
+    indexer_symbol: String,
+) -> (String, String, bool) {
+    match token {
+        SendToken::Native => (indexer_amount_str, indexer_symbol, true),
+        SendToken::Erc20 { .. } => match verified_meta {
+            Some((info, verified)) => {
+                let amount = format_units(amount_units, info.decimals)
+                    .map(|v| sim_view::trim_trailing_decimal_zeros(&v))
+                    .unwrap_or_else(|_| "?".to_string());
+                (amount, info.symbol, verified)
+            }
+            None => (indexer_amount_str, indexer_symbol, false),
+        },
+    }
 }
 
 /// Render the Safe send review body inside the `sign_review` overlay — intent
@@ -2292,6 +2341,7 @@ pub(crate) fn render_safe_send_review<'a, M: 'a + CopyKick>(
     let chain = r.chain;
     let amount_str = r.amount_str.as_str();
     let symbol = r.symbol.as_str();
+    let amount_unverified = !r.amount_verified;
     let recip_label = r
         .recipient_name
         .clone()
@@ -2303,10 +2353,14 @@ pub(crate) fn render_safe_send_review<'a, M: 'a + CopyKick>(
             row![
                 kao_text(t, "(•̀ᴗ•́)و", 16.0),
                 Space::new().width(8),
-                text(format!("Sending {amount_str} {symbol}"))
-                    .size(14)
-                    .color(t.a1)
-                    .font(bold()),
+                text(if amount_unverified {
+                    format!("Sending {amount_str} {symbol}  (unverified)")
+                } else {
+                    format!("Sending {amount_str} {symbol}")
+                })
+                .size(14)
+                .color(t.a1)
+                .font(bold()),
             ]
             .align_y(Alignment::Center),
             text(format!("on {}", chain.display_name()))
@@ -2497,6 +2551,29 @@ pub(crate) fn render_safe_send_review<'a, M: 'a + CopyKick>(
     let mut badges = row![hint_pill(t, "✓ Hash verified on-chain")].spacing(6);
     if r.sim.is_success() && r.sim.verified {
         badges = badges.push(hint_pill(t, "✓ Simulation passed"));
+    }
+    if amount_unverified {
+        // The token's `decimals`/`symbol` couldn't be re-read through Helios, so
+        // the amount above rests on the untrusted indexer. Flag it in the same
+        // red badge language the EOA review uses for unverified reads.
+        badges = badges.push(
+            container(
+                text("⚠ Amount unverified · indexer decimals")
+                    .size(10)
+                    .color(t.down)
+                    .font(mono_bold()),
+            )
+            .padding(Padding::from([3, 7]))
+            .style(move |_| container::Style {
+                background: Some(Background::Color(with_alpha(t.down, 0.08))),
+                border: Border {
+                    color: with_alpha(t.down, 0.30),
+                    width: 1.0,
+                    radius: Radius::from(6),
+                },
+                ..container::Style::default()
+            }),
+        );
     }
     let badges_row = container(badges)
         .padding(Padding::from([4, 0]))
@@ -3078,6 +3155,108 @@ mod tests {
             "zero address must resolve to Invalid, got {:?}",
             pane.resolution,
         );
+    }
+
+    fn token_info(symbol: &str, decimals: u8) -> crate::decode::render::TokenInfo {
+        crate::decode::render::TokenInfo {
+            symbol: symbol.to_string(),
+            decimals,
+        }
+    }
+
+    /// A verified on-chain read whose `decimals` matches the indexer yields the
+    /// same figure and is trusted.
+    #[test]
+    fn resolve_safe_amount_verified_matching_decimals() {
+        // 100 USDC at 6 decimals.
+        let units = U256::from(100_000_000u64);
+        let erc20 = SendToken::Erc20 {
+            contract: Address::repeat_byte(0x11),
+        };
+        let (amount, symbol, verified) = resolve_safe_amount_display(
+            units,
+            &erc20,
+            Some((token_info("USDC", 6), true)),
+            "100".into(),
+            "USDC".into(),
+        );
+        assert_eq!(amount, "100");
+        assert_eq!(symbol, "USDC");
+        assert!(verified);
+    }
+
+    /// A lying indexer (claimed 18 decimals so `amount_units` was scaled by
+    /// 10^18) is exposed: the verified 6-decimal read reformats the SAME raw
+    /// units to the true, wildly-larger on-chain figure, and stays verified.
+    #[test]
+    fn resolve_safe_amount_verified_exposes_indexer_lie() {
+        // User thought "100 TKN"; indexer's 18-dec lie made units = 100 * 10^18.
+        let units = U256::from(100u64) * U256::from(10u64).pow(U256::from(18u64));
+        let erc20 = SendToken::Erc20 {
+            contract: Address::repeat_byte(0x22),
+        };
+        let (amount, symbol, verified) = resolve_safe_amount_display(
+            units,
+            &erc20,
+            Some((token_info("TKN", 6), true)),
+            "100".into(), // the deceptive indexer-consistent display
+            "TKN".into(),
+        );
+        // 100e18 / 10^6 = 100,000,000,000,000 — the truth the user must see.
+        assert_eq!(amount, "100000000000000");
+        assert_eq!(symbol, "TKN");
+        assert!(verified);
+    }
+
+    /// An unverified (Helios-fallback) read still reformats but flags the amount
+    /// so the UI tags it and softens the action.
+    #[test]
+    fn resolve_safe_amount_unverified_read_flags() {
+        let units = U256::from(5_000_000u64);
+        let erc20 = SendToken::Erc20 {
+            contract: Address::repeat_byte(0x33),
+        };
+        let (amount, symbol, verified) = resolve_safe_amount_display(
+            units,
+            &erc20,
+            Some((token_info("DAI", 6), false)),
+            "5".into(),
+            "DAI".into(),
+        );
+        assert_eq!(amount, "5");
+        assert_eq!(symbol, "DAI");
+        assert!(!verified, "fallback read must not be trusted");
+    }
+
+    /// A failed read (`None`) falls back to the indexer display but is flagged
+    /// unverified.
+    #[test]
+    fn resolve_safe_amount_read_failure_falls_back_unverified() {
+        let units = U256::from(1u64);
+        let erc20 = SendToken::Erc20 {
+            contract: Address::repeat_byte(0x44),
+        };
+        let (amount, symbol, verified) =
+            resolve_safe_amount_display(units, &erc20, None, "1.23".into(), "WHO".into());
+        assert_eq!(amount, "1.23");
+        assert_eq!(symbol, "WHO");
+        assert!(!verified);
+    }
+
+    /// Native sends carry no ERC-20 decimals risk (the native row's identity is
+    /// chain-pinned at ingestion), so they pass through as verified.
+    #[test]
+    fn resolve_safe_amount_native_passthrough() {
+        let (amount, symbol, verified) = resolve_safe_amount_display(
+            U256::from(10u64),
+            &SendToken::Native,
+            None,
+            "0.5".into(),
+            "ETH".into(),
+        );
+        assert_eq!(amount, "0.5");
+        assert_eq!(symbol, "ETH");
+        assert!(verified);
     }
 
     #[test]

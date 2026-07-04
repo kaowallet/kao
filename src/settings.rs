@@ -1621,11 +1621,12 @@ pub fn parse_rpc_input(s: &str) -> Option<String> {
 /// Like [`parse_rpc_input`] but tailored to the Kao server field: it accepts
 /// an explicit `https://` URL (any host) or — for the common self-hosted dev
 /// setup — a plain `http://` URL pointed at loopback (`localhost`,
-/// `127.0.0.1`, `[::1]`, …). A bare `host[:port][/path]` is wrapped: loopback
-/// and IP hosts get `http://`, public hostnames get `https://`. Plain http to
-/// a *public* host is rejected so Kao traffic can't be silently downgraded
-/// onto a MITM-able transport. Returns the normalized URL, or `None` when the
-/// input can't be made safe.
+/// `127.0.0.1`, `[::1]`, …). A bare `host[:port][/path]` is wrapped: only
+/// loopback hosts get `http://`; every public host — hostname *or* IP — gets
+/// `https://`. Plain http to a *public* host is refused so Kao traffic can't be
+/// silently downgraded onto a MITM-able transport, whether or not the user
+/// typed the scheme. Returns the normalized URL, or `None` when the input can't
+/// be made safe.
 ///
 /// Unlike [`parse_rpc_input`], an explicit `http://localhost` is kept rather
 /// than rejected — that's what we store after wrapping bare loopback input, so
@@ -1656,7 +1657,14 @@ pub fn parse_kao_server_input(s: &str) -> Option<String> {
         }
         None => host_port,
     };
-    if host.parse::<std::net::IpAddr>().is_ok() || host.eq_ignore_ascii_case("localhost") {
+    // Only loopback (localhost / 127.0.0.0/8 / ::1) may be wrapped as plain
+    // http — that traffic never leaves the machine. A bare *public* IP must NOT
+    // be silently downgraded to plaintext: the explicit-scheme branch above
+    // already rejects `http://<public-ip>` for the byte-identical URL, so
+    // accepting the same address here just because the user omitted the scheme
+    // is an inconsistent downgrade. Fall through so a public IP is forced to
+    // https like any other public host.
+    if is_loopback_host(host) {
         return Some(format!("http://{s}"));
     }
     if !is_plausible_host(host) {
@@ -2691,6 +2699,33 @@ enabled = true
         assert_eq!(parse_kao_server_input("asdf"), None);
         assert_eq!(parse_kao_server_input(""), None);
         assert_eq!(parse_kao_server_input("   "), None);
+    }
+
+    /// A bare public IP (no scheme) must NOT be wrapped as plaintext http — the
+    /// explicit-scheme path already rejects the byte-identical
+    /// `http://1.2.3.4:8080`, so the scheme-omitted form must be forced to
+    /// https rather than silently downgraded (finding #17). Loopback IPs still
+    /// wrap as http since that traffic never leaves the machine.
+    #[test]
+    fn parse_kao_server_input_forces_bare_public_ip_to_https() {
+        assert_eq!(
+            parse_kao_server_input("1.2.3.4:8080"),
+            Some("https://1.2.3.4:8080".into()),
+            "bare public IP must be forced to https, not plaintext http",
+        );
+        assert_eq!(
+            parse_kao_server_input("203.0.113.7"),
+            Some("https://203.0.113.7".into()),
+        );
+        // Loopback IPs remain plain http — that hop never leaves the machine.
+        assert_eq!(
+            parse_kao_server_input("127.0.0.1:8080"),
+            Some("http://127.0.0.1:8080".into()),
+        );
+        assert_eq!(
+            parse_kao_server_input("[::1]:8080"),
+            Some("http://[::1]:8080".into()),
+        );
     }
 
     #[test]

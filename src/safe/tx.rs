@@ -475,19 +475,31 @@ pub async fn execute_safe_tx(
         .from(from)
         .to(safe)
         .input(alloy::rpc::types::TransactionInput::new(calldata.clone()));
+    // Alloy transport errors `Display` the full request URL, which for the
+    // execution RPC embeds the API key in its path/query (Alchemy, dRPC). These
+    // strings flow to warn! logs and the sign-review overlay, so scrub URLs down
+    // to the host before they leave here — matching the redaction discipline in
+    // `net.rs` and `safe/service.rs`.
     let gas_limit = provider
         .estimate_gas(req)
         .await
-        .map_err(|e| format!("estimate_gas: {e}"))?;
-    let fees = provider
-        .estimate_eip1559_fees()
-        .await
-        .map_err(|e| format!("estimate_eip1559_fees: {e}"))?;
+        .map_err(|e| format!("estimate_gas: {}", crate::net::redact_urls(&e.to_string())))?;
+    let fees = provider.estimate_eip1559_fees().await.map_err(|e| {
+        format!(
+            "estimate_eip1559_fees: {}",
+            crate::net::redact_urls(&e.to_string())
+        )
+    })?;
     let nonce = provider
         .get_transaction_count(from)
         .pending()
         .await
-        .map_err(|e| format!("get_transaction_count: {e}"))?;
+        .map_err(|e| {
+            format!(
+                "get_transaction_count: {}",
+                crate::net::redact_urls(&e.to_string())
+            )
+        })?;
 
     let mut envelope = TxEip1559 {
         chain_id: chain.chain_id(),
@@ -505,10 +517,12 @@ pub async fn execute_safe_tx(
         .await
         .map_err(|e| crate::wallet::friendly_signer_error(&e))?;
     let raw = TxEnvelope::from(envelope.into_signed(sig)).encoded_2718();
-    let pending = provider
-        .send_raw_transaction(&raw)
-        .await
-        .map_err(|e| format!("broadcast failed: {e}"))?;
+    let pending = provider.send_raw_transaction(&raw).await.map_err(|e| {
+        format!(
+            "broadcast failed: {}",
+            crate::net::redact_urls(&e.to_string())
+        )
+    })?;
     Ok(*pending.tx_hash())
 }
 

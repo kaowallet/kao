@@ -372,6 +372,20 @@ pub fn into_discovered_tokens(tokens: Vec<IndexedToken>) -> Vec<DiscoveredToken>
 /// portfolio path. Logos resolve at render time from `(chain, contract)`
 /// against the bundled SVG set; tokens not in the bundle render the
 /// kaomoji fallback avatar.
+///
+/// **Native-row identity is chain-authoritative, never indexer-supplied.**
+/// A `contract: None` row is the native gas coin, and the send flow keys off
+/// exactly that (`build_plan` maps `None` → `SendToken::Native`). The row's
+/// `symbol`/`name`/`decimals` flow straight into the send review's title,
+/// intent banner, and revm balance-change card, so if we trusted the
+/// indexer's fields here a hostile or compromised indexer could label a
+/// native-ETH transfer as, say, `USDC` — the user reviews and signs a "token"
+/// send that is actually plain ETH (review != signed). We therefore overwrite
+/// the native row's identity with the chain's own native currency and pin its
+/// decimals to 18, matching what the trusted on-chain portfolio path already
+/// hardcodes. The (unverified) indexer balance is kept — that is the
+/// documented L2 trade-off and only feeds display + a soft gas check, not the
+/// asset being signed.
 pub fn into_live_tokens(chain: Chain, tokens: Vec<IndexedToken>) -> Vec<LiveToken> {
     tokens
         .into_iter()
@@ -387,17 +401,28 @@ pub fn into_live_tokens(chain: Chain, tokens: Vec<IndexedToken>) -> Vec<LiveToke
                 true
             }
         })
-        .map(|t| LiveToken {
-            symbol: t.symbol,
-            name: t.name,
-            balance: t.balance,
-            balance_f64: t.balance_f64,
-            balance_raw: t.balance_raw,
-            decimals: t.decimals,
-            contract: t.contract,
-            usd_price: t.usd_price.unwrap_or(0.0),
-            usd_value: t.usd_value.unwrap_or(0.0),
-            chain: chain.into(),
+        .map(|t| {
+            let is_native = t.contract.is_none();
+            LiveToken {
+                symbol: if is_native {
+                    chain.native_symbol().to_string()
+                } else {
+                    t.symbol
+                },
+                name: if is_native {
+                    chain.native_name().to_string()
+                } else {
+                    t.name
+                },
+                balance: t.balance,
+                balance_f64: t.balance_f64,
+                balance_raw: t.balance_raw,
+                decimals: if is_native { 18 } else { t.decimals },
+                contract: t.contract,
+                usd_price: t.usd_price.unwrap_or(0.0),
+                usd_value: t.usd_value.unwrap_or(0.0),
+                chain: chain.into(),
+            }
         })
         .collect()
 }
@@ -575,6 +600,37 @@ mod tests {
         for tk in &live {
             assert_eq!(tk.chain, Chain::Mainnet.into());
         }
+    }
+
+    /// Security regression for the native-row spoof: a hostile/compromised L2
+    /// indexer that returns a `contract: None` (native) row wearing an ERC-20's
+    /// symbol/name/decimals must NOT be able to make the send review call a
+    /// native-ETH transfer "USDC". `into_live_tokens` pins the native row's
+    /// identity to the chain's own coin regardless of what the indexer claimed;
+    /// only the (unverified) balance is carried through.
+    #[test]
+    fn into_live_tokens_pins_native_row_identity_over_indexer() {
+        let tokens = vec![IndexedToken {
+            // Attacker-controlled: a native row masquerading as USDC.
+            symbol: "USDC".into(),
+            name: "USD Coin".into(),
+            contract: None,
+            decimals: 6,
+            balance_raw: alloy::primitives::U256::from(5u8),
+            balance_f64: 5.0,
+            balance: "5".into(),
+            usd_price: Some(1.0),
+            usd_value: Some(5.0),
+            logo_url: None,
+        }];
+        let live = into_live_tokens(Chain::Base, tokens);
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].contract, None, "still a native row");
+        assert_eq!(live[0].symbol, "ETH", "spoofed native symbol overridden");
+        assert_eq!(live[0].name, "Ethereum", "spoofed native name overridden");
+        assert_eq!(live[0].decimals, 18, "native decimals pinned to 18");
+        // The (unverified) balance is the documented L2 trade-off; it is kept.
+        assert_eq!(live[0].balance_raw, alloy::primitives::U256::from(5u8));
     }
 
     #[test]

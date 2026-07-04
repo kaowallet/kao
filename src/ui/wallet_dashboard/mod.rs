@@ -5952,32 +5952,18 @@ fn spawn_safe_send_prepare(
                 }
             };
 
-            // Advisory inner sim (nonce 0 — only reads to/value/data), with one
-            // verified-retry if the first run landed on unverified fallback state.
+            // Advisory inner sim (nonce 0 — only reads to/value/data). One
+            // attempt, no verified-retry: the sim is display-only (it degrades to
+            // `unavailable()` and never gates signing), so it must not block the
+            // review — an earlier verified-retry slept `FALLBACK_COOLDOWN + 1s`
+            // (~11s) whenever the first run landed on unverified fallback state,
+            // stranding the overlay on "Preparing…". The pinned safeTxHash above
+            // is the artifact the review actually needs; it's already ready here.
             let sim = {
                 let tx = build_safe_tx_with_nonce(req.safe_tx_input(), 0);
-                let first = crate::safe::sim::simulate_safe_inner(
-                    network.clone(),
-                    req.safe_address,
-                    &tx,
-                    chain,
-                )
-                .await
-                .unwrap_or_else(|_| SimulationResult::unavailable());
-                if first.is_success() && !first.verified {
-                    tokio::time::sleep(sim_retry_delay()).await;
-                    let tx2 = build_safe_tx_with_nonce(req.safe_tx_input(), 0);
-                    crate::safe::sim::simulate_safe_inner(
-                        network.clone(),
-                        req.safe_address,
-                        &tx2,
-                        chain,
-                    )
+                crate::safe::sim::simulate_safe_inner(network.clone(), req.safe_address, &tx, chain)
                     .await
-                    .unwrap_or(first)
-                } else {
-                    first
-                }
+                    .unwrap_or_else(|_| SimulationResult::unavailable())
             };
 
             let review = send::SafeSendReview {

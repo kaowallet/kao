@@ -27,10 +27,10 @@ use crate::portfolio::LiveToken;
 use crate::safe::tx::{Operation, SafeTxInput};
 use crate::ui::kao_theme::{KaoTheme, with_alpha};
 use crate::ui::kao_widgets::{
-    avatar, black, bold, colored_address, colored_hash, ghost_button, hint_pill, hover_tint,
-    kao_fit, kao_fit_size, kao_scrollable_style, kao_text, kaomoji_for_account, kaomoji_for_index,
-    modal_wrapper, mono, mono_black, mono_bold, primary_button, secondary_button, text_input_style,
-    token_avatar, vspace,
+    CopyKick, avatar, black, bold, colored_address, colored_hash, ghost_button, hint_pill,
+    hover_tint, kao_fit, kao_fit_size, kao_scrollable_style, kao_text, kaomoji_for_account,
+    kaomoji_for_index, modal_wrapper, mono, mono_black, mono_bold, primary_button,
+    secondary_button, text_input_style, token_avatar, vspace,
 };
 use crate::ui::wallet_dashboard::function_panel;
 use crate::ui::wallet_dashboard::sim_view;
@@ -1684,24 +1684,6 @@ impl SendPane {
 
 // ── Free helpers ────────────────────────────────────────────────────────────
 
-pub(crate) fn colored_address_compact<'a, M: 'a>(t: KaoTheme, addr: Address) -> Element<'a, M> {
-    use crate::ui::kao_widgets::chunk_palette;
-    let checksum = addr.to_checksum(None);
-    let body = &checksum[2..];
-    let chunk_colors = chunk_palette(t);
-    let mut spans = row![text("0x").size(12).color(t.sub).font(mono_bold())].spacing(0);
-    for (i, color) in chunk_colors.iter().enumerate() {
-        let start = i * 4;
-        let chunk = body[start..start + 4].to_string();
-        spans = spans.push(text(chunk).size(12).color(*color).font(mono_bold()));
-    }
-    container(spans)
-        .width(Length::Fill)
-        .center_x(Length::Fill)
-        .padding(Padding::from([2, 0]))
-        .into()
-}
-
 pub(crate) fn sim_row<'a, M: 'a>(
     t: KaoTheme,
     chain: crate::chain::NetworkId,
@@ -1823,7 +1805,7 @@ impl SendReview {
 /// everything else is display-only. The simulation-block fallback is only used
 /// for the revert/unavailable case (which never renders per-transfer rows), so
 /// it needs no portfolio.
-pub(crate) fn render_send_review<'a, M: 'a + Clone>(
+pub(crate) fn render_send_review<'a, M: 'a + Clone + CopyKick>(
     t: KaoTheme,
     r: &'a SendReview,
     show_calldata: bool,
@@ -2013,7 +1995,7 @@ pub(crate) fn render_send_review<'a, M: 'a + Clone>(
             name_col
         ]
         .align_y(Alignment::Center);
-        let addr_container = container(colored_address_compact::<M>(t, addr))
+        let addr_container = container(colored_address::<M>(t, addr))
             .padding(Padding::from([10, 12]))
             .width(Length::Fill)
             .style(move |_| container::Style {
@@ -2303,7 +2285,7 @@ impl SafeSendReview {
 /// owners commit to, the signing owner set, and verification badges. Purely
 /// display (the execute/propose actions live in the overlay's action row), so it
 /// is generic over the host message type.
-pub(crate) fn render_safe_send_review<'a, M: 'a>(
+pub(crate) fn render_safe_send_review<'a, M: 'a + CopyKick>(
     t: KaoTheme,
     r: &'a SafeSendReview,
 ) -> Element<'a, M> {
@@ -2426,7 +2408,7 @@ pub(crate) fn render_safe_send_review<'a, M: 'a>(
             .align_y(Alignment::Center),
         );
     }
-    let addr_sub = container(colored_address_compact::<M>(t, r.recipient))
+    let addr_sub = container(colored_address::<M>(t, r.recipient))
         .padding(Padding::from([6, 10]))
         .width(Length::Fill)
         .style(move |_| container::Style {

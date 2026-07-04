@@ -308,11 +308,9 @@ impl SwapComposer {
                             );
                             return None;
                         }
-                        let (s, _) = format_token_balance(max_raw, sell.decimals);
-                        self.amount = s;
+                        self.amount = exact_amount_string(max_raw, sell.decimals);
                     } else {
-                        let (s, _) = format_token_balance(sell.balance_raw, sell.decimals);
-                        self.amount = s;
+                        self.amount = exact_amount_string(sell.balance_raw, sell.decimals);
                     }
                     self.invalidate_quote();
                 }
@@ -962,6 +960,22 @@ fn pill_chip<'a>(t: KaoTheme, label: &str, selected: bool, msg: Message) -> Elem
         .into()
 }
 
+/// Exact decimal string for `raw` base-units — round-trips through
+/// [`parse_amount_units`] back to `raw`. The "Max" fill needs this: the f64
+/// display formatter (`format_token_balance`) rounds to 4 dp and can round
+/// *up*, producing a string that re-parses to *more* than the balance, which
+/// trips `parsed_amount`'s `amt > balance_raw` guard and silently disables
+/// "Get quote". An exact string is always `<= balance`, so the quote stays live.
+fn exact_amount_string(raw: U256, decimals: u8) -> String {
+    let s =
+        alloy::primitives::utils::format_units(raw, decimals).unwrap_or_else(|_| raw.to_string());
+    if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        s
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -982,6 +996,33 @@ mod tests {
             address: address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
             decimals: 6,
         }
+    }
+
+    /// A DAI balance whose 4-dp display rounds *up* — `1.00366` shows as
+    /// "1.0037". The old Max fill stored that rounded string, which re-parsed to
+    /// `1.0037e18` > the real balance and disabled "Get quote".
+    fn dai_pick_rounds_up() -> SellPick {
+        SellPick {
+            symbol: "DAI".into(),
+            contract: Some(address!("0x6B175474E89094C44Da98b954EedeAC495271d0F")),
+            decimals: 18,
+            balance_raw: U256::from(1_003_660_000_000_000_000u64), // 1.00366 DAI
+        }
+    }
+
+    #[test]
+    fn max_on_round_up_balance_keeps_quote_enabled() {
+        // Regression: Max on a balance whose display rounds up must still leave a
+        // valid, quotable draft (the "Get quote" button gates on `draft()`).
+        let mut c = SwapComposer::new();
+        c.update(Message::SelectSell(dai_pick_rounds_up()));
+        c.update(Message::SelectBuy(usdc_buy()));
+        c.update(Message::MaxAmount);
+        let d = c
+            .draft()
+            .expect("Max must leave a valid draft (Get quote enabled)");
+        // Exactly the full balance, never over it.
+        assert_eq!(d.sell_amount, U256::from(1_003_660_000_000_000_000u64));
     }
 
     #[test]

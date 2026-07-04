@@ -134,7 +134,12 @@ pub async fn broadcast(
                 .pending()
                 .await
                 .map_err(|e| format!("get_transaction_count: {e}"))?;
-            (nonce, gas_limit, f.max_fee_per_gas, f.max_priority_fee_per_gas)
+            (
+                nonce,
+                gas_limit,
+                f.max_fee_per_gas,
+                f.max_priority_fee_per_gas,
+            )
         }
     };
 

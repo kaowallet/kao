@@ -517,10 +517,12 @@ pub async fn execute_safe_tx(
         .await
         .map_err(|e| crate::wallet::friendly_signer_error(&e))?;
     let raw = TxEnvelope::from(envelope.into_signed(sig)).encoded_2718();
-    let pending = provider
-        .send_raw_transaction(&raw)
-        .await
-        .map_err(|e| format!("broadcast failed: {}", crate::net::redact_urls(&e.to_string())))?;
+    let pending = provider.send_raw_transaction(&raw).await.map_err(|e| {
+        format!(
+            "broadcast failed: {}",
+            crate::net::redact_urls(&e.to_string())
+        )
+    })?;
     Ok(*pending.tx_hash())
 }
 

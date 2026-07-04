@@ -125,10 +125,9 @@ pub async fn broadcast(
             // the execution RPC embeds the API key (Alchemy, dRPC). These
             // strings reach warn! logs and the sign-review overlay, so scrub
             // URLs to the host first (see `net::redact_urls`).
-            let gas_limit = provider
-                .estimate_gas(req)
-                .await
-                .map_err(|e| format!("estimate_gas: {}", crate::net::redact_urls(&e.to_string())))?;
+            let gas_limit = provider.estimate_gas(req).await.map_err(|e| {
+                format!("estimate_gas: {}", crate::net::redact_urls(&e.to_string()))
+            })?;
             let f = provider.estimate_eip1559_fees().await.map_err(|e| {
                 format!(
                     "estimate_eip1559_fees: {}",

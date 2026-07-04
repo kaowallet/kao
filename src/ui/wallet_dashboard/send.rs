@@ -3236,13 +3236,8 @@ mod tests {
         let erc20 = SendToken::Erc20 {
             contract: Address::repeat_byte(0x44),
         };
-        let (amount, symbol, verified) = resolve_safe_amount_display(
-            units,
-            &erc20,
-            None,
-            "1.23".into(),
-            "WHO".into(),
-        );
+        let (amount, symbol, verified) =
+            resolve_safe_amount_display(units, &erc20, None, "1.23".into(), "WHO".into());
         assert_eq!(amount, "1.23");
         assert_eq!(symbol, "WHO");
         assert!(!verified);

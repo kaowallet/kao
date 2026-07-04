@@ -1372,9 +1372,7 @@ impl NetworkSetupScreen {
         // setting doesn't mean clicking through every section. Onboarding keeps
         // the linear Continue → … → Connect & Finish flow.
         let (right_label, right_msg, can_go): (&str, Message, bool) = match self.mode {
-            WizardMode::Settings => {
-                ("Save", Message::Save, self.step_valid(WizardStep::Review))
-            }
+            WizardMode::Settings => ("Save", Message::Save, self.step_valid(WizardStep::Review)),
             WizardMode::Onboarding if self.step == WizardStep::Review => {
                 ("Connect & Finish", Message::Finish, self.can_advance())
             }

@@ -1019,7 +1019,7 @@ where
 /// flip makes neighbours pop apart far more than a smooth gradient
 /// does, and keeps homoglyph swaps from blending into a same-coloured
 /// neighbour. Shared by [`colored_address`] (10 chunks, exactly one
-/// cycle) and [`colored_hash`] (16 chunks, wraps — the 9→0 seam still
+/// cycle) and [`colored_hash_copyable`] (16 chunks, wraps — the 9→0 seam still
 /// flips lightness within the a1 hue, so no two neighbours merge).
 pub(crate) fn chunk_palette(t: KaoTheme) -> [Color; 10] {
     [
@@ -1046,10 +1046,6 @@ pub(crate) fn chunk_palette(t: KaoTheme) -> [Color; 10] {
 /// safeTxHash, so a user can compare chunk-by-chunk across devices and
 /// co-signers. Never truncated: a prefix/suffix display is exactly what
 /// a hash-collision phisher relies on.
-pub fn colored_hash<'a, M: 'a>(t: KaoTheme, hash: B256) -> Element<'a, M> {
-    colored_hash_body(t, hash, false)
-}
-
 /// A clickable, hover-greying hash — a left click copies the full `0x…` hex to
 /// the clipboard, exactly like [`colored_address`]. Used where the user must
 /// copy the value to compare it elsewhere (the Safe review's `safeTxHash`, which

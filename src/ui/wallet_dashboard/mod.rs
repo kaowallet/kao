@@ -1891,7 +1891,7 @@ impl WalletScreen {
             recipient_name.unwrap_or_else(|| short_address(recipient))
         ));
         let note = Some(
-            "A Safe transaction — each owner signs the safeTxHash below. Verify it on \
+            "A Safe transaction — each owner signs the safeTxHash shown above. Verify it on \
              every device."
                 .to_string(),
         );

@@ -23,8 +23,9 @@ use crate::safe::SafeTx;
 use crate::safe::service::{PendingSafeTx, SafeTxDetail, SafeTxState};
 use crate::ui::kao_theme::{KaoTheme, with_alpha};
 use crate::ui::kao_widgets::{
-    bold, colored_address, colored_hash, kao_fit, kao_scrollable_style, modal_wrapper, mono,
-    mono_black, mono_bold, primary_button, secondary_button, section_card, small_secondary_button,
+    bold, colored_address, colored_hash_copyable, kao_fit, kao_scrollable_style, modal_wrapper,
+    mono, mono_black, mono_bold, primary_button, secondary_button, section_card,
+    small_secondary_button,
 };
 use crate::ui::wallet_dashboard::sim_view;
 use crate::wallet::sim::SimulationResult;
@@ -501,8 +502,13 @@ impl SafeTxDetailPane {
             t,
             "VERIFY BEFORE SIGNING",
             column![
-                colored_hash(t, self.pending.safe_tx_hash),
-                Space::new().height(4),
+                text("SafeTx hash · click to copy")
+                    .size(12)
+                    .color(t.text)
+                    .font(bold()),
+                Space::new().height(6),
+                colored_hash_copyable(t, self.pending.safe_tx_hash),
+                Space::new().height(6),
                 text("Verify this exact hash on your signing device and with co-signers.")
                     .size(11)
                     .color(t.sub),

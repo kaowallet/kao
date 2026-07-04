@@ -1758,6 +1758,11 @@ pub struct SendReview {
     pub has_insufficient_eth: bool,
     pub quote: TxQuote,
     pub decoded: Box<DecodeResult>,
+    /// ERC-8213 Calldata Digest of the transaction being signed — `Some` for an
+    /// ERC-20 transfer (the `transfer()` calldata), `None` for a native send
+    /// (empty calldata, so the standard prescribes no digest). Computed at review
+    /// build from [`crate::wallet::tx::SendPlan::tx_target`].
+    pub calldata_digest: Option<B256>,
 }
 
 impl SendReview {
@@ -2272,6 +2277,13 @@ pub struct SafeSendReview {
     pub recipient_in_book: bool,
     pub nonce: u64,
     pub safe_tx_hash: B256,
+    /// ERC-8213 digests of the `SafeTx` EIP-712 signature the owners produce.
+    /// `eip712.digest` equals `safe_tx_hash`; the domain / message hashes let the
+    /// fingerprints section show all three components.
+    pub eip712: crate::sign::digest::Eip712Digests,
+    /// ERC-8213 Calldata Digest of the Safe's **inner** call — `Some` for an
+    /// ERC-20 transfer, `None` for a native transfer (empty inner calldata).
+    pub inner_calldata_digest: Option<B256>,
     pub threshold: u32,
     pub owner_count: usize,
     /// The signable owner addresses that will sign now (execute path). Fewer than
@@ -3324,6 +3336,7 @@ mod tests {
                 sim: SimulationResult::unavailable(),
             },
             decoded: Box::new(DecodeResult::Empty),
+            calldata_digest: None,
         };
 
         let funded = make(false);

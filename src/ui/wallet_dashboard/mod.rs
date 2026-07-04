@@ -4008,6 +4008,11 @@ impl WalletScreen {
                         r.show_calldata = !r.show_calldata;
                     }
                 }
+                sign_review::Message::ToggleFingerprints => {
+                    if let Some(r) = self.sign_review.as_mut() {
+                        r.show_fingerprints = !r.show_fingerprints;
+                    }
+                }
                 // The overlay's optional second action (Safe send: "Propose to
                 // co-signers"). Ignore once a signature is already in flight.
                 sign_review::Message::Secondary => {
@@ -5907,6 +5912,11 @@ fn spawn_send_prepare(
                 (seed.eth_balance_wei, needed),
                 (Some(bal), Some(need)) if need > bal
             );
+            // ERC-8213 Calldata Digest of the exact bytes being signed — `None`
+            // for a native transfer (empty calldata, no digest per the standard).
+            let (_, _, calldata) = quote.plan.tx_target();
+            let calldata_digest =
+                (!calldata.is_empty()).then(|| crate::sign::digest::calldata_digest(&calldata));
             let review = send::SendReview {
                 chain,
                 recipient: seed.recipient,
@@ -5923,6 +5933,7 @@ fn spawn_send_prepare(
                 has_insufficient_eth,
                 quote,
                 decoded: Box::new(decoded),
+                calldata_digest,
             };
             (seq, Ok(vec![sign_review::SignStep::Send(review)]))
         },
@@ -6024,6 +6035,16 @@ fn spawn_safe_send_prepare(
                 seed.symbol,
             );
 
+            // ERC-8213 digests for the fingerprints section: the `SafeTx` EIP-712
+            // signature (its `.digest` == the pinned `hash`) plus the inner call's
+            // Calldata Digest (`None` for a native transfer, empty inner calldata).
+            let eip712 = crate::sign::digest::Eip712Digests::of(
+                &build_safe_tx_with_nonce(req.safe_tx_input(), nonce),
+                &safe_domain(req.safe_address, chain),
+            );
+            let inner_data = req.safe_tx_input().data;
+            let inner_calldata_digest =
+                (!inner_data.is_empty()).then(|| crate::sign::digest::calldata_digest(&inner_data));
             let review = send::SafeSendReview {
                 chain,
                 amount_str,
@@ -6035,6 +6056,8 @@ fn spawn_safe_send_prepare(
                 recipient_in_book: seed.recipient_in_book,
                 nonce,
                 safe_tx_hash: hash,
+                eip712,
+                inner_calldata_digest,
                 threshold: req.threshold,
                 owner_count: seed.owner_count,
                 signing_addresses: seed.signing_addresses,
@@ -6116,6 +6139,23 @@ fn build_order_review(
     let sell_amount = trim_trailing_decimal_zeros(&sell_amount);
     let buy_amount = trim_trailing_decimal_zeros(&buy_amount);
     let min_received = trim_trailing_decimal_zeros(&min_received);
+    // ERC-8213 EIP-712 digests of the order the wallet actually signs. Rebuild the
+    // exact GPv2 `Order` the sign path builds (`build_sell_order` with full sell =
+    // quote sell + fee, and the deterministic market appData for this slippage),
+    // so the reviewed Digest/Domain/Message match the signature byte-for-byte.
+    let (_, app_data_hash) = crate::cow::market_app_data(draft.slippage_bps);
+    let order = crate::cow::order::build_sell_order(
+        draft.sell_token,
+        draft.buy_token,
+        receiver,
+        full_sell,
+        q.buy_amount,
+        q.valid_to,
+        draft.slippage_bps,
+        app_data_hash,
+    );
+    let eip712 =
+        crate::sign::digest::Eip712Digests::of(&order, &crate::cow::order::cow_domain(draft.chain));
     sign_review::OrderReview {
         chain: draft.chain,
         sell_amount,
@@ -6128,6 +6168,7 @@ fn build_order_review(
         slippage_bps: draft.slippage_bps,
         settlement: crate::cow::SETTLEMENT,
         native: draft.is_native,
+        eip712,
     }
 }
 
@@ -6158,7 +6199,7 @@ fn spawn_name_prepare(
                 crate::chain::Chain::Mainnet,
                 from,
                 to,
-                calldata,
+                calldata.clone(),
                 value,
                 local_names,
             )
@@ -6168,6 +6209,7 @@ fn spawn_name_prepare(
                 to,
                 value,
                 chain: crate::chain::Chain::Mainnet,
+                calldata,
                 decoded: Box::new(decoded),
             }])
         },
@@ -6288,7 +6330,7 @@ fn spawn_cow_prepare(
                         chain,
                         user,
                         cow::ETHFLOW,
-                        calldata,
+                        calldata.clone(),
                         value,
                         local_names,
                     )
@@ -6298,6 +6340,7 @@ fn spawn_cow_prepare(
                         to: cow::ETHFLOW,
                         value,
                         chain,
+                        calldata,
                         decoded: Box::new(decoded),
                     }));
                 } else {
@@ -6316,7 +6359,7 @@ fn spawn_cow_prepare(
                             chain,
                             user,
                             draft.sell_token,
-                            calldata,
+                            calldata.clone(),
                             U256::ZERO,
                             local_names,
                         )
@@ -6326,6 +6369,7 @@ fn spawn_cow_prepare(
                             to: draft.sell_token,
                             value: U256::ZERO,
                             chain,
+                            calldata,
                             decoded: Box::new(decoded),
                         }));
                     }
@@ -6368,7 +6412,7 @@ fn spawn_cow_prepare(
                     chain,
                     safe,
                     cow::ETHFLOW,
-                    calldata,
+                    calldata.clone(),
                     value,
                     local_names,
                 )
@@ -6380,11 +6424,13 @@ fn spawn_cow_prepare(
                         threshold: ctx.threshold,
                         owner_count: ctx.owner_count,
                         safe_tx_hash: hash,
+                        eip712: crate::sign::digest::Eip712Digests::of(&tx, &domain),
                         inner: Box::new(sign_review::ReviewLeg {
                             title: "Place on-chain order — EthFlow createOrder".to_string(),
                             to: cow::ETHFLOW,
                             value,
                             chain,
+                            calldata,
                             decoded: Box::new(decoded),
                         }),
                     },
@@ -6417,7 +6463,7 @@ fn spawn_cow_prepare(
                         chain,
                         safe,
                         draft.sell_token,
-                        calldata,
+                        calldata.clone(),
                         U256::ZERO,
                         local_names,
                     )
@@ -6429,6 +6475,7 @@ fn spawn_cow_prepare(
                             threshold: ctx.threshold,
                             owner_count: ctx.owner_count,
                             safe_tx_hash: hash,
+                            eip712: crate::sign::digest::Eip712Digests::of(&tx, &domain),
                             inner: Box::new(sign_review::ReviewLeg {
                                 title: format!(
                                     "Approve {} for CoW (vault relayer)",
@@ -6437,6 +6484,7 @@ fn spawn_cow_prepare(
                                 to: draft.sell_token,
                                 value: U256::ZERO,
                                 chain,
+                                calldata,
                                 decoded: Box::new(decoded),
                             }),
                         },
@@ -6463,6 +6511,7 @@ fn spawn_cow_prepare(
                         owner_count: ctx.owner_count,
                         order_digest,
                         message_hash,
+                        eip712: cow::safe_sig::safe_message_digests(order_digest, safe, chain),
                     },
                 ));
             }
@@ -7498,7 +7547,7 @@ fn spawn_pool_prepare(
                             chain,
                             from,
                             token,
-                            appr,
+                            appr.clone(),
                             U256::ZERO,
                             local_names.clone(),
                         )
@@ -7508,6 +7557,7 @@ fn spawn_pool_prepare(
                             to: token,
                             value: U256::ZERO,
                             chain,
+                            calldata: appr,
                             decoded: Box::new(decoded),
                         });
                     }
@@ -7516,7 +7566,7 @@ fn spawn_pool_prepare(
                         chain,
                         from,
                         to,
-                        calldata,
+                        calldata.clone(),
                         value,
                         local_names,
                     )
@@ -7526,6 +7576,7 @@ fn spawn_pool_prepare(
                         to,
                         value,
                         chain,
+                        calldata,
                         decoded: Box::new(decoded),
                     });
                     Ok::<_, String>(legs)
@@ -7541,7 +7592,7 @@ fn spawn_pool_prepare(
                         chain,
                         from,
                         pool,
-                        calldata,
+                        calldata.clone(),
                         U256::ZERO,
                         local_names,
                     )
@@ -7551,6 +7602,7 @@ fn spawn_pool_prepare(
                         to: pool,
                         value: U256::ZERO,
                         chain,
+                        calldata,
                         decoded: Box::new(decoded),
                     }])
                 }
@@ -10117,6 +10169,44 @@ mod tests {
     }
 
     #[test]
+    fn build_order_review_eip712_digest_matches_the_signed_order() {
+        // ERC-8213: the EIP-712 Digest the EOA swap review shows must equal what
+        // the sign path (`cow_place_order`, mod.rs:8015) signs. Rebuild the order
+        // the same way and assert the reviewed digest is byte-identical — the
+        // reviewed==signed guarantee for the fingerprints section.
+        let user = addr(0x11);
+        let draft = sample_swap_draft();
+        let quote = sample_quote();
+        let q = &quote.quote;
+        let full_sell = q.sell_amount.saturating_add(q.fee_amount);
+        let (_, app_data_hash) = cow::market_app_data(draft.slippage_bps);
+        let order = cow::order::build_sell_order(
+            draft.sell_token,
+            draft.buy_token,
+            user,
+            full_sell,
+            q.buy_amount,
+            q.valid_to,
+            draft.slippage_bps,
+            app_data_hash,
+        );
+        let expected = cow::order::order_digest(&order, &cow::order::cow_domain(draft.chain));
+
+        let review = build_order_review(&draft, &quote, user);
+        assert_eq!(review.eip712.digest, expected);
+        assert_ne!(review.eip712.digest, alloy::primitives::B256::ZERO);
+        // The triple is internally consistent: rebuilding from the two component
+        // hashes reproduces the same digest.
+        assert_eq!(
+            crate::sign::digest::Eip712Digests::from_parts(
+                review.eip712.domain_hash,
+                review.eip712.message_hash,
+            ),
+            review.eip712,
+        );
+    }
+
+    #[test]
     fn pinned_nonce_check_refuses_advance() {
         assert!(check_pinned_nonce(5, 5).is_ok());
         let e = check_pinned_nonce(6, 5).unwrap_err();
@@ -10166,6 +10256,7 @@ mod tests {
                 to: addr(2),
                 value: U256::ZERO,
                 chain: Chain::Mainnet,
+                calldata: alloy::primitives::Bytes::new(),
                 decoded: Box::new(crate::decode::clear_sign::DecodeResult::Empty),
             })
         };
@@ -10181,6 +10272,10 @@ mod tests {
                 threshold: 2,
                 owner_count: 3,
                 safe_tx_hash: B256::repeat_byte(0xAA),
+                eip712: crate::sign::digest::Eip712Digests::from_parts(
+                    B256::repeat_byte(0xD0),
+                    B256::repeat_byte(0xD1),
+                ),
                 inner: leg(),
             }),
             sign_review::SignStep::SafeMessage(sign_review::SafeMessageReview {
@@ -10196,12 +10291,17 @@ mod tests {
                     slippage_bps: 50,
                     settlement: addr(3),
                     native: false,
+                    eip712: crate::sign::digest::Eip712Digests::from_parts(B256::ZERO, B256::ZERO),
                 },
                 safe: addr(0x5A),
                 threshold: 2,
                 owner_count: 3,
                 order_digest: B256::repeat_byte(0xBB),
                 message_hash: B256::repeat_byte(0xCC),
+                eip712: crate::sign::digest::Eip712Digests::from_parts(
+                    B256::repeat_byte(0xD2),
+                    B256::repeat_byte(0xD3),
+                ),
             }),
         ];
         let pin = cow_pin_from_steps(&steps).expect("safe steps yield a pin");

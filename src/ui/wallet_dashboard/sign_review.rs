@@ -27,7 +27,7 @@ use std::time::Instant;
 
 use alloy::primitives::{Address, B256, Bytes, U256};
 use iced::keyboard;
-use iced::widget::{Space, column, container, row, scrollable, text};
+use iced::widget::{Space, button, column, container, row, scrollable, text};
 use iced::{Alignment, Element, Length, Padding};
 
 use crate::chain::Chain;
@@ -35,6 +35,10 @@ use crate::cow::api::QuoteResponse;
 use crate::cow::composer::SwapDraft;
 use crate::decode::clear_sign::DecodeResult;
 use crate::names::registrar::{Namespace, RegisterPlan};
+use crate::sign::digest::{
+    self, CALLDATA_DIGEST_LABEL, DOMAIN_HASH_LABEL, EIP712_DIGEST_LABEL, Eip712Digests,
+    MESSAGE_HASH_LABEL,
+};
 use crate::sign::typed::{IntoTypedModel, TypedDataModel, TypedRow, TypedValue};
 use crate::ui::kao_theme::KaoTheme;
 use crate::ui::kao_widgets::{
@@ -60,6 +64,9 @@ pub enum Message {
     /// Expand/collapse the "for the paranoid" decoded-calldata block on a Send
     /// review step (the only interactive control inside a reviewed step).
     ToggleCalldata,
+    /// Expand/collapse the "ERC-8213 fingerprints" section (Calldata Digest /
+    /// EIP-712 Digest + Domain + Message hashes) shown on every reviewed step.
+    ToggleFingerprints,
     /// The overlay's optional secondary action (Safe send: "Propose to
     /// co-signers", alongside the primary "Sign & execute"). Only emitted when a
     /// `secondary_label` is set.
@@ -75,6 +82,11 @@ pub struct ReviewLeg {
     pub to: Address,
     pub value: U256,
     pub chain: Chain,
+    /// The exact calldata this leg signs — retained (not just its decode) so the
+    /// ERC-8213 Calldata Digest is computed over the real bytes. `DecodeResult`
+    /// drops the raw input on its descriptor-matched (`ClearSigned`) path, so it
+    /// can't be recovered from `decoded`. Empty for a pure value transfer.
+    pub calldata: Bytes,
     pub decoded: Box<DecodeResult>,
 }
 
@@ -97,6 +109,11 @@ pub struct OrderReview {
     /// Native-ETH (EthFlow) order — settles on-chain and costs gas, vs. a gasless
     /// off-chain ERC-20 order.
     pub native: bool,
+    /// ERC-8213 digests of the CoW GPv2 order's own EIP-712 signature (domain =
+    /// `cow_domain(chain)`, message = the `Order` struct). Computed from a
+    /// byte-exact reconstruction of the signed order, so the EOA typed-data panel
+    /// shows the Digest/Domain/Message the wallet actually signs.
+    pub eip712: Eip712Digests,
 }
 
 impl IntoTypedModel for OrderReview {
@@ -162,6 +179,10 @@ pub struct SafeExecReview {
     /// The exact 32 bytes each owner signs — identical to what `sign_owner` will
     /// consume at dispatch (nonce-pinned).
     pub safe_tx_hash: B256,
+    /// ERC-8213 digests of the `SafeTx` EIP-712 signature. `eip712.digest` equals
+    /// `safe_tx_hash` (both are `SafeTx::eip712_signing_hash`); the extra domain /
+    /// message hashes let the fingerprints section show all three components.
+    pub eip712: Eip712Digests,
     /// The decoded inner call the Safe will `execTransaction`. Always a raw tx, so
     /// it reuses [`ReviewLeg`] and its `leg_card` renderer verbatim.
     pub inner: Box<ReviewLeg>,
@@ -181,6 +202,10 @@ pub struct SafeMessageReview {
     /// `safe_message_hash(order_digest, safe, chain)` — the 32 bytes each owner
     /// signs. A pure function of `(order_digest, safe, chain)`, so no pin needed.
     pub message_hash: B256,
+    /// ERC-8213 digests of the `SafeMessage` EIP-712 signature the owners produce
+    /// (domain = `safe_domain(safe, chain)`, message = the `SafeMessage` wrapping
+    /// `order_digest`). `eip712.digest` equals `message_hash`.
+    pub eip712: Eip712Digests,
 }
 
 /// One reviewable step in a signature. A review is an ordered list of these: an
@@ -392,6 +417,9 @@ pub struct SignReview {
     pub secondary_label: Option<String>,
     /// Expand state for the Send step's "for the paranoid" decoded-calldata block.
     pub show_calldata: bool,
+    /// Expand state for the "ERC-8213 fingerprints" section on every reviewed
+    /// step (the signature/calldata digests). One flag toggles them all together.
+    pub show_fingerprints: bool,
     /// The ceremony the waiting card describes once signing is in flight. Set at
     /// dispatch for a multi-device Safe send (execute or propose) so the "waiting
     /// for a signature" card lays out the per-owner device prompts; `None` for a
@@ -438,6 +466,7 @@ impl SignReview {
             confirm_disabled: false,
             secondary_label: None,
             show_calldata: false,
+            show_fingerprints: false,
             signing_progress: None,
         };
         // Coordinator-driven open: every caller assigns this straight into the
@@ -479,7 +508,12 @@ pub fn view<'a>(t: KaoTheme, review: &'a SignReview, progress: f32) -> Element<'
             };
             body = body.push(Space::new().height(gap));
         }
-        body = body.push(step_card(t, step, review.show_calldata));
+        body = body.push(step_card(
+            t,
+            step,
+            review.show_calldata,
+            review.show_fingerprints,
+        ));
     }
 
     if review.legs_loading {
@@ -719,10 +753,15 @@ fn ceremony_owner_list<'a>(t: KaoTheme, owners: &'a [SigningOwner]) -> Element<'
     container(list).width(Length::Fill).into()
 }
 
-/// Render one reviewed step: a raw-tx leg through `function_panel`, or an EIP-712
-/// typed-data step through `typed_panel`.
-fn step_card<'a>(t: KaoTheme, step: &'a SignStep, show_calldata: bool) -> Element<'a, Message> {
-    match step {
+/// Render one reviewed step: its type-specific panel, then the collapsible
+/// ERC-8213 fingerprints section (the signature/calldata digests for this step).
+fn step_card<'a>(
+    t: KaoTheme,
+    step: &'a SignStep,
+    show_calldata: bool,
+    show_fingerprints: bool,
+) -> Element<'a, Message> {
+    let panel = match step {
         SignStep::RawTx(leg) => leg_card(t, leg),
         SignStep::Typed(order) => order_panel(t, order),
         SignStep::SafeExec(x) => safe_exec_panel(t, x),
@@ -731,7 +770,130 @@ fn step_card<'a>(t: KaoTheme, step: &'a SignStep, show_calldata: bool) -> Elemen
             super::send::render_send_review(t, r, show_calldata, Message::ToggleCalldata)
         }
         SignStep::SafeSend(r) => super::send::render_safe_send_review::<Message>(t, r),
+    };
+    let rows = erc8213_rows(step);
+    if rows.is_empty() {
+        return panel;
     }
+    column![
+        panel,
+        Space::new().height(6),
+        fingerprints_section(t, show_fingerprints, rows),
+    ]
+    .spacing(0)
+    .width(Length::Fill)
+    .into()
+}
+
+/// The ERC-8213 fingerprint rows for one reviewed step: `(exact-ERC-label, hash)`
+/// pairs the fingerprints section renders — and the tests assert. This is the
+/// single source of truth, so what is verified is exactly what is displayed.
+///
+/// A raw transaction contributes its **Calldata Digest**; an EIP-712 signature
+/// contributes the **EIP-712 Digest** + **Domain Hash** + **Message Hash**; a Safe
+/// step contributes both the wrapping `SafeTx`/`SafeMessage` signature *and* the
+/// inner calldata. A native (calldata-less) transfer contributes nothing.
+pub(crate) fn erc8213_rows(step: &SignStep) -> Vec<(String, B256)> {
+    fn push_eip712(rows: &mut Vec<(String, B256)>, d: &Eip712Digests) {
+        rows.push((EIP712_DIGEST_LABEL.to_string(), d.digest));
+        rows.push((DOMAIN_HASH_LABEL.to_string(), d.domain_hash));
+        rows.push((MESSAGE_HASH_LABEL.to_string(), d.message_hash));
+    }
+    fn push_calldata(rows: &mut Vec<(String, B256)>, label: &str, calldata: &[u8]) {
+        if !calldata.is_empty() {
+            rows.push((label.to_string(), digest::calldata_digest(calldata)));
+        }
+    }
+
+    let mut rows = Vec::new();
+    match step {
+        SignStep::RawTx(leg) => push_calldata(&mut rows, CALLDATA_DIGEST_LABEL, &leg.calldata),
+        SignStep::Typed(order) => push_eip712(&mut rows, &order.eip712),
+        SignStep::SafeExec(x) => {
+            push_eip712(&mut rows, &x.eip712);
+            push_calldata(&mut rows, "Calldata Digest (inner call)", &x.inner.calldata);
+        }
+        SignStep::SafeMessage(m) => {
+            push_eip712(&mut rows, &m.eip712);
+            rows.push(("Order Digest (CoW EIP-712)".to_string(), m.order_digest));
+        }
+        SignStep::Send(r) => {
+            if let Some(cd) = r.calldata_digest {
+                rows.push((CALLDATA_DIGEST_LABEL.to_string(), cd));
+            }
+        }
+        SignStep::SafeSend(r) => {
+            push_eip712(&mut rows, &r.eip712);
+            if let Some(cd) = r.inner_calldata_digest {
+                rows.push(("Calldata Digest (inner call)".to_string(), cd));
+            }
+        }
+    }
+    rows
+}
+
+/// The collapsible **ERC-8213 fingerprints** section: a click-to-toggle header
+/// (mirroring the Send step's "for the paranoid" block) that, when expanded,
+/// lists each labelled digest via [`hash_row`] — the full 32-byte, 0x-prefixed,
+/// monospace, click-to-copy display ERC-8213 requires. Callers pass a non-empty
+/// `rows`; an empty step renders no section at all (see [`step_card`]).
+fn fingerprints_section<'a>(
+    t: KaoTheme,
+    show: bool,
+    rows: Vec<(String, B256)>,
+) -> Element<'a, Message> {
+    let caret = if show { "▾" } else { "▸" };
+    let header = row![
+        text(caret).size(12).color(t.sub).font(mono()),
+        Space::new().width(6),
+        text("ERC-8213 fingerprints")
+            .size(12)
+            .color(t.text)
+            .font(mono_bold()),
+        Space::new().width(Length::Fill),
+        text(if show { "hide" } else { "verify hashes" })
+            .size(11)
+            .color(t.sub)
+            .font(mono()),
+    ]
+    .align_y(Alignment::Center)
+    .spacing(0);
+    let toggle: Element<'a, Message> = button(header.width(Length::Fill))
+        .width(Length::Fill)
+        .padding(Padding::from([10, 14]))
+        .on_press(Message::ToggleFingerprints)
+        .style(move |_theme, _status| button::Style {
+            background: Some(iced::Background::Color(iced::Color::TRANSPARENT)),
+            text_color: t.text,
+            ..button::Style::default()
+        })
+        .into();
+
+    let mut col = column![toggle].spacing(0).width(Length::Fill);
+    if show {
+        let mut body = column![].spacing(6).width(Length::Fill);
+        for (label, hash) in rows {
+            body = body.push(hash_row(t, label, hash));
+        }
+        col = col.push(
+            container(body)
+                .padding(Padding::from([0, 14]).bottom(12.0))
+                .width(Length::Fill),
+        );
+    }
+    container(col)
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(iced::Background::Color(t.card_alt)),
+            border: iced::Border {
+                color: t.border,
+                width: 1.0,
+                radius: iced::border::Radius::from(12),
+            },
+            text_color: Some(t.text),
+            ..container::Style::default()
+        })
+        .into()
 }
 
 /// A Safe `execTransaction` step: the ceremony header (N-of-M owners, Safe
@@ -1117,6 +1279,7 @@ mod tests {
             slippage_bps: 50,
             settlement: Address::repeat_byte(0x55),
             native: false,
+            eip712: Eip712Digests::from_parts(B256::ZERO, B256::ZERO),
         };
         let m = o.to_typed_model();
 
@@ -1153,5 +1316,142 @@ mod tests {
             m.rows[9].value,
             TypedValue::Text("off-chain via solvers · gasless".into())
         );
+    }
+
+    // ── ERC-8213 fingerprints ────────────────────────────────────────────────
+
+    /// A minimal `ReviewLeg` carrying the given calldata (the only field the
+    /// ERC-8213 mapping reads).
+    fn leg_with(calldata: Bytes) -> ReviewLeg {
+        ReviewLeg {
+            title: "leg".into(),
+            to: Address::repeat_byte(0x01),
+            value: U256::ZERO,
+            chain: Chain::Mainnet,
+            calldata,
+            decoded: Box::new(DecodeResult::Empty),
+        }
+    }
+
+    /// A minimal `OrderReview` carrying `eip712` (the only field the mapping reads).
+    fn order_with(eip712: Eip712Digests) -> OrderReview {
+        OrderReview {
+            chain: Chain::Mainnet,
+            sell_amount: "1".into(),
+            sell_symbol: "A".into(),
+            buy_amount: "2".into(),
+            buy_symbol: "B".into(),
+            min_received: "2".into(),
+            receiver: Address::repeat_byte(0x5A),
+            valid_to: 1_900_000_000,
+            slippage_bps: 50,
+            settlement: Address::repeat_byte(0x03),
+            native: false,
+            eip712,
+        }
+    }
+
+    #[test]
+    fn erc8213_rows_raw_tx_is_the_calldata_digest() {
+        let calldata = Bytes::from(vec![0x11, 0x22, 0x33]);
+        let rows = erc8213_rows(&SignStep::RawTx(leg_with(calldata.clone())));
+        assert_eq!(
+            rows,
+            vec![(
+                CALLDATA_DIGEST_LABEL.to_string(),
+                digest::calldata_digest(&calldata)
+            )],
+        );
+    }
+
+    #[test]
+    fn erc8213_rows_empty_calldata_leg_has_no_fingerprints() {
+        // A pure value transfer signs no calldata → the standard prescribes no
+        // digest, and the section renders nothing (see `step_card`).
+        assert!(erc8213_rows(&SignStep::RawTx(leg_with(Bytes::new()))).is_empty());
+    }
+
+    #[test]
+    fn erc8213_rows_typed_is_the_full_eip712_triple() {
+        let d = Eip712Digests::from_parts(B256::repeat_byte(0xA1), B256::repeat_byte(0xA2));
+        let rows = erc8213_rows(&SignStep::Typed(order_with(d)));
+        assert_eq!(
+            rows,
+            vec![
+                (EIP712_DIGEST_LABEL.to_string(), d.digest),
+                (DOMAIN_HASH_LABEL.to_string(), d.domain_hash),
+                (MESSAGE_HASH_LABEL.to_string(), d.message_hash),
+            ],
+        );
+    }
+
+    #[test]
+    fn erc8213_rows_safe_exec_shows_the_signed_hash_and_inner_calldata() {
+        let d = Eip712Digests::from_parts(B256::repeat_byte(0xB1), B256::repeat_byte(0xB2));
+        let inner = Bytes::from(vec![0xde, 0xad, 0xbe, 0xef]);
+        let x = SafeExecReview {
+            safe: Address::repeat_byte(0x5A),
+            nonce: 3,
+            threshold: 2,
+            owner_count: 3,
+            // In production this always equals `eip712.digest`.
+            safe_tx_hash: d.digest,
+            eip712: d,
+            inner: Box::new(leg_with(inner.clone())),
+        };
+        let rows = erc8213_rows(&SignStep::SafeExec(x));
+        assert_eq!(
+            rows,
+            vec![
+                (EIP712_DIGEST_LABEL.to_string(), d.digest),
+                (DOMAIN_HASH_LABEL.to_string(), d.domain_hash),
+                (MESSAGE_HASH_LABEL.to_string(), d.message_hash),
+                (
+                    "Calldata Digest (inner call)".to_string(),
+                    digest::calldata_digest(&inner)
+                ),
+            ],
+        );
+    }
+
+    #[test]
+    fn erc8213_rows_safe_message_shows_the_triple_and_the_order_digest() {
+        let d = Eip712Digests::from_parts(B256::repeat_byte(0xC1), B256::repeat_byte(0xC2));
+        let order_digest = B256::repeat_byte(0xBB);
+        let m = SafeMessageReview {
+            order: order_with(Eip712Digests::from_parts(B256::ZERO, B256::ZERO)),
+            safe: Address::repeat_byte(0x5A),
+            threshold: 2,
+            owner_count: 3,
+            order_digest,
+            message_hash: d.digest,
+            eip712: d,
+        };
+        let rows = erc8213_rows(&SignStep::SafeMessage(m));
+        // The EIP-712 Digest the owners sign == the SafeMessage hash.
+        assert_eq!(rows[0], (EIP712_DIGEST_LABEL.to_string(), d.digest));
+        assert_eq!(rows[1].0, DOMAIN_HASH_LABEL);
+        assert_eq!(rows[2].0, MESSAGE_HASH_LABEL);
+        // …plus the wrapped CoW order digest, so a signer can cross-check the order.
+        assert_eq!(
+            rows[3],
+            ("Order Digest (CoW EIP-712)".to_string(), order_digest),
+        );
+    }
+
+    #[test]
+    fn fingerprints_section_defaults_collapsed() {
+        let review = SignReview::pending(
+            "Cancel order".into(),
+            None,
+            Vec::new(),
+            None,
+            0,
+            SignAction::CowCancel {
+                host: CowHost::Apps,
+                uid: "0xabc".into(),
+            },
+        );
+        assert!(!review.show_fingerprints);
     }
 }

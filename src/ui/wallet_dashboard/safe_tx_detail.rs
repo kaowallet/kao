@@ -498,24 +498,55 @@ impl SafeTxDetailPane {
         // owner signs, what the Transaction Service keys this record
         // by, and what a hardware wallet / the Safe web app shows a
         // co-signer. Compare chunk-by-chunk before confirming.
-        fields = fields.push(section_card(
-            t,
-            "VERIFY BEFORE SIGNING",
-            column![
-                text("SafeTx hash · click to copy")
-                    .size(12)
-                    .color(t.text)
-                    .font(bold()),
-                Space::new().height(6),
-                colored_hash_copyable(t, self.pending.safe_tx_hash),
-                Space::new().height(6),
-                text("Verify this exact hash on your signing device and with co-signers.")
+        let mut verify = column![
+            text("EIP-712 Digest (SafeTx hash) · click to copy")
+                .size(12)
+                .color(t.text)
+                .font(bold()),
+            Space::new().height(6),
+            colored_hash_copyable(t, self.pending.safe_tx_hash),
+            Space::new().height(6),
+            text("Verify this exact hash on your signing device and with co-signers.")
+                .size(11)
+                .color(t.sub),
+        ]
+        .width(Length::Fill);
+        // ERC-8213 fingerprints: the safeTxHash above IS the EIP-712 Digest; add
+        // its Domain / Message component hashes (from the authoritative loaded
+        // `SafeTx`, so they reconstruct that exact digest) plus the inner call's
+        // Calldata Digest. A signer can then verify any of the four labelled
+        // values against their device or a co-signer.
+        let mut prints: Vec<(&str, B256)> = Vec::new();
+        if let Some(detail) = &self.detail {
+            let e = crate::sign::digest::Eip712Digests::of(
+                &detail.tx,
+                &crate::safe::tx::safe_domain(self.safe, self.chain),
+            );
+            prints.push((crate::sign::digest::DOMAIN_HASH_LABEL, e.domain_hash));
+            prints.push((crate::sign::digest::MESSAGE_HASH_LABEL, e.message_hash));
+        }
+        if !self.pending.data.is_empty() {
+            prints.push((
+                crate::sign::digest::CALLDATA_DIGEST_LABEL,
+                crate::sign::digest::calldata_digest(&self.pending.data),
+            ));
+        }
+        if !prints.is_empty() {
+            verify = verify.push(Space::new().height(12));
+            verify = verify.push(
+                text("ERC-8213 fingerprints")
                     .size(11)
-                    .color(t.sub),
-            ]
-            .width(Length::Fill)
-            .into(),
-        ));
+                    .color(t.sub)
+                    .font(mono_bold()),
+            );
+            for (label, hash) in prints {
+                verify = verify.push(Space::new().height(6));
+                verify = verify.push(text(label).size(11).color(t.sub).font(mono()));
+                verify = verify.push(Space::new().height(3));
+                verify = verify.push(colored_hash_copyable(t, hash));
+            }
+        }
+        fields = fields.push(section_card(t, "VERIFY BEFORE SIGNING", verify.into()));
 
         fields = fields.push(section_card(t, "SIMULATION", self.sim_block(t, portfolio)));
 

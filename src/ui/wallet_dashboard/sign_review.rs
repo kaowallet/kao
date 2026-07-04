@@ -321,6 +321,40 @@ pub enum NameSign {
     },
 }
 
+/// One owner the wallet will drive through a Safe signing ceremony. Display-only
+/// — the label, address, and whether signing prompts a hardware device — so the
+/// waiting card can tell the user how many device prompts to expect and on which
+/// accounts, instead of a single generic "waiting for a signature".
+#[derive(Debug, Clone)]
+pub struct SigningOwner {
+    pub label: String,
+    pub address: Address,
+    /// `true` for a Ledger/Trezor owner (the user must confirm on the device);
+    /// `false` for a software owner (signs in-process, no prompt).
+    pub hardware: bool,
+}
+
+/// The shape of the signing ceremony the overlay is waiting on. Snapshotted at
+/// dispatch — the owner set is known then — so the waiting card can lay out a
+/// multi-device Safe ceremony. The whole ceremony runs as one task that emits a
+/// single result, so this is the *plan* the user is about to walk through, not a
+/// live per-owner cursor. `None` on the review means "a single signature"
+/// (EOA send, CoW, name/pool write): the plain waiting card.
+#[derive(Debug, Clone)]
+pub enum SigningKind {
+    /// A Safe `execTransaction`: each `owners` entry signs the SafeTx on its own
+    /// device in turn, then the transaction is broadcast — by a separate linked
+    /// gas payer when `separate_gas_payer`, otherwise by re-using the first owner
+    /// (one extra prompt on that device).
+    SafeExecute {
+        owners: Vec<SigningOwner>,
+        separate_gas_payer: bool,
+    },
+    /// A Safe proposal: sign once as `owner` and POST to the Transaction Service
+    /// for co-signers to finish from their own wallets.
+    SafePropose { owner: SigningOwner },
+}
+
 /// Coordinator-held overlay state: what to show, and what to do on confirm.
 #[derive(Debug, Clone)]
 pub struct SignReview {
@@ -359,6 +393,11 @@ pub struct SignReview {
     pub secondary_label: Option<String>,
     /// Expand state for the Send step's "for the paranoid" decoded-calldata block.
     pub show_calldata: bool,
+    /// The ceremony the waiting card describes once signing is in flight. Set at
+    /// dispatch for a multi-device Safe send (execute or propose) so the "waiting
+    /// for a signature" card lays out the per-owner device prompts; `None` for a
+    /// single-signature flow (the plain card). Cleared when a dispatch resolves.
+    pub signing_progress: Option<SigningKind>,
 }
 
 impl SignReview {
@@ -400,6 +439,7 @@ impl SignReview {
             confirm_disabled: false,
             secondary_label: None,
             show_calldata: false,
+            signing_progress: None,
         };
         // Coordinator-driven open: every caller assigns this straight into the
         // overlay slot (guarded by an is-already-open early return), so the
@@ -486,7 +526,11 @@ pub fn view<'a>(t: KaoTheme, review: &'a SignReview, progress: f32) -> Element<'
     // bytes stay visible above it. Otherwise show the Confirm / Cancel gate.
     body = body.push(Space::new().height(20));
     if let Some(since) = review.signing_since {
-        body = body.push(waiting_card(t, since.elapsed().as_secs_f32()));
+        body = body.push(waiting_card(
+            t,
+            since.elapsed().as_secs_f32(),
+            review.signing_progress.as_ref(),
+        ));
     } else {
         // Confirm stays disabled while legs are still decoding so the user can't
         // approve bytes they haven't been shown yet, and while a step-level guard
@@ -555,31 +599,125 @@ pub fn view<'a>(t: KaoTheme, review: &'a SignReview, progress: f32) -> Element<'
 /// The post-confirm "waiting for a signature" panel: a font-safe bouncing-bullet
 /// animator (shared with the ZK proving screen) over a short notice. Shown in
 /// place of the Confirm / Cancel gate while the signing task runs.
-fn waiting_card<'a>(t: KaoTheme, elapsed: f32) -> Element<'a, Message> {
-    card(
-        t,
-        column![
-            text(bullet_wave(elapsed))
-                .size(15)
-                .color(t.a3)
-                .font(mono_bold()),
-            Space::new().height(8),
-            text("Waiting for a signature")
-                .size(14)
-                .color(t.text)
-                .font(bold()),
-            Space::new().height(4),
-            text(
-                "Confirm the transaction on your device — this window stays open until it's signed."
-            )
-            .size(12)
-            .color(t.sub)
-            .font(mono()),
-        ]
-        .align_x(Alignment::Center)
-        .width(Length::Fill)
-        .into(),
-    )
+///
+/// `progress` lays out a multi-device Safe ceremony (execute or propose) as a
+/// per-owner checklist, so the user knows how many device prompts to expect and
+/// on which accounts — otherwise a single generic "confirm on your device" line.
+/// The ceremony runs as one task, so the checklist is the plan, not a live
+/// cursor: it can't highlight the owner currently signing.
+fn waiting_card<'a>(
+    t: KaoTheme,
+    elapsed: f32,
+    progress: Option<&'a SigningKind>,
+) -> Element<'a, Message> {
+    let plural = matches!(
+        progress,
+        Some(SigningKind::SafeExecute { owners, .. }) if owners.len() > 1
+    );
+    let title = if plural {
+        "Waiting for signatures"
+    } else {
+        "Waiting for a signature"
+    };
+
+    let mut col = column![
+        text(bullet_wave(elapsed))
+            .size(15)
+            .color(t.a3)
+            .font(mono_bold()),
+        Space::new().height(8),
+        text(title).size(14).color(t.text).font(bold()),
+    ]
+    .align_x(Alignment::Center)
+    .width(Length::Fill);
+
+    match progress {
+        Some(SigningKind::SafeExecute {
+            owners,
+            separate_gas_payer,
+        }) => {
+            col = col.push(Space::new().height(4));
+            col = col.push(
+                text("Approve the Safe transaction on each owner in turn:")
+                    .size(12)
+                    .color(t.sub)
+                    .font(mono()),
+            );
+            col = col.push(Space::new().height(8));
+            col = col.push(ceremony_owner_list(t, owners));
+            col = col.push(Space::new().height(6));
+            let broadcast = if *separate_gas_payer {
+                "Then a linked account broadcasts it and pays the gas."
+            } else {
+                "Then owner 1 re-signs to broadcast it and pay the gas."
+            };
+            col = col.push(text(broadcast).size(11).color(t.sub).font(mono()));
+        }
+        Some(SigningKind::SafePropose { owner }) => {
+            col = col.push(Space::new().height(4));
+            col = col.push(
+                text(if owner.hardware {
+                    "Approve the Safe transaction on your device to propose it."
+                } else {
+                    "Signing the Safe transaction to propose it to co-signers."
+                })
+                .size(12)
+                .color(t.sub)
+                .font(mono()),
+            );
+            col = col.push(Space::new().height(8));
+            col = col.push(ceremony_owner_list(t, std::slice::from_ref(owner)));
+            col = col.push(Space::new().height(6));
+            col = col.push(
+                text("Co-signers finish it from their own wallets.")
+                    .size(11)
+                    .color(t.sub)
+                    .font(mono()),
+            );
+        }
+        None => {
+            col = col.push(Space::new().height(4));
+            col = col.push(
+                text(
+                    "Confirm the transaction on your device — this window stays open until it's signed.",
+                )
+                .size(12)
+                .color(t.sub)
+                .font(mono()),
+            );
+        }
+    }
+
+    card(t, col.into())
+}
+
+/// The per-owner rows for a Safe signing ceremony: an ordinal, the owner's
+/// label + short address, and whether it prompts a hardware device or signs
+/// in-process. Left-aligned inside the otherwise-centered waiting card.
+fn ceremony_owner_list<'a>(t: KaoTheme, owners: &'a [SigningOwner]) -> Element<'a, Message> {
+    let mut list = column![].spacing(4).width(Length::Fill);
+    for (i, owner) in owners.iter().enumerate() {
+        let how = if owner.hardware {
+            "confirm on device"
+        } else {
+            "signs automatically"
+        };
+        let head = format!(
+            "{}. {} · {}",
+            i + 1,
+            owner.label,
+            crate::wallet::short_address(owner.address),
+        );
+        list = list.push(
+            column![
+                text(head).size(12).color(t.text).font(mono_bold()),
+                text(how).size(11).color(t.sub).font(mono()),
+            ]
+            .spacing(1)
+            .width(Length::Fill),
+        );
+    }
+    container(list).width(Length::Fill).into()
 }
 
 /// Render one reviewed step: a raw-tx leg through `function_panel`, or an EIP-712
@@ -914,6 +1052,59 @@ mod tests {
     #[test]
     fn format_iso_utc_epoch() {
         assert_eq!(format_iso_utc(0), "1970-01-01 00:00 UTC");
+    }
+
+    #[test]
+    fn pending_review_starts_without_signing_progress() {
+        // A freshly-opened review is in its prepare/confirm phase — no ceremony
+        // plan until a Safe dispatch sets one, so the waiting card falls back to
+        // the plain single-signature notice.
+        let review = SignReview::pending(
+            "Cancel order".into(),
+            None,
+            Vec::new(),
+            None,
+            0,
+            SignAction::CowCancel {
+                host: CowHost::Apps,
+                uid: "0xabc".into(),
+            },
+        );
+        assert!(review.signing_progress.is_none());
+        assert_eq!(review.phase(), "prepare");
+    }
+
+    #[test]
+    fn safe_execute_ceremony_carries_every_owner() {
+        // The execute ceremony lists one entry per signing owner (so the waiting
+        // card can spell out each device prompt) and records whether a separate
+        // account pays the gas.
+        let kind = SigningKind::SafeExecute {
+            owners: vec![
+                SigningOwner {
+                    label: "Ledger".into(),
+                    address: Address::repeat_byte(0x11),
+                    hardware: true,
+                },
+                SigningOwner {
+                    label: "Hot key".into(),
+                    address: Address::repeat_byte(0x22),
+                    hardware: false,
+                },
+            ],
+            separate_gas_payer: true,
+        };
+        let SigningKind::SafeExecute {
+            owners,
+            separate_gas_payer,
+        } = kind
+        else {
+            panic!("expected SafeExecute");
+        };
+        assert_eq!(owners.len(), 2);
+        assert!(owners[0].hardware);
+        assert!(!owners[1].hardware);
+        assert!(separate_gas_payer);
     }
 
     #[test]

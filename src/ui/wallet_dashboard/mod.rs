@@ -1936,15 +1936,25 @@ impl WalletScreen {
             return Task::none();
         }
         // Build the dispatch task first (owner collection can fail); only commit
-        // to the waiting state once we know we can proceed.
-        let task = if execute && can_execute {
-            let signer_owners: Vec<AccountDescriptor> = req
+        // to the waiting state once we know we can proceed. Each branch also
+        // returns the ceremony plan the waiting card lays out (per-owner device
+        // prompts) once signing is in flight.
+        let (task, signing_kind) = if execute && can_execute {
+            // Keep the account index alongside each descriptor: `filter_map` may
+            // drop dangling/view-only indices, so `signable_indices[i]` no longer
+            // aligns with the kept owners — the index is needed for the label.
+            let signer_pairs: Vec<(usize, AccountDescriptor)> = req
                 .signable_indices
                 .iter()
-                .filter_map(|&idx| self.accounts.get(idx as usize).cloned())
+                .filter_map(|&idx| {
+                    self.accounts
+                        .get(idx as usize)
+                        .cloned()
+                        .map(|d| (idx as usize, d))
+                })
                 .take(req.threshold as usize)
                 .collect();
-            if (signer_owners.len() as u32) < req.threshold {
+            if (signer_pairs.len() as u32) < req.threshold {
                 if let Some(r) = self.sign_review.as_mut() {
                     r.error = Some(
                         "Not enough signable owners linked to this Safe to meet its threshold — \
@@ -1955,36 +1965,57 @@ impl WalletScreen {
                 return Task::none();
             }
             let executor_key = first_local_key_of(&self.accounts);
+            let owners = signer_pairs
+                .iter()
+                .map(|(i, d)| signing_owner_of(*i, d))
+                .collect();
+            let kind = sign_review::SigningKind::SafeExecute {
+                owners,
+                separate_gas_payer: executor_key.is_some(),
+            };
+            let signer_owners: Vec<AccountDescriptor> =
+                signer_pairs.into_iter().map(|(_, d)| d).collect();
             info!(
                 safe = %req.safe_address,
                 to = %req.recipient,
                 threshold = req.threshold,
                 "safe-send: dispatching execute via sign_review overlay",
             );
-            spawn_safe_broadcast_task(self.network.clone(), req, signer_owners, executor_key)
+            (
+                spawn_safe_broadcast_task(self.network.clone(), req, signer_owners, executor_key),
+                kind,
+            )
         } else {
-            let Some(owner_desc) = req
-                .signable_indices
-                .first()
-                .and_then(|&idx| self.accounts.get(idx as usize).cloned())
-            else {
+            let Some((idx, owner_desc)) = req.signable_indices.first().and_then(|&idx| {
+                self.accounts
+                    .get(idx as usize)
+                    .cloned()
+                    .map(|d| (idx as usize, d))
+            }) else {
                 if let Some(r) = self.sign_review.as_mut() {
                     r.error = Some("no signable owner linked to this Safe".to_string());
                 }
                 return Task::none();
+            };
+            let kind = sign_review::SigningKind::SafePropose {
+                owner: signing_owner_of(idx, &owner_desc),
             };
             info!(
                 safe = %req.safe_address,
                 to = %req.recipient,
                 "safe-send: dispatching propose via sign_review overlay",
             );
-            spawn_safe_propose_task(self.network.clone(), owner_desc, req)
+            (
+                spawn_safe_propose_task(self.network.clone(), owner_desc, req),
+                kind,
+            )
         };
         if let Modal::Send(p) = &mut self.modal {
             p.mark_busy();
         }
         if let Some(r) = self.sign_review.as_mut() {
             r.signing_since = Some(Instant::now());
+            r.signing_progress = Some(signing_kind);
             r.error = None;
         }
         task
@@ -3597,6 +3628,7 @@ impl WalletScreen {
                                 Err(e) => {
                                     if let Some(r) = self.sign_review.as_mut() {
                                         r.signing_since = None;
+                                        r.signing_progress = None;
                                         r.error = Some(e.clone());
                                     }
                                     if let Modal::Send(p) = &mut self.modal {
@@ -3644,6 +3676,7 @@ impl WalletScreen {
                                 Err(e) => {
                                     if let Some(r) = self.sign_review.as_mut() {
                                         r.signing_since = None;
+                                        r.signing_progress = None;
                                         r.error = Some(e.clone());
                                     }
                                     if let Modal::Send(p) = &mut self.modal {
@@ -6428,6 +6461,21 @@ fn signable_owners_of(
         .collect()
 }
 
+/// Build the display-only [`sign_review::SigningOwner`] for account `idx`: its
+/// label, address, and whether signing prompts its hardware device. Feeds the
+/// waiting card's Safe-ceremony breakdown so the user knows the device prompts
+/// to expect.
+fn signing_owner_of(idx: usize, desc: &AccountDescriptor) -> sign_review::SigningOwner {
+    sign_review::SigningOwner {
+        label: desc.display_name(idx),
+        address: account_address(desc).unwrap_or_default(),
+        hardware: matches!(
+            desc,
+            AccountDescriptor::Ledger { .. } | AccountDescriptor::Trezor { .. }
+        ),
+    }
+}
+
 /// The descriptor whose address matches `addr`, if the wallet holds it.
 fn owner_desc_by_address(
     addr: Address,
@@ -6556,15 +6604,29 @@ fn spawn_safe_broadcast_task(
             let (safe_tx, domain, local_hash) =
                 rebuild_reviewed_safe_tx(network.as_ref(), &req).await?;
 
+            // Sign with each owner. The signers were built up front (so a dead
+            // device surfaces before the on-chain rebuild), but that rebuild's
+            // round-trips ran since — re-probe/reconnect each owner's device
+            // right before it signs, so an auto-locked Ledger self-heals instead
+            // of aborting the ceremony mid-way. `ensure_connected` consumes the
+            // signer, so own each element (a borrow loop can't hand it over) and
+            // keep the live one back for a possible executor re-use.
             let mut sigs = Vec::with_capacity(owner_signers.len());
-            for signer in &owner_signers {
-                let pair = sign_owner(signer, &safe_tx, &domain, local_hash).await?;
+            let mut live_owners = Vec::with_capacity(owner_signers.len());
+            for (signer, desc) in owner_signers.into_iter().zip(signer_owners.iter()) {
+                let signer = crate::wallet::ensure_connected(signer, desc)
+                    .await
+                    .map_err(|(_, e)| e)?;
+                let pair = sign_owner(&signer, &safe_tx, &domain, local_hash).await?;
                 sigs.push(pair);
+                live_owners.push(signer);
             }
             let packed = assemble_signatures(sigs)?;
 
             // Executor: prefer a Local gas payer (no extra device prompt);
-            // otherwise reuse the first owner signer (hardware self-pay).
+            // otherwise re-use the first owner signer (hardware self-pay),
+            // re-probed once more — gas estimation inside `execute_safe_tx`
+            // runs after that owner last signed, so its device may have dropped.
             let local_executor;
             let executor: &KaoSigner = match local_executor_key {
                 Some(key) => {
@@ -6573,7 +6635,16 @@ fn spawn_safe_broadcast_task(
                     local_executor = KaoSigner::Local(s);
                     &local_executor
                 }
-                None => &owner_signers[0],
+                None => {
+                    let first = live_owners
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| "no owner signer available to execute".to_string())?;
+                    local_executor = crate::wallet::ensure_connected(first, &signer_owners[0])
+                        .await
+                        .map_err(|(_, e)| e)?;
+                    &local_executor
+                }
             };
 
             execute_safe_tx(
@@ -6610,6 +6681,9 @@ fn spawn_safe_propose_task(
     Task::perform(
         async move {
             let (tx, domain, local) = rebuild_reviewed_safe_tx(network.as_ref(), &req).await?;
+            // One owner, built immediately before it signs — no post-rebuild gap
+            // for a device to drop across (unlike the execute loop, which builds
+            // every owner up front), so no separate `ensure_connected` re-probe.
             let signer = crate::wallet::build_owner_signer(&owner_desc).await?;
             let owner_sig = sign_owner(&signer, &tx, &domain, local).await?;
             crate::safe::service::propose(
@@ -10436,6 +10510,27 @@ mod tests {
             Some(AccountDescriptor::Local { .. })
         ));
         assert!(owner_desc_by_address(addr(0xff), &accounts).is_none());
+    }
+
+    #[test]
+    fn signing_owner_of_labels_hardware_and_software() {
+        // Hardware owner: `hardware` set, address carried from the descriptor,
+        // and the label falls back to "Account {idx+1}" when unnamed.
+        let hw = ledger_acct(addr(0xcc));
+        let owner = signing_owner_of(2, &hw);
+        assert!(owner.hardware);
+        assert_eq!(owner.address, addr(0xcc));
+        assert_eq!(owner.label, "Account 3");
+
+        // Software owner: `hardware` clear, derived address, named label wins.
+        let sw = AccountDescriptor::Local {
+            name: Some("Gas payer".to_string()),
+            key_bytes: crate::wallet::SecretKeyBytes::new([0x09; 32]),
+        };
+        let owner = signing_owner_of(0, &sw);
+        assert!(!owner.hardware);
+        assert_eq!(owner.address, account_address(&sw).unwrap());
+        assert_eq!(owner.label, "Gas payer");
     }
 
     #[test]

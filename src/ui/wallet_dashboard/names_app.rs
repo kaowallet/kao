@@ -21,7 +21,7 @@
 
 use std::time::Duration;
 
-use alloy::primitives::{Address, TxHash, U256};
+use alloy::primitives::{Address, U256};
 use iced::border::Radius;
 use iced::widget::{Space, button, column, container, row, text, text_input};
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Subscription};
@@ -836,11 +836,11 @@ impl NamesApp {
         self.trace_delta(&before);
     }
 
-    pub fn on_commit(&mut self, result: Result<(RegisterPlan, TxHash), String>) {
+    pub fn on_commit(&mut self, result: Result<RegisterPlan, String>) {
         let before = self.trace_snapshot();
         let Some(r) = &mut self.reg else { return };
         match result {
-            Ok((plan, _hash)) => {
+            Ok(plan) => {
                 r.phase = RegPhase::Waiting {
                     plan,
                     since: crate::names::manage::now_secs(),
@@ -851,7 +851,7 @@ impl NamesApp {
         self.trace_delta(&before);
     }
 
-    pub fn on_register(&mut self, result: Result<(String, TxHash), String>) {
+    pub fn on_register(&mut self, result: Result<(), String>) {
         let before = self.trace_snapshot();
         // Pull the registered target out of the flow (and flip its phase) before
         // touching the rest of `self`, so the success path can update the search
@@ -910,21 +910,21 @@ impl NamesApp {
         }]);
     }
 
-    pub fn on_renew(&mut self, result: Result<(String, TxHash), String>) {
+    pub fn on_renew(&mut self, result: Result<String, String>) {
         let before = self.trace_snapshot();
         self.manage_busy = false;
         match result {
-            Ok((name, _)) => self.manage_notice = Some((false, format!("Renewed {name}."))),
+            Ok(name) => self.manage_notice = Some((false, format!("Renewed {name}."))),
             Err(e) => self.manage_notice = Some((true, e)),
         }
         self.trace_delta(&before);
     }
 
-    pub fn on_set_recipient(&mut self, result: Result<(String, TxHash), String>) {
+    pub fn on_set_recipient(&mut self, result: Result<String, String>) {
         let before = self.trace_snapshot();
         self.manage_busy = false;
         match result {
-            Ok((name, _)) => {
+            Ok(name) => {
                 self.manage_recipient.clear();
                 self.manage_notice = Some((false, format!("Updated {name}'s recipient.")));
             }
@@ -2009,7 +2009,7 @@ mod tests {
             duration_secs: registrar::YEAR_SECONDS,
             secret: alloy::primitives::B256::repeat_byte(7),
         };
-        a.on_commit(Ok((plan, TxHash::ZERO)));
+        a.on_commit(Ok(plan));
         // Too early → no reveal.
         assert!(a.update(Message::CompleteRegister).is_none());
         // Backdate past the 60s window → reveal allowed.
@@ -2257,7 +2257,7 @@ mod tests {
         }];
         a.update(Message::PickResult(0));
         a.update(Message::StartRegister); // XNS one-shot → Registering
-        a.on_register(Ok(("cow.crops".to_string(), TxHash::ZERO)));
+        a.on_register(Ok(()));
 
         assert!(matches!(a.reg.as_ref().unwrap().phase, RegPhase::Done));
         // The search row no longer offers Register — it reads as ours now.
@@ -2283,7 +2283,7 @@ mod tests {
             status: HitStatus::Available { quote: None },
         }];
         a.update(Message::PickResult(0)); // years defaults to 1
-        a.on_register(Ok(("vitalik.eth".to_string(), TxHash::ZERO)));
+        a.on_register(Ok(()));
         // A commit-reveal name lands in the owned list with a future expiry.
         assert_eq!(a.owned.len(), 1);
         let exp = a.owned[0]

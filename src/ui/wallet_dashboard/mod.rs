@@ -156,6 +156,70 @@ pub enum CowHost {
     Apps,
 }
 
+/// The on-success payload every in-app signing task resolves to — the unified
+/// result carried by [`Message::Signed`]. Heterogeneous per flow, but every flow
+/// lands in exactly one of these three shapes: a broadcast/mined transaction, a
+/// placed CoW order, or nothing (a propose-to-service / off-chain-cancel that
+/// produces no artifact the coordinator needs).
+#[derive(Debug, Clone)]
+pub enum SignOutcome {
+    /// A broadcast (and, for names, mined) transaction hash — EOA/Safe sends,
+    /// every name write.
+    Tx(TxHash),
+    /// A placed CoW order.
+    Order(Box<TrackedOrder>),
+    /// No artifact — a Safe propose-to-service, or an off-chain order cancel.
+    Unit,
+}
+
+impl SignOutcome {
+    /// Extract the transaction hash from a `Tx` outcome. The producer/handler
+    /// pairing guarantees a tx-shaped flow (Send / Safe / names) always yields
+    /// `Tx`; a mismatch can only be an internal wiring bug, surfaced as an error
+    /// (never a panic — this runs on the fund-safety result path).
+    fn tx(self) -> Result<TxHash, String> {
+        match self {
+            SignOutcome::Tx(hash) => Ok(hash),
+            _ => Err("internal: expected a transaction outcome".to_string()),
+        }
+    }
+
+    /// Extract the placed order from an `Order` outcome (see [`Self::tx`]).
+    fn order(self) -> Result<Box<TrackedOrder>, String> {
+        match self {
+            SignOutcome::Order(order) => Ok(order),
+            _ => Err("internal: expected an order outcome".to_string()),
+        }
+    }
+}
+
+/// Which in-app signing flow produced a [`Message::Signed`], plus the small bit
+/// of flow context the result handler needs but the [`SignOutcome`] doesn't
+/// carry (the CoW host surface, a cancelled order's uid, a commit's plan). One
+/// tag per flow: the result-side mirror of `sign_review::SignAction`.
+#[derive(Debug, Clone)]
+pub enum SignTag {
+    /// EOA send (overlay kept open until this lands).
+    Send,
+    /// Safe send, direct sign+execute.
+    SafeSendExecute,
+    /// Safe send, propose to the transaction service.
+    SafeSendPropose,
+    /// CoW order placement, routed back to `host`.
+    Cow { host: CowHost },
+    /// CoW off-chain order cancellation for `uid`, reported on `host`.
+    CowCancel { host: CowHost, uid: String },
+    /// Name registration step 1 (commit) — carries the plan for the reveal step.
+    NameCommit { plan: RegisterPlan },
+    /// Name registration step 2 (reveal/register) — the pane holds its own label
+    /// state, so the result collapses to `Ok(())` / `Err`.
+    NameRegister,
+    /// Name renewal — the success notice ("Renewed {name}") needs the label.
+    NameRenew { name: String },
+    /// Set-recipient — the success notice ("Updated {name}'s recipient") needs it.
+    NameSetRecipient { name: String },
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     /// Side-effect ack from the Mainnet Helios verification refresh.
@@ -245,14 +309,19 @@ pub enum Message {
         ens: Option<String>,
     },
     Contacts(contacts_settings::Message),
-    /// Result of a Safe-send sign+broadcast task. No signer handoff
-    /// needed: the executor was derived inside the task from a
-    /// linked owner's key, so nothing was moved out of the
-    /// dashboard.
-    SafeSendBroadcastReturn(Result<TxHash, String>),
-    /// Result of a Safe-send *propose-to-service* task (vs. the direct
-    /// broadcast above).
-    SafeSendProposeReturn(Result<(), String>),
+    /// Unified result of every in-app signing task — EOA/Safe sends, CoW
+    /// place/cancel, and name writes all resolve here. `tag` names the flow (+ the
+    /// little context the outcome doesn't carry), `signer` is `Some` for the
+    /// parked-EOA flows that must reclaim it (`None` for Safe, whose owner signers
+    /// are built inside the task), and `result` is the flow's [`SignOutcome`] or a
+    /// friendly error. Replaced the per-flow `*BroadcastReturn` / `CowPlaced` /
+    /// `CowCancel` / `Name*` fan-out. (Privacy-Pools keeps its own `PoolSubmitted`
+    /// — its `Option<String>` payload + no-signature relayed path don't fit here.)
+    Signed {
+        tag: SignTag,
+        signer: Option<SignerHandoff>,
+        result: Result<SignOutcome, String>,
+    },
     /// User tapped a pending Safe queue row. Index into `safe_pending`
     /// at click time; bounds-checked on handling.
     OpenSafeTxDetails(usize),
@@ -286,14 +355,6 @@ pub enum Message {
     CommitRename,
     /// User pressed Escape (or clicked ✗) — discard the draft.
     CancelRename,
-    /// Result of a sign-and-broadcast task spawned from `Message::Send(Confirm)`.
-    /// Carries the signer back via `SignerHandoff` so the dashboard can put it
-    /// back into `self.signer` (it had to be moved out by value to be sent to
-    /// the async task — `KaoSigner` is non-`Clone`).
-    SendBroadcastReturn {
-        result: Result<TxHash, String>,
-        signer: SignerHandoff,
-    },
     /// Result of the dashboard's startup reverse-ENS lookup. Carries the
     /// address it was issued against so a quick account switch can't apply
     /// a name to the wrong account.
@@ -359,47 +420,10 @@ pub enum Message {
         years: u32,
         result: Result<crate::names::manage::RegisterQuote, String>,
     },
-    /// Names app: the commit landed (mined). Carries the plan (with its secret)
-    /// for the reveal step, and the parked signer back.
-    NameCommitted {
-        result: Result<(RegisterPlan, TxHash), String>,
-        signer: SignerHandoff,
-    },
-    /// Names app: register/reveal finished. `String` is the registered name.
-    NameRegistered {
-        result: Result<(String, TxHash), String>,
-        signer: SignerHandoff,
-    },
-    /// Names app: renewal finished.
-    NameRenewed {
-        result: Result<(String, TxHash), String>,
-        signer: SignerHandoff,
-    },
-    /// Names app: set-recipient finished.
-    NameRecipientSet {
-        result: Result<(String, TxHash), String>,
-        signer: SignerHandoff,
-    },
     /// A CoW quote returned (or errored). Routed back to the host's composer.
     CowQuote {
         host: CowHost,
         result: Result<crate::cow::api::QuoteResponse, String>,
-    },
-    /// A CoW order placement finished. Carries the signer back via
-    /// `SignerHandoff` (moved out for the async approve/sign path, like Send).
-    CowPlaced {
-        host: CowHost,
-        result: Result<TrackedOrder, String>,
-        signer: SignerHandoff,
-    },
-    /// An off-chain order cancellation finished. Signer handed back as above.
-    /// `host` records which surface (Swap modal / Apps) raised the cancel so a
-    /// failure can be reported back there instead of being swallowed.
-    CowCancel {
-        host: CowHost,
-        uid: String,
-        result: Result<(), String>,
-        signer: SignerHandoff,
     },
     /// A tracked order's status poll returned. Errors (incl. indexer-lag 404s)
     /// are ignored so a transient miss never flips an order to a wrong state.
@@ -1447,21 +1471,6 @@ impl WalletScreen {
         self.order_op_in_flight = true;
         let signer = mem::replace(&mut self.signer, KaoSigner::ViewOnly(self.address));
         handoff_with(signer)
-    }
-
-    /// Reclaim the EOA signer parked for a name-service write op and clear the
-    /// in-flight flag — the shared tail of every `Name*` result handler.
-    ///
-    /// Only a *real* signer for the *current* account is restored. Refusing a
-    /// `ViewOnly` placeholder stops a stray/late reclaim from downgrading a live
-    /// signer to view-only (which would silently disable signing across the whole
-    /// wallet); refusing a signer whose address ≠ the active account stops an op
-    /// spawned before an account switch from contaminating the new account with
-    /// the old account's key. In both cases the reclaimed value is simply
-    /// dropped.
-    fn reclaim_order_signer(&mut self, signer: SignerHandoff) {
-        self.install_reclaimed_signer(&signer);
-        self.order_op_in_flight = false;
     }
 
     /// Safely restore a signer parked for an in-flight signing op: install it
@@ -3483,89 +3492,264 @@ impl WalletScreen {
                     }
                 }
             }
-            Message::SendBroadcastReturn { result, signer } => {
-                // Reclaim the signer regardless of pane/overlay state — the
-                // dashboard must end up holding it again (and only if it's the
-                // real signer for the current account; see
-                // `install_reclaimed_signer`).
-                self.install_reclaimed_signer(&signer);
-                match &result {
-                    Ok(hash) => info!(hash = %format!("{hash:#x}"), "broadcast ok"),
-                    Err(e) => warn!(error = %e, "broadcast failed"),
+            Message::Signed {
+                tag,
+                signer,
+                result,
+            } => {
+                // ── Shared tail ── reclaim the parked signer and clear the
+                // in-flight flag. Signing is serialized (`is_signing_busy`), so at
+                // most one op is ever live — clearing `order_op_in_flight` here is
+                // correct for every flow (a no-op for the ones, Send / Safe, that
+                // never set it). Safe sends carry `signer: None` (their owner
+                // signers are built inside the task, nothing was parked). This is
+                // the single reclaim site the whole point of P4 centralized.
+                if let Some(s) = &signer {
+                    self.install_reclaimed_signer(s);
                 }
-                // Refresh balance + portfolio + history after a successful send so
-                // the dashboard reflects the new state. History is gated on
-                // `history_loaded` — no point fetching a tab the user never opened.
-                let refresh_on_success = |s: &mut Self| -> Task<Message> {
-                    let mut tasks = vec![s.refresh_verification_task(), s.fetch_portfolio_task()];
-                    if s.history_loaded {
-                        s.history_loading = true;
-                        s.reset_history_pending();
-                        tasks.push(s.fetch_history_task());
-                    }
-                    Task::batch(tasks)
-                };
+                self.order_op_in_flight = false;
 
-                // Overlay-driven EOA send: the review was kept open in its waiting
-                // phase across the sign + broadcast.
-                let overlay_send = self
-                    .sign_review
-                    .as_ref()
-                    .is_some_and(|r| matches!(r.action, sign_review::SignAction::Send { .. }));
-                if overlay_send {
-                    match result {
-                        Err(e) => {
-                            // Keep the review up so the user can read the failure
-                            // and retry Confirm; clear the pane's busy flag so the
-                            // retry can dispatch.
-                            if let Some(r) = self.sign_review.as_mut() {
-                                r.signing_since = None;
-                                r.error = Some(e.clone());
-                            }
-                            if let Modal::Send(p) = &mut self.modal {
-                                let _ = p.update(send::Message::BroadcastDone(Err(e)));
-                            }
-                            return (Task::none(), None);
+                match tag {
+                    SignTag::Send => {
+                        let result = result.and_then(SignOutcome::tx);
+                        match &result {
+                            Ok(hash) => info!(hash = %format!("{hash:#x}"), "broadcast ok"),
+                            Err(e) => warn!(error = %e, "broadcast failed"),
                         }
-                        Ok(hash) => {
-                            // Close the overlay and drive the host pane straight to
-                            // its success screen — the overlay already provided the
-                            // waiting feedback, so no separate "broadcasting" beat.
-                            self.sign_review = None;
-                            if let Modal::Send(p) = &mut self.modal {
-                                let _ = p.update(send::Message::BroadcastDone(Ok(hash)));
-                                let _ = p.update(send::Message::AdvanceToDone);
+                        // Refresh balance + portfolio + history after a successful
+                        // send. History is gated on `history_loaded` — no point
+                        // fetching a tab the user never opened.
+                        let refresh_on_success = |s: &mut Self| -> Task<Message> {
+                            let mut tasks =
+                                vec![s.refresh_verification_task(), s.fetch_portfolio_task()];
+                            if s.history_loaded {
+                                s.history_loading = true;
+                                s.reset_history_pending();
+                                tasks.push(s.fetch_history_task());
                             }
-                            return (refresh_on_success(self), None);
+                            Task::batch(tasks)
+                        };
+                        let overlay_send = self.sign_review.as_ref().is_some_and(|r| {
+                            matches!(r.action, sign_review::SignAction::Send { .. })
+                        });
+                        if overlay_send {
+                            match result {
+                                Err(e) => {
+                                    // Keep the review up so the user can read the
+                                    // failure and retry; clear the pane busy flag.
+                                    if let Some(r) = self.sign_review.as_mut() {
+                                        r.signing_since = None;
+                                        r.error = Some(e.clone());
+                                    }
+                                    if let Modal::Send(p) = &mut self.modal {
+                                        let _ = p.update(send::Message::BroadcastDone(Err(e)));
+                                    }
+                                    return (Task::none(), None);
+                                }
+                                Ok(hash) => {
+                                    // Close the overlay and drive the host pane
+                                    // straight to its success screen.
+                                    self.sign_review = None;
+                                    if let Modal::Send(p) = &mut self.modal {
+                                        let _ = p.update(send::Message::BroadcastDone(Ok(hash)));
+                                        let _ = p.update(send::Message::AdvanceToDone);
+                                    }
+                                    return (refresh_on_success(self), None);
+                                }
+                            }
+                        }
+                        // No overlay (modal closed mid-broadcast): pump the pane if
+                        // still open, else drop it — the tx was still sent.
+                        if let Modal::Send(p) = &mut self.modal {
+                            let success = result.is_ok();
+                            let (task, _outcome) = p.update(send::Message::BroadcastDone(result));
+                            let advance_task = if success {
+                                Task::perform(
+                                    async {
+                                        tokio::time::sleep(Duration::from_millis(2200)).await;
+                                    },
+                                    |_| Message::Send(send::Message::AdvanceToDone),
+                                )
+                            } else {
+                                Task::none()
+                            };
+                            let refresh = if success {
+                                refresh_on_success(self)
+                            } else {
+                                Task::none()
+                            };
+                            return (
+                                Task::batch([task.map(Message::Send), refresh, advance_task]),
+                                None,
+                            );
                         }
                     }
-                }
-
-                // No overlay (modal closed mid-broadcast, or a legacy path): pump
-                // the pane if it's still open, else drop the result — the tx was
-                // still sent and a future balance refresh will surface it.
-                if let Modal::Send(p) = &mut self.modal {
-                    let success = result.is_ok();
-                    let (task, _outcome) = p.update(send::Message::BroadcastDone(result));
-                    let advance_task = if success {
-                        Task::perform(
-                            async {
-                                tokio::time::sleep(Duration::from_millis(2200)).await;
-                            },
-                            |_| Message::Send(send::Message::AdvanceToDone),
-                        )
-                    } else {
-                        Task::none()
-                    };
-                    let refresh = if success {
-                        refresh_on_success(self)
-                    } else {
-                        Task::none()
-                    };
-                    return (
-                        Task::batch([task.map(Message::Send), refresh, advance_task]),
-                        None,
-                    );
+                    SignTag::SafeSendExecute => {
+                        let result = result.and_then(SignOutcome::tx);
+                        match &result {
+                            Ok(hash) => {
+                                info!(hash = %format!("{hash:#x}"), "safe-send broadcast ok")
+                            }
+                            Err(e) => warn!(error = %e, "safe-send broadcast failed"),
+                        }
+                        if self.overlay_is_safe_send() {
+                            match result {
+                                Err(e) => {
+                                    if let Some(r) = self.sign_review.as_mut() {
+                                        r.signing_since = None;
+                                        r.error = Some(e.clone());
+                                    }
+                                    if let Modal::Send(p) = &mut self.modal {
+                                        let _ = p.update(send::Message::BroadcastDone(Err(e)));
+                                    }
+                                    return (Task::none(), None);
+                                }
+                                Ok(hash) => {
+                                    self.sign_review = None;
+                                    if let Modal::Send(p) = &mut self.modal {
+                                        let _ = p.update(send::Message::BroadcastDone(Ok(hash)));
+                                    }
+                                    return (
+                                        Task::batch([
+                                            self.refresh_verification_task(),
+                                            self.fetch_portfolio_task(),
+                                        ]),
+                                        None,
+                                    );
+                                }
+                            }
+                        }
+                        if let Modal::Send(p) = &mut self.modal {
+                            let success = result.is_ok();
+                            let (task, _outcome) = p.update(send::Message::BroadcastDone(result));
+                            let refresh = if success {
+                                Task::batch([
+                                    self.refresh_verification_task(),
+                                    self.fetch_portfolio_task(),
+                                ])
+                            } else {
+                                Task::none()
+                            };
+                            return (Task::batch([task.map(Message::Send), refresh]), None);
+                        }
+                    }
+                    SignTag::SafeSendPropose => {
+                        let result = result.map(|_| ());
+                        match &result {
+                            Ok(()) => info!("safe-send propose ok"),
+                            Err(e) => warn!(error = %e, "safe-send propose failed"),
+                        }
+                        if self.overlay_is_safe_send() {
+                            match result {
+                                Err(e) => {
+                                    if let Some(r) = self.sign_review.as_mut() {
+                                        r.signing_since = None;
+                                        r.error = Some(e.clone());
+                                    }
+                                    if let Modal::Send(p) = &mut self.modal {
+                                        let _ = p.update(send::Message::ProposeDone(Err(e)));
+                                    }
+                                    return (Task::none(), None);
+                                }
+                                Ok(()) => {
+                                    self.sign_review = None;
+                                    if let Modal::Send(p) = &mut self.modal {
+                                        let _ = p.update(send::Message::ProposeDone(Ok(())));
+                                    }
+                                    return (
+                                        self.fetch_safe_pending_task().unwrap_or_else(Task::none),
+                                        None,
+                                    );
+                                }
+                            }
+                        }
+                        if let Modal::Send(p) = &mut self.modal {
+                            let success = result.is_ok();
+                            let (task, _outcome) = p.update(send::Message::ProposeDone(result));
+                            let refresh = if success {
+                                self.fetch_safe_pending_task().unwrap_or_else(Task::none)
+                            } else {
+                                Task::none()
+                            };
+                            return (Task::batch([task.map(Message::Send), refresh]), None);
+                        }
+                    }
+                    SignTag::Cow { host } => {
+                        match result.and_then(SignOutcome::order) {
+                            Ok(order) => {
+                                let order = *order;
+                                let uid = order.uid.clone();
+                                let chain = order.chain;
+                                if !self.tracked_orders.iter().any(|o| o.uid == uid) {
+                                    self.tracked_orders.push(order);
+                                }
+                                match host {
+                                    CowHost::Modal => {
+                                        if let Modal::Swap(p) = &mut self.modal {
+                                            p.begin_tracking(uid.clone());
+                                        }
+                                    }
+                                    CowHost::Apps => self.apps.placement_done(),
+                                }
+                                // Immediate status fetch so the UI isn't blank
+                                // until the 10s poll tick.
+                                return (spawn_cow_status(chain, uid), None);
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "cow: order placement failed");
+                                match host {
+                                    CowHost::Modal => {
+                                        if let Modal::Swap(p) = &mut self.modal {
+                                            p.placement_failed(e);
+                                        }
+                                    }
+                                    CowHost::Apps => self.apps.placement_failed(e),
+                                }
+                            }
+                        }
+                    }
+                    SignTag::CowCancel { host, uid } => {
+                        match result.map(|_| ()) {
+                            Ok(()) => {
+                                if let Some(o) =
+                                    self.tracked_orders.iter_mut().find(|o| o.uid == uid)
+                                {
+                                    o.status = OrderStatus::Cancelled;
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "cow: cancel failed");
+                                // Surface the failure on the originating pane rather
+                                // than swallowing it (reuses the placement channel).
+                                match host {
+                                    CowHost::Modal => {
+                                        if let Modal::Swap(p) = &mut self.modal {
+                                            p.placement_failed(e);
+                                        }
+                                    }
+                                    CowHost::Apps => self.apps.placement_failed(e),
+                                }
+                            }
+                        }
+                    }
+                    SignTag::NameCommit { plan } => {
+                        // `on_commit` uses only the plan (for the reveal step), not
+                        // the hash — so `Tx(_)` collapses to the plan.
+                        self.apps.names_pane().on_commit(result.map(|_| plan));
+                    }
+                    SignTag::NameRegister => {
+                        // `on_register` reads the label from its own retained state,
+                        // so the outcome collapses to `Ok(())` / `Err`.
+                        self.apps.names_pane().on_register(result.map(|_| ()));
+                    }
+                    SignTag::NameRenew { name } => {
+                        self.apps.names_pane().on_renew(result.map(|_| name));
+                    }
+                    SignTag::NameSetRecipient { name } => {
+                        self.apps
+                            .names_pane()
+                            .on_set_recipient(result.map(|_| name));
+                    }
                 }
             }
             Message::EnsAutoNameResolved { address, result } => {
@@ -3916,22 +4100,6 @@ impl WalletScreen {
                     self.apps.names_pane().on_quote(years, result);
                 }
             }
-            Message::NameCommitted { result, signer } => {
-                self.reclaim_order_signer(signer);
-                self.apps.names_pane().on_commit(result);
-            }
-            Message::NameRegistered { result, signer } => {
-                self.reclaim_order_signer(signer);
-                self.apps.names_pane().on_register(result);
-            }
-            Message::NameRenewed { result, signer } => {
-                self.reclaim_order_signer(signer);
-                self.apps.names_pane().on_renew(result);
-            }
-            Message::NameRecipientSet { result, signer } => {
-                self.reclaim_order_signer(signer);
-                self.apps.names_pane().on_set_recipient(result);
-            }
             Message::CowQuote { host, result } => match host {
                 CowHost::Modal => {
                     if let Modal::Swap(p) = &mut self.modal {
@@ -3940,78 +4108,6 @@ impl WalletScreen {
                 }
                 CowHost::Apps => self.apps.on_quote(result),
             },
-            Message::CowPlaced {
-                host,
-                result,
-                signer,
-            } => {
-                // Always reclaim the signer, regardless of pane state.
-                self.install_reclaimed_signer(&signer);
-                // The order op has resolved — the signer is back, so the Apps
-                // surface no longer needs the in-flight reprieve.
-                self.order_op_in_flight = false;
-                match result {
-                    Ok(order) => {
-                        let uid = order.uid.clone();
-                        let chain = order.chain;
-                        if !self.tracked_orders.iter().any(|o| o.uid == uid) {
-                            self.tracked_orders.push(order);
-                        }
-                        match host {
-                            CowHost::Modal => {
-                                if let Modal::Swap(p) = &mut self.modal {
-                                    p.begin_tracking(uid.clone());
-                                }
-                            }
-                            CowHost::Apps => self.apps.placement_done(),
-                        }
-                        // Immediate status fetch so the UI isn't blank until the
-                        // 10s poll tick.
-                        return (spawn_cow_status(chain, uid), None);
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "cow: order placement failed");
-                        match host {
-                            CowHost::Modal => {
-                                if let Modal::Swap(p) = &mut self.modal {
-                                    p.placement_failed(e);
-                                }
-                            }
-                            CowHost::Apps => self.apps.placement_failed(e),
-                        }
-                    }
-                }
-            }
-            Message::CowCancel {
-                host,
-                uid,
-                result,
-                signer,
-            } => {
-                self.install_reclaimed_signer(&signer);
-                self.order_op_in_flight = false;
-                match result {
-                    Ok(()) => {
-                        if let Some(o) = self.tracked_orders.iter_mut().find(|o| o.uid == uid) {
-                            o.status = OrderStatus::Cancelled;
-                        }
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "cow: cancel failed");
-                        // Surface the failure on the originating pane instead of
-                        // swallowing it — otherwise a locked-Ledger cancel looks
-                        // like a no-op. Reuses the placement-error channel.
-                        match host {
-                            CowHost::Modal => {
-                                if let Modal::Swap(p) = &mut self.modal {
-                                    p.placement_failed(e);
-                                }
-                            }
-                            CowHost::Apps => self.apps.placement_failed(e),
-                        }
-                    }
-                }
-            }
             Message::PoolsDiscovered { chain, result } => {
                 let pools = match result {
                     Ok(pools) => pools,
@@ -4506,98 +4602,6 @@ impl WalletScreen {
                         return (task, None);
                     }
                     None => return (task, None),
-                }
-            }
-            Message::SafeSendBroadcastReturn(result) => {
-                match &result {
-                    Ok(hash) => info!(hash = %format!("{hash:#x}"), "safe-send broadcast ok"),
-                    Err(e) => warn!(error = %e, "safe-send broadcast failed"),
-                }
-                // Overlay-driven Safe execute: resolve the still-open review.
-                if self.overlay_is_safe_send() {
-                    match result {
-                        Err(e) => {
-                            // Keep the review up so the user can read the failure
-                            // and retry; clear the pane's busy flag.
-                            if let Some(r) = self.sign_review.as_mut() {
-                                r.signing_since = None;
-                                r.error = Some(e.clone());
-                            }
-                            if let Modal::Send(p) = &mut self.modal {
-                                let _ = p.update(send::Message::BroadcastDone(Err(e)));
-                            }
-                            return (Task::none(), None);
-                        }
-                        Ok(hash) => {
-                            self.sign_review = None;
-                            if let Modal::Send(p) = &mut self.modal {
-                                let _ = p.update(send::Message::BroadcastDone(Ok(hash)));
-                            }
-                            return (
-                                Task::batch([
-                                    self.refresh_verification_task(),
-                                    self.fetch_portfolio_task(),
-                                ]),
-                                None,
-                            );
-                        }
-                    }
-                }
-                if let Modal::Send(p) = &mut self.modal {
-                    let success = result.is_ok();
-                    let (task, _outcome) = p.update(send::Message::BroadcastDone(result));
-                    let refresh = if success {
-                        Task::batch([
-                            self.refresh_verification_task(),
-                            self.fetch_portfolio_task(),
-                        ])
-                    } else {
-                        Task::none()
-                    };
-                    return (Task::batch([task.map(Message::Send), refresh]), None);
-                }
-            }
-            Message::SafeSendProposeReturn(result) => {
-                match &result {
-                    Ok(()) => info!("safe-send propose ok"),
-                    Err(e) => warn!(error = %e, "safe-send propose failed"),
-                }
-                // Overlay-driven Safe propose: resolve the still-open review.
-                if self.overlay_is_safe_send() {
-                    match result {
-                        Err(e) => {
-                            if let Some(r) = self.sign_review.as_mut() {
-                                r.signing_since = None;
-                                r.error = Some(e.clone());
-                            }
-                            if let Modal::Send(p) = &mut self.modal {
-                                let _ = p.update(send::Message::ProposeDone(Err(e)));
-                            }
-                            return (Task::none(), None);
-                        }
-                        Ok(()) => {
-                            self.sign_review = None;
-                            if let Modal::Send(p) = &mut self.modal {
-                                let _ = p.update(send::Message::ProposeDone(Ok(())));
-                            }
-                            return (
-                                self.fetch_safe_pending_task().unwrap_or_else(Task::none),
-                                None,
-                            );
-                        }
-                    }
-                }
-                if let Modal::Send(p) = &mut self.modal {
-                    let success = result.is_ok();
-                    let (task, _outcome) = p.update(send::Message::ProposeDone(result));
-                    // On success refresh the pending queue so the new
-                    // proposal shows up the moment the user closes.
-                    let refresh = if success {
-                        self.fetch_safe_pending_task().unwrap_or_else(Task::none)
-                    } else {
-                        Task::none()
-                    };
-                    return (Task::batch([task.map(Message::Send), refresh]), None);
                 }
             }
             Message::OpenSafeTxDetails(idx) => {
@@ -6582,7 +6586,11 @@ fn spawn_safe_broadcast_task(
             )
             .await
         },
-        Message::SafeSendBroadcastReturn,
+        |result| Message::Signed {
+            tag: SignTag::SafeSendExecute,
+            signer: None,
+            result: result.map(SignOutcome::Tx),
+        },
     )
 }
 
@@ -6616,7 +6624,11 @@ fn spawn_safe_propose_task(
             .await?;
             Ok(())
         },
-        Message::SafeSendProposeReturn,
+        |result: Result<(), String>| Message::Signed {
+            tag: SignTag::SafeSendPropose,
+            signer: None,
+            result: result.map(|()| SignOutcome::Unit),
+        },
     )
 }
 
@@ -6895,9 +6907,10 @@ fn spawn_broadcast_task(
             }
             result
         },
-        move |result| Message::SendBroadcastReturn {
-            result,
-            signer: handoff,
+        move |result| Message::Signed {
+            tag: SignTag::Send,
+            signer: Some(handoff),
+            result: result.map(SignOutcome::Tx),
         },
     )
 }
@@ -7013,16 +7026,17 @@ fn spawn_name_commit(
     plan: RegisterPlan,
 ) -> Task<Message> {
     let inner = handoff.clone();
+    let tag_plan = plan.clone();
     Task::perform(
         async move {
             let signer = match take_live_signer(&inner, &desc).await {
                 Ok(s) => s,
-                Err(e) => return Err::<(RegisterPlan, TxHash), String>(e),
+                Err(e) => return Err::<TxHash, String>(e),
             };
             let result = async {
                 let hash = crate::names::manage::submit_commit(&*network, &signer, &plan).await?;
                 await_mined(&network, hash).await?;
-                Ok::<_, String>((plan.clone(), hash))
+                Ok::<_, String>(hash)
             }
             .await;
             if let Ok(mut g) = inner.lock() {
@@ -7030,9 +7044,10 @@ fn spawn_name_commit(
             }
             result
         },
-        move |result| Message::NameCommitted {
-            result,
-            signer: handoff,
+        move |result| Message::Signed {
+            tag: SignTag::NameCommit { plan: tag_plan },
+            signer: Some(handoff),
+            result: result.map(SignOutcome::Tx),
         },
     )
 }
@@ -7045,17 +7060,16 @@ fn spawn_name_register(
     plan: RegisterPlan,
 ) -> Task<Message> {
     let inner = handoff.clone();
-    let name = format!("{}{}", plan.label, plan.namespace.tld());
     Task::perform(
         async move {
             let signer = match take_live_signer(&inner, &desc).await {
                 Ok(s) => s,
-                Err(e) => return Err::<(String, TxHash), String>(e),
+                Err(e) => return Err::<TxHash, String>(e),
             };
             let result = async {
                 let hash = crate::names::manage::submit_register(&*network, &signer, &plan).await?;
                 await_mined(&network, hash).await?;
-                Ok::<_, String>((name, hash))
+                Ok::<_, String>(hash)
             }
             .await;
             if let Ok(mut g) = inner.lock() {
@@ -7063,9 +7077,10 @@ fn spawn_name_register(
             }
             result
         },
-        move |result| Message::NameRegistered {
-            result,
-            signer: handoff,
+        move |result| Message::Signed {
+            tag: SignTag::NameRegister,
+            signer: Some(handoff),
+            result: result.map(SignOutcome::Tx),
         },
     )
 }
@@ -7081,12 +7096,11 @@ fn spawn_name_register_xns(
     label: String,
 ) -> Task<Message> {
     let inner = handoff.clone();
-    let name = format!("{label}.{namespace}");
     Task::perform(
         async move {
             let signer = match take_live_signer(&inner, &desc).await {
                 Ok(s) => s,
-                Err(e) => return Err::<(String, TxHash), String>(e),
+                Err(e) => return Err::<TxHash, String>(e),
             };
             let result = async {
                 let hash = crate::names::manage::submit_register_xns(
@@ -7094,7 +7108,7 @@ fn spawn_name_register_xns(
                 )
                 .await?;
                 await_mined(&network, hash).await?;
-                Ok::<_, String>((name, hash))
+                Ok::<_, String>(hash)
             }
             .await;
             if let Ok(mut g) = inner.lock() {
@@ -7102,9 +7116,10 @@ fn spawn_name_register_xns(
             }
             result
         },
-        move |result| Message::NameRegistered {
-            result,
-            signer: handoff,
+        move |result| Message::Signed {
+            tag: SignTag::NameRegister,
+            signer: Some(handoff),
+            result: result.map(SignOutcome::Tx),
         },
     )
 }
@@ -7124,7 +7139,7 @@ fn spawn_name_renew(
         async move {
             let signer = match take_live_signer(&inner, &desc).await {
                 Ok(s) => s,
-                Err(e) => return Err::<(String, TxHash), String>(e),
+                Err(e) => return Err::<TxHash, String>(e),
             };
             let result = async {
                 let duration = crate::names::registrar::ens_duration_secs(years);
@@ -7133,7 +7148,7 @@ fn spawn_name_renew(
                 )
                 .await?;
                 await_mined(&network, hash).await?;
-                Ok::<_, String>((name, hash))
+                Ok::<_, String>(hash)
             }
             .await;
             if let Ok(mut g) = inner.lock() {
@@ -7141,9 +7156,10 @@ fn spawn_name_renew(
             }
             result
         },
-        move |result| Message::NameRenewed {
-            result,
-            signer: handoff,
+        move |result| Message::Signed {
+            tag: SignTag::NameRenew { name },
+            signer: Some(handoff),
+            result: result.map(SignOutcome::Tx),
         },
     )
 }
@@ -7163,7 +7179,7 @@ fn spawn_name_set_recipient(
         async move {
             let signer = match take_live_signer(&inner, &desc).await {
                 Ok(s) => s,
-                Err(e) => return Err::<(String, TxHash), String>(e),
+                Err(e) => return Err::<TxHash, String>(e),
             };
             let result = async {
                 let hash = crate::names::manage::submit_set_recipient(
@@ -7171,7 +7187,7 @@ fn spawn_name_set_recipient(
                 )
                 .await?;
                 await_mined(&network, hash).await?;
-                Ok::<_, String>((name, hash))
+                Ok::<_, String>(hash)
             }
             .await;
             if let Ok(mut g) = inner.lock() {
@@ -7179,9 +7195,10 @@ fn spawn_name_set_recipient(
             }
             result
         },
-        move |result| Message::NameRecipientSet {
-            result,
-            signer: handoff,
+        move |result| Message::Signed {
+            tag: SignTag::NameSetRecipient { name },
+            signer: Some(handoff),
+            result: result.map(SignOutcome::Tx),
         },
     )
 }
@@ -7721,10 +7738,10 @@ fn spawn_cow_place(
             }
             result
         },
-        move |result| Message::CowPlaced {
-            host,
-            result,
-            signer: handoff,
+        move |result| Message::Signed {
+            tag: SignTag::Cow { host },
+            signer: Some(handoff),
+            result: result.map(|order| SignOutcome::Order(Box::new(order))),
         },
     )
 }
@@ -8072,15 +8089,17 @@ fn spawn_name_commit_safe(
     ctx: SafeNameCtx,
     plan: RegisterPlan,
 ) -> Task<Message> {
+    let tag_plan = plan.clone();
     Task::perform(
         async move {
             let call = crate::names::manage::commit_call_for(&*network, &plan).await?;
             let hash = run_name_write_as_safe(&network, &ctx, call).await?;
-            Ok::<_, String>((plan.clone(), hash))
+            Ok::<_, String>(hash)
         },
-        move |result| Message::NameCommitted {
-            result,
-            signer: handoff,
+        move |result| Message::Signed {
+            tag: SignTag::NameCommit { plan: tag_plan },
+            signer: Some(handoff),
+            result: result.map(SignOutcome::Tx),
         },
     )
 }
@@ -8092,16 +8111,16 @@ fn spawn_name_register_safe(
     ctx: SafeNameCtx,
     plan: RegisterPlan,
 ) -> Task<Message> {
-    let name = format!("{}{}", plan.label, plan.namespace.tld());
     Task::perform(
         async move {
             let call = crate::names::manage::register_call_for(&*network, &plan).await?;
             let hash = run_name_write_as_safe(&network, &ctx, call).await?;
-            Ok::<_, String>((name, hash))
+            Ok::<_, String>(hash)
         },
-        move |result| Message::NameRegistered {
-            result,
-            signer: handoff,
+        move |result| Message::Signed {
+            tag: SignTag::NameRegister,
+            signer: Some(handoff),
+            result: result.map(SignOutcome::Tx),
         },
     )
 }
@@ -8115,17 +8134,17 @@ fn spawn_name_register_xns_safe(
     namespace: String,
     label: String,
 ) -> Task<Message> {
-    let name = format!("{label}.{namespace}");
     Task::perform(
         async move {
             let call =
                 crate::names::manage::register_xns_call_for(&*network, &namespace, &label).await?;
             let hash = run_name_write_as_safe(&network, &ctx, call).await?;
-            Ok::<_, String>((name, hash))
+            Ok::<_, String>(hash)
         },
-        move |result| Message::NameRegistered {
-            result,
-            signer: handoff,
+        move |result| Message::Signed {
+            tag: SignTag::NameRegister,
+            signer: Some(handoff),
+            result: result.map(SignOutcome::Tx),
         },
     )
 }
@@ -8146,11 +8165,12 @@ fn spawn_name_renew_safe(
             let call = crate::names::manage::renew_call_for(&*network, namespace, &label, duration)
                 .await?;
             let hash = run_name_write_as_safe(&network, &ctx, call).await?;
-            Ok::<_, String>((name, hash))
+            Ok::<_, String>(hash)
         },
-        move |result| Message::NameRenewed {
-            result,
-            signer: handoff,
+        move |result| Message::Signed {
+            tag: SignTag::NameRenew { name },
+            signer: Some(handoff),
+            result: result.map(SignOutcome::Tx),
         },
     )
 }
@@ -8169,11 +8189,12 @@ fn spawn_name_set_recipient_safe(
         async move {
             let call = crate::names::manage::set_recipient_call_for(namespace, &label, recipient);
             let hash = run_name_write_as_safe(&network, &ctx, call).await?;
-            Ok::<_, String>((name, hash))
+            Ok::<_, String>(hash)
         },
-        move |result| Message::NameRecipientSet {
-            result,
-            signer: handoff,
+        move |result| Message::Signed {
+            tag: SignTag::NameSetRecipient { name },
+            signer: Some(handoff),
+            result: result.map(SignOutcome::Tx),
         },
     )
 }
@@ -8229,10 +8250,10 @@ fn spawn_cow_place_safe(
             )
             .await
         },
-        move |result| Message::CowPlaced {
-            host,
-            result,
-            signer: handoff,
+        move |result| Message::Signed {
+            tag: SignTag::Cow { host },
+            signer: Some(handoff),
+            result: result.map(|order| SignOutcome::Order(Box::new(order))),
         },
     )
 }
@@ -8572,11 +8593,13 @@ fn spawn_cow_cancel(
             }
             res
         },
-        move |result| Message::CowCancel {
-            host,
-            uid: uid_for_msg.clone(),
-            result,
-            signer: handoff,
+        move |result| Message::Signed {
+            tag: SignTag::CowCancel {
+                host,
+                uid: uid_for_msg.clone(),
+            },
+            signer: Some(handoff),
+            result: result.map(|()| SignOutcome::Unit),
         },
     )
 }
@@ -8626,11 +8649,13 @@ fn spawn_cow_cancel_safe(
             }
             cow_cancel_safe(&network, &owners, ctx.safe, chain, &uid).await
         },
-        move |result| Message::CowCancel {
-            host,
-            uid: uid_for_msg.clone(),
-            result,
-            signer: handoff,
+        move |result| Message::Signed {
+            tag: SignTag::CowCancel {
+                host,
+                uid: uid_for_msg.clone(),
+            },
+            signer: Some(handoff),
+            result: result.map(|()| SignOutcome::Unit),
         },
     )
 }
@@ -9102,10 +9127,12 @@ mod tests {
 
         // Resolving the op (here an errored placement) reclaims the signer and
         // clears the in-flight reprieve — back to the normal capability check.
-        s.update(Message::CowPlaced {
-            host: CowHost::Apps,
+        s.update(Message::Signed {
+            tag: SignTag::Cow {
+                host: CowHost::Apps,
+            },
+            signer: Some(handoff),
             result: Err("placement failed (test)".into()),
-            signer: handoff,
         });
         assert!(
             !s.order_op_in_flight,
@@ -9258,20 +9285,24 @@ mod tests {
         assert!(s.is_signing_busy());
 
         // The first op (holding the REAL signer) resolves first — restoring it.
-        s.update(Message::CowPlaced {
-            host: CowHost::Apps,
+        s.update(Message::Signed {
+            tag: SignTag::Cow {
+                host: CowHost::Apps,
+            },
+            signer: Some(h1),
             result: Err("first op (test)".into()),
-            signer: h1,
         });
         assert!(s.can_swap(), "real signer restored by the first reclaim");
 
         // The second op resolves later holding only the ViewOnly placeholder.
         // The hardened reclaim must NOT overwrite the live signer with it — that
         // is exactly the bug that would strand the wallet as view-only.
-        s.update(Message::CowPlaced {
-            host: CowHost::Apps,
+        s.update(Message::Signed {
+            tag: SignTag::Cow {
+                host: CowHost::Apps,
+            },
+            signer: Some(h2),
             result: Err("second op (test)".into()),
-            signer: h2,
         });
         assert!(
             s.can_swap(),

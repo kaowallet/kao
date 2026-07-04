@@ -27,7 +27,7 @@ use crate::portfolio::LiveToken;
 use crate::safe::tx::{Operation, SafeTxInput};
 use crate::ui::kao_theme::{KaoTheme, with_alpha};
 use crate::ui::kao_widgets::{
-    CopyKick, avatar, black, bold, colored_address, colored_hash, ghost_button, hint_pill,
+    CopyKick, avatar, black, bold, colored_address, colored_hash_copyable, ghost_button, hint_pill,
     hover_tint, kao_fit, kao_fit_size, kao_scrollable_style, kao_text, kaomoji_for_account,
     kaomoji_for_index, modal_wrapper, mono, mono_black, mono_bold, primary_button,
     secondary_button, text_input_style, token_avatar, vspace,
@@ -2424,7 +2424,9 @@ pub(crate) fn render_safe_send_review<'a, M: 'a + CopyKick>(
     recip_col = recip_col.push(recip_inner);
     let recipient_card = review_card(t, recip_col.into());
 
-    // Safe-tx hash card — the exact bytes every owner commits to.
+    // Safe-tx hash card — the exact bytes every owner commits to. Named and
+    // click-to-copy: for a first-time signer it isn't obvious what this string
+    // is or that it's actionable, so spell out both.
     let hash_card = review_card(
         t,
         column![
@@ -2432,12 +2434,20 @@ pub(crate) fn render_safe_send_review<'a, M: 'a + CopyKick>(
                 .size(10)
                 .color(t.sub)
                 .font(mono_bold()),
-            vspace(8),
-            colored_hash(t, r.safe_tx_hash),
-            vspace(4),
-            text("Verify this exact hash on your signing device and with co-signers.")
-                .size(10)
-                .color(t.sub),
+            vspace(2),
+            text("SafeTx hash · click to copy")
+                .size(12)
+                .color(t.text)
+                .font(bold()),
+            vspace(6),
+            colored_hash_copyable::<M>(t, r.safe_tx_hash),
+            vspace(6),
+            text(
+                "This is the fingerprint of this exact transaction — every owner signs it. \
+                 It must match on your signing device and your co-signers' before you approve."
+            )
+            .size(10)
+            .color(t.sub),
             vspace(4),
             text(format!("Safe nonce {}", r.nonce))
                 .size(10)

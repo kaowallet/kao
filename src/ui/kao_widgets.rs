@@ -1047,6 +1047,26 @@ pub(crate) fn chunk_palette(t: KaoTheme) -> [Color; 10] {
 /// co-signers. Never truncated: a prefix/suffix display is exactly what
 /// a hash-collision phisher relies on.
 pub fn colored_hash<'a, M: 'a>(t: KaoTheme, hash: B256) -> Element<'a, M> {
+    colored_hash_body(t, hash, false)
+}
+
+/// A clickable, hover-greying hash — a left click copies the full `0x…` hex to
+/// the clipboard, exactly like [`colored_address`]. Used where the user must
+/// copy the value to compare it elsewhere (the Safe review's `safeTxHash`, which
+/// has to match on every signing device and co-signer).
+pub fn colored_hash_copyable<'a, M: CopyKick + 'a>(t: KaoTheme, hash: B256) -> Element<'a, M> {
+    CopyableAddress::new(
+        colored_hash_body(t, hash, false),
+        colored_hash_body(t, hash, true),
+        format!("{hash:#x}"),
+    )
+    .into()
+}
+
+/// The two-row chunked hash render. `grey` paints every chunk in the muted
+/// colour (the copyable widget's hover state); otherwise each 4-char chunk gets
+/// its palette colour.
+fn colored_hash_body<'a, M: 'a>(t: KaoTheme, hash: B256, grey: bool) -> Element<'a, M> {
     let hex = format!("{hash:x}"); // 64 lowercase hex chars, no 0x
     debug_assert_eq!(hex.len(), 64);
     let chunk_colors = chunk_palette(t);
@@ -1066,12 +1086,8 @@ pub fn colored_hash<'a, M: 'a>(t: KaoTheme, hash: B256) -> Element<'a, M> {
             // `.get()` over `[start..start + 4]`: see `colored_address` — avoids
             // a release-build GUI panic if the hash hex is ever not 64 chars.
             let chunk = hex.get(start..start + 4).unwrap_or("").to_string();
-            spans = spans.push(
-                text(chunk)
-                    .size(13)
-                    .color(chunk_colors[i % 10])
-                    .font(mono_bold()),
-            );
+            let color = if grey { t.sub } else { chunk_colors[i % 10] };
+            spans = spans.push(text(chunk).size(13).color(color).font(mono_bold()));
         }
         lines = lines.push(spans);
     }

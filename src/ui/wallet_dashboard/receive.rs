@@ -9,12 +9,15 @@ use iced::widget::{Space, button, column, container, qr_code, text};
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Subscription, Task};
 
 use crate::ui::kao_theme::KaoTheme;
-use crate::ui::kao_widgets::{black, hover_fill, kao_fit, modal_wrapper, mono};
+use crate::ui::kao_widgets::{black, colored_address, hover_fill, kao_fit, modal_wrapper};
 
 #[derive(Debug, Clone)]
 pub enum Message {
     Copy,
     CopyReset,
+    /// No-op kick published by the click-to-copy address so the update loop
+    /// runs after a copy (see [`crate::ui::kao_widgets::CopyKick`]).
+    AddressCopied,
     Close,
     BoxClickIgnored,
     Key(keyboard::Event),
@@ -71,7 +74,9 @@ impl ReceivePane {
         match msg {
             Message::Copy => {
                 self.copied = true;
-                let addr = format!("{:#x}", self.address);
+                // EIP-55 checksum form — the same string the click-to-copy
+                // address renders and copies, so both affordances agree.
+                let addr = self.address.to_checksum(None);
                 let task = Task::batch([
                     iced::clipboard::write(addr).map(|_: ()| Message::CopyReset),
                     Task::perform(
@@ -87,6 +92,9 @@ impl ReceivePane {
                 self.copied = false;
                 (Task::none(), None)
             }
+            // The click-to-copy address wrote the clipboard itself; this kick
+            // just wakes the update loop and needs no state change.
+            Message::AddressCopied => (Task::none(), None),
             Message::Close => (Task::none(), Some(Outcome::Closed)),
             Message::BoxClickIgnored => (Task::none(), None),
             Message::Key(keyboard::Event::KeyPressed { key, .. }) => {
@@ -105,8 +113,6 @@ impl ReceivePane {
     }
 
     pub fn view<'a>(&'a self, t: KaoTheme, progress: f32) -> Element<'a, Message> {
-        let addr = format!("{:#x}", self.address);
-
         let header_kao = container(kao_fit(t, "(っ◕‿◕)っ", 260.0, 52.0))
             .width(Length::Fill)
             .center_x(Length::Fill);
@@ -126,7 +132,7 @@ impl ReceivePane {
         let light_cell = if t.dark { t.card_alt } else { Color::WHITE };
         let qr_box: Element<'_, Message> = if let Some(qr_data) = &self.qr {
             let qr = qr_code(qr_data)
-                .total_size(180.0)
+                .total_size(300.0)
                 .style(move |_| qr_code::Style {
                     cell: dark_cell,
                     background: light_cell,
@@ -142,25 +148,22 @@ impl ReceivePane {
                 .into()
         };
 
-        let addr_box = container(
-            text(addr)
-                .size(13)
-                .color(t.sub)
-                .font(mono())
-                .wrapping(text::Wrapping::WordOrGlyph),
-        )
-        .padding(Padding::from([10, 14]))
-        .width(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(Background::Color(t.card_alt)),
-            border: Border {
-                color: t.border,
-                width: 1.0,
-                radius: Radius::from(11),
-            },
-            text_color: Some(t.sub),
-            ..container::Style::default()
-        });
+        // Colored, click-to-copy address (same widget the review screens use):
+        // each 4-hex chunk gets a palette colour, hovering greys it, and a click
+        // copies the EIP-55 checksum form to the clipboard.
+        let addr_box = container(colored_address(t, self.address))
+            .padding(Padding::from([12, 14]))
+            .width(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(Background::Color(t.card_alt)),
+                border: Border {
+                    color: t.border,
+                    width: 1.0,
+                    radius: Radius::from(11),
+                },
+                text_color: Some(t.sub),
+                ..container::Style::default()
+            });
 
         let btn_label = if self.copied {
             "Copied! ٩(◕‿◕｡)۶"
@@ -210,7 +213,7 @@ impl ReceivePane {
 
         modal_wrapper(
             t,
-            360.0,
+            480.0,
             progress,
             Message::Close,
             Message::BoxClickIgnored,

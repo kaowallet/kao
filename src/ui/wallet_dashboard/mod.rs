@@ -144,6 +144,11 @@ impl CopyKick for safe_tx_detail::Message {
         Some(safe_tx_detail::Message::AddressCopied)
     }
 }
+impl CopyKick for receive::Message {
+    fn copy_kick() -> Option<Self> {
+        Some(receive::Message::AddressCopied)
+    }
+}
 impl CopyKick for crate::ui::safe_onboarding::Message {}
 
 // ── Messages ────────────────────────────────────────────────────────────────

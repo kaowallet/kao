@@ -2367,6 +2367,7 @@ impl WalletScreen {
             return Task::none();
         };
         let (sell_s, _) = crate::portfolio::format_token_balance(o.sell_amount, o.sell_decimals);
+        let sell_s = trim_trailing_decimal_zeros(&sell_s);
         self.sign_review_seq += 1;
         let seq = self.sign_review_seq;
         let title = format!(
@@ -6052,6 +6053,11 @@ fn build_order_review(
     let (sell_amount, _) = crate::portfolio::format_token_balance(full_sell, draft.sell_decimals);
     let (buy_amount, _) = crate::portfolio::format_token_balance(q.buy_amount, draft.buy_decimals);
     let (min_received, _) = crate::portfolio::format_token_balance(min_raw, draft.buy_decimals);
+    // `format_token_balance` pads to a fixed dp count ("0.005" → "0.005000");
+    // trim the padding so the title and the order rows read cleanly.
+    let sell_amount = trim_trailing_decimal_zeros(&sell_amount);
+    let buy_amount = trim_trailing_decimal_zeros(&buy_amount);
+    let min_received = trim_trailing_decimal_zeros(&min_received);
     sign_review::OrderReview {
         chain: draft.chain,
         sell_amount,

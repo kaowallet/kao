@@ -5152,20 +5152,47 @@ impl WalletScreen {
                 let (task, outcome) = p.update(child_msg);
                 let task = task.map(Message::NetworkWizard);
                 match outcome {
-                    Some(network_setup::Outcome::Completed)
-                    | Some(network_setup::Outcome::Closed)
-                    | Some(network_setup::Outcome::Back) => {
+                    Some(
+                        outcome @ (network_setup::Outcome::Completed
+                        | network_setup::Outcome::Closed
+                        | network_setup::Outcome::Back),
+                    ) => {
                         self.settings_pane = SettingsPane::Root;
                         // The wizard may have changed RPC endpoints and/or
                         // added, edited, toggled, or removed custom networks.
-                        // The network client rebuilds lazily from settings and
-                        // custom providers are built per-fetch, so a portfolio
-                        // refresh is all that's needed to reflect the new
-                        // config (e.g. a freshly-added custom network appears).
-                        return (
-                            Task::batch([task, Task::done(Message::RefreshPortfolio)]),
-                            None,
-                        );
+                        // Endpoint changes rebuild lazily (they're part of the
+                        // network client's `built_with` comparison) and custom
+                        // providers are built per-fetch, so a portfolio refresh
+                        // reflects those (e.g. a freshly-added custom network).
+                        //
+                        // A checkpoint change is the exception: it's
+                        // deliberately excluded from that comparison (see
+                        // `NetworkClient::get`), so a plain refresh would reuse
+                        // the already-synced client and the new checkpoint would
+                        // never take effect until restart. `Completed` is the
+                        // only outcome that applied the draft, so on it we
+                        // `invalidate()` first — dropping every cached client —
+                        // and refresh once the tasks are stopped, forcing a
+                        // rebuild against the new checkpoint. Closed/Back didn't
+                        // write settings, so a refresh alone suffices there.
+                        let refresh = if matches!(outcome, network_setup::Outcome::Completed) {
+                            // Flip the badge to "Connecting…" now, synchronously.
+                            // `invalidate()` resets the network client's internal
+                            // status, but the dashboard's `self.verification` copy
+                            // only refreshes on `VerificationRefreshed`, which
+                            // doesn't fire until the (multi-second) helios rebuild
+                            // finishes — so without this the badge would keep
+                            // showing the stale prior state for the whole rebuild
+                            // and the user gets no sign anything is happening.
+                            self.verification = VerificationStatus::Connecting;
+                            let network = self.network.clone();
+                            Task::perform(async move { network.invalidate().await }, |()| {
+                                Message::RefreshPortfolio
+                            })
+                        } else {
+                            Task::done(Message::RefreshPortfolio)
+                        };
+                        return (Task::batch([task, refresh]), None);
                     }
                     None => return (task, None),
                 }

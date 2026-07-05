@@ -21,7 +21,11 @@ const DEFAULT_RPCS: &[&str] = &["https://eth.llamarpc.com"];
 ///
 /// HTTPS only. Plain-HTTP endpoints would let a network attacker tamper with
 /// the light-client bootstrap before any consensus signatures get verified.
-const DEFAULT_CONSENSUS_RPCS: &[&str] = &["https://ethereum-beacon-api.publicnode.com"];
+// ChainSafe's public Lodestar node. Replaced ethereum-beacon-api.publicnode.com,
+// whose load-balanced backends intermittently return corrupt (out-of-order
+// period) `light_client/updates` — helios fails the sync with `InvalidPeriod`
+// on the bad entry. See `Chain::default_consensus_url`.
+const DEFAULT_CONSENSUS_RPCS: &[&str] = &["https://lodestar-mainnet.chainsafe.io"];
 
 /// Default Kao privacy-proxy server. All Kao-proxied RPC and indexer
 /// queries are relayed through this endpoint.

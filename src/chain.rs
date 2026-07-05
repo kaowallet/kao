@@ -100,7 +100,13 @@ impl Chain {
     /// are operationsolarstorm.org's L2 light-client beacon proxies.
     pub fn default_consensus_url(self) -> &'static str {
         match self {
-            Chain::Mainnet => "https://ethereum-beacon-api.publicnode.com",
+            // ChainSafe's public Lodestar node. Switched away from
+            // ethereum-beacon-api.publicnode.com, which is load-balanced across
+            // backends that intermittently serve corrupt (out-of-order period)
+            // `light_client/updates` responses — helios chokes on the bad entry
+            // with `InvalidPeriod` and fails the whole sync. Lodestar served a
+            // clean, in-order list on every probe.
+            Chain::Mainnet => "https://lodestar-mainnet.chainsafe.io",
             Chain::Base => "https://base.operationsolarstorm.org",
             Chain::Optimism => "https://op-mainnet.operationsolarstorm.org",
         }

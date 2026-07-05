@@ -39,6 +39,7 @@ pub fn view<'a>(
     hardware: Option<HardwareStatus>,
     network_name: &'a str,
     verification: VerificationStatus,
+    checkpoint_refreshing: bool,
 ) -> Element<'a, Message> {
     let mut body = column![
         brand_header(t),
@@ -92,7 +93,12 @@ pub fn view<'a>(
         body = body.push(hardware_footer(t, status));
         body = body.push(Space::new().height(10));
     }
-    body = body.push(network_footer(t, network_name, verification));
+    body = body.push(network_footer(
+        t,
+        network_name,
+        verification,
+        checkpoint_refreshing,
+    ));
 
     container(body)
         .padding(Padding {
@@ -433,6 +439,7 @@ fn network_footer<'a>(
     t: KaoTheme,
     network_name: &'a str,
     verification: VerificationStatus,
+    checkpoint_refreshing: bool,
 ) -> Element<'a, Message> {
     let dot_color = match verification {
         VerificationStatus::Verified => t.up,
@@ -480,7 +487,7 @@ fn network_footer<'a>(
     ]
     .align_y(Alignment::Center);
 
-    let body = column![
+    let mut body = column![
         top,
         Space::new().height(3),
         text(privacy_line)
@@ -490,6 +497,29 @@ fn network_footer<'a>(
     ]
     .spacing(0)
     .width(Length::Fill);
+
+    // A "Refresh checkpoint" affordance appears only when Helios can't verify —
+    // a stale weak-subjectivity checkpoint is the usual culprit (they rotate
+    // ~daily), and re-fetching a fresh one is the fix. While a refresh is in
+    // flight we keep the row visible with a disabled "Refreshing…" label so the
+    // action reads as taken even as the badge sits on "Connecting…". When
+    // verification is healthy the row is hidden entirely — no busywork offered.
+    let offer_refresh = checkpoint_refreshing
+        || matches!(
+            verification,
+            VerificationStatus::Fallback | VerificationStatus::Unavailable
+        );
+    if offer_refresh {
+        body = body.push(Space::new().height(4));
+        body = body.push(
+            text("checkpoint may be stale")
+                .size(11)
+                .color(t.down)
+                .wrapping(Wrapping::None),
+        );
+        body = body.push(Space::new().height(8));
+        body = body.push(checkpoint_button(t, checkpoint_refreshing));
+    }
 
     container(body)
         .padding(Padding::from([10, 12]))
@@ -505,4 +535,51 @@ fn network_footer<'a>(
             ..container::Style::default()
         })
         .into()
+}
+
+/// Accent "Refresh checkpoint" action inside the network card, shown when
+/// Helios can't verify. Emits `Message::RefreshCheckpoint`, which fetches a
+/// fresh community checkpoint and rebuilds the light client against it. While a
+/// fetch is in flight the button is disabled (no `on_press`) and reads
+/// "Refreshing…" so a second click can't stack another fetch.
+fn checkpoint_button<'a>(t: KaoTheme, refreshing: bool) -> Element<'a, Message> {
+    let label = if refreshing {
+        "Refreshing…"
+    } else {
+        "Refresh checkpoint"
+    };
+    let mut btn = button(
+        container(
+            text(label)
+                .size(13)
+                .color(Color::WHITE)
+                .font(bold())
+                .wrapping(Wrapping::None),
+        )
+        .width(Length::Fill)
+        .align_x(Horizontal::Center)
+        .padding(Padding::from([8, 0])),
+    )
+    .width(Length::Fill)
+    .style(move |_theme, status| button::Style {
+        background: Some(Background::Color(if refreshing {
+            with_alpha(t.a1, 0.55)
+        } else {
+            match status {
+                button::Status::Hovered | button::Status::Pressed => hover_fill(t.a1, Color::WHITE),
+                _ => t.a1,
+            }
+        })),
+        text_color: Color::WHITE,
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: Radius::from(10),
+        },
+        ..button::Style::default()
+    });
+    if !refreshing {
+        btn = btn.on_press(Message::RefreshCheckpoint);
+    }
+    btn.into()
 }

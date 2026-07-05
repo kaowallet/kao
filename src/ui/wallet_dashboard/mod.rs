@@ -286,6 +286,16 @@ pub enum Message {
     /// the current identity. Tokens stay visible during the refresh;
     /// only the indicator on the button reflects the in-flight state.
     RefreshPortfolio,
+    /// User clicked the sidebar's "Refresh checkpoint" button, shown when
+    /// Helios can't verify (a stale weak-subjectivity checkpoint is a common
+    /// cause). Fetches a fresh community checkpoint through the configured
+    /// proxy; the badge flips to "Connecting…" while it runs.
+    RefreshCheckpoint,
+    /// Result of the sidebar checkpoint refresh. On success the new root is
+    /// persisted as the checkpoint override and the network client is
+    /// invalidated so Helios rebuilds against it; on failure the badge is
+    /// re-probed to reflect reality.
+    CheckpointRefreshed(Result<B256, String>),
     /// User clicked an activity row. The argument is the index into
     /// `self.history` at the moment of the click; bounds-checked when
     /// handling because the history can refresh between view and event.
@@ -690,6 +700,9 @@ pub struct WalletScreen {
     /// lands; rendered in the header as a small "Verified by Helios /
     /// Unverified RPC" badge.
     verification: VerificationStatus,
+    /// True while the sidebar's checkpoint refresh is in flight. Gates the
+    /// button (prevents concurrent fetches) and drives its "Refreshing…" label.
+    checkpoint_refreshing: bool,
     /// Which Settings sub-screen is currently rendered.
     settings_pane: SettingsPane,
     /// Live portfolio entries fetched from on-chain balances + CoinGecko.
@@ -890,6 +903,7 @@ impl WalletScreen {
             chrome: ModalChrome::new(),
             network,
             verification: VerificationStatus::Connecting,
+            checkpoint_refreshing: false,
             settings_pane: SettingsPane::Root,
             portfolio,
             portfolio_loading,
@@ -3211,6 +3225,56 @@ impl WalletScreen {
                     None,
                 );
             }
+            Message::RefreshCheckpoint => {
+                // Guard against a second fetch while one is in flight (the
+                // button also hides its own on-press when refreshing).
+                if self.checkpoint_refreshing {
+                    return (Task::none(), None);
+                }
+                self.checkpoint_refreshing = true;
+                // Flip the badge to "Connecting…" immediately so the user sees
+                // the action took, even though the actual rebuild only happens
+                // once a fresh checkpoint lands and the client is invalidated.
+                self.verification = VerificationStatus::Connecting;
+                // Route the fetch through the configured proxy when one is set,
+                // so resolving the checkpoint doesn't leak the real IP — same
+                // posture the wizard's Refresh button uses.
+                let proxy = settings::proxy_enabled().then(settings::proxy_address);
+                return (
+                    Task::perform(
+                        crate::net::fetch_latest_checkpoint(proxy),
+                        Message::CheckpointRefreshed,
+                    ),
+                    None,
+                );
+            }
+            Message::CheckpointRefreshed(result) => {
+                self.checkpoint_refreshing = false;
+                match result {
+                    Ok(cp) => {
+                        info!(checkpoint = %cp, "dashboard: checkpoint refreshed — rebuilding Helios");
+                        // Persist as the override so the fresh root survives
+                        // restart, then invalidate every cached client so the
+                        // next fetch rebuilds Helios against it (the checkpoint
+                        // is deliberately excluded from `built_with`, so a plain
+                        // refresh would reuse the stale-bootstrapped client).
+                        settings::set_checkpoint_override(Some(cp));
+                        let network = self.network.clone();
+                        return (
+                            Task::perform(async move { network.invalidate().await }, |()| {
+                                Message::RefreshPortfolio
+                            }),
+                            None,
+                        );
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "dashboard: checkpoint refresh failed");
+                        // Re-probe so the badge returns to reality rather than
+                        // lingering on the optimistic "Connecting…".
+                        return (self.refresh_verification_task(), None);
+                    }
+                }
+            }
             Message::SafesUpdated(safes) => {
                 // Wholesale replace — refresh-on-open runs in batch
                 // and returns the complete updated list, so there's
@@ -5306,6 +5370,7 @@ impl WalletScreen {
             self.hardware_status(),
             self.network_short_name(),
             self.verification,
+            self.checkpoint_refreshing,
         );
         let app = row![sidebar, self.main_pane(t)]
             .width(Length::Fill)

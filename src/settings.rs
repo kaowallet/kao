@@ -15,17 +15,17 @@ use crate::ui::kao_theme::ThemeKind;
 /// `eth_getBalance` isn't enough). Users can swap to their own provider via
 /// the Custom RPC option in setup.
 const DEFAULT_RPCS: &[&str] = &["https://eth.llamarpc.com"];
-/// Default beacon-chain LC API endpoint for Mainnet. PublicNode's beacon API
-/// serves the `/eth/v1/beacon/light_client/{bootstrap,finality_update}`
-/// calls Helios needs to verify consensus.
+/// Default beacon-chain LC endpoint for Mainnet: the Kao server's beacon proxy.
+///
+/// The Kao server fronts the beacon light-client API Helios needs, doing the
+/// per-endpoint splitting server-side (see SERVER_CONSENSUS.md) so the wallet
+/// talks to one reliable endpoint instead of juggling flaky public providers.
+/// Users can override this with any beacon node in the Consensus step. Matches
+/// `DEFAULT_KAO_SERVER_URL` + `/beacon`; keep the two in sync.
 ///
 /// HTTPS only. Plain-HTTP endpoints would let a network attacker tamper with
 /// the light-client bootstrap before any consensus signatures get verified.
-// ChainSafe's public Lodestar node. Replaced ethereum-beacon-api.publicnode.com,
-// whose load-balanced backends intermittently return corrupt (out-of-order
-// period) `light_client/updates` — helios fails the sync with `InvalidPeriod`
-// on the bad entry. See `Chain::default_consensus_url`.
-const DEFAULT_CONSENSUS_RPCS: &[&str] = &["https://lodestar-mainnet.chainsafe.io"];
+const DEFAULT_CONSENSUS_RPCS: &[&str] = &["https://api.kaowallet.com/beacon"];
 
 /// Default Kao privacy-proxy server. All Kao-proxied RPC and indexer
 /// queries are relayed through this endpoint.
@@ -2759,6 +2759,7 @@ enabled = true
         assert_eq!(extract_drpc_key("https://eth.drpc.org/"), None);
         assert_eq!(extract_drpc_key("not-a-url"), None);
     }
+
 
     #[test]
     fn alchemy_exec_urls_generates_all_chains() {

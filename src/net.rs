@@ -1466,9 +1466,20 @@ async fn build_eth_backend(
         .with_file_db()
         .build()
         .map_err(|e| e.to_string())?;
-    client.wait_synced().await.map_err(|e| e.to_string())?;
+    // On any sync/head failure, shut the client down before returning the
+    // error. helios spawns a consensus task per build whose drop alone doesn't
+    // stop it, so a failed build (bad checkpoint, unreachable beacon endpoint)
+    // would otherwise leak a task that keeps polling the beacon RPC forever —
+    // and failed builds recur (each dashboard refresh retries).
+    if let Err(e) = client.wait_synced().await {
+        client.shutdown().await;
+        return Err(e.to_string());
+    }
     let backend = HeliosBackend::Eth(Arc::new(client));
-    wait_for_head(&backend).await?;
+    if let Err(e) = wait_for_head(&backend).await {
+        backend.shutdown().await;
+        return Err(e);
+    }
     Ok(backend)
 }
 

@@ -12,6 +12,11 @@ RPC (of your choice) is all you need; you can opt in to an Indexer for better to
 
 All the assets (like ERC-20 logos) and databases (like 4Bytes or ERC-7730 registry) are bundled during the build, not fetched in the runtime. Although this produces a slightly heavier app, it reduces the attack surface and is way more private.
 
+Note: Apps use their APIs:
+
+- CoW Swap -> api.cow.fi (getting a quote)
+- Privacy Pools -> api.0xbow.io (loading pools, ASP feed)
+
 ## ( ˶˘ ³˘)♡ No phoning home ε=ε=ε=ε=ε=ε=┌(;￣◇￣)┘
 
 Kao doesn't ship telemetry — neither opt-in nor opt-out. The only metric is GitHub stars (give us a star).

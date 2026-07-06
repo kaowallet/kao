@@ -286,6 +286,16 @@ pub enum Message {
     /// the current identity. Tokens stay visible during the refresh;
     /// only the indicator on the button reflects the in-flight state.
     RefreshPortfolio,
+    /// User clicked the sidebar's "Refresh checkpoint" button, shown when
+    /// Helios can't verify (a stale weak-subjectivity checkpoint is a common
+    /// cause). Fetches a fresh community checkpoint through the configured
+    /// proxy; the badge flips to "Connecting…" while it runs.
+    RefreshCheckpoint,
+    /// Result of the sidebar checkpoint refresh. On success the new root is
+    /// persisted as the checkpoint override and the network client is
+    /// invalidated so Helios rebuilds against it; on failure the badge is
+    /// re-probed to reflect reality.
+    CheckpointRefreshed(Result<B256, String>),
     /// User clicked an activity row. The argument is the index into
     /// `self.history` at the moment of the click; bounds-checked when
     /// handling because the history can refresh between view and event.
@@ -690,6 +700,9 @@ pub struct WalletScreen {
     /// lands; rendered in the header as a small "Verified by Helios /
     /// Unverified RPC" badge.
     verification: VerificationStatus,
+    /// True while the sidebar's checkpoint refresh is in flight. Gates the
+    /// button (prevents concurrent fetches) and drives its "Refreshing…" label.
+    checkpoint_refreshing: bool,
     /// Which Settings sub-screen is currently rendered.
     settings_pane: SettingsPane,
     /// Live portfolio entries fetched from on-chain balances + CoinGecko.
@@ -890,6 +903,7 @@ impl WalletScreen {
             chrome: ModalChrome::new(),
             network,
             verification: VerificationStatus::Connecting,
+            checkpoint_refreshing: false,
             settings_pane: SettingsPane::Root,
             portfolio,
             portfolio_loading,
@@ -3211,6 +3225,56 @@ impl WalletScreen {
                     None,
                 );
             }
+            Message::RefreshCheckpoint => {
+                // Guard against a second fetch while one is in flight (the
+                // button also hides its own on-press when refreshing).
+                if self.checkpoint_refreshing {
+                    return (Task::none(), None);
+                }
+                self.checkpoint_refreshing = true;
+                // Flip the badge to "Connecting…" immediately so the user sees
+                // the action took, even though the actual rebuild only happens
+                // once a fresh checkpoint lands and the client is invalidated.
+                self.verification = VerificationStatus::Connecting;
+                // Route the fetch through the configured proxy when one is set,
+                // so resolving the checkpoint doesn't leak the real IP — same
+                // posture the wizard's Refresh button uses.
+                let proxy = settings::proxy_enabled().then(settings::proxy_address);
+                return (
+                    Task::perform(
+                        crate::net::fetch_latest_checkpoint(proxy),
+                        Message::CheckpointRefreshed,
+                    ),
+                    None,
+                );
+            }
+            Message::CheckpointRefreshed(result) => {
+                self.checkpoint_refreshing = false;
+                match result {
+                    Ok(cp) => {
+                        info!(checkpoint = %cp, "dashboard: checkpoint refreshed — rebuilding Helios");
+                        // Persist as the override so the fresh root survives
+                        // restart, then invalidate every cached client so the
+                        // next fetch rebuilds Helios against it (the checkpoint
+                        // is deliberately excluded from `built_with`, so a plain
+                        // refresh would reuse the stale-bootstrapped client).
+                        settings::set_checkpoint_override(Some(cp));
+                        let network = self.network.clone();
+                        return (
+                            Task::perform(async move { network.invalidate().await }, |()| {
+                                Message::RefreshPortfolio
+                            }),
+                            None,
+                        );
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "dashboard: checkpoint refresh failed");
+                        // Re-probe so the badge returns to reality rather than
+                        // lingering on the optimistic "Connecting…".
+                        return (self.refresh_verification_task(), None);
+                    }
+                }
+            }
             Message::SafesUpdated(safes) => {
                 // Wholesale replace — refresh-on-open runs in batch
                 // and returns the complete updated list, so there's
@@ -4006,6 +4070,11 @@ impl WalletScreen {
                 sign_review::Message::ToggleCalldata => {
                     if let Some(r) = self.sign_review.as_mut() {
                         r.show_calldata = !r.show_calldata;
+                    }
+                }
+                sign_review::Message::ToggleFingerprints => {
+                    if let Some(r) = self.sign_review.as_mut() {
+                        r.show_fingerprints = !r.show_fingerprints;
                     }
                 }
                 // The overlay's optional second action (Safe send: "Propose to
@@ -5147,20 +5216,47 @@ impl WalletScreen {
                 let (task, outcome) = p.update(child_msg);
                 let task = task.map(Message::NetworkWizard);
                 match outcome {
-                    Some(network_setup::Outcome::Completed)
-                    | Some(network_setup::Outcome::Closed)
-                    | Some(network_setup::Outcome::Back) => {
+                    Some(
+                        outcome @ (network_setup::Outcome::Completed
+                        | network_setup::Outcome::Closed
+                        | network_setup::Outcome::Back),
+                    ) => {
                         self.settings_pane = SettingsPane::Root;
                         // The wizard may have changed RPC endpoints and/or
                         // added, edited, toggled, or removed custom networks.
-                        // The network client rebuilds lazily from settings and
-                        // custom providers are built per-fetch, so a portfolio
-                        // refresh is all that's needed to reflect the new
-                        // config (e.g. a freshly-added custom network appears).
-                        return (
-                            Task::batch([task, Task::done(Message::RefreshPortfolio)]),
-                            None,
-                        );
+                        // Endpoint changes rebuild lazily (they're part of the
+                        // network client's `built_with` comparison) and custom
+                        // providers are built per-fetch, so a portfolio refresh
+                        // reflects those (e.g. a freshly-added custom network).
+                        //
+                        // A checkpoint change is the exception: it's
+                        // deliberately excluded from that comparison (see
+                        // `NetworkClient::get`), so a plain refresh would reuse
+                        // the already-synced client and the new checkpoint would
+                        // never take effect until restart. `Completed` is the
+                        // only outcome that applied the draft, so on it we
+                        // `invalidate()` first — dropping every cached client —
+                        // and refresh once the tasks are stopped, forcing a
+                        // rebuild against the new checkpoint. Closed/Back didn't
+                        // write settings, so a refresh alone suffices there.
+                        let refresh = if matches!(outcome, network_setup::Outcome::Completed) {
+                            // Flip the badge to "Connecting…" now, synchronously.
+                            // `invalidate()` resets the network client's internal
+                            // status, but the dashboard's `self.verification` copy
+                            // only refreshes on `VerificationRefreshed`, which
+                            // doesn't fire until the (multi-second) helios rebuild
+                            // finishes — so without this the badge would keep
+                            // showing the stale prior state for the whole rebuild
+                            // and the user gets no sign anything is happening.
+                            self.verification = VerificationStatus::Connecting;
+                            let network = self.network.clone();
+                            Task::perform(async move { network.invalidate().await }, |()| {
+                                Message::RefreshPortfolio
+                            })
+                        } else {
+                            Task::done(Message::RefreshPortfolio)
+                        };
+                        return (Task::batch([task, refresh]), None);
                     }
                     None => return (task, None),
                 }
@@ -5274,6 +5370,7 @@ impl WalletScreen {
             self.hardware_status(),
             self.network_short_name(),
             self.verification,
+            self.checkpoint_refreshing,
         );
         let app = row![sidebar, self.main_pane(t)]
             .width(Length::Fill)
@@ -5907,6 +6004,11 @@ fn spawn_send_prepare(
                 (seed.eth_balance_wei, needed),
                 (Some(bal), Some(need)) if need > bal
             );
+            // ERC-8213 Calldata Digest of the exact bytes being signed — `None`
+            // for a native transfer (empty calldata, no digest per the standard).
+            let (_, _, calldata) = quote.plan.tx_target();
+            let calldata_digest =
+                (!calldata.is_empty()).then(|| crate::sign::digest::calldata_digest(&calldata));
             let review = send::SendReview {
                 chain,
                 recipient: seed.recipient,
@@ -5923,6 +6025,7 @@ fn spawn_send_prepare(
                 has_insufficient_eth,
                 quote,
                 decoded: Box::new(decoded),
+                calldata_digest,
             };
             (seq, Ok(vec![sign_review::SignStep::Send(review)]))
         },
@@ -6024,6 +6127,16 @@ fn spawn_safe_send_prepare(
                 seed.symbol,
             );
 
+            // ERC-8213 digests for the fingerprints section: the `SafeTx` EIP-712
+            // signature (its `.digest` == the pinned `hash`) plus the inner call's
+            // Calldata Digest (`None` for a native transfer, empty inner calldata).
+            let eip712 = crate::sign::digest::Eip712Digests::of(
+                &build_safe_tx_with_nonce(req.safe_tx_input(), nonce),
+                &safe_domain(req.safe_address, chain),
+            );
+            let inner_data = req.safe_tx_input().data;
+            let inner_calldata_digest =
+                (!inner_data.is_empty()).then(|| crate::sign::digest::calldata_digest(&inner_data));
             let review = send::SafeSendReview {
                 chain,
                 amount_str,
@@ -6035,6 +6148,8 @@ fn spawn_safe_send_prepare(
                 recipient_in_book: seed.recipient_in_book,
                 nonce,
                 safe_tx_hash: hash,
+                eip712,
+                inner_calldata_digest,
                 threshold: req.threshold,
                 owner_count: seed.owner_count,
                 signing_addresses: seed.signing_addresses,
@@ -6116,6 +6231,23 @@ fn build_order_review(
     let sell_amount = trim_trailing_decimal_zeros(&sell_amount);
     let buy_amount = trim_trailing_decimal_zeros(&buy_amount);
     let min_received = trim_trailing_decimal_zeros(&min_received);
+    // ERC-8213 EIP-712 digests of the order the wallet actually signs. Rebuild the
+    // exact GPv2 `Order` the sign path builds (`build_sell_order` with full sell =
+    // quote sell + fee, and the deterministic market appData for this slippage),
+    // so the reviewed Digest/Domain/Message match the signature byte-for-byte.
+    let (_, app_data_hash) = crate::cow::market_app_data(draft.slippage_bps);
+    let order = crate::cow::order::build_sell_order(
+        draft.sell_token,
+        draft.buy_token,
+        receiver,
+        full_sell,
+        q.buy_amount,
+        q.valid_to,
+        draft.slippage_bps,
+        app_data_hash,
+    );
+    let eip712 =
+        crate::sign::digest::Eip712Digests::of(&order, &crate::cow::order::cow_domain(draft.chain));
     sign_review::OrderReview {
         chain: draft.chain,
         sell_amount,
@@ -6128,6 +6260,7 @@ fn build_order_review(
         slippage_bps: draft.slippage_bps,
         settlement: crate::cow::SETTLEMENT,
         native: draft.is_native,
+        eip712,
     }
 }
 
@@ -6158,7 +6291,7 @@ fn spawn_name_prepare(
                 crate::chain::Chain::Mainnet,
                 from,
                 to,
-                calldata,
+                calldata.clone(),
                 value,
                 local_names,
             )
@@ -6168,6 +6301,7 @@ fn spawn_name_prepare(
                 to,
                 value,
                 chain: crate::chain::Chain::Mainnet,
+                calldata,
                 decoded: Box::new(decoded),
             }])
         },
@@ -6288,7 +6422,7 @@ fn spawn_cow_prepare(
                         chain,
                         user,
                         cow::ETHFLOW,
-                        calldata,
+                        calldata.clone(),
                         value,
                         local_names,
                     )
@@ -6298,6 +6432,7 @@ fn spawn_cow_prepare(
                         to: cow::ETHFLOW,
                         value,
                         chain,
+                        calldata,
                         decoded: Box::new(decoded),
                     }));
                 } else {
@@ -6316,7 +6451,7 @@ fn spawn_cow_prepare(
                             chain,
                             user,
                             draft.sell_token,
-                            calldata,
+                            calldata.clone(),
                             U256::ZERO,
                             local_names,
                         )
@@ -6326,6 +6461,7 @@ fn spawn_cow_prepare(
                             to: draft.sell_token,
                             value: U256::ZERO,
                             chain,
+                            calldata,
                             decoded: Box::new(decoded),
                         }));
                     }
@@ -6368,7 +6504,7 @@ fn spawn_cow_prepare(
                     chain,
                     safe,
                     cow::ETHFLOW,
-                    calldata,
+                    calldata.clone(),
                     value,
                     local_names,
                 )
@@ -6380,11 +6516,13 @@ fn spawn_cow_prepare(
                         threshold: ctx.threshold,
                         owner_count: ctx.owner_count,
                         safe_tx_hash: hash,
+                        eip712: crate::sign::digest::Eip712Digests::of(&tx, &domain),
                         inner: Box::new(sign_review::ReviewLeg {
                             title: "Place on-chain order — EthFlow createOrder".to_string(),
                             to: cow::ETHFLOW,
                             value,
                             chain,
+                            calldata,
                             decoded: Box::new(decoded),
                         }),
                     },
@@ -6417,7 +6555,7 @@ fn spawn_cow_prepare(
                         chain,
                         safe,
                         draft.sell_token,
-                        calldata,
+                        calldata.clone(),
                         U256::ZERO,
                         local_names,
                     )
@@ -6429,6 +6567,7 @@ fn spawn_cow_prepare(
                             threshold: ctx.threshold,
                             owner_count: ctx.owner_count,
                             safe_tx_hash: hash,
+                            eip712: crate::sign::digest::Eip712Digests::of(&tx, &domain),
                             inner: Box::new(sign_review::ReviewLeg {
                                 title: format!(
                                     "Approve {} for CoW (vault relayer)",
@@ -6437,6 +6576,7 @@ fn spawn_cow_prepare(
                                 to: draft.sell_token,
                                 value: U256::ZERO,
                                 chain,
+                                calldata,
                                 decoded: Box::new(decoded),
                             }),
                         },
@@ -6463,6 +6603,7 @@ fn spawn_cow_prepare(
                         owner_count: ctx.owner_count,
                         order_digest,
                         message_hash,
+                        eip712: cow::safe_sig::safe_message_digests(order_digest, safe, chain),
                     },
                 ));
             }
@@ -7498,7 +7639,7 @@ fn spawn_pool_prepare(
                             chain,
                             from,
                             token,
-                            appr,
+                            appr.clone(),
                             U256::ZERO,
                             local_names.clone(),
                         )
@@ -7508,6 +7649,7 @@ fn spawn_pool_prepare(
                             to: token,
                             value: U256::ZERO,
                             chain,
+                            calldata: appr,
                             decoded: Box::new(decoded),
                         });
                     }
@@ -7516,7 +7658,7 @@ fn spawn_pool_prepare(
                         chain,
                         from,
                         to,
-                        calldata,
+                        calldata.clone(),
                         value,
                         local_names,
                     )
@@ -7526,6 +7668,7 @@ fn spawn_pool_prepare(
                         to,
                         value,
                         chain,
+                        calldata,
                         decoded: Box::new(decoded),
                     });
                     Ok::<_, String>(legs)
@@ -7541,7 +7684,7 @@ fn spawn_pool_prepare(
                         chain,
                         from,
                         pool,
-                        calldata,
+                        calldata.clone(),
                         U256::ZERO,
                         local_names,
                     )
@@ -7551,6 +7694,7 @@ fn spawn_pool_prepare(
                         to: pool,
                         value: U256::ZERO,
                         chain,
+                        calldata,
                         decoded: Box::new(decoded),
                     }])
                 }
@@ -10117,6 +10261,44 @@ mod tests {
     }
 
     #[test]
+    fn build_order_review_eip712_digest_matches_the_signed_order() {
+        // ERC-8213: the EIP-712 Digest the EOA swap review shows must equal what
+        // the sign path (`cow_place_order`, mod.rs:8015) signs. Rebuild the order
+        // the same way and assert the reviewed digest is byte-identical — the
+        // reviewed==signed guarantee for the fingerprints section.
+        let user = addr(0x11);
+        let draft = sample_swap_draft();
+        let quote = sample_quote();
+        let q = &quote.quote;
+        let full_sell = q.sell_amount.saturating_add(q.fee_amount);
+        let (_, app_data_hash) = cow::market_app_data(draft.slippage_bps);
+        let order = cow::order::build_sell_order(
+            draft.sell_token,
+            draft.buy_token,
+            user,
+            full_sell,
+            q.buy_amount,
+            q.valid_to,
+            draft.slippage_bps,
+            app_data_hash,
+        );
+        let expected = cow::order::order_digest(&order, &cow::order::cow_domain(draft.chain));
+
+        let review = build_order_review(&draft, &quote, user);
+        assert_eq!(review.eip712.digest, expected);
+        assert_ne!(review.eip712.digest, alloy::primitives::B256::ZERO);
+        // The triple is internally consistent: rebuilding from the two component
+        // hashes reproduces the same digest.
+        assert_eq!(
+            crate::sign::digest::Eip712Digests::from_parts(
+                review.eip712.domain_hash,
+                review.eip712.message_hash,
+            ),
+            review.eip712,
+        );
+    }
+
+    #[test]
     fn pinned_nonce_check_refuses_advance() {
         assert!(check_pinned_nonce(5, 5).is_ok());
         let e = check_pinned_nonce(6, 5).unwrap_err();
@@ -10166,6 +10348,7 @@ mod tests {
                 to: addr(2),
                 value: U256::ZERO,
                 chain: Chain::Mainnet,
+                calldata: alloy::primitives::Bytes::new(),
                 decoded: Box::new(crate::decode::clear_sign::DecodeResult::Empty),
             })
         };
@@ -10181,6 +10364,10 @@ mod tests {
                 threshold: 2,
                 owner_count: 3,
                 safe_tx_hash: B256::repeat_byte(0xAA),
+                eip712: crate::sign::digest::Eip712Digests::from_parts(
+                    B256::repeat_byte(0xD0),
+                    B256::repeat_byte(0xD1),
+                ),
                 inner: leg(),
             }),
             sign_review::SignStep::SafeMessage(sign_review::SafeMessageReview {
@@ -10196,12 +10383,17 @@ mod tests {
                     slippage_bps: 50,
                     settlement: addr(3),
                     native: false,
+                    eip712: crate::sign::digest::Eip712Digests::from_parts(B256::ZERO, B256::ZERO),
                 },
                 safe: addr(0x5A),
                 threshold: 2,
                 owner_count: 3,
                 order_digest: B256::repeat_byte(0xBB),
                 message_hash: B256::repeat_byte(0xCC),
+                eip712: crate::sign::digest::Eip712Digests::from_parts(
+                    B256::repeat_byte(0xD2),
+                    B256::repeat_byte(0xD3),
+                ),
             }),
         ];
         let pin = cow_pin_from_steps(&steps).expect("safe steps yield a pin");

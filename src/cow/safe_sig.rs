@@ -58,6 +58,21 @@ pub fn safe_message_hash(data_hash: B256, safe: Address, chain: Chain) -> B256 {
     msg.eip712_signing_hash(&safe_domain(safe, chain))
 }
 
+/// The ERC-8213 [`crate::sign::digest::Eip712Digests`] of the `SafeMessage` an
+/// owner signs over `data_hash` (a CoW order digest). `digest` equals
+/// [`safe_message_hash`]; the domain / message component hashes let the review's
+/// fingerprints section show all three.
+pub fn safe_message_digests(
+    data_hash: B256,
+    safe: Address,
+    chain: Chain,
+) -> crate::sign::digest::Eip712Digests {
+    let msg = SafeMessage {
+        message: Bytes::from(data_hash.as_slice().to_vec()),
+    };
+    crate::sign::digest::Eip712Digests::of(&msg, &safe_domain(safe, chain))
+}
+
 /// Build the EIP-1271 `signature` blob for an arbitrary EIP-712 `data_hash`
 /// (a CoW order digest when placing, an `OrderCancellations` digest when
 /// cancelling): each owner signs the Safe message hash via EIP-712
@@ -184,6 +199,23 @@ mod tests {
         let manual = keccak256(&preimage);
 
         assert_eq!(safe_message_hash(digest, safe, chain), manual);
+    }
+
+    #[test]
+    fn safe_message_digests_agree_with_the_hash() {
+        // The ERC-8213 triple's `digest` is exactly what an owner signs
+        // (`safe_message_hash`), and its components reconstruct that digest — so
+        // the review can show Domain/Message hashes that verifiably compose to it.
+        let digest = B256::repeat_byte(0x7e);
+        let safe = safe_addr();
+        let chain = Chain::Mainnet;
+        let d = safe_message_digests(digest, safe, chain);
+        assert_eq!(d.digest, safe_message_hash(digest, safe, chain));
+        assert_eq!(d.domain_hash, safe_domain(safe, chain).separator());
+        assert_eq!(
+            crate::sign::digest::Eip712Digests::from_parts(d.domain_hash, d.message_hash),
+            d,
+        );
     }
 
     #[test]

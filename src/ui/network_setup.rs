@@ -1957,8 +1957,12 @@ impl NetworkSetupScreen {
                     .color(t.text)
                     .font(bold()),
                 vspace(4),
-                text("Beacon-chain light-client API endpoints Helios bootstraps from. Leave an L2 blank to use the chain's default.")
+                text("Beacon-chain light-client API endpoints Helios bootstraps from. Mainnet defaults to the Kao server's beacon endpoint; leave a field blank to use its default.")
                     .size(12)
+                    .color(t.sub),
+                vspace(6),
+                text("Temporary: the Kao beacon endpoint is being finalized server-side. You can point Helios at any beacon-chain light-client node here — leave blank to track the Kao default.")
+                    .size(10)
                     .color(t.sub),
                 vspace(12),
                 rows,

@@ -100,7 +100,14 @@ impl Chain {
     /// are operationsolarstorm.org's L2 light-client beacon proxies.
     pub fn default_consensus_url(self) -> &'static str {
         match self {
-            Chain::Mainnet => "https://ethereum-beacon-api.publicnode.com",
+            // The Kao server's beacon proxy. It fronts the beacon light-client
+            // API Helios needs and does the per-endpoint splitting server-side
+            // (see SERVER_CONSENSUS.md) — no single free public endpoint serves
+            // both `light_client/updates` (publicnode corrupts them) AND the
+            // full `/eth/v2/beacon/blocks/{slot}` (Lodestar 429s them), so the
+            // server combines a clean-updates upstream with a working-blocks one
+            // behind one URL. Overridable per user in the Consensus step.
+            Chain::Mainnet => "https://api.kaowallet.com/beacon",
             Chain::Base => "https://base.operationsolarstorm.org",
             Chain::Optimism => "https://op-mainnet.operationsolarstorm.org",
         }

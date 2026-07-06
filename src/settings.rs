@@ -2760,7 +2760,6 @@ enabled = true
         assert_eq!(extract_drpc_key("not-a-url"), None);
     }
 
-
     #[test]
     fn alchemy_exec_urls_generates_all_chains() {
         let urls = alchemy_exec_urls("testkey");

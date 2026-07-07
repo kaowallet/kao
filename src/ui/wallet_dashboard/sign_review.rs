@@ -295,6 +295,15 @@ pub enum SignAction {
         req: super::send::SafeSendRequest,
         can_execute: bool,
     },
+    /// A Transaction Builder batch. The Safe variant signs one MultiSend
+    /// `execTransaction` (its `prepared` `(nonce, safeTxHash)` pinned once the
+    /// prepare task lands, `can_execute` picking sign-and-execute vs a blocked
+    /// state); the EOA variant broadcasts a single call. Reuses the existing
+    /// `SafeExec` / `RawTx` review steps for rendering.
+    TxBuilder {
+        req: super::tx_builder::BatchSignRequest,
+        can_execute: bool,
+    },
 }
 
 /// A prepared Privacy Pools EOA transaction to sign. A deposit carries an

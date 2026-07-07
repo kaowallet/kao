@@ -22,7 +22,7 @@
 //! because that requires a multi-thread tokio runtime — and iced's tokio
 //! integration doesn't guarantee one.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -31,9 +31,11 @@ use revm::context::result::{ExecutionResult, Output};
 use revm::context::{BlockEnv, CfgEnv, TxEnv};
 use revm::context_interface::block::BlobExcessGasAndPrice;
 use revm::database_interface::DBErrorMarker;
-use revm::primitives::{KECCAK_EMPTY, hardfork::SpecId};
-use revm::state::{AccountInfo, Bytecode};
-use revm::{Context, Database, ExecuteEvm, MainBuilder, MainContext};
+use revm::primitives::{HashMap as RevmHashMap, KECCAK_EMPTY, hardfork::SpecId};
+use revm::state::{Account, AccountInfo, Bytecode};
+use revm::{
+    Context, Database, DatabaseCommit, ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext,
+};
 use tokio::runtime::Handle;
 use tracing::{debug, info, warn};
 
@@ -196,6 +198,11 @@ struct HeliosDb {
     handle: Handle,
     accounts: HashMap<Address, AccountInfo>,
     storage: HashMap<(Address, U256), U256>,
+    /// Addresses whose storage was locally cleared by a committed tx
+    /// (CREATE or SELFDESTRUCT). A storage miss on one of these reads as
+    /// zero rather than re-fetching stale on-chain state — only relevant
+    /// on the batch path, where state is committed between sub-calls.
+    cleared: HashSet<Address>,
     /// `true` while every read so far went through Helios's verified
     /// path. Flipped to `false` the first time a read returns
     /// `VerifiedRead { verified: false, .. }`. The simulator surfaces
@@ -213,6 +220,7 @@ impl HeliosDb {
             handle,
             accounts: HashMap::new(),
             storage: HashMap::new(),
+            cleared: HashSet::new(),
             all_verified: true,
         }
     }
@@ -270,6 +278,11 @@ impl Database for HeliosDb {
         if let Some(value) = self.storage.get(&(address, slot)) {
             return Ok(*value);
         }
+        // A locally created/destructed account starts with empty storage;
+        // an unset slot is zero, not whatever the chain held before.
+        if self.cleared.contains(&address) {
+            return Ok(U256::ZERO);
+        }
         let net = self.network.clone();
         let chain = self.chain;
         let read = self
@@ -293,6 +306,38 @@ impl Database for HeliosDb {
         Err(DbError(format!(
             "block_hash({number}) unsupported — no send-flow tx reads BLOCKHASH"
         )))
+    }
+}
+
+/// Commit an executed tx's state changes back into the cache so a later
+/// sub-call in the same batch observes them (e.g. `approve` then a
+/// `supply` that spends the allowance). Mirrors revm's own in-memory
+/// commit: skip untouched accounts, reset self-destructed / freshly-created
+/// accounts to empty storage, and write through each changed slot's present
+/// value. Only exercised by [`simulate_batch`]; the single-call path uses
+/// `replay()` and never commits.
+impl DatabaseCommit for HeliosDb {
+    fn commit(&mut self, changes: RevmHashMap<Address, Account>) {
+        for (address, account) in changes {
+            if !account.is_touched() {
+                continue;
+            }
+            if account.is_selfdestructed() {
+                self.accounts.insert(address, AccountInfo::default());
+                self.storage.retain(|(a, _), _| *a != address);
+                self.cleared.insert(address);
+                continue;
+            }
+            if account.is_created() {
+                // New account: its prior on-chain storage (if any) is gone.
+                self.storage.retain(|(a, _), _| *a != address);
+                self.cleared.insert(address);
+            }
+            self.accounts.insert(address, account.info);
+            for (slot, value) in account.storage {
+                self.storage.insert((address, slot), value.present_value());
+            }
+        }
     }
 }
 
@@ -410,6 +455,176 @@ pub async fn simulate_call(
         verified = result.verified,
         reverted = result.is_revert(),
         "sim: done",
+    );
+    Ok(result)
+}
+
+// ============================================================================
+// Batch simulation (Transaction Builder)
+// ============================================================================
+
+/// One sub-call of a batch. Mirrors the inner semantics of a MultiSend
+/// delegatecall: each sub-call runs with `msg.sender == from` (the Safe)
+/// against state carried over from the previous sub-call.
+#[derive(Debug, Clone)]
+pub struct BatchStep {
+    pub to: Address,
+    pub value: U256,
+    pub input: Bytes,
+}
+
+/// Aggregate outcome of simulating a whole batch.
+#[derive(Debug, Clone)]
+pub enum BatchOutcome {
+    /// Every sub-call executed successfully.
+    Success,
+    /// Sub-call `step` (0-based) reverted; the real batch reverts atomically.
+    Revert { step: usize, reason: String },
+    /// Sub-call `step` halted (out of gas / invalid opcode / …).
+    Halt { step: usize, reason: String },
+    /// Simulation couldn't run (unsupported chain / upstream error).
+    Unavailable,
+}
+
+#[derive(Debug, Clone)]
+pub struct BatchSimResult {
+    pub outcome: BatchOutcome,
+    /// Sum of gas metered by the executed sub-calls. Advisory: excludes the
+    /// MultiSend loop, the `execTransaction` wrapper, and signature-check
+    /// overhead — the review pairs it with a real `eth_estimateGas` at
+    /// execute time.
+    pub gas_used: u64,
+    /// Net token transfers observed across all sub-calls. Only meaningful on
+    /// `Success` — a reverting batch performs no net transfer, so it's
+    /// cleared.
+    pub transfers: Vec<TokenTransfer>,
+    pub verified: bool,
+    pub base_fee_per_gas: u64,
+}
+
+impl BatchSimResult {
+    pub fn unavailable() -> Self {
+        Self {
+            outcome: BatchOutcome::Unavailable,
+            gas_used: 0,
+            transfers: Vec::new(),
+            verified: false,
+            base_fee_per_gas: 0,
+        }
+    }
+
+    pub fn is_success(&self) -> bool {
+        matches!(self.outcome, BatchOutcome::Success)
+    }
+
+    pub fn is_revert(&self) -> bool {
+        matches!(
+            self.outcome,
+            BatchOutcome::Revert { .. } | BatchOutcome::Halt { .. }
+        )
+    }
+}
+
+/// Simulate a batch of sub-calls as one atomic unit.
+///
+/// Each step runs from `from` (the Safe) against *shared, committed* state,
+/// so a `supply` sees the allowance a preceding `approve` granted. Execution
+/// stops at the first revert/halt — exactly where the on-chain MultiSend
+/// would revert the whole batch — and reports which step failed and why.
+///
+/// This models the *inner* effect of the MultiSend delegatecall (each
+/// sub-call as the Safe), not the full `execTransaction` wrapper. Like the
+/// single-call preflight it is advisory: a stale-state false negative must
+/// never hard-block a legitimate batch.
+pub async fn simulate_batch(
+    network: Arc<dyn BalanceFetcher>,
+    chain: Chain,
+    from: Address,
+    steps: Vec<BatchStep>,
+) -> Result<BatchSimResult, SimError> {
+    if steps.is_empty() {
+        return Err(SimError::Evm("empty batch".into()));
+    }
+    info!(
+        chain = %chain.label(),
+        from = %from,
+        steps = steps.len(),
+        "batch sim: starting",
+    );
+
+    let latest = network.latest_block(chain).await.map_err(SimError::State)?;
+    let block_verified = latest.verified;
+    let block = latest.value;
+    let chain_id = chain.chain_id();
+    let base_fee_per_gas = block.base_fee_per_gas;
+    let handle = Handle::current();
+
+    let result = tokio::task::spawn_blocking(move || -> Result<BatchSimResult, SimError> {
+        let mut db = HeliosDb::new(network, chain, handle);
+        if !block_verified {
+            db.all_verified = false;
+        }
+        let block_env = build_block_env(&block);
+        let cfg = build_cfg(chain_id);
+        let ctx = Context::mainnet().with_block(block_env).with_cfg(cfg);
+        let mut evm = ctx.with_db(&mut db).build_mainnet();
+
+        let mut gas_used: u64 = 0;
+        let mut transfers: Vec<TokenTransfer> = Vec::new();
+        let mut outcome = BatchOutcome::Success;
+        for (i, step) in steps.iter().enumerate() {
+            let tx_env = build_tx_env(from, step.to, step.value, step.input.clone(), 0, chain_id);
+            let res = evm
+                .transact_commit(tx_env)
+                .map_err(|e| SimError::Evm(format!("{e:?}")))?;
+            gas_used = gas_used.saturating_add(res.gas_used());
+            match res {
+                ExecutionResult::Success { logs, .. } => {
+                    transfers.extend(extract_transfers(&logs));
+                }
+                ExecutionResult::Revert { output, .. } => {
+                    let reason = decode_revert_reason(&output).unwrap_or_else(|| {
+                        if output.is_empty() {
+                            "reverted without reason".to_string()
+                        } else {
+                            format!("0x{}", alloy::hex::encode(output.as_ref()))
+                        }
+                    });
+                    outcome = BatchOutcome::Revert { step: i, reason };
+                    break;
+                }
+                ExecutionResult::Halt { reason, .. } => {
+                    outcome = BatchOutcome::Halt {
+                        step: i,
+                        reason: format!("{reason:?}"),
+                    };
+                    break;
+                }
+            }
+        }
+        // A reverting batch performs no net transfer — don't show one.
+        if !matches!(outcome, BatchOutcome::Success) {
+            transfers.clear();
+        }
+        let verified = db.all_verified;
+        Ok(BatchSimResult {
+            outcome,
+            gas_used,
+            transfers,
+            verified,
+            base_fee_per_gas,
+        })
+    })
+    .await
+    .map_err(|e| SimError::Join(e.to_string()))??;
+
+    info!(
+        chain = %chain.label(),
+        gas_used = result.gas_used,
+        transfers = result.transfers.len(),
+        verified = result.verified,
+        reverted = result.is_revert(),
+        "batch sim: done",
     );
     Ok(result)
 }
@@ -1214,6 +1429,46 @@ mod tests {
     /// `verified = false` must survive `is_revert` / `is_unavailable`
     /// inspection without being misclassified — the UI sources its
     /// trust badge directly from this field.
+    #[tokio::test]
+    async fn simulate_batch_native_transfers_sum_gas() {
+        // Two native sends from a codeless caller succeed and meter
+        // 21000 gas each — the batch reports their sum.
+        use crate::net::MockFetcher;
+        use alloy::primitives::address;
+
+        let network: Arc<dyn BalanceFetcher> = Arc::new(MockFetcher::new());
+        let safe = address!("0x0000000000000000000000000000000000005AFE");
+        let steps = vec![
+            BatchStep {
+                to: address!("0x000000000000000000000000000000000000dEaD"),
+                value: U256::ZERO,
+                input: Bytes::new(),
+            },
+            BatchStep {
+                to: address!("0x000000000000000000000000000000000000bEEF"),
+                value: U256::ZERO,
+                input: Bytes::new(),
+            },
+        ];
+        let res = simulate_batch(network, Chain::Mainnet, safe, steps)
+            .await
+            .expect("batch sim runs");
+        assert!(res.is_success(), "got {:?}", res.outcome);
+        assert_eq!(res.gas_used, 42000);
+        assert!(res.transfers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn simulate_batch_empty_errors() {
+        use crate::net::MockFetcher;
+        let network: Arc<dyn BalanceFetcher> = Arc::new(MockFetcher::new());
+        assert!(
+            simulate_batch(network, Chain::Mainnet, Address::ZERO, Vec::new())
+                .await
+                .is_err()
+        );
+    }
+
     #[test]
     fn unverified_success_still_reports_success() {
         let r = SimulationResult {

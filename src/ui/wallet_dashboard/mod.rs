@@ -38,6 +38,7 @@ mod sidebar;
 mod sign_review;
 mod sim_view;
 mod swap;
+mod tx_builder;
 mod tx_details;
 
 use account_dropdown::AccountDropdown;
@@ -75,7 +76,7 @@ const CLIPBOARD_CLEAR_SECS: u64 = 10;
 use modal_chrome::ModalChrome;
 pub use nav::Nav;
 
-use crate::chain::PerChain;
+use crate::chain::{Chain, PerChain};
 use crate::cow::{
     self,
     composer::SwapDraft,
@@ -223,6 +224,11 @@ pub enum SignTag {
     NameRenew { name: String },
     /// Set-recipient — the success notice ("Updated {name}'s recipient") needs it.
     NameSetRecipient { name: String },
+    /// Transaction Builder Safe batch — sign the owners' safeTxHash and
+    /// broadcast the MultiSend `execTransaction`.
+    TxBuilderExecute,
+    /// Transaction Builder EOA single call — broadcast an ordinary tx.
+    TxBuilderEoa,
 }
 
 #[derive(Debug, Clone)]
@@ -409,6 +415,17 @@ pub enum Message {
     SignReviewPrepared {
         seq: u64,
         steps: Result<Vec<sign_review::SignStep>, String>,
+    },
+    /// Transaction Builder: a contract's runtime bytecode was fetched (or the
+    /// fetch failed) so the composer can recover its ABI. `seq` round-trips to
+    /// drop a stale answer after the user typed a different address.
+    TxBuilderResolved {
+        seq: u64,
+        code: Result<Bytes, String>,
+    },
+    /// Transaction Builder: a batch simulation finished.
+    TxBuilderSimulated {
+        result: Result<crate::wallet::sim::BatchSimResult, String>,
     },
     /// Names app: reverse-lookup discovery finished. `owner` is the account the
     /// scan was spawned for — the handler drops it if the active account changed.
@@ -2056,6 +2073,250 @@ impl WalletScreen {
         task
     }
 
+    // ── Transaction Builder ──────────────────────────────────────────────
+
+    /// Chain + Safe context for the Transaction Builder: the active Safe's
+    /// chain/version when in Safe mode, else Mainnet/EOA. The EOA builder is
+    /// Mainnet-oriented in v1 (its known-contract picker and single-call
+    /// broadcast target Ethereum).
+    fn txbuilder_identity(&self) -> (Chain, bool, Option<String>) {
+        match self.active_safe_descriptor() {
+            Some(d) => (
+                Chain::from_chain_id(d.chain_id).unwrap_or(Chain::Mainnet),
+                true,
+                Some(d.version.clone()),
+            ),
+            None => (Chain::Mainnet, false, None),
+        }
+    }
+
+    fn handle_txbuilder_outcome(&mut self, o: tx_builder::Outcome) -> Task<Message> {
+        use tx_builder::Outcome as O;
+        match o {
+            O::Close => Task::none(),
+            O::CopyText(s) => self.arm_clipboard_clear(s),
+            O::ResolveContract { seq, address } => {
+                let (chain, _, _) = self.txbuilder_identity();
+                spawn_txbuilder_resolve(self.network.clone(), seq, chain, address)
+            }
+            O::Simulate { calls } => {
+                let (chain, is_safe, _) = self.txbuilder_identity();
+                let from = if is_safe {
+                    self.active_safe_descriptor()
+                        .map(|d| Address::from(d.address))
+                        .unwrap_or(self.address)
+                } else {
+                    self.address
+                };
+                spawn_txbuilder_simulate(self.network.clone(), chain, from, calls)
+            }
+            O::Review { calls } => self.open_txbuilder_review(calls),
+        }
+    }
+
+    /// Snapshot the batch request from the active identity and open the
+    /// sign-review overlay (reviewed == signed).
+    fn open_txbuilder_review(&mut self, calls: Vec<crate::txbuilder::QueuedCall>) -> Task<Message> {
+        if self.sign_review.is_some() || calls.is_empty() {
+            return Task::none();
+        }
+        let req = match self.build_txbuilder_request(&calls) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "tx-builder: refusing to open review");
+                return Task::none();
+            }
+        };
+        self.sign_review_seq += 1;
+        let seq = self.sign_review_seq;
+        let (title, subtitle, note, can_execute) = match &req {
+            tx_builder::BatchSignRequest::Safe(s) => (
+                format!("Batch · {} → 1 atomic transaction", s.call_count),
+                Some(format!(
+                    "from Safe {} · {}-of-{} multisig",
+                    short_address(s.safe),
+                    s.threshold,
+                    s.owner_count
+                )),
+                Some(
+                    "Bundled via MultiSendCallOnly — all-or-nothing; if one call reverts, the \
+                     whole batch reverts. Verify the safeTxHash on every device."
+                        .to_string(),
+                ),
+                (s.signable_indices.len() as u32) >= s.threshold,
+            ),
+            tx_builder::BatchSignRequest::Eoa(e) => (
+                e.title.clone(),
+                Some(format!(
+                    "from {} · on {}",
+                    short_address(e.from),
+                    e.chain.display_name()
+                )),
+                Some(format!(
+                    "A single transaction from your account, broadcast on {}. \
+                     The Transaction Builder targets Ethereum Mainnet for plain accounts.",
+                    e.chain.display_name()
+                )),
+                true,
+            ),
+        };
+        let action = sign_review::SignAction::TxBuilder {
+            req: req.clone(),
+            can_execute,
+        };
+        self.sign_review = Some(sign_review::SignReview::pending(
+            title,
+            subtitle,
+            Vec::new(),
+            note,
+            seq,
+            action,
+        ));
+        spawn_txbuilder_prepare(self.network.clone(), seq, req)
+    }
+
+    /// Build the sign request: a Safe MultiSend batch (active Safe) or an EOA
+    /// single call.
+    fn build_txbuilder_request(
+        &self,
+        calls: &[crate::txbuilder::QueuedCall],
+    ) -> Result<tx_builder::BatchSignRequest, String> {
+        match self.active_safe_descriptor() {
+            Some(d) => {
+                let chain = Chain::from_chain_id(d.chain_id)
+                    .ok_or_else(|| "Safe is on an unsupported chain".to_string())?;
+                let input = crate::txbuilder::multisend::build_multisend_input(calls, &d.version)
+                    .map_err(|e| e.to_string())?;
+                // Owners the wallet can actually sign with (Local / Ledger /
+                // Trezor); view-only owners never count.
+                let signable_indices: Vec<u32> = d
+                    .linked_signer_indices
+                    .iter()
+                    .copied()
+                    .filter(|&idx| {
+                        matches!(
+                            self.accounts.get(idx as usize),
+                            Some(
+                                AccountDescriptor::Local { .. }
+                                    | AccountDescriptor::Ledger { .. }
+                                    | AccountDescriptor::Trezor { .. }
+                            )
+                        )
+                    })
+                    .collect();
+                Ok(tx_builder::BatchSignRequest::Safe(
+                    tx_builder::SafeBatchRequest {
+                        safe: Address::from(d.address),
+                        chain,
+                        version: d.version.clone(),
+                        trust: d.trust.clone(),
+                        threshold: d.threshold,
+                        owner_count: d.owners.len(),
+                        signable_indices,
+                        input,
+                        call_count: calls.len(),
+                        prepared: None,
+                    },
+                ))
+            }
+            None => {
+                let call = calls.first().ok_or_else(|| "empty batch".to_string())?;
+                Ok(tx_builder::BatchSignRequest::Eoa(
+                    tx_builder::EoaCallRequest {
+                        chain: Chain::Mainnet,
+                        from: self.address,
+                        to: call.to,
+                        value: call.value,
+                        data: call.data.clone(),
+                        title: call.title.clone(),
+                    },
+                ))
+            }
+        }
+    }
+
+    /// User confirmed the batch review — sign + execute (Safe) or broadcast
+    /// (EOA). Overlay stays open in its waiting phase.
+    fn dispatch_txbuilder(&mut self, _execute: bool) -> Task<Message> {
+        let req = match self.sign_review.as_ref().map(|r| &r.action) {
+            Some(sign_review::SignAction::TxBuilder { req, .. }) => req.clone(),
+            _ => {
+                warn!("tx-builder: dispatch dropped — no review");
+                return Task::none();
+            }
+        };
+        if self.is_signing_busy() {
+            if let Some(r) = self.sign_review.as_mut() {
+                r.error = Some(
+                    "another signing operation is in progress — try again in a moment".to_string(),
+                );
+            }
+            return Task::none();
+        }
+        match req {
+            tx_builder::BatchSignRequest::Safe(sreq) => {
+                if sreq.prepared.is_none() {
+                    warn!("tx-builder: safe dispatch dropped — reviewed hash not ready");
+                    return Task::none();
+                }
+                let signer_pairs: Vec<(usize, AccountDescriptor)> = sreq
+                    .signable_indices
+                    .iter()
+                    .filter_map(|&idx| {
+                        self.accounts
+                            .get(idx as usize)
+                            .cloned()
+                            .map(|d| (idx as usize, d))
+                    })
+                    .take(sreq.threshold as usize)
+                    .collect();
+                if (signer_pairs.len() as u32) < sreq.threshold {
+                    if let Some(r) = self.sign_review.as_mut() {
+                        r.error = Some(
+                            "Not enough signable owners linked to this Safe to meet its threshold."
+                                .to_string(),
+                        );
+                    }
+                    return Task::none();
+                }
+                let executor_key = first_local_key_of(&self.accounts);
+                let owners = signer_pairs
+                    .iter()
+                    .map(|(i, d)| signing_owner_of(*i, d))
+                    .collect();
+                let kind = sign_review::SigningKind::SafeExecute {
+                    owners,
+                    separate_gas_payer: executor_key.is_some(),
+                };
+                let signer_owners: Vec<AccountDescriptor> =
+                    signer_pairs.into_iter().map(|(_, d)| d).collect();
+                info!(safe = %sreq.safe, calls = sreq.call_count, "tx-builder: dispatching Safe batch execute");
+                if let Some(r) = self.sign_review.as_mut() {
+                    r.signing_since = Some(Instant::now());
+                    r.signing_progress = Some(kind);
+                    r.error = None;
+                }
+                spawn_txbuilder_safe_execute(
+                    self.network.clone(),
+                    sreq,
+                    signer_owners,
+                    executor_key,
+                )
+            }
+            tx_builder::BatchSignRequest::Eoa(ereq) => {
+                let desc = self.active_signer_descriptor();
+                let signer = mem::replace(&mut self.signer, KaoSigner::ViewOnly(self.address));
+                let handoff = handoff_with(signer);
+                info!(to = %ereq.to, "tx-builder: dispatching EOA single call");
+                if let Some(r) = self.sign_review.as_mut() {
+                    r.signing_since = Some(Instant::now());
+                    r.error = None;
+                }
+                spawn_txbuilder_eoa_send(self.network.clone(), handoff, desc, ereq)
+            }
+        }
+    }
+
     /// Whether the sign-review overlay currently hosts a Safe send — the
     /// `SafeSend*Return` handlers use this to resolve the overlay (close on
     /// success, keep-with-error on failure) instead of the legacy pane pump.
@@ -2461,6 +2722,15 @@ impl WalletScreen {
             let execute = *can_execute;
             return self.dispatch_safe_send(execute);
         }
+        // Transaction Builder: Confirm signs + executes the Safe MultiSend batch
+        // (or broadcasts the EOA single call). Overlay stays open in its waiting
+        // phase; resolved by the `SignTag::TxBuilder*` result arms.
+        if let Some(review) = self.sign_review.as_ref()
+            && let sign_review::SignAction::TxBuilder { can_execute, .. } = &review.action
+        {
+            let execute = *can_execute;
+            return self.dispatch_txbuilder(execute);
+        }
         // CoW placement keeps its overlay open across the sign + submit too (like
         // the EOA send): a slow hardware sign shows the "waiting" card, and a
         // connect/sign failure surfaces on the overlay with a retry instead of the
@@ -2499,6 +2769,8 @@ impl WalletScreen {
             // unreachable but keep the match exhaustive.
             sign_review::SignAction::Send { .. } => Task::none(),
             sign_review::SignAction::SafeSend { .. } => Task::none(),
+            // Handled by the keep-open early return above.
+            sign_review::SignAction::TxBuilder { .. } => Task::none(),
         }
     }
 
@@ -2550,6 +2822,11 @@ impl WalletScreen {
             }
             sign_review::SignAction::SafeSend { .. } => {
                 error!(error = %e, "safe-send: clear-sign review prepare failed");
+            }
+            // TxBuilder keeps its overlay up showing the error (handled inline in
+            // `SignReviewPrepared`), so this is a fallback; the review is dropped.
+            sign_review::SignAction::TxBuilder { .. } => {
+                error!(error = %e, "tx-builder: clear-sign review prepare failed");
             }
         }
     }
@@ -3802,6 +4079,44 @@ impl WalletScreen {
                             return (Task::batch([task.map(Message::Send), refresh]), None);
                         }
                     }
+                    SignTag::TxBuilderExecute | SignTag::TxBuilderEoa => {
+                        let result = result.and_then(SignOutcome::tx);
+                        match &result {
+                            Ok(hash) => {
+                                info!(hash = %format!("{hash:#x}"), "tx-builder broadcast ok")
+                            }
+                            Err(e) => warn!(error = %e, "tx-builder broadcast failed"),
+                        }
+                        let is_txb = self.sign_review.as_ref().is_some_and(|r| {
+                            matches!(r.action, sign_review::SignAction::TxBuilder { .. })
+                        });
+                        if is_txb {
+                            match result {
+                                Err(e) => {
+                                    // Keep the overlay up so the user can read the
+                                    // failure (a Safe ceremony can't be retried, but
+                                    // the reason must be visible).
+                                    if let Some(r) = self.sign_review.as_mut() {
+                                        r.signing_since = None;
+                                        r.signing_progress = None;
+                                        r.error = Some(e);
+                                    }
+                                    return (Task::none(), None);
+                                }
+                                Ok(_hash) => {
+                                    self.sign_review = None;
+                                    self.apps.txbuilder_pane().on_executed();
+                                    return (
+                                        Task::batch([
+                                            self.refresh_verification_task(),
+                                            self.fetch_portfolio_task(),
+                                        ]),
+                                        None,
+                                    );
+                                }
+                            }
+                        }
+                    }
                     SignTag::Cow { host } => {
                         match result.and_then(SignOutcome::order) {
                             Ok(order) => {
@@ -4007,6 +4322,12 @@ impl WalletScreen {
                 }
             }
             Message::Apps(child) => {
+                // Refresh the Transaction Builder's identity context before it
+                // processes a message, so batch-cap / known-contract lookup see
+                // the live chain and whether a Safe is active. Cheap.
+                let (txb_chain, txb_is_safe, txb_ver) = self.txbuilder_identity();
+                self.apps
+                    .set_txbuilder_context(txb_chain, txb_is_safe, txb_ver);
                 let outcome = self.apps.update(child);
                 // After pumping the pane, dispatch a forward name resolution if
                 // the Privacy Pools withdrawal target now points at a name-shaped
@@ -4047,9 +4368,16 @@ impl WalletScreen {
                     Some(apps::Outcome::CopyText(s)) => (self.arm_clipboard_clear(s), None),
                     Some(apps::Outcome::Name(o)) => (self.handle_name_outcome(o), None),
                     Some(apps::Outcome::Pool(o)) => self.handle_pool_outcome(o),
+                    Some(apps::Outcome::TxBuilder(o)) => (self.handle_txbuilder_outcome(o), None),
                     None => (Task::none(), None),
                 };
                 return (Task::batch([resolve_task, task]), out);
+            }
+            Message::TxBuilderResolved { seq, code } => {
+                self.apps.txbuilder_pane().on_contract_resolved(seq, code);
+            }
+            Message::TxBuilderSimulated { result } => {
+                self.apps.txbuilder_pane().on_sim(result);
             }
             Message::SignReview(child) => match child {
                 sign_review::Message::Confirm => {
@@ -4195,6 +4523,21 @@ impl WalletScreen {
                                 );
                             }
                         }
+                        // Transaction Builder Safe batch: pin the reviewed
+                        // `(nonce, safeTxHash)` from the SafeExec step into the
+                        // request so the owners sign exactly what was shown.
+                        let txb_pin = review.steps.iter().find_map(|s| match s {
+                            sign_review::SignStep::SafeExec(x) => Some((x.nonce, x.safe_tx_hash)),
+                            _ => None,
+                        });
+                        if let Some((nonce, hash)) = txb_pin
+                            && let sign_review::SignAction::TxBuilder {
+                                req: tx_builder::BatchSignRequest::Safe(sreq),
+                                ..
+                            } = &mut review.action
+                        {
+                            sreq.prepared = Some((nonce, hash));
+                        }
                     }
                     Err(e) => {
                         // A Send / SafeSend keeps its overlay up showing the failure
@@ -4205,6 +4548,7 @@ impl WalletScreen {
                             review.action,
                             sign_review::SignAction::Send { .. }
                                 | sign_review::SignAction::SafeSend { .. }
+                                | sign_review::SignAction::TxBuilder { .. }
                         );
                         if keeps_overlay {
                             review.error = Some(e);
@@ -5856,6 +6200,319 @@ fn spawn_pool_resolve_task(
         },
         |(seq, name, result)| Message::PoolTargetResolved { seq, name, result },
     )
+}
+
+// ── Transaction Builder task functions ──────────────────────────────────
+
+/// Fetch a contract's runtime bytecode so the composer can recover its ABI.
+fn spawn_txbuilder_resolve(
+    network: Arc<dyn BalanceFetcher>,
+    seq: u64,
+    chain: Chain,
+    address: Address,
+) -> Task<Message> {
+    Task::perform(
+        async move { network.get_code(address, chain).await.map(|r| r.value) },
+        move |code| Message::TxBuilderResolved { seq, code },
+    )
+}
+
+/// Simulate a batch (from the Safe / EOA) against Helios-verified state.
+fn spawn_txbuilder_simulate(
+    network: Arc<dyn BalanceFetcher>,
+    chain: Chain,
+    from: Address,
+    calls: Vec<crate::txbuilder::QueuedCall>,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            let steps = crate::txbuilder::sim::to_steps(&calls);
+            crate::txbuilder::sim::simulate_batch(network, chain, from, steps)
+                .await
+                .map_err(|e| e.to_string())
+        },
+        |result| Message::TxBuilderSimulated { result },
+    )
+}
+
+/// Build the review steps for a batch: a Safe `execTransaction` wrapping the
+/// MultiSend (with the pinned safeTxHash + digests), or an EOA raw-tx leg.
+fn spawn_txbuilder_prepare(
+    network: Arc<dyn BalanceFetcher>,
+    seq: u64,
+    req: tx_builder::BatchSignRequest,
+) -> Task<Message> {
+    use crate::safe::tx::{
+        build_safe_tx_with_nonce, current_safe_nonce, ensure_signable_version, safe_domain,
+        safe_tx_hash, verify_safe_tx_before_signing,
+    };
+    Task::perform(
+        async move {
+            match req {
+                tx_builder::BatchSignRequest::Safe(s) => {
+                    let build = async {
+                        if let Some(reason) = s.trust.signing_block_reason() {
+                            return Err(reason.to_string());
+                        }
+                        ensure_signable_version(&s.version)?;
+                        // A delegatecall to a code-less address silently succeeds
+                        // and burns the Safe's nonce — refuse if the MultiSend
+                        // library isn't actually deployed on this chain.
+                        let ms = s.input.to;
+                        let code = network.get_code(ms, s.chain).await?.value;
+                        if code.is_empty() {
+                            return Err(format!(
+                                "MultiSend contract {} is not deployed on {} — cannot batch",
+                                short_address(ms),
+                                s.chain.label(),
+                            ));
+                        }
+                        let nonce = current_safe_nonce(network.as_ref(), s.safe, s.chain).await?;
+                        let tx = build_safe_tx_with_nonce(s.input.clone(), nonce);
+                        let domain = safe_domain(s.safe, s.chain);
+                        let local = safe_tx_hash(&tx, &domain);
+                        verify_safe_tx_before_signing(
+                            network.as_ref(),
+                            &tx,
+                            s.safe,
+                            s.chain,
+                            local,
+                        )
+                        .await?;
+                        Ok::<_, String>((nonce, local))
+                    }
+                    .await;
+                    let (nonce, hash) = match build {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return (seq, Err::<Vec<sign_review::SignStep>, String>(e));
+                        }
+                    };
+                    let tx = build_safe_tx_with_nonce(s.input.clone(), nonce);
+                    let domain = safe_domain(s.safe, s.chain);
+                    let eip712 = crate::sign::digest::Eip712Digests::of(&tx, &domain);
+                    let inner = sign_review::ReviewLeg {
+                        title: format!(
+                            "MultiSend · {} call{}",
+                            s.call_count,
+                            if s.call_count == 1 { "" } else { "s" }
+                        ),
+                        to: s.input.to,
+                        value: s.input.value,
+                        chain: s.chain,
+                        calldata: s.input.data.clone(),
+                        decoded: Box::new(crate::decode::clear_sign::DecodeResult::Empty),
+                    };
+                    let review = sign_review::SafeExecReview {
+                        safe: s.safe,
+                        nonce,
+                        threshold: s.threshold.min(u8::MAX as u32) as u8,
+                        owner_count: s.owner_count.min(u8::MAX as usize) as u8,
+                        safe_tx_hash: hash,
+                        eip712,
+                        inner: Box::new(inner),
+                    };
+                    (seq, Ok(vec![sign_review::SignStep::SafeExec(review)]))
+                }
+                tx_builder::BatchSignRequest::Eoa(e) => {
+                    let leg = sign_review::ReviewLeg {
+                        title: e.title.clone(),
+                        to: e.to,
+                        value: e.value,
+                        chain: e.chain,
+                        calldata: e.data.clone(),
+                        decoded: Box::new(crate::decode::clear_sign::DecodeResult::Empty),
+                    };
+                    (seq, Ok(vec![sign_review::SignStep::RawTx(leg)]))
+                }
+            }
+        },
+        |(seq, steps)| Message::SignReviewPrepared { seq, steps },
+    )
+}
+
+/// Sign the MultiSend `SafeTx` with each owner over the pinned hash, assemble,
+/// and broadcast `execTransaction`. Mirrors `spawn_safe_broadcast_task`.
+fn spawn_txbuilder_safe_execute(
+    network: Arc<dyn BalanceFetcher>,
+    sreq: tx_builder::SafeBatchRequest,
+    signer_owners: Vec<AccountDescriptor>,
+    local_executor_key: Option<B256>,
+) -> Task<Message> {
+    use crate::safe::tx::{
+        assemble_signatures, build_safe_tx_with_nonce, execute_safe_tx, safe_domain, safe_tx_hash,
+        sign_owner,
+    };
+    Task::perform(
+        async move {
+            let chain = sreq.chain;
+            let Some((nonce, pinned_hash)) = sreq.prepared else {
+                return Err::<TxHash, String>("batch not prepared".into());
+            };
+            let provider = match network.provider(chain).await {
+                Some(p) => p,
+                None => return Err("no execution RPCs configured".into()),
+            };
+            // Rebuild the SafeTx deterministically at the pinned nonce and assert
+            // its hash equals what the owners reviewed (reviewed == signed).
+            let tx = build_safe_tx_with_nonce(sreq.input.clone(), nonce);
+            let domain = safe_domain(sreq.safe, chain);
+            let local_hash = safe_tx_hash(&tx, &domain);
+            if local_hash != pinned_hash {
+                return Err("batch hash changed since review — aborting".into());
+            }
+            let needed = sreq.threshold as usize;
+            let mut sigs = Vec::with_capacity(needed);
+            let mut live_owners = Vec::with_capacity(needed);
+            for desc in signer_owners.iter().take(needed) {
+                let signer = crate::wallet::build_owner_signer(desc).await?;
+                let signer = crate::wallet::ensure_connected(signer, desc)
+                    .await
+                    .map_err(|(_, e)| e)?;
+                let pair = sign_owner(&signer, &tx, &domain, local_hash).await?;
+                sigs.push(pair);
+                live_owners.push(signer);
+            }
+            if (sigs.len() as u32) < sreq.threshold {
+                return Err("not enough signable owners to meet the Safe threshold".into());
+            }
+            let packed = assemble_signatures(sigs)?;
+            let local_executor;
+            let executor: &KaoSigner = match local_executor_key {
+                Some(key) => {
+                    let s = crate::wallet::signer_from_bytes(&key)
+                        .map_err(|e| format!("derive executor: {e}"))?;
+                    local_executor = KaoSigner::Local(s);
+                    &local_executor
+                }
+                None => {
+                    let first = live_owners
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| "no owner signer available to execute".to_string())?;
+                    local_executor = crate::wallet::ensure_connected(first, &signer_owners[0])
+                        .await
+                        .map_err(|(_, e)| e)?;
+                    &local_executor
+                }
+            };
+            execute_safe_tx(&provider, executor, sreq.safe, chain, tx, packed).await
+        },
+        |result| Message::Signed {
+            tag: SignTag::TxBuilderExecute,
+            signer: None,
+            result: result.map(SignOutcome::Tx),
+        },
+    )
+}
+
+/// Broadcast an EOA single call. Parks/reclaims the active signer like the
+/// Send flow.
+fn spawn_txbuilder_eoa_send(
+    network: Arc<dyn BalanceFetcher>,
+    handoff: SignerHandoff,
+    desc: AccountDescriptor,
+    ereq: tx_builder::EoaCallRequest,
+) -> Task<Message> {
+    let inner = handoff.clone();
+    Task::perform(
+        async move {
+            let chain = ereq.chain;
+            let provider = match network.provider(chain).await {
+                Some(p) => p,
+                None => return Err::<TxHash, String>("no execution RPCs configured".into()),
+            };
+            let signer = match take_live_signer(&inner, &desc).await {
+                Ok(s) => s,
+                Err(e) => return Err(e),
+            };
+            let result = send_eoa_call(
+                &provider,
+                &signer,
+                chain,
+                ereq.to,
+                ereq.value,
+                ereq.data.clone(),
+            )
+            .await;
+            if let Ok(mut g) = inner.lock() {
+                *g = Some(signer);
+            }
+            result
+        },
+        move |result| Message::Signed {
+            tag: SignTag::TxBuilderEoa,
+            signer: Some(handoff),
+            result: result.map(SignOutcome::Tx),
+        },
+    )
+}
+
+/// Build an EIP-1559 envelope for an arbitrary `(to, value, data)` call, sign
+/// it with `signer`, and broadcast. Same build→sign→broadcast shape as
+/// `safe::tx::execute_safe_tx`, but for a plain EOA call.
+async fn send_eoa_call(
+    provider: &alloy::providers::RootProvider<alloy::network::Ethereum>,
+    signer: &KaoSigner,
+    chain: Chain,
+    to: Address,
+    value: U256,
+    data: Bytes,
+) -> Result<TxHash, String> {
+    use alloy::consensus::{SignableTransaction, TxEip1559, TxEnvelope};
+    use alloy::eips::eip2718::Encodable2718;
+    use alloy::primitives::TxKind;
+    use alloy::providers::Provider;
+
+    let from = signer.address();
+    let req = alloy::rpc::types::TransactionRequest::default()
+        .from(from)
+        .to(to)
+        .value(value)
+        .input(alloy::rpc::types::TransactionInput::new(data.clone()));
+    let gas_limit = provider
+        .estimate_gas(req)
+        .await
+        .map_err(|e| format!("estimate_gas: {}", crate::net::redact_urls(&e.to_string())))?;
+    let fees = provider.estimate_eip1559_fees().await.map_err(|e| {
+        format!(
+            "estimate_eip1559_fees: {}",
+            crate::net::redact_urls(&e.to_string())
+        )
+    })?;
+    let nonce = provider
+        .get_transaction_count(from)
+        .pending()
+        .await
+        .map_err(|e| {
+            format!(
+                "get_transaction_count: {}",
+                crate::net::redact_urls(&e.to_string())
+            )
+        })?;
+    let mut envelope = TxEip1559 {
+        chain_id: chain.chain_id(),
+        nonce,
+        gas_limit,
+        max_fee_per_gas: fees.max_fee_per_gas,
+        max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
+        to: TxKind::Call(to),
+        value,
+        access_list: Default::default(),
+        input: data,
+    };
+    let sig = signer
+        .sign_tx(&mut envelope)
+        .await
+        .map_err(|e| crate::wallet::friendly_signer_error(&e))?;
+    let raw = TxEnvelope::from(envelope.into_signed(sig)).encoded_2718();
+    let pending = provider.send_raw_transaction(&raw).await.map_err(|e| {
+        format!(
+            "broadcast failed: {}",
+            crate::net::redact_urls(&e.to_string())
+        )
+    })?;
+    Ok(*pending.tx_hash())
 }
 
 /// Take the parked signer out of `handoff` and make sure its hardware device is

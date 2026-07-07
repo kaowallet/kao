@@ -21,6 +21,7 @@ use crate::portfolio::{LiveToken, format_token_balance};
 
 use super::names_app::{self, NamesApp};
 use super::pool_app::{self, PoolApp};
+use super::tx_builder::{self, TxBuilderApp};
 use crate::ui::kao_theme::{KaoTheme, with_alpha};
 use crate::ui::kao_widgets::{
     avatar, bold, ghost_button, kao_scrollable_style, mono, mono_bold, screen_subtitle,
@@ -38,10 +39,14 @@ pub enum Message {
     OpenNamesApp,
     /// Open the Privacy Pools app from the launcher.
     OpenPrivacyPoolsApp,
+    /// Open the Transaction Builder app from the launcher.
+    OpenTxBuilderApp,
     /// Messages for the embedded Names app.
     Names(names_app::Message),
     /// Messages for the embedded Privacy Pools app.
     Pool(pool_app::Message),
+    /// Messages for the embedded Transaction Builder app.
+    TxBuilder(tx_builder::Message),
     /// Return from a sub-app to the launcher.
     BackHome,
     Composer(composer::Message),
@@ -62,6 +67,7 @@ enum AppsView {
     Swap,
     Names,
     PrivacyPools,
+    TxBuilder,
 }
 
 impl AppsView {
@@ -72,6 +78,7 @@ impl AppsView {
             AppsView::Swap => "Swap",
             AppsView::Names => "Names",
             AppsView::PrivacyPools => "PrivacyPools",
+            AppsView::TxBuilder => "TxBuilder",
         }
     }
 }
@@ -102,6 +109,11 @@ pub enum Outcome {
     /// services it (discover/sync/quote/prove/submit, seed plumbing) and feeds
     /// the result back via [`AppsPane::pool_pane`].
     Pool(pool_app::Outcome),
+    /// A request bubbled up from the embedded Transaction Builder app
+    /// (resolve a contract, simulate a batch, or open the sign-review for
+    /// it); the coordinator services it and feeds results back via
+    /// [`AppsPane::txbuilder_pane`].
+    TxBuilder(tx_builder::Outcome),
 }
 
 impl Outcome {
@@ -115,6 +127,7 @@ impl Outcome {
             Outcome::RefreshOrders => "RefreshOrders",
             Outcome::Name(_) => "Name",
             Outcome::Pool(_) => "Pool",
+            Outcome::TxBuilder(_) => "TxBuilder",
         }
     }
 }
@@ -124,6 +137,7 @@ pub struct AppsPane {
     composer: SwapComposer,
     names: NamesApp,
     pool: PoolApp,
+    tx_builder: TxBuilderApp,
     view: AppsView,
 }
 
@@ -133,8 +147,28 @@ impl AppsPane {
             composer: SwapComposer::new(),
             names: NamesApp::new(owner),
             pool: PoolApp::new(),
+            tx_builder: TxBuilderApp::new(owner),
             view: AppsView::Launcher,
         }
+    }
+
+    /// Mutable access to the Transaction Builder app so the coordinator can
+    /// deliver async results (resolved contract code, batch simulation,
+    /// post-execute cleanup).
+    pub fn txbuilder_pane(&mut self) -> &mut TxBuilderApp {
+        &mut self.tx_builder
+    }
+
+    /// Refresh the builder's identity context (active chain + whether a Safe
+    /// is active) before it processes a message, so batch-cap and known-
+    /// contract lookup see the live identity.
+    pub fn set_txbuilder_context(
+        &mut self,
+        chain: crate::chain::Chain,
+        is_safe: bool,
+        safe_version: Option<String>,
+    ) {
+        self.tx_builder.set_context(chain, is_safe, safe_version);
     }
 
     /// Mutable access to the Privacy Pools app so the coordinator can deliver
@@ -197,7 +231,20 @@ impl AppsPane {
                 // Load the identity + sync the first time it's opened.
                 self.pool.on_open().map(Outcome::Pool)
             }
+            Message::OpenTxBuilderApp => {
+                self.view = AppsView::TxBuilder;
+                None
+            }
             Message::Names(child) => self.names.update(child).map(Outcome::Name),
+            Message::TxBuilder(child) => match self.tx_builder.update(child) {
+                // The "← Apps" link steps back to the launcher rather than
+                // bubbling to the dashboard.
+                Some(tx_builder::Outcome::Close) => {
+                    self.view = AppsView::Launcher;
+                    None
+                }
+                other => other.map(Outcome::TxBuilder),
+            },
             Message::Pool(child) => match self.pool.update(child) {
                 // The pane's "← Apps" link steps back to the launcher rather
                 // than bubbling to the dashboard.
@@ -230,7 +277,10 @@ impl AppsPane {
                 } = event
                     && matches!(
                         self.view,
-                        AppsView::Swap | AppsView::Names | AppsView::PrivacyPools
+                        AppsView::Swap
+                            | AppsView::Names
+                            | AppsView::PrivacyPools
+                            | AppsView::TxBuilder
                     )
                 {
                     self.view = AppsView::Launcher;
@@ -257,6 +307,8 @@ impl AppsPane {
                 keyboard::listen().map(Message::Key),
                 self.pool.subscription().map(Message::Pool),
             ]),
+            // Esc steps back to the launcher.
+            AppsView::TxBuilder => keyboard::listen().map(Message::Key),
             AppsView::Launcher => Subscription::none(),
         }
     }
@@ -278,6 +330,7 @@ impl AppsPane {
             AppsView::Names if !names_available => self.launcher_view(t, orders, names_available),
             AppsView::Names => self.names.view(t).map(Message::Names),
             AppsView::PrivacyPools => self.pool.view(t, portfolio, recipients).map(Message::Pool),
+            AppsView::TxBuilder => self.tx_builder.view(t).map(Message::TxBuilder),
         };
 
         // Center the bounded (max-width 560) content within the full-width
@@ -346,6 +399,15 @@ impl AppsPane {
             "Privacy Pools",
             "Deposit & withdraw privately with ZK proofs",
             Message::OpenPrivacyPoolsApp,
+        ));
+        // Transaction Builder works for both a plain EOA (single call) and a
+        // Safe (atomic MultiSend batch), so the card is always available.
+        col = col.push(Space::new().height(10)).push(app_card(
+            t,
+            "( •̀ω•́ )✧",
+            "Transaction Builder",
+            "Compose contract calls & batch them atomically",
+            Message::OpenTxBuilderApp,
         ));
         col.width(Length::Fill).max_width(560).into()
     }

@@ -16,6 +16,7 @@ mod sanitize;
 mod settings;
 mod sign;
 mod trace;
+mod txbuilder;
 mod ui;
 mod wallet;
 

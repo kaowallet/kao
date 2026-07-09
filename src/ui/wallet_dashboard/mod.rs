@@ -2079,14 +2079,18 @@ impl WalletScreen {
     /// chain/version when in Safe mode, else Mainnet/EOA. The EOA builder is
     /// Mainnet-oriented in v1 (its known-contract picker and single-call
     /// broadcast target Ethereum).
-    fn txbuilder_identity(&self) -> (Chain, bool, Option<String>) {
+    /// `(chain, is_safe, safe_version, eoa_can_batch)`. `eoa_can_batch` is
+    /// whether the active plain-EOA signer can authorize an EIP-7702
+    /// delegation (Local / Ledger) — the gate for atomic EOA batching.
+    fn txbuilder_identity(&self) -> (Chain, bool, Option<String>, bool) {
         match self.active_safe_descriptor() {
             Some(d) => (
                 Chain::from_chain_id(d.chain_id).unwrap_or(Chain::Mainnet),
                 true,
                 Some(d.version.clone()),
+                false,
             ),
-            None => (Chain::Mainnet, false, None),
+            None => (Chain::Mainnet, false, None, self.signer.supports_7702()),
         }
     }
 
@@ -2096,11 +2100,11 @@ impl WalletScreen {
             O::Close => Task::none(),
             O::CopyText(s) => self.arm_clipboard_clear(s),
             O::ResolveContract { seq, address } => {
-                let (chain, _, _) = self.txbuilder_identity();
+                let (chain, ..) = self.txbuilder_identity();
                 spawn_txbuilder_resolve(self.network.clone(), seq, chain, address)
             }
             O::Simulate { calls } => {
-                let (chain, is_safe, _) = self.txbuilder_identity();
+                let (chain, is_safe, ..) = self.txbuilder_identity();
                 let from = if is_safe {
                     self.active_safe_descriptor()
                         .map(|d| Address::from(d.address))
@@ -2146,17 +2150,27 @@ impl WalletScreen {
                 (s.signable_indices.len() as u32) >= s.threshold,
             ),
             tx_builder::BatchSignRequest::Eoa(e) => (
-                e.title.clone(),
+                e.title(),
                 Some(format!(
                     "from {} · on {}",
                     short_address(e.from),
                     e.chain.display_name()
                 )),
-                Some(format!(
-                    "A single transaction from your account, broadcast on {}. \
-                     The Transaction Builder targets Ethereum Mainnet for plain accounts.",
-                    e.chain.display_name()
-                )),
+                Some(if e.is_batch() {
+                    format!(
+                        "{} calls executed atomically from your account via EIP-7702 \
+                         (Simple7702Account) — all-or-nothing. The delegation target is \
+                         shown on the transaction below; on a Ledger this is two \
+                         confirmations. Mainnet only for plain accounts.",
+                        e.calls.len()
+                    )
+                } else {
+                    format!(
+                        "A single transaction from your account, broadcast on {}. \
+                         The Transaction Builder targets Ethereum Mainnet for plain accounts.",
+                        e.chain.display_name()
+                    )
+                }),
                 true,
             ),
         };
@@ -2220,15 +2234,22 @@ impl WalletScreen {
                 ))
             }
             None => {
-                let call = calls.first().ok_or_else(|| "empty batch".to_string())?;
+                if calls.is_empty() {
+                    return Err("empty batch".to_string());
+                }
+                // A multi-call EOA batch needs a 7702-capable signer; the UI cap
+                // already enforces this, but guard here too so a stale request
+                // can't reach the delegation path with a hardware/view-only key.
+                if calls.len() > 1 && !self.signer.supports_7702() {
+                    return Err(
+                        "atomic batching needs a software key or a Ledger (EIP-7702)".to_string(),
+                    );
+                }
                 Ok(tx_builder::BatchSignRequest::Eoa(
-                    tx_builder::EoaCallRequest {
+                    tx_builder::EoaBatchRequest {
                         chain: Chain::Mainnet,
                         from: self.address,
-                        to: call.to,
-                        value: call.value,
-                        data: call.data.clone(),
-                        title: call.title.clone(),
+                        calls: calls.to_vec(),
                     },
                 ))
             }
@@ -2307,7 +2328,12 @@ impl WalletScreen {
                 let desc = self.active_signer_descriptor();
                 let signer = mem::replace(&mut self.signer, KaoSigner::ViewOnly(self.address));
                 let handoff = handoff_with(signer);
-                info!(to = %ereq.to, "tx-builder: dispatching EOA single call");
+                info!(
+                    from = %ereq.from,
+                    calls = ereq.calls.len(),
+                    batch = ereq.is_batch(),
+                    "tx-builder: dispatching EOA send",
+                );
                 if let Some(r) = self.sign_review.as_mut() {
                     r.signing_since = Some(Instant::now());
                     r.error = None;
@@ -4325,9 +4351,9 @@ impl WalletScreen {
                 // Refresh the Transaction Builder's identity context before it
                 // processes a message, so batch-cap / known-contract lookup see
                 // the live chain and whether a Safe is active. Cheap.
-                let (txb_chain, txb_is_safe, txb_ver) = self.txbuilder_identity();
+                let (txb_chain, txb_is_safe, txb_ver, txb_can_batch) = self.txbuilder_identity();
                 self.apps
-                    .set_txbuilder_context(txb_chain, txb_is_safe, txb_ver);
+                    .set_txbuilder_context(txb_chain, txb_is_safe, txb_ver, txb_can_batch);
                 let outcome = self.apps.update(child);
                 // After pumping the pane, dispatch a forward name resolution if
                 // the Privacy Pools withdrawal target now points at a name-shaped
@@ -6315,15 +6341,55 @@ fn spawn_txbuilder_prepare(
                     (seq, Ok(vec![sign_review::SignStep::SafeExec(review)]))
                 }
                 tx_builder::BatchSignRequest::Eoa(e) => {
-                    let leg = sign_review::ReviewLeg {
-                        title: e.title.clone(),
-                        to: e.to,
-                        value: e.value,
-                        chain: e.chain,
-                        calldata: e.data.clone(),
-                        decoded: Box::new(crate::decode::clear_sign::DecodeResult::Empty),
-                    };
-                    (seq, Ok(vec![sign_review::SignStep::RawTx(leg)]))
+                    use crate::txbuilder::eip7702;
+                    let build = async {
+                        if e.calls.len() > 1 {
+                            // Atomic batch → executeBatch on the (to-be-)delegated
+                            // account. If not already delegated to the EF contract,
+                            // a fresh authorization will be signed — refuse early if
+                            // that delegate isn't deployed (a delegation to a
+                            // code-less address would brick the account), mirroring
+                            // the MultiSend deployment check above.
+                            let code = network.get_code(e.from, e.chain).await?.value;
+                            let already_ef = eip7702::delegated_to(&code)
+                                == Some(eip7702::EF_SIMPLE_7702_ACCOUNT);
+                            if !already_ef {
+                                let dcode = network
+                                    .get_code(eip7702::EF_SIMPLE_7702_ACCOUNT, e.chain)
+                                    .await?
+                                    .value;
+                                if dcode.is_empty() {
+                                    return Err(format!(
+                                        "EIP-7702 delegate {} is not deployed on {} — cannot batch",
+                                        short_address(eip7702::EF_SIMPLE_7702_ACCOUNT),
+                                        e.chain.label(),
+                                    ));
+                                }
+                            }
+                            let leg = sign_review::ReviewLeg {
+                                title: format!("executeBatch · {} calls", e.calls.len()),
+                                to: e.from, // self-call into the delegated account
+                                value: U256::ZERO,
+                                chain: e.chain,
+                                calldata: eip7702::encode_execute_batch(&e.calls),
+                                decoded: Box::new(crate::decode::clear_sign::DecodeResult::Empty),
+                            };
+                            Ok(vec![sign_review::SignStep::RawTx(leg)])
+                        } else {
+                            let call = e.calls.first().ok_or_else(|| "empty batch".to_string())?;
+                            let leg = sign_review::ReviewLeg {
+                                title: call.title.clone(),
+                                to: call.to,
+                                value: call.value,
+                                chain: e.chain,
+                                calldata: call.data.clone(),
+                                decoded: Box::new(crate::decode::clear_sign::DecodeResult::Empty),
+                            };
+                            Ok(vec![sign_review::SignStep::RawTx(leg)])
+                        }
+                    }
+                    .await;
+                    (seq, build)
                 }
             }
         },
@@ -6406,13 +6472,13 @@ fn spawn_txbuilder_safe_execute(
     )
 }
 
-/// Broadcast an EOA single call. Parks/reclaims the active signer like the
-/// Send flow.
+/// Broadcast a plain-EOA batch (one call as a normal tx, or N calls atomically
+/// via EIP-7702). Parks/reclaims the active signer like the Send flow.
 fn spawn_txbuilder_eoa_send(
     network: Arc<dyn BalanceFetcher>,
     handoff: SignerHandoff,
     desc: AccountDescriptor,
-    ereq: tx_builder::EoaCallRequest,
+    ereq: tx_builder::EoaBatchRequest,
 ) -> Task<Message> {
     let inner = handoff.clone();
     Task::perform(
@@ -6426,15 +6492,7 @@ fn spawn_txbuilder_eoa_send(
                 Ok(s) => s,
                 Err(e) => return Err(e),
             };
-            let result = send_eoa_call(
-                &provider,
-                &signer,
-                chain,
-                ereq.to,
-                ereq.value,
-                ereq.data.clone(),
-            )
-            .await;
+            let result = send_eoa_batch(&provider, &signer, &ereq).await;
             if let Ok(mut g) = inner.lock() {
                 *g = Some(signer);
             }
@@ -6448,38 +6506,42 @@ fn spawn_txbuilder_eoa_send(
     )
 }
 
-/// Build an EIP-1559 envelope for an arbitrary `(to, value, data)` call, sign
-/// it with `signer`, and broadcast. Same build→sign→broadcast shape as
-/// `safe::tx::execute_safe_tx`, but for a plain EOA call.
-async fn send_eoa_call(
+/// Broadcast a plain-EOA batch. A single call goes out as an ordinary
+/// EIP-1559 transaction; N calls are wrapped as
+/// `Simple7702Account.executeBatch` and run atomically via EIP-7702.
+///
+/// The delegation decision is made here from the account's **live** on-chain
+/// code (authoritative at signing time):
+/// - already delegated to the EF `Simple7702Account` → a plain EIP-1559 call
+///   to the delegated `executeBatch` (one signature);
+/// - otherwise → a `TxEip7702` carrying a fresh authorization
+///   (`nonce+1`, self-sponsored) that the account signs first, then the outer
+///   tx (two signatures — two device prompts on hardware).
+///
+/// The `from == signer` wall (recovered signer must equal the reviewed sender)
+/// is enforced before broadcast, mirroring `sign::broadcast`.
+async fn send_eoa_batch(
     provider: &alloy::providers::RootProvider<alloy::network::Ethereum>,
     signer: &KaoSigner,
-    chain: Chain,
-    to: Address,
-    value: U256,
-    data: Bytes,
+    req: &tx_builder::EoaBatchRequest,
 ) -> Result<TxHash, String> {
-    use alloy::consensus::{SignableTransaction, TxEip1559, TxEnvelope};
+    use crate::txbuilder::eip7702;
+    use alloy::consensus::{SignableTransaction, TxEip1559, TxEip7702, TxEnvelope};
     use alloy::eips::eip2718::Encodable2718;
     use alloy::primitives::TxKind;
     use alloy::providers::Provider;
+    use alloy::rpc::types::{TransactionInput, TransactionRequest};
 
+    let chain = req.chain;
+    let chain_id = chain.chain_id();
     let from = signer.address();
-    let req = alloy::rpc::types::TransactionRequest::default()
-        .from(from)
-        .to(to)
-        .value(value)
-        .input(alloy::rpc::types::TransactionInput::new(data.clone()));
-    let gas_limit = provider
-        .estimate_gas(req)
-        .await
-        .map_err(|e| format!("estimate_gas: {}", crate::net::redact_urls(&e.to_string())))?;
-    let fees = provider.estimate_eip1559_fees().await.map_err(|e| {
-        format!(
-            "estimate_eip1559_fees: {}",
-            crate::net::redact_urls(&e.to_string())
-        )
-    })?;
+    // Wall: the live signer must be the account the review showed as sender.
+    // A mismatch (wrong key handed to this task) is refused before signing.
+    if from != req.from {
+        warn!(reviewed = %req.from, signer = %from, "tx-builder: EOA signer != reviewed from");
+        return Err("signer does not match the reviewed sender — refusing to broadcast".into());
+    }
+
     let nonce = provider
         .get_transaction_count(from)
         .pending()
@@ -6490,22 +6552,99 @@ async fn send_eoa_call(
                 crate::net::redact_urls(&e.to_string())
             )
         })?;
-    let mut envelope = TxEip1559 {
-        chain_id: chain.chain_id(),
-        nonce,
-        gas_limit,
-        max_fee_per_gas: fees.max_fee_per_gas,
-        max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
-        to: TxKind::Call(to),
-        value,
-        access_list: Default::default(),
-        input: data,
+
+    // Resolve the outer call + whether a fresh delegation authorization is
+    // needed. Only a multi-call batch delegates; a single call keeps its
+    // original target/value/data.
+    let mut signed_auth: Option<alloy::eips::eip7702::SignedAuthorization> = None;
+    let (to, value, data) = if req.calls.len() > 1 {
+        let code = provider
+            .get_code_at(from)
+            .await
+            .map_err(|e| format!("get_code: {}", crate::net::redact_urls(&e.to_string())))?;
+        let already_ef = eip7702::delegated_to(&code) == Some(eip7702::EF_SIMPLE_7702_ACCOUNT);
+        if !already_ef {
+            // Self-sponsored: the outer tx consumes `nonce`, so the
+            // authorization commits to `nonce + 1`. Signed first (device
+            // prompt #1 on hardware, where it clear-signs the delegate).
+            let auth = eip7702::build_authorization(chain_id, nonce + 1);
+            let s = signer
+                .sign_authorization(&auth)
+                .await
+                .map_err(|e| crate::wallet::friendly_signer_error(&e))?;
+            signed_auth = Some(s);
+        }
+        // Self-call into the (to-be-)delegated account.
+        (from, U256::ZERO, eip7702::encode_execute_batch(&req.calls))
+    } else {
+        let c = req.calls.first().ok_or_else(|| "empty batch".to_string())?;
+        (c.to, c.value, c.data.clone())
     };
-    let sig = signer
-        .sign_tx(&mut envelope)
+
+    // Estimate gas against the exact shape being signed — include the
+    // authorization so the estimate accounts for the delegation set-up cost.
+    let mut est = TransactionRequest::default()
+        .from(from)
+        .to(to)
+        .value(value)
+        .input(TransactionInput::new(data.clone()));
+    if let Some(a) = &signed_auth {
+        est.authorization_list = Some(vec![a.clone()]);
+    }
+    let gas_limit = provider
+        .estimate_gas(est)
         .await
-        .map_err(|e| crate::wallet::friendly_signer_error(&e))?;
-    let raw = TxEnvelope::from(envelope.into_signed(sig)).encoded_2718();
+        .map_err(|e| format!("estimate_gas: {}", crate::net::redact_urls(&e.to_string())))?;
+    let fees = provider.estimate_eip1559_fees().await.map_err(|e| {
+        format!(
+            "estimate_eip1559_fees: {}",
+            crate::net::redact_urls(&e.to_string())
+        )
+    })?;
+
+    // Build + sign the outer tx (device prompt #2 on hardware), asserting the
+    // recovered signer equals `from` before the envelope leaves the wallet.
+    let raw = if let Some(auth) = signed_auth {
+        let mut tx = TxEip7702 {
+            chain_id,
+            nonce,
+            gas_limit,
+            max_fee_per_gas: fees.max_fee_per_gas,
+            max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
+            to,
+            value,
+            access_list: Default::default(),
+            authorization_list: vec![auth],
+            input: data,
+        };
+        let sighash = tx.signature_hash();
+        let sig = signer
+            .sign_tx(&mut tx)
+            .await
+            .map_err(|e| crate::wallet::friendly_signer_error(&e))?;
+        assert_eoa_from_equals_signer(&sig, sighash, from)?;
+        TxEnvelope::from(tx.into_signed(sig)).encoded_2718()
+    } else {
+        let mut tx = TxEip1559 {
+            chain_id,
+            nonce,
+            gas_limit,
+            max_fee_per_gas: fees.max_fee_per_gas,
+            max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
+            to: TxKind::Call(to),
+            value,
+            access_list: Default::default(),
+            input: data,
+        };
+        let sighash = tx.signature_hash();
+        let sig = signer
+            .sign_tx(&mut tx)
+            .await
+            .map_err(|e| crate::wallet::friendly_signer_error(&e))?;
+        assert_eoa_from_equals_signer(&sig, sighash, from)?;
+        TxEnvelope::from(tx.into_signed(sig)).encoded_2718()
+    };
+
     let pending = provider.send_raw_transaction(&raw).await.map_err(|e| {
         format!(
             "broadcast failed: {}",
@@ -6513,6 +6652,24 @@ async fn send_eoa_call(
         )
     })?;
     Ok(*pending.tx_hash())
+}
+
+/// The `from == signer` wall for the EOA batch path: the address recovered
+/// from the signature over `sighash` must equal the reviewed sender. Mirrors
+/// `sign::broadcast::assert_from_equals_signer` (private to that module).
+fn assert_eoa_from_equals_signer(
+    sig: &alloy::primitives::Signature,
+    sighash: B256,
+    from: Address,
+) -> Result<(), String> {
+    let recovered = sig
+        .recover_address_from_prehash(&sighash)
+        .map_err(|e| format!("could not recover signer from signature: {e}"))?;
+    if recovered != from {
+        warn!(expected = %from, recovered = %recovered, "tx-builder: signer != reviewed from");
+        return Err("signer does not match the reviewed sender — refusing to broadcast".into());
+    }
+    Ok(())
 }
 
 /// Take the parked signer out of `handoff` and make sure its hardware device is

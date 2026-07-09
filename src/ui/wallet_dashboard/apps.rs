@@ -167,8 +167,10 @@ impl AppsPane {
         chain: crate::chain::Chain,
         is_safe: bool,
         safe_version: Option<String>,
+        eoa_can_batch: bool,
     ) {
-        self.tx_builder.set_context(chain, is_safe, safe_version);
+        self.tx_builder
+            .set_context(chain, is_safe, safe_version, eoa_can_batch);
     }
 
     /// Mutable access to the Privacy Pools app so the coordinator can deliver

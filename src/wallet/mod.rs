@@ -1,4 +1,5 @@
 use alloy::consensus::SignableTransaction;
+use alloy::eips::eip7702::{Authorization, SignedAuthorization};
 use alloy::network::TxSigner;
 use alloy::primitives::{Address, B256, Signature};
 use alloy::signers::Signer;
@@ -554,6 +555,48 @@ impl KaoSigner {
                 ))
             }
         }
+    }
+
+    /// Sign an EIP-7702 authorization tuple (`chain_id`, delegate `address`,
+    /// `nonce`) so the account can delegate its code to a batch-executor.
+    ///
+    /// Unlike `sign_hash`, hardware **is** supported here: the authorization
+    /// is a first-class signing object the device recognises, not a bare
+    /// blind hash. `Local` hashes the tuple locally (`signature_hash`);
+    /// `Ledger` streams it over the `SIGN_EIP7702_AUTHORIZATION` APDU
+    /// (`sign_auth`), which clear-signs the delegate address on-device.
+    ///
+    /// `Trezor` has no 7702 APDU in `alloy-signer-trezor` yet, and
+    /// `ViewOnly` has no key → both `UnsupportedOperation`.
+    pub async fn sign_authorization(
+        &self,
+        auth: &Authorization,
+    ) -> Result<SignedAuthorization, alloy::signers::Error> {
+        match self {
+            KaoSigner::Local(s) => {
+                let sig = s.sign_hash(&auth.signature_hash()).await?;
+                Ok(auth.clone().into_signed(sig))
+            }
+            KaoSigner::Ledger(s) => {
+                let sig = s
+                    .sign_auth(auth)
+                    .await
+                    .map_err(alloy::signers::Error::other)?;
+                Ok(auth.clone().into_signed(sig))
+            }
+            KaoSigner::Trezor(_) | KaoSigner::ViewOnly(_) => {
+                Err(alloy::signers::Error::UnsupportedOperation(
+                    alloy::signers::UnsupportedSignerOperation::SignHash,
+                ))
+            }
+        }
+    }
+
+    /// Whether this signer can produce an EIP-7702 authorization — the gate
+    /// for offering atomic EOA batching. Local (software) and Ledger only;
+    /// Trezor/view-only fall back to single-call sends.
+    pub fn supports_7702(&self) -> bool {
+        matches!(self, KaoSigner::Local(_) | KaoSigner::Ledger(_))
     }
 
     /// Sign an EIP-712 typed-data payload (e.g. a `SafeTx`) — the path

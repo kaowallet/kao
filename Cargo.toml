@@ -36,7 +36,7 @@ alloy = { version = "2.0.1", features = ["full", "signer-mnemonic", "signer-ledg
 alloy-core = { version = "1.5.7", features = ["eip712"] }
 alloy-signer = { version = "2.0.1", features = ["eip712"] }
 alloy-signer-local = { version = "2.0.1", features = ["eip712"] }
-alloy-signer-ledger = { version = "2.0.1", features = ["eip712"] }
+alloy-signer-ledger = { version = "2.0.1", features = ["eip712", "eip7702"] }
 clear-signing = { git = "https://github.com/kaowallet/clear-signing", features = ["bundled-registry"] }
 # rusb reaches us transitively via alloy-signer-ledger -> hidapi-rusb -> rusb.
 # Its default build dynamically links the host's libusb, baking an absolute

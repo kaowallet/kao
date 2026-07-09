@@ -146,11 +146,15 @@ impl Outcome {
 #[derive(Debug, Clone)]
 struct Ctx {
     chain: Chain,
-    /// Whether the active identity is a Safe (atomic batching available).
+    /// Whether the active identity is a Safe (atomic batching via MultiSend).
     is_safe: bool,
     /// The active Safe's contract version, for the MultiSend routing hint.
     #[allow(dead_code)]
     safe_version: Option<String>,
+    /// For a plain EOA: whether the active signer can authorize an EIP-7702
+    /// delegation (Local / Ledger) and therefore batch N calls atomically.
+    /// Trezor / view-only cannot, and stay capped at a single call.
+    eoa_can_batch: bool,
 }
 
 impl Default for Ctx {
@@ -159,6 +163,7 @@ impl Default for Ctx {
             chain: Chain::Mainnet,
             is_safe: false,
             safe_version: None,
+            eoa_can_batch: false,
         }
     }
 }
@@ -245,7 +250,13 @@ impl TxBuilderApp {
     /// Coordinator refreshes chain / Safe context before dispatching a
     /// message, so message-time logic (known-contract lookup, batch cap)
     /// sees the live identity.
-    pub fn set_context(&mut self, chain: Chain, is_safe: bool, safe_version: Option<String>) {
+    pub fn set_context(
+        &mut self,
+        chain: Chain,
+        is_safe: bool,
+        safe_version: Option<String>,
+        eoa_can_batch: bool,
+    ) {
         // A chain change invalidates a resolved contract (known addresses
         // are per-chain).
         if self.ctx.chain != chain {
@@ -255,6 +266,7 @@ impl TxBuilderApp {
             chain,
             is_safe,
             safe_version,
+            eoa_can_batch,
         };
     }
 
@@ -549,10 +561,13 @@ impl TxBuilderApp {
     }
 
     fn add_to_batch(&mut self) {
-        // EOA can't atomically batch; cap at one call.
-        if !self.ctx.is_safe && !self.batch.is_empty() {
+        // A plain EOA batches atomically only when its signer can authorize an
+        // EIP-7702 delegation (Local / Ledger). Trezor / view-only cannot, so
+        // they stay capped at one call.
+        if !self.ctx.is_safe && !self.ctx.eoa_can_batch && !self.batch.is_empty() {
             self.error = Some(
-                "A plain account sends one call at a time — switch to a Safe for atomic batches."
+                "This account sends one call at a time — atomic batching needs a software key \
+                 or a Ledger (EIP-7702), or a Safe."
                     .into(),
             );
             return;
@@ -625,7 +640,7 @@ impl TxBuilderApp {
 #[derive(Debug, Clone)]
 pub enum BatchSignRequest {
     Safe(SafeBatchRequest),
-    Eoa(EoaCallRequest),
+    Eoa(EoaBatchRequest),
 }
 
 /// A Safe MultiSend batch. `input` is the deterministic MultiSend wrapper
@@ -647,15 +662,40 @@ pub struct SafeBatchRequest {
     pub prepared: Option<(u64, B256)>,
 }
 
-/// A single plain-EOA contract call.
+/// A plain-EOA batch. One or more calls executed from `from`:
+///
+/// - a single call, or an account that can't delegate, broadcasts as an
+///   ordinary EIP-1559 transaction;
+/// - N calls from a 7702-capable signer are wrapped as
+///   `Simple7702Account.executeBatch` and run atomically.
+///
+/// Whether a fresh EIP-7702 authorization is signed is decided in the send
+/// task from the account's live on-chain code (authoritative at signing
+/// time): if the account is already delegated to the EF `Simple7702Account`,
+/// the batch is a plain call to the delegated code; otherwise the send signs
+/// a delegation authorization first.
 #[derive(Debug, Clone)]
-pub struct EoaCallRequest {
+pub struct EoaBatchRequest {
     pub chain: Chain,
     pub from: Address,
-    pub to: Address,
-    pub value: U256,
-    pub data: Bytes,
-    pub title: String,
+    pub calls: Vec<QueuedCall>,
+}
+
+impl EoaBatchRequest {
+    /// True when this batch runs via `executeBatch` (more than one call). A
+    /// single call keeps its original `to`/`value`/`data` and needs no
+    /// delegation.
+    pub fn is_batch(&self) -> bool {
+        self.calls.len() > 1
+    }
+
+    /// A short human title for the review header.
+    pub fn title(&self) -> String {
+        match self.calls.split_first() {
+            Some((first, [])) => first.title.clone(),
+            _ => format!("Batch · {} calls", self.calls.len()),
+        }
+    }
 }
 
 /// Build a demo approve + supply batch (mirrors the design's sample).
@@ -720,7 +760,7 @@ mod tests {
 
     fn safe_app() -> TxBuilderApp {
         let mut app = TxBuilderApp::new(Address::repeat_byte(0x5a));
-        app.set_context(Chain::Mainnet, true, Some("1.4.1".into()));
+        app.set_context(Chain::Mainnet, true, Some("1.4.1".into()), false);
         app
     }
 
@@ -762,9 +802,9 @@ mod tests {
     }
 
     #[test]
-    fn eoa_mode_caps_batch_at_one() {
+    fn eoa_without_7702_caps_batch_at_one() {
         let mut app = TxBuilderApp::new(Address::repeat_byte(0x11));
-        app.set_context(Chain::Mainnet, false, None); // EOA
+        app.set_context(Chain::Mainnet, false, None, false); // EOA, can't delegate
         app.update(Message::PickKnown(0));
         let to = address!("0x000000000000000000000000000000000000dEaD");
         app.update(Message::ArgChanged(0, to.to_string()));
@@ -775,8 +815,25 @@ mod tests {
         app.update(Message::ArgChanged(0, to.to_string()));
         app.update(Message::ArgChanged(1, "2".into()));
         app.update(Message::AddToBatch);
-        assert_eq!(app.batch.len(), 1, "EOA batch stays capped at 1");
+        assert_eq!(app.batch.len(), 1, "non-7702 EOA batch stays capped at 1");
         assert!(app.error.is_some());
+    }
+
+    #[test]
+    fn eoa_with_7702_can_batch_multiple() {
+        let mut app = TxBuilderApp::new(Address::repeat_byte(0x11));
+        app.set_context(Chain::Mainnet, false, None, true); // EOA, Local/Ledger
+        let to = address!("0x000000000000000000000000000000000000dEaD");
+        app.update(Message::PickKnown(0));
+        app.update(Message::ArgChanged(0, to.to_string()));
+        app.update(Message::ArgChanged(1, "1".into()));
+        app.update(Message::AddToBatch);
+        // a second call is now allowed (EIP-7702 atomic batch)
+        app.update(Message::ArgChanged(0, to.to_string()));
+        app.update(Message::ArgChanged(1, "2".into()));
+        app.update(Message::AddToBatch);
+        assert_eq!(app.batch.len(), 2, "7702-capable EOA batches N calls");
+        assert!(app.error.is_none());
     }
 
     #[test]

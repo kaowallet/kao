@@ -10,9 +10,12 @@
 //!   whole batch reverts. Threshold owner signatures are collected
 //!   through the shared `sign_review` overlay, then broadcast via
 //!   `safe::tx::execute_safe_tx`.
-//! - **Plain EOA** — no atomic batching is possible without a smart
-//!   account, so the builder is capped at a single queued call, which is
-//!   broadcast as an ordinary EIP-1559 transaction through the same
+//! - **Plain EOA** — atomic batching is achieved via EIP-7702: the account
+//!   delegates its code to the EF `Simple7702Account` and self-calls
+//!   `executeBatch(Call[])` in one `SetCode` (type `0x04`) transaction, so N
+//!   calls run all-or-nothing (see `eip7702`). A single-call batch, or an
+//!   account whose signer can't authorize a delegation (Trezor / view-only),
+//!   still broadcasts as an ordinary EIP-1559 transaction through the same
 //!   review/broadcast pipeline the Send flow uses.
 //!
 //! This module holds the *domain* logic (ABI loading, calldata encoding,
@@ -23,6 +26,7 @@
 
 pub mod abi;
 pub mod bundle;
+pub mod eip7702;
 pub mod encode;
 pub mod multisend;
 pub mod sim;

@@ -12,8 +12,8 @@ use super::{Message, Modal, Mode, TxBuilderApp, encode, wei_to_eth};
 use crate::txbuilder::sim::BatchOutcome;
 use crate::ui::kao_theme::{KaoTheme, with_alpha};
 use crate::ui::kao_widgets::{
-    avatar, black, bold, ghost_button, kao_scrollable_style, mono, mono_bold, primary_button,
-    text_input_style,
+    avatar, black, bold, ghost_button, kao_checkbox, kao_scrollable_style, mono, mono_bold,
+    primary_button, text_input_style,
 };
 
 const BATCH_WIDTH: f32 = 400.0;
@@ -574,6 +574,15 @@ fn batch_pane(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
             .push(sim_strip(app, t, sim));
     }
 
+    // flash-approval toggle: only when the batch can batch (Safe / 7702 EOA)
+    // and there's actually an allowance to revoke.
+    let targets = app.revoke_targets();
+    if app.can_batch() && !targets.is_empty() {
+        inner = inner
+            .push(Space::new().height(14))
+            .push(revoke_toggle(app, t, targets.len()));
+    }
+
     // footer
     inner = inner
         .push(Space::new().height(14))
@@ -623,6 +632,40 @@ fn batch_pane(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
         .push(cta);
 
     card(t, inner.into())
+}
+
+/// Flash-approval toggle: append `approve(spender, 0)` revokes after the batch
+/// so no allowance survives the transaction. `n` is the number of allowances
+/// that would be reset.
+fn revoke_toggle(app: &TxBuilderApp, t: KaoTheme, n: usize) -> Element<'_, Message> {
+    let cb = kao_checkbox(t, app.auto_revoke)
+        .label("Revoke approvals after batch")
+        .on_toggle(Message::ToggleAutoRevoke)
+        .size(16)
+        .spacing(10)
+        .text_size(13);
+    let hint = if app.auto_revoke {
+        format!(
+            "+{n} revoke{} appended · allowance reset to 0",
+            if n == 1 { "" } else { "s" }
+        )
+    } else {
+        format!(
+            "leaves {n} standing allowance{}",
+            if n == 1 { "" } else { "s" }
+        )
+    };
+    column![
+        cb,
+        row![
+            Space::new().width(26),
+            text(hint).size(11).color(t.sub).font(mono()),
+        ]
+        .align_y(Alignment::Center),
+    ]
+    .spacing(4)
+    .width(Length::Fill)
+    .into()
 }
 
 fn tx_card<'a>(
@@ -714,19 +757,33 @@ fn tx_card<'a>(
 
 fn decoded_panel<'a>(t: KaoTheme, c: &'a super::QueuedCall) -> Element<'a, Message> {
     let mut lines = column![].spacing(2).width(Length::Fill);
-    let comment = move |s: &str| text(s.to_string()).size(11).color(t.sub).font(mono());
-    let val = move |s: String| text(s).size(11).color(t.a1).font(mono());
+    let comment = move |s: &str| {
+        text(s.to_string())
+            .size(11)
+            .color(terminal_muted(t))
+            .font(mono())
+    };
+    let val = move |s: String| {
+        text(s)
+            .size(11)
+            .color(t.a1)
+            .font(mono())
+            .wrapping(Wrapping::WordOrGlyph)
+    };
 
     // Every value here is a long, space-free mono string (address, hex
-    // calldata, big integers). iced containers don't clip, so each is given
-    // width(Fill) inside this Fill column, letting the text glyph-wrap within
-    // the terminal box instead of spilling past the card.
+    // calldata, big integers). iced's default text wrapping is `Word`, which
+    // only breaks on spaces — so these would overflow the card. Each value is
+    // given width(Fill) plus `WordOrGlyph` wrapping so it falls back to a
+    // per-glyph break and wraps within the terminal box instead of spilling
+    // past the card.
     lines = lines.push(comment("// target"));
     lines = lines.push(
         text(c.to.to_string())
             .size(11)
-            .color(t.text)
+            .color(terminal_fg(t))
             .font(mono())
+            .wrapping(Wrapping::WordOrGlyph)
             .width(Length::Fill),
     );
 
@@ -743,6 +800,7 @@ fn decoded_panel<'a>(t: KaoTheme, c: &'a super::QueuedCall) -> Element<'a, Messa
                         .size(11)
                         .color(t.a2)
                         .font(mono())
+                        .wrapping(Wrapping::WordOrGlyph)
                         .width(Length::Fill),
                 );
         }
@@ -753,7 +811,7 @@ fn decoded_panel<'a>(t: KaoTheme, c: &'a super::QueuedCall) -> Element<'a, Messa
                     .push(
                         text(format!("{} =", a.name))
                             .size(11)
-                            .color(t.text)
+                            .color(terminal_fg(t))
                             .font(mono()),
                     )
                     .push(val(a.value.clone()).width(Length::Fill));
@@ -769,6 +827,7 @@ fn decoded_panel<'a>(t: KaoTheme, c: &'a super::QueuedCall) -> Element<'a, Messa
                     .size(11)
                     .color(t.a3)
                     .font(mono())
+                    .wrapping(Wrapping::WordOrGlyph)
                     .width(Length::Fill),
             );
     }
@@ -784,6 +843,7 @@ fn decoded_panel<'a>(t: KaoTheme, c: &'a super::QueuedCall) -> Element<'a, Messa
             .size(11)
             .color(t.a3)
             .font(mono())
+            .wrapping(Wrapping::WordOrGlyph)
             .width(Length::Fill),
         );
 
@@ -922,7 +982,7 @@ fn modal_view(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
             scrollable(
                 text(app.json_text.clone())
                     .size(11)
-                    .color(t.text)
+                    .color(terminal_fg(t))
                     .font(mono()),
             )
             .height(Length::Fixed(280.0))
@@ -1455,5 +1515,26 @@ fn terminal_bg(t: KaoTheme) -> Color {
         Color::from_rgb(0.06, 0.07, 0.09)
     } else {
         Color::from_rgb(0.13, 0.15, 0.18)
+    }
+}
+
+/// Foreground ink for text on `terminal_bg`. The panel is dark in *every*
+/// theme, so a light theme's near-black `t.text` would be invisible on it —
+/// use an explicit light ink there. Dark themes already have a light `t.text`.
+fn terminal_fg(t: KaoTheme) -> Color {
+    if t.dark {
+        t.text
+    } else {
+        Color::from_rgb(0.92, 0.93, 0.96)
+    }
+}
+
+/// Dimmer ink for comments / labels on `terminal_bg` (same rationale as
+/// [`terminal_fg`] — a light theme's `t.sub` is too dark to read on the panel).
+fn terminal_muted(t: KaoTheme) -> Color {
+    if t.dark {
+        t.sub
+    } else {
+        Color::from_rgb(0.62, 0.65, 0.72)
     }
 }

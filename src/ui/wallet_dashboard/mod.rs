@@ -2174,6 +2174,19 @@ impl WalletScreen {
                 true,
             ),
         };
+        // Flash approval: disclose any allowance resets folded into the batch.
+        let revoke_n = crate::txbuilder::flash_approval::revoke_count(&calls);
+        let note = note.map(|n| {
+            if revoke_n > 0 {
+                format!(
+                    "{n} Resets {revoke_n} approval{} to 0 in the same transaction \
+                     (flash approval — no allowance is left standing).",
+                    if revoke_n == 1 { "" } else { "s" }
+                )
+            } else {
+                n
+            }
+        });
         let action = sign_review::SignAction::TxBuilder {
             req: req.clone(),
             can_execute,

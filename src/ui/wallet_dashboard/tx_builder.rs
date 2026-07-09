@@ -16,7 +16,7 @@ use crate::portfolio::format_token_balance;
 use crate::safe::tx::SafeTxInput;
 use crate::txbuilder::abi::{self, LoadedContract};
 use crate::txbuilder::sim::BatchSimResult;
-use crate::txbuilder::{QueuedCall, bundle, encode};
+use crate::txbuilder::{QueuedCall, bundle, encode, flash_approval};
 use crate::ui::kao_theme::KaoTheme;
 use crate::wallet::SafeTrust;
 
@@ -62,6 +62,7 @@ pub enum Message {
     ToggleExpand(u64),
     ClearBatch,
     LoadSample,
+    ToggleAutoRevoke(bool),
     // simulate / review
     Simulate,
     Review,
@@ -101,6 +102,7 @@ impl Message {
             Message::ToggleExpand(_) => "ToggleExpand",
             Message::ClearBatch => "ClearBatch",
             Message::LoadSample => "LoadSample",
+            Message::ToggleAutoRevoke(_) => "ToggleAutoRevoke",
             Message::Simulate => "Simulate",
             Message::Review => "Review",
             Message::OpenSave => "OpenSave",
@@ -201,6 +203,9 @@ pub struct TxBuilderApp {
     batch: Vec<QueuedCall>,
     next_id: u64,
     expanded: Option<u64>,
+    /// Flash approval: when on, `approve(spender, 0)` revokes are appended to
+    /// the batch at simulate / review time so no allowance survives the tx.
+    auto_revoke: bool,
 
     // ── simulation strip ──
     sim: Option<BatchSimResult>,
@@ -238,6 +243,7 @@ impl TxBuilderApp {
             batch: Vec::new(),
             next_id: 1,
             expanded: None,
+            auto_revoke: false,
             sim: None,
             sim_busy: false,
             modal: Modal::None,
@@ -394,19 +400,24 @@ impl TxBuilderApp {
                 self.batch = sample_batch(&mut self.next_id, self.owner);
                 self.invalidate_sim();
             }
+            Message::ToggleAutoRevoke(v) => {
+                self.auto_revoke = v;
+                // The revoke set changes what gets simulated — drop any stale sim.
+                self.invalidate_sim();
+            }
             Message::Simulate => {
                 if !self.batch.is_empty() {
                     self.sim_busy = true;
                     self.sim = None;
                     return Some(Outcome::Simulate {
-                        calls: self.batch.clone(),
+                        calls: self.effective_calls(),
                     });
                 }
             }
             Message::Review => {
                 if !self.batch.is_empty() {
                     return Some(Outcome::Review {
-                        calls: self.batch.clone(),
+                        calls: self.effective_calls(),
                     });
                 }
             }
@@ -518,6 +529,30 @@ impl TxBuilderApp {
     fn invalidate_sim(&mut self) {
         self.sim = None;
         self.sim_busy = false;
+    }
+
+    /// The calls to simulate / review / sign: the queue, plus flash-approval
+    /// revokes appended when the toggle is on. Revokes are derived here (never
+    /// stored in `batch`) so the queue stays editable and reorder-safe.
+    fn effective_calls(&self) -> Vec<QueuedCall> {
+        if self.auto_revoke && self.can_batch() {
+            flash_approval::wrap_with_revoke(&self.batch, self.next_id)
+        } else {
+            self.batch.clone()
+        }
+    }
+
+    /// Whether the active identity can execute more than one call atomically —
+    /// a Safe (MultiSend) or a 7702-capable EOA. Gates the flash-approval
+    /// toggle: appending a revoke only makes sense if the batch can batch.
+    fn can_batch(&self) -> bool {
+        self.ctx.is_safe || self.ctx.eoa_can_batch
+    }
+
+    /// The `(token, spender)` allowances a flash-approval revoke would reset —
+    /// used by the view to show/hide the toggle and its count hint.
+    fn revoke_targets(&self) -> Vec<(Address, Address)> {
+        flash_approval::revoke_targets(&self.batch)
     }
 
     fn move_call(&mut self, id: u64, dir: i32) {
@@ -834,6 +869,41 @@ mod tests {
         app.update(Message::AddToBatch);
         assert_eq!(app.batch.len(), 2, "7702-capable EOA batches N calls");
         assert!(app.error.is_none());
+    }
+
+    #[test]
+    fn auto_revoke_appends_revoke_to_effective_calls() {
+        use crate::txbuilder::abi;
+        use crate::txbuilder::encode::build_contract_call;
+        let usdc = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let spender = address!("0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2");
+        let c = abi::known_by_address(Chain::Mainnet, usdc).unwrap();
+        let approve = c.methods.iter().find(|m| m.name == "approve").unwrap();
+        let approve_call = build_contract_call(
+            1,
+            usdc,
+            "USDC",
+            approve,
+            &[spender.to_string(), "5000".into()],
+            "0",
+        )
+        .unwrap();
+
+        let mut app = safe_app(); // is_safe → can_batch
+        app.batch = vec![approve_call];
+        app.next_id = 2;
+
+        // Off: unchanged.
+        assert_eq!(app.effective_calls().len(), 1);
+        // On: one revoke appended.
+        app.auto_revoke = true;
+        let eff = app.effective_calls();
+        assert_eq!(eff.len(), 2);
+        assert_eq!(eff[1].to, usdc);
+        assert_eq!(U256::from_be_slice(&eff[1].data[36..68]), U256::ZERO);
+        // A non-batching EOA never appends (nothing to batch into).
+        app.set_context(Chain::Mainnet, false, None, false);
+        assert_eq!(app.effective_calls().len(), 1, "no batching → no revoke");
     }
 
     #[test]

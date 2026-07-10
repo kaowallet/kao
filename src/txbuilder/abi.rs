@@ -307,7 +307,10 @@ pub fn known_contracts() -> &'static [KnownContract] {
     KNOWN.get_or_init(build_known)
 }
 
-/// The known contracts available on `chain`, in registry order.
+/// The known contracts available on `chain`, in registry order. Test-only:
+/// the composer resolves known contracts by address (`known_by_address`) now
+/// that the quick-pick chips are gone, so this only backs the registry tests.
+#[cfg(test)]
 pub fn known_for_chain(chain: Chain) -> Vec<&'static KnownContract> {
     known_contracts()
         .iter()

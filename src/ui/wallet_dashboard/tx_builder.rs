@@ -41,7 +41,6 @@ pub enum Message {
     SetMode(Mode),
     // contract-call composer
     AddrChanged(String),
-    PickKnown(usize),
     ShowAbiPaste,
     AbiPasteChanged(String),
     LoadPastedAbi,
@@ -83,7 +82,6 @@ impl Message {
             Message::Close => "Close",
             Message::SetMode(_) => "SetMode",
             Message::AddrChanged(_) => "AddrChanged",
-            Message::PickKnown(_) => "PickKnown",
             Message::ShowAbiPaste => "ShowAbiPaste",
             Message::AbiPasteChanged(_) => "AbiPasteChanged",
             Message::LoadPastedAbi => "LoadPastedAbi",
@@ -330,15 +328,6 @@ impl TxBuilderApp {
                 self.error = None;
             }
             Message::AddrChanged(v) => return self.on_addr_changed(v),
-            Message::PickKnown(i) => {
-                let known = abi::known_for_chain(self.ctx.chain);
-                if let Some(k) = known.get(i) {
-                    self.addr_input = k.address.to_string();
-                    if let Some(loaded) = abi::known_by_address(self.ctx.chain, k.address) {
-                        self.set_loaded(loaded);
-                    }
-                }
-            }
             Message::ShowAbiPaste => {
                 self.paste_open = true;
             }
@@ -799,10 +788,16 @@ mod tests {
         app
     }
 
+    /// Mainnet USDC — a known contract, so pasting its address resolves the ABI
+    /// synchronously (no light-client round-trip).
+    fn usdc() -> Address {
+        address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
+    }
+
     #[test]
-    fn known_pick_loads_contract_synchronously() {
+    fn known_address_loads_contract_synchronously() {
         let mut app = safe_app();
-        let out = app.update(Message::PickKnown(0)); // USDC
+        let out = app.update(Message::AddrChanged(usdc().to_string()));
         assert!(out.is_none(), "known contracts resolve without I/O");
         assert!(app.loaded.is_some());
         assert!(!app.resolving);
@@ -824,7 +819,7 @@ mod tests {
     #[test]
     fn add_to_batch_queues_a_call_and_resets_args() {
         let mut app = safe_app();
-        app.update(Message::PickKnown(0)); // USDC, method 0 = transfer
+        app.update(Message::AddrChanged(usdc().to_string())); // USDC, method 0 = transfer
         let to = address!("0x000000000000000000000000000000000000dEaD");
         app.update(Message::ArgChanged(0, to.to_string()));
         app.update(Message::ArgChanged(1, "1000000".into()));
@@ -840,7 +835,7 @@ mod tests {
     fn eoa_without_7702_caps_batch_at_one() {
         let mut app = TxBuilderApp::new(Address::repeat_byte(0x11));
         app.set_context(Chain::Mainnet, false, None, false); // EOA, can't delegate
-        app.update(Message::PickKnown(0));
+        app.update(Message::AddrChanged(usdc().to_string()));
         let to = address!("0x000000000000000000000000000000000000dEaD");
         app.update(Message::ArgChanged(0, to.to_string()));
         app.update(Message::ArgChanged(1, "1".into()));
@@ -859,7 +854,7 @@ mod tests {
         let mut app = TxBuilderApp::new(Address::repeat_byte(0x11));
         app.set_context(Chain::Mainnet, false, None, true); // EOA, Local/Ledger
         let to = address!("0x000000000000000000000000000000000000dEaD");
-        app.update(Message::PickKnown(0));
+        app.update(Message::AddrChanged(usdc().to_string()));
         app.update(Message::ArgChanged(0, to.to_string()));
         app.update(Message::ArgChanged(1, "1".into()));
         app.update(Message::AddToBatch);

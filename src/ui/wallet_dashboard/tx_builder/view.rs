@@ -16,8 +16,6 @@ use crate::ui::kao_widgets::{
     primary_button, text_input_style,
 };
 
-const BATCH_WIDTH: f32 = 400.0;
-
 pub(super) fn root(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
     if app.modal != Modal::None {
         return modal_view(app, t);
@@ -56,14 +54,20 @@ pub(super) fn root(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
     ]
     .width(Length::Fill);
 
-    let panes = row![
-        container(composer_pane(app, t)).width(Length::Fill),
-        container(batch_pane(app, t)).width(Length::Fixed(BATCH_WIDTH)),
-    ]
-    .spacing(16)
-    .width(Length::Fill);
+    // Two matched columns: identical width (each `Fill` → an even 50/50 split at
+    // every window size) and identical height (each `Fill` against the bounded
+    // pane height). Each card scrolls its own overflow internally — see
+    // `pane_card` — which is why the Transaction Builder opts out of the shared
+    // page scroll (apps.rs); that scroll would hand the row an unbounded height
+    // and collapse the equal-height fill.
+    let panes = row![composer_pane(app, t), batch_pane(app, t)]
+        .spacing(16)
+        .width(Length::Fill)
+        .height(Length::Fill);
 
-    let mut col = column![header, Space::new().height(16), panes].width(Length::Fill);
+    let mut col = column![header, Space::new().height(16), panes]
+        .width(Length::Fill)
+        .height(Length::Fill);
 
     if let Some(err) = &app.error {
         col = col.push(Space::new().height(12)).push(error_banner(t, err));
@@ -192,7 +196,7 @@ fn composer_pane(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
     ]
     .width(Length::Fill);
 
-    card(t, inner.into())
+    pane_card(t, inner.into())
 }
 
 fn call_composer(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
@@ -217,26 +221,7 @@ fn call_composer(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
             .into(),
     );
 
-    // known-contract quick picker. iced has no flex-wrap, so the chips are
-    // laid out in fixed-width rows that wrap instead of overflowing the pane
-    // on a narrow window.
-    const CHIPS_PER_ROW: usize = 3;
-    let known = super::abi::known_for_chain(app.ctx.chain);
-    let mut known_col = column![text("known:").size(11).color(t.sub).font(mono())].spacing(6);
-    let mut cur = row![].spacing(6).align_y(Alignment::Center);
-    for (i, k) in known.iter().enumerate() {
-        if i > 0 && i % CHIPS_PER_ROW == 0 {
-            known_col = known_col.push(cur);
-            cur = row![].spacing(6).align_y(Alignment::Center);
-        }
-        let on = app.loaded.as_ref().is_some_and(|c| c.address == k.address);
-        cur = cur.push(known_chip(t, k.name, on, Message::PickKnown(i)));
-    }
-    if !known.is_empty() {
-        known_col = known_col.push(cur);
-    }
-
-    let mut col = column![addr_field, Space::new().height(10), known_col].width(Length::Fill);
+    let mut col = column![addr_field].width(Length::Fill);
 
     if app.resolving {
         col = col.push(Space::new().height(14)).push(info_box(
@@ -297,7 +282,7 @@ fn call_composer(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
     } else if app.addr_input.trim().is_empty() {
         col = col.push(Space::new().height(22)).push(
             container(
-                text("Pick a known contract or paste an address to load its ABI.")
+                text("Paste a verified contract address to load its ABI.")
                     .size(13)
                     .color(t.sub),
             )
@@ -631,7 +616,7 @@ fn batch_pane(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
         .push(Space::new().height(9))
         .push(cta);
 
-    card(t, inner.into())
+    pane_card(t, inner.into())
 }
 
 /// Flash-approval toggle: append `approve(spender, 0)` revokes after the batch
@@ -977,14 +962,21 @@ fn modal_view(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
     .width(Length::Fill);
 
     let editor: Element<'_, Message> = if is_save {
-        // Read-only display of the exported JSON.
+        // Read-only display of the exported JSON. The scrollable is given a
+        // Fill width (and the text too) so it spans the whole panel — otherwise
+        // it shrinks to the widest JSON line and parks the scrollbar mid-panel
+        // instead of at the right edge. `WordOrGlyph` wraps any long, space-free
+        // value line (e.g. a big `data` hex) so nothing is clipped off the right.
         container(
             scrollable(
                 text(app.json_text.clone())
                     .size(11)
                     .color(terminal_fg(t))
-                    .font(mono()),
+                    .font(mono())
+                    .wrapping(Wrapping::WordOrGlyph)
+                    .width(Length::Fill),
             )
+            .width(Length::Fill)
             .height(Length::Fixed(280.0))
             .style(move |_, s| kao_scrollable_style(t, s)),
         )
@@ -1024,9 +1016,15 @@ fn modal_view(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
             .push(text(err.clone()).size(12).color(t.down).font(bold()));
     }
 
+    // The ghost button's padding is bumped so it matches the taller primary CTA
+    // beside it (primary: text 16 + inner pad 13 + button pad 5 ≈ 57px; ghost:
+    // text 13 + button pad 20 ≈ 57px) — otherwise the two render at different
+    // heights. Can't use height(Fill): the ghost is laid out before the natural
+    // primary sets the row's cross size, so it would collapse to nothing.
+    let ghost_pad = Padding::from([20, 12]);
     let actions: Element<'_, Message> = if is_save {
         row![
-            ghost_secondary(t, "Copy JSON", Some(Message::CopyJson)),
+            ghost_secondary(t, "Copy JSON", Some(Message::CopyJson)).padding(ghost_pad),
             Space::new().width(9),
             primary_button(t, "Done", true)
                 .width(Length::Fill)
@@ -1037,7 +1035,7 @@ fn modal_view(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
     } else {
         let can = !app.json_text.trim().is_empty();
         row![
-            ghost_secondary(t, "Cancel", Some(Message::CloseModal)),
+            ghost_secondary(t, "Cancel", Some(Message::CloseModal)).padding(ghost_pad),
             Space::new().width(9),
             primary_button(t, "Load batch →", can)
                 .width(Length::Fill)
@@ -1049,11 +1047,16 @@ fn modal_view(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
 
     col = col.push(Space::new().height(16)).push(actions);
 
-    container(card(t, col.into()))
+    // Center the bounded card in the full pane width. `center_x` + `max_width`
+    // on one container would only cap it to 620 and pin it left (centering just
+    // the card *inside* that 620 box); the centering has to live on a separate
+    // full-width outer container.
+    let modal_card = container(card(t, col.into()))
+        .width(Length::Fill)
+        .max_width(620);
+    container(modal_card)
         .center_x(Length::Fill)
         .padding(Padding::from([10, 0]))
-        .width(Length::Fill)
-        .max_width(620)
         .into()
 }
 
@@ -1093,6 +1096,37 @@ fn card<'a>(t: KaoTheme, body: Element<'a, Message>) -> Element<'a, Message> {
     container(body)
         .padding(Padding::from([18, 20]))
         .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(t.card)),
+            border: Border {
+                color: t.border,
+                width: 1.0,
+                radius: Radius::from(18),
+            },
+            text_color: Some(t.text),
+            ..Default::default()
+        })
+        .into()
+}
+
+/// A full-height pane card (composer / batch). Unlike [`card`], it fills the
+/// row height — so the two side-by-side panes are always the same height — and
+/// scrolls its own overflow internally. The Transaction Builder therefore opts
+/// out of the shared page scroll so these panes are handed a bounded height to
+/// fill (a scrollable would give them an unbounded one, collapsing the fill).
+fn pane_card<'a>(t: KaoTheme, body: Element<'a, Message>) -> Element<'a, Message> {
+    let scroller = scrollable(
+        container(body)
+            .padding(Padding::from([18, 20]))
+            .width(Length::Fill),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .style(move |_, s| kao_scrollable_style(t, s));
+
+    container(scroller)
+        .width(Length::Fill)
+        .height(Length::Fill)
         .style(move |_| container::Style {
             background: Some(Background::Color(t.card)),
             border: Border {
@@ -1217,35 +1251,6 @@ fn mode_tab<'a>(t: KaoTheme, label: &'a str, on: bool, msg: Message) -> Element<
     .into()
 }
 
-fn known_chip<'a>(t: KaoTheme, label: &'a str, on: bool, msg: Message) -> Element<'a, Message> {
-    button(
-        text(label.to_string())
-            .size(12)
-            .color(if on { t.a1 } else { t.text })
-            .font(bold()),
-    )
-    .padding(Padding::from([5, 10]))
-    .on_press(msg)
-    .style(move |_, status| button::Style {
-        background: Some(Background::Color(if on {
-            with_alpha(t.a1, 0.12)
-        } else {
-            match status {
-                button::Status::Hovered => with_alpha(t.text, 0.04),
-                _ => t.card_alt,
-            }
-        })),
-        text_color: t.text,
-        border: Border {
-            color: if on { with_alpha(t.a1, 0.6) } else { t.border },
-            width: 1.0,
-            radius: Radius::from(999),
-        },
-        ..Default::default()
-    })
-    .into()
-}
-
 fn bool_btn<'a>(t: KaoTheme, label: &'a str, on: bool, msg: Message) -> Element<'a, Message> {
     button(
         text(label.to_string())
@@ -1290,10 +1295,16 @@ fn icon_btn<'a>(
         t.sub
     };
     let mut b = button(
-        text(glyph.to_string())
-            .size(11)
-            .color(color)
-            .font(mono_bold()),
+        // Center the glyph in the 24×24 box — placed raw, each glyph
+        // (↑ ↓ </> ✕) sits at its own baseline and they look misaligned.
+        container(
+            text(glyph.to_string())
+                .size(11)
+                .color(color)
+                .font(mono_bold()),
+        )
+        .center_x(Length::Fill)
+        .center_y(Length::Fill),
     )
     .width(24)
     .height(24)
@@ -1321,7 +1332,14 @@ fn icon_btn<'a>(
 }
 
 /// A ghost/secondary flat button used in the batch footer and modal.
-fn ghost_secondary<'a>(t: KaoTheme, label: &'a str, msg: Option<Message>) -> Element<'a, Message> {
+/// Returns the `Button` (not an `Element`) so callers can chain sizing — e.g.
+/// `.padding(...)` to grow it to a taller primary button's height beside it. It
+/// still drops into any `row!`/`push` position via `Into<Element>`.
+fn ghost_secondary<'a>(
+    t: KaoTheme,
+    label: &'a str,
+    msg: Option<Message>,
+) -> button::Button<'a, Message> {
     let enabled = msg.is_some();
     let mut b = button(
         container(
@@ -1350,7 +1368,7 @@ fn ghost_secondary<'a>(t: KaoTheme, label: &'a str, msg: Option<Message>) -> Ele
     if let Some(m) = msg {
         b = b.on_press(m);
     }
-    b.into()
+    b
 }
 
 fn info_box<'a>(t: KaoTheme, msg: &str, accent: Color) -> Element<'a, Message> {

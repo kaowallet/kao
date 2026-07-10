@@ -335,6 +335,19 @@ impl AppsPane {
             AppsView::TxBuilder => self.tx_builder.view(t).map(Message::TxBuilder),
         };
 
+        // The Transaction Builder runs its own full-height, two-pane layout and
+        // scrolls each pane internally, so it needs a *bounded* height to fill.
+        // Wrapping it in the shared vertical scrollable would hand it an
+        // unbounded height and collapse the equal-height panes — so it takes the
+        // pane at full size and skips the page scroll.
+        if matches!(self.view, AppsView::TxBuilder) {
+            return container(content)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .padding(Padding::from([28, 32]))
+                .into();
+        }
+
         // Center the bounded (max-width 560) content within the full-width
         // scroll area. Centering has to live on the inner container: the
         // scrollable fills the pane, so its own child is what needs to be

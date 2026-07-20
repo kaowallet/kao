@@ -143,11 +143,15 @@ pub struct AppsPane {
 
 impl AppsPane {
     pub fn new(owner: Address) -> Self {
+        // Load the user's saved Transaction-Builder templates once, at build
+        // time (a tiny plaintext redb read; tolerant of a missing file).
+        let mut tx_builder = TxBuilderApp::new(owner);
+        tx_builder.set_templates(crate::txbuilder::templates::load());
         Self {
             composer: SwapComposer::new(),
             names: NamesApp::new(owner),
             pool: PoolApp::new(),
-            tx_builder: TxBuilderApp::new(owner),
+            tx_builder,
             view: AppsView::Launcher,
         }
     }
@@ -160,17 +164,25 @@ impl AppsPane {
     }
 
     /// Refresh the builder's identity context (active chain + whether a Safe
-    /// is active) before it processes a message, so batch-cap and known-
-    /// contract lookup see the live identity.
+    /// is active + enabled custom networks) before it processes a message, so
+    /// batch-cap, known-contract lookup, and the network switcher see the live
+    /// identity.
     pub fn set_txbuilder_context(
         &mut self,
         chain: crate::chain::Chain,
         is_safe: bool,
         safe_version: Option<String>,
         eoa_can_batch: bool,
+        custom_networks: Vec<(u64, String)>,
     ) {
         self.tx_builder
-            .set_context(chain, is_safe, safe_version, eoa_can_batch);
+            .set_context(chain, is_safe, safe_version, eoa_can_batch, custom_networks);
+    }
+
+    /// The network the Transaction Builder is composing against — read by the
+    /// coordinator to build the EOA request / route resolve + broadcast.
+    pub fn txbuilder_selected_net(&self) -> crate::chain::NetworkId {
+        self.tx_builder.selected_net()
     }
 
     /// Mutable access to the Privacy Pools app so the coordinator can deliver

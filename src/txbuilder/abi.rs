@@ -54,11 +54,19 @@ impl AbiParam {
     }
 }
 
-/// A state-mutating function the user can compose a call to.
+/// A contract function the user can compose a call to. Covers both
+/// state-mutating (write) and `view`/`pure` (read) functions — the composer
+/// keeps the two in separate lists on [`LoadedContract`], but the shape is
+/// identical.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AbiMethod {
     pub name: String,
     pub inputs: Vec<AbiParam>,
+    /// Return values, in declared order. Populated for read (`view`/`pure`)
+    /// methods so an `eth_call` result can be ABI-decoded and shown typed;
+    /// empty for write methods (their return, if any, is never surfaced) and
+    /// for bytecode-recovered methods (evmole doesn't recover outputs).
+    pub outputs: Vec<AbiParam>,
     /// True iff the method accepts ETH (`payable`). The composer shows a
     /// wei value field only for these. Always `false` for bytecode-derived
     /// methods (evmole doesn't recover mutability) — use raw-hex mode for
@@ -68,6 +76,21 @@ pub struct AbiMethod {
     pub selector: [u8; 4],
     /// Canonical signature, e.g. `approve(address,uint256)`.
     pub signature: String,
+}
+
+impl AbiMethod {
+    /// The return type to ABI-decode an `eth_call` result against: a tuple of
+    /// the declared outputs (a bare tuple decodes identically to head-tail ABI
+    /// return data). `None` when the method declares no outputs.
+    pub fn output_tuple(&self) -> Option<DynSolType> {
+        if self.outputs.is_empty() {
+            None
+        } else {
+            Some(DynSolType::Tuple(
+                self.outputs.iter().map(|o| o.ty.clone()).collect(),
+            ))
+        }
+    }
 }
 
 /// How a contract's ABI was obtained — drives the verification badge.
@@ -82,7 +105,9 @@ pub enum AbiSource {
     Bytecode,
 }
 
-/// A contract whose write methods are available to compose against.
+/// A contract whose functions are available to compose against. `methods`
+/// holds the state-changing (write) functions; `read_methods` holds the
+/// `view`/`pure` functions the Read tab queries via `eth_call`.
 #[derive(Debug, Clone)]
 pub struct LoadedContract {
     pub address: Address,
@@ -91,6 +116,10 @@ pub struct LoadedContract {
     /// Longer descriptor (`USD Coin · proxy`), may be empty.
     pub label: String,
     pub methods: Vec<AbiMethod>,
+    /// Read-only (`view`/`pure`) functions, with decodable `outputs`. Empty for
+    /// a bytecode load (evmole can't recover outputs); the Read tab then prompts
+    /// for a pasted ABI.
+    pub read_methods: Vec<AbiMethod>,
     pub source: AbiSource,
     /// Brand kaomoji for known contracts; `None` otherwise.
     pub kaomoji: Option<&'static str>,
@@ -143,7 +172,51 @@ fn method(name: &str, payable: bool, params: &[(&str, &str)]) -> AbiMethod {
     AbiMethod {
         name: name.to_string(),
         inputs,
+        outputs: Vec::new(),
         payable,
+        selector,
+        signature,
+    }
+}
+
+/// Construct a read-only [`AbiMethod`] (`view`/`pure`) from a name, a list of
+/// `(param_name, type_string)` inputs, and a list of `(name, type_string)`
+/// outputs. Output names are cosmetic (shown beside the decoded value) and may
+/// be empty. Panics on an unparseable type — compile-time registry only.
+fn read_method(name: &str, params: &[(&str, &str)], outputs: &[(&str, &str)]) -> AbiMethod {
+    let parse = |ty: &str| -> DynSolType {
+        ty.parse()
+            .unwrap_or_else(|e| panic!("known-contract type {ty:?} must parse: {e}"))
+    };
+    let inputs: Vec<AbiParam> = params
+        .iter()
+        .map(|(pname, ty)| {
+            let parsed = parse(ty);
+            AbiParam {
+                name: (*pname).to_string(),
+                ty_str: parsed.sol_type_name().into_owned(),
+                ty: parsed,
+            }
+        })
+        .collect();
+    let outputs: Vec<AbiParam> = outputs
+        .iter()
+        .map(|(oname, ty)| {
+            let parsed = parse(ty);
+            AbiParam {
+                name: (*oname).to_string(),
+                ty_str: parsed.sol_type_name().into_owned(),
+                ty: parsed,
+            }
+        })
+        .collect();
+    // Read methods are always non-payable; the selector hashes over inputs only.
+    let (signature, selector) = signature_and_selector(name, &inputs);
+    AbiMethod {
+        name: name.to_string(),
+        inputs,
+        outputs,
+        payable: false,
         selector,
         signature,
     }
@@ -164,6 +237,8 @@ pub struct KnownContract {
     pub label: &'static str,
     pub kaomoji: &'static str,
     pub methods: Vec<AbiMethod>,
+    /// Curated read-only functions surfaced in the Read tab. May be empty.
+    pub read_methods: Vec<AbiMethod>,
 }
 
 impl KnownContract {
@@ -173,10 +248,33 @@ impl KnownContract {
             name: self.name.to_string(),
             label: self.label.to_string(),
             methods: self.methods.clone(),
+            read_methods: self.read_methods.clone(),
             source: AbiSource::Known,
             kaomoji: Some(self.kaomoji),
         }
     }
+}
+
+/// The standard ERC-20 read surface, shared by every token in the registry.
+/// Selectors are derived from the canonical signatures, so these match any
+/// compliant token (`balanceOf`, `allowance`, `totalSupply`, metadata).
+fn erc20_reads() -> Vec<AbiMethod> {
+    vec![
+        read_method(
+            "balanceOf",
+            &[("account", "address")],
+            &[("balance", "uint256")],
+        ),
+        read_method(
+            "allowance",
+            &[("owner", "address"), ("spender", "address")],
+            &[("remaining", "uint256")],
+        ),
+        read_method("totalSupply", &[], &[("supply", "uint256")]),
+        read_method("decimals", &[], &[("decimals", "uint8")]),
+        read_method("symbol", &[], &[("symbol", "string")]),
+        read_method("name", &[], &[("name", "string")]),
+    ]
 }
 
 fn build_known() -> Vec<KnownContract> {
@@ -208,6 +306,7 @@ fn build_known() -> Vec<KnownContract> {
                     ],
                 ),
             ],
+            read_methods: erc20_reads(),
         },
         KnownContract {
             chain: Chain::Mainnet,
@@ -257,6 +356,18 @@ fn build_known() -> Vec<KnownContract> {
                     ],
                 ),
             ],
+            read_methods: vec![
+                read_method(
+                    "getReserveNormalizedIncome",
+                    &[("asset", "address")],
+                    &[("normalizedIncome", "uint256")],
+                ),
+                read_method(
+                    "getReserveNormalizedVariableDebt",
+                    &[("asset", "address")],
+                    &[("normalizedDebt", "uint256")],
+                ),
+            ],
         },
         KnownContract {
             chain: Chain::Mainnet,
@@ -278,6 +389,7 @@ fn build_known() -> Vec<KnownContract> {
                     &[("spender", "address"), ("amount", "uint256")],
                 ),
             ],
+            read_methods: erc20_reads(),
         },
         KnownContract {
             chain: Chain::Mainnet,
@@ -297,6 +409,7 @@ fn build_known() -> Vec<KnownContract> {
                     &[("spender", "address"), ("amount", "uint256")],
                 ),
             ],
+            read_methods: erc20_reads(),
         },
     ]
 }
@@ -337,11 +450,17 @@ struct AbiEntry {
     name: Option<String>,
     #[serde(default)]
     inputs: Vec<AbiJsonParam>,
+    #[serde(default)]
+    outputs: Vec<AbiJsonParam>,
     #[serde(rename = "stateMutability")]
     state_mutability: Option<String>,
     /// Legacy (pre-`stateMutability`) ABIs carried a bare `payable` bool.
     #[serde(default)]
     payable: Option<bool>,
+    /// Legacy (pre-`stateMutability`) read-only marker. `constant: true` ⇒ a
+    /// `view`-equivalent function.
+    #[serde(default)]
+    constant: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -382,49 +501,70 @@ fn is_writable(state_mutability: Option<&str>, payable: Option<bool>) -> Option<
     }
 }
 
+/// Parse a list of JSON ABI params into typed [`AbiParam`]s, expanding tuples.
+fn params_from_json(list: &[AbiJsonParam]) -> Result<Vec<AbiParam>, TxBuilderError> {
+    let mut out = Vec::with_capacity(list.len());
+    for p in list {
+        let ty_str = canonical_ty(p);
+        let ty: DynSolType = ty_str
+            .parse()
+            .map_err(|e| TxBuilderError::Abi(format!("unsupported type {ty_str:?}: {e}")))?;
+        out.push(AbiParam {
+            name: p.name.clone().unwrap_or_default(),
+            ty_str: ty.sol_type_name().into_owned(),
+            ty,
+        });
+    }
+    Ok(out)
+}
+
 /// Parse a standard Solidity JSON ABI array into a [`LoadedContract`],
-/// keeping only the state-mutating functions.
+/// splitting state-mutating functions (`methods`) from `view`/`pure` reads
+/// (`read_methods`, which carry decodable `outputs`).
 pub fn parse_abi_json(json: &str, address: Address) -> Result<LoadedContract, TxBuilderError> {
     let entries: Vec<AbiEntry> = serde_json::from_str(json.trim())
         .map_err(|e| TxBuilderError::Abi(format!("not a JSON ABI array — {e}")))?;
 
     let mut methods = Vec::new();
+    let mut read_methods = Vec::new();
     for entry in &entries {
         if entry.kind.as_deref() != Some("function") {
             continue;
         }
-        let Some(payable) = is_writable(entry.state_mutability.as_deref(), entry.payable) else {
-            continue; // view / pure — skip
-        };
         let Some(name) = entry.name.clone() else {
             continue;
         };
-        let mut inputs = Vec::with_capacity(entry.inputs.len());
-        for p in &entry.inputs {
-            let ty_str = canonical_ty(p);
-            let ty: DynSolType = ty_str
-                .parse()
-                .map_err(|e| TxBuilderError::Abi(format!("unsupported type {ty_str:?}: {e}")))?;
-            inputs.push(AbiParam {
-                name: p.name.clone().unwrap_or_default(),
-                ty_str: ty.sol_type_name().into_owned(),
-                ty,
+        let inputs = params_from_json(&entry.inputs)?;
+        let (signature, selector) = signature_and_selector(&name, &inputs);
+        let is_read = matches!(
+            entry.state_mutability.as_deref(),
+            Some("view") | Some("pure")
+        ) || (entry.state_mutability.is_none() && entry.constant == Some(true));
+        if is_read {
+            let outputs = params_from_json(&entry.outputs)?;
+            read_methods.push(AbiMethod {
+                name,
+                inputs,
+                outputs,
+                payable: false,
+                selector,
+                signature,
+            });
+        } else if let Some(payable) = is_writable(entry.state_mutability.as_deref(), entry.payable)
+        {
+            methods.push(AbiMethod {
+                name,
+                inputs,
+                outputs: Vec::new(),
+                payable,
+                selector,
+                signature,
             });
         }
-        let (signature, selector) = signature_and_selector(&name, &inputs);
-        methods.push(AbiMethod {
-            name,
-            inputs,
-            payable,
-            selector,
-            signature,
-        });
     }
 
-    if methods.is_empty() {
-        return Err(TxBuilderError::Abi(
-            "no state-changing functions in this ABI".into(),
-        ));
+    if methods.is_empty() && read_methods.is_empty() {
+        return Err(TxBuilderError::Abi("no functions in this ABI".into()));
     }
 
     Ok(LoadedContract {
@@ -432,6 +572,7 @@ pub fn parse_abi_json(json: &str, address: Address) -> Result<LoadedContract, Tx
         name: crate::wallet::short_address(address),
         label: "pasted ABI".into(),
         methods,
+        read_methods,
         source: AbiSource::Pasted,
         kaomoji: None,
     })
@@ -494,6 +635,7 @@ pub fn from_bytecode(code: &[u8], address: Address) -> Option<LoadedContract> {
         methods.push(AbiMethod {
             name,
             inputs,
+            outputs: Vec::new(),
             payable: false,
             selector,
             signature,
@@ -505,6 +647,10 @@ pub fn from_bytecode(code: &[u8], address: Address) -> Option<LoadedContract> {
         name: crate::wallet::short_address(address),
         label: "recovered from bytecode".into(),
         methods,
+        // evmole recovers selectors + arg types but not return types, so a
+        // bytecode load exposes no decodable reads — the Read tab prompts for
+        // a pasted ABI instead.
+        read_methods: Vec::new(),
         source: AbiSource::Bytecode,
         kaomoji: None,
     })
@@ -616,10 +762,43 @@ mod tests {
     }
 
     #[test]
-    fn parse_json_abi_empty_or_readonly_errors() {
-        let only_view = r#"[{"type":"function","name":"x","stateMutability":"view","inputs":[]}]"#;
-        assert!(parse_abi_json(only_view, Address::ZERO).is_err());
+    fn parse_json_abi_view_loads_as_read_method() {
+        // A view-only ABI is now valid — it loads with a read method (no writes),
+        // and the return type is parsed for decoding.
+        let only_view = r#"[{"type":"function","name":"balanceOf","stateMutability":"view",
+            "inputs":[{"name":"who","type":"address"}],"outputs":[{"name":"bal","type":"uint256"}]}]"#;
+        let c = parse_abi_json(only_view, Address::ZERO).unwrap();
+        assert!(c.methods.is_empty());
+        assert_eq!(c.read_methods.len(), 1);
+        let m = &c.read_methods[0];
+        assert_eq!(m.name, "balanceOf");
+        assert_eq!(m.selector, [0x70, 0xa0, 0x82, 0x31]);
+        assert_eq!(m.outputs.len(), 1);
+        assert_eq!(m.outputs[0].ty_str, "uint256");
+    }
+
+    #[test]
+    fn parse_json_abi_empty_or_garbage_errors() {
+        let no_fns = r#"[{"type":"event","name":"Transfer","inputs":[]}]"#;
+        assert!(parse_abi_json(no_fns, Address::ZERO).is_err());
         assert!(parse_abi_json("not json", Address::ZERO).is_err());
+    }
+
+    #[test]
+    fn known_erc20_reads_have_canonical_selectors() {
+        let usdc = known_by_address(
+            Chain::Mainnet,
+            address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        )
+        .unwrap();
+        let bal = usdc
+            .read_methods
+            .iter()
+            .find(|m| m.name == "balanceOf")
+            .unwrap();
+        // keccak256("balanceOf(address)")[..4] == 0x70a08231
+        assert_eq!(bal.selector, [0x70, 0xa0, 0x82, 0x31]);
+        assert!(bal.output_tuple().is_some());
     }
 
     #[test]

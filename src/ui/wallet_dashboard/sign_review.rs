@@ -81,13 +81,27 @@ pub struct ReviewLeg {
     pub title: String,
     pub to: Address,
     pub value: U256,
-    pub chain: Chain,
+    /// The network this leg broadcasts on. A [`NetworkId`] (not [`Chain`]) so a
+    /// Transaction-Builder call on a user-defined custom network renders and
+    /// signs on the right chain id; built-in flows pass `chain.into()`.
+    pub net: crate::chain::NetworkId,
     /// The exact calldata this leg signs — retained (not just its decode) so the
     /// ERC-8213 Calldata Digest is computed over the real bytes. `DecodeResult`
     /// drops the raw input on its descriptor-matched (`ClearSigned`) path, so it
     /// can't be recovered from `decoded`. Empty for a pure value transfer.
     pub calldata: Bytes,
     pub decoded: Box<DecodeResult>,
+    /// The calls a batch leg fans out into, each clear-signed on its own.
+    ///
+    /// A Transaction Builder batch signs one outer call — a Safe `multiSend(bytes)`
+    /// delegatecall, or an EIP-7702 `executeBatch(Call[])` self-call — whose own
+    /// decode says nothing a user can act on ("multiSend, 1 argument, 412 bytes").
+    /// The sub-calls are recovered *from that outer calldata* (not from the queue
+    /// it was built from) and decoded individually, so the panels the user reads
+    /// are derived from the exact bytes being signed.
+    ///
+    /// Empty for an ordinary single-call leg.
+    pub sub_legs: Vec<ReviewLeg>,
 }
 
 /// The CoW GPv2 order the user signs as EIP-712 typed data. Every field here is a
@@ -771,9 +785,9 @@ fn step_card<'a>(
     show_fingerprints: bool,
 ) -> Element<'a, Message> {
     let panel = match step {
-        SignStep::RawTx(leg) => leg_card(t, leg),
+        SignStep::RawTx(leg) => leg_card(t, leg, show_calldata),
         SignStep::Typed(order) => order_panel(t, order),
-        SignStep::SafeExec(x) => safe_exec_panel(t, x),
+        SignStep::SafeExec(x) => safe_exec_panel(t, x, show_calldata),
         SignStep::SafeMessage(m) => safe_message_panel(t, m),
         SignStep::Send(r) => {
             super::send::render_send_review(t, r, show_calldata, Message::ToggleCalldata)
@@ -908,7 +922,11 @@ fn fingerprints_section<'a>(
 /// A Safe `execTransaction` step: the ceremony header (N-of-M owners, Safe
 /// address, nonce), the decoded inner call (via the shared `leg_card`), and the
 /// exact `safeTxHash` each owner signs on their device.
-fn safe_exec_panel<'a>(t: KaoTheme, x: &'a SafeExecReview) -> Element<'a, Message> {
+fn safe_exec_panel<'a>(
+    t: KaoTheme,
+    x: &'a SafeExecReview,
+    show_detail: bool,
+) -> Element<'a, Message> {
     let mut col = column![
         text("Safe transaction — execTransaction")
             .size(11)
@@ -931,7 +949,7 @@ fn safe_exec_panel<'a>(t: KaoTheme, x: &'a SafeExecReview) -> Element<'a, Messag
     col = col.push(Space::new().height(8));
     col = col.push(text("Safe will execute").size(11).color(t.sub).font(bold()));
     col = col.push(Space::new().height(4));
-    col = col.push(leg_card(t, x.inner.as_ref()));
+    col = col.push(leg_card(t, x.inner.as_ref(), show_detail));
     col = col.push(Space::new().height(8));
     col = col.push(hash_row(
         t,
@@ -1043,8 +1061,10 @@ fn typed_panel<'a>(t: KaoTheme, model: TypedDataModel) -> Element<'a, Message> {
 }
 
 /// A decoded raw-transaction leg: destination + value, then the shared
-/// `function_panel` clear-signing render of its calldata.
-fn leg_card<'a>(t: KaoTheme, leg: &'a ReviewLeg) -> Element<'a, Message> {
+/// `function_panel` clear-signing render of its calldata. A batch leg
+/// additionally renders each of its [`sub_legs`](ReviewLeg::sub_legs) — the
+/// calls the outer transaction fans out into, decoded individually.
+fn leg_card<'a>(t: KaoTheme, leg: &'a ReviewLeg, show_detail: bool) -> Element<'a, Message> {
     let mut col = column![
         text(&leg.title).size(13).color(t.text).font(bold()),
         Space::new().height(6),
@@ -1052,18 +1072,140 @@ fn leg_card<'a>(t: KaoTheme, leg: &'a ReviewLeg) -> Element<'a, Message> {
     .spacing(0)
     .width(Length::Fill);
 
-    col = col.push(addr_kv(t, "To", leg.to));
-    col = col.push(kv(t, "Network", leg.chain.display_name()));
-    col = col.push(kv(t, "Value", format!("{} ETH", format_eth(leg.value))));
-
-    if let Some(panel) =
-        super::function_panel::view::<Message>(t, Some(leg.decoded.as_ref()), false)
-    {
+    // What it does, before who it touches: the headline leads the card, the
+    // destination rows follow, the mechanical decode comes last.
+    let headline = leg.decoded.headline();
+    if let Some(h) = &headline {
+        col = col.push(super::function_panel::headline_view::<Message>(t, h));
         col = col.push(Space::new().height(8));
-        col = col.push(panel);
+    }
+
+    // A clear-signed call has an authored sentence saying what it does, so the
+    // destination/value rows and the decoded entries are corroboration, not the
+    // primary read — fold them behind a toggle. Without a descriptor there is
+    // no such sentence, so everything stays unfolded.
+    let collapsible = headline.as_ref().is_some_and(|h| h.clear_signed);
+    if collapsible {
+        col = col.push(detail_toggle(t, show_detail));
+    }
+    if !collapsible || show_detail {
+        if collapsible {
+            col = col.push(Space::new().height(6));
+        }
+        col = col.push(addr_kv(t, "To", leg.to));
+        col = col.push(kv(t, "Network", leg.net.display_name()));
+        col = col.push(kv(t, "Value", format!("{} ETH", format_eth(leg.value))));
+
+        if let Some(panel) =
+            super::function_panel::view::<Message>(t, Some(leg.decoded.as_ref()), false)
+        {
+            col = col.push(Space::new().height(8));
+            col = col.push(panel);
+        }
+    }
+
+    if !leg.sub_legs.is_empty() {
+        col = col.push(Space::new().height(10));
+        col = col.push(
+            text(format!(
+                "This transaction performs {} call{} — all-or-nothing",
+                leg.sub_legs.len(),
+                if leg.sub_legs.len() == 1 { "" } else { "s" }
+            ))
+            .size(11)
+            .color(t.sub)
+            .font(bold()),
+        );
+        for sub in &leg.sub_legs {
+            col = col.push(Space::new().height(6));
+            col = col.push(sub_leg_card(t, sub, show_detail));
+        }
     }
 
     card(t, col.into())
+}
+
+/// The show/hide control for a clear-signed leg's mechanical detail. Emits the
+/// shared [`Message::ToggleCalldata`], so one click unfolds every leg on the
+/// overlay at once — the same "one flag toggles them all" rule the ERC-8213
+/// fingerprints section follows.
+fn detail_toggle<'a>(t: KaoTheme, shown: bool) -> Element<'a, Message> {
+    button(
+        row![
+            text(if shown { "▾" } else { "▸" })
+                .size(11)
+                .color(t.sub)
+                .font(mono()),
+            Space::new().width(6),
+            text(if shown {
+                "Hide details"
+            } else {
+                "Show details"
+            })
+            .size(11)
+            .color(t.sub)
+            .font(bold()),
+        ]
+        .align_y(Alignment::Center),
+    )
+    .padding(Padding::from([4, 0]))
+    .on_press(Message::ToggleCalldata)
+    .style(move |_theme, _status| button::Style {
+        background: None,
+        text_color: t.sub,
+        ..button::Style::default()
+    })
+    .into()
+}
+
+/// One call inside a batch: the same fields and clear-signing panel as a
+/// top-level leg, in a tighter card so the nesting reads as "inside the
+/// transaction above". `Network` is dropped — every sub-call runs on the outer
+/// leg's chain, so repeating it per call is noise.
+fn sub_leg_card<'a>(t: KaoTheme, leg: &'a ReviewLeg, show_detail: bool) -> Element<'a, Message> {
+    let mut col = column![
+        text(&leg.title).size(11).color(t.sub).font(bold()),
+        Space::new().height(4),
+    ]
+    .spacing(0)
+    .width(Length::Fill);
+
+    let headline = leg.decoded.headline();
+    if let Some(h) = &headline {
+        col = col.push(super::function_panel::headline_view::<Message>(t, h));
+        col = col.push(Space::new().height(6));
+    }
+
+    // No toggle of its own — a sub-call follows the outer leg's disclosure
+    // state, so one click unfolds the whole batch rather than N.
+    if !headline.as_ref().is_some_and(|h| h.clear_signed) || show_detail {
+        col = col.push(addr_kv(t, "To", leg.to));
+        if !leg.value.is_zero() {
+            col = col.push(kv(t, "Value", format!("{} ETH", format_eth(leg.value))));
+        }
+
+        if let Some(panel) =
+            super::function_panel::view::<Message>(t, Some(leg.decoded.as_ref()), false)
+        {
+            col = col.push(Space::new().height(6));
+            col = col.push(panel);
+        }
+    }
+
+    container(col)
+        .padding(Padding::from([10, 12]))
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(iced::Background::Color(t.card)),
+            border: iced::Border {
+                color: t.border,
+                width: 1.0,
+                radius: iced::border::Radius::from(10),
+            },
+            text_color: Some(t.text),
+            ..container::Style::default()
+        })
+        .into()
 }
 
 fn kv<'a>(t: KaoTheme, label: impl Into<String>, value: impl Into<String>) -> Element<'a, Message> {
@@ -1336,9 +1478,10 @@ mod tests {
             title: "leg".into(),
             to: Address::repeat_byte(0x01),
             value: U256::ZERO,
-            chain: Chain::Mainnet,
+            net: crate::chain::NetworkId::Builtin(Chain::Mainnet),
             calldata,
             decoded: Box::new(DecodeResult::Empty),
+            sub_legs: Vec::new(),
         }
     }
 

@@ -331,6 +331,7 @@ fn method_from_meta(cm: &ContractMethod) -> Result<AbiMethod, TxBuilderError> {
     Ok(AbiMethod {
         name: cm.name.clone(),
         inputs,
+        outputs: Vec::new(),
         payable: cm.payable,
         selector,
         signature: sig,

@@ -93,6 +93,96 @@ pub fn encode_multisend_calldata(packed: &[u8]) -> Bytes {
     Bytes::from(out)
 }
 
+/// One sub-transaction recovered from a packed MultiSend blob. Produced by
+/// [`decode_multisend_calldata`] — the review's clear-signing panels are built
+/// from *these*, not from the queue they were packed from, so what the user
+/// reads is derived from the exact bytes the Safe will delegatecall.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackedCall {
+    /// Inner operation byte. Always `0` (CALL) for a blob this wallet built;
+    /// `MultiSendCallOnly` reverts on anything else, but it is surfaced so a
+    /// foreign blob can be shown for what it is.
+    pub operation: u8,
+    pub to: Address,
+    pub value: U256,
+    pub data: Bytes,
+}
+
+/// Unpack a `transactions` blob back into its sub-transactions. The inverse of
+/// [`encode_packed`]; errors on a truncated or over-long record rather than
+/// showing a partial batch.
+pub fn decode_packed(packed: &[u8]) -> Result<Vec<PackedCall>, TxBuilderError> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < packed.len() {
+        // operation(1) ‖ to(20) ‖ value(32) ‖ dataLen(32) — 85-byte header.
+        let header_end = i
+            .checked_add(85)
+            .ok_or_else(|| TxBuilderError::Assembly("MultiSend blob is malformed".into()))?;
+        if header_end > packed.len() {
+            return Err(TxBuilderError::Assembly(
+                "MultiSend blob ends mid-header".into(),
+            ));
+        }
+        let operation = packed[i];
+        let to = Address::from_slice(&packed[i + 1..i + 21]);
+        let value = U256::from_be_slice(&packed[i + 21..i + 53]);
+        let len = U256::from_be_slice(&packed[i + 53..i + 85]);
+        let len = usize::try_from(len)
+            .map_err(|_| TxBuilderError::Assembly("MultiSend sub-call length overflows".into()))?;
+        let data_end = header_end.checked_add(len).ok_or_else(|| {
+            TxBuilderError::Assembly("MultiSend sub-call length overflows".into())
+        })?;
+        if data_end > packed.len() {
+            return Err(TxBuilderError::Assembly(
+                "MultiSend blob ends mid-payload".into(),
+            ));
+        }
+        out.push(PackedCall {
+            operation,
+            to,
+            value,
+            data: Bytes::copy_from_slice(&packed[header_end..data_end]),
+        });
+        i = data_end;
+    }
+    Ok(out)
+}
+
+/// Recover the sub-transactions from `multiSend(bytes)` calldata: check the
+/// selector, read the ABI header, then unpack the blob. Used by the sign review
+/// to clear-sign each inner call of the batch it is about to sign.
+pub fn decode_multisend_calldata(calldata: &[u8]) -> Result<Vec<PackedCall>, TxBuilderError> {
+    if calldata.len() < 4 + 64 || calldata[..4] != MULTISEND_SELECTOR {
+        return Err(TxBuilderError::Assembly(
+            "not a multiSend(bytes) call".into(),
+        ));
+    }
+    let offset = usize::try_from(U256::from_be_slice(&calldata[4..36]))
+        .map_err(|_| TxBuilderError::Assembly("MultiSend offset overflows".into()))?;
+    // The blob's length word sits at `4 + offset`; its bytes follow.
+    let len_at = 4usize
+        .checked_add(offset)
+        .ok_or_else(|| TxBuilderError::Assembly("MultiSend offset overflows".into()))?;
+    if len_at + 32 > calldata.len() {
+        return Err(TxBuilderError::Assembly(
+            "MultiSend calldata is truncated".into(),
+        ));
+    }
+    let len = usize::try_from(U256::from_be_slice(&calldata[len_at..len_at + 32]))
+        .map_err(|_| TxBuilderError::Assembly("MultiSend length overflows".into()))?;
+    let start = len_at + 32;
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| TxBuilderError::Assembly("MultiSend length overflows".into()))?;
+    if end > calldata.len() {
+        return Err(TxBuilderError::Assembly(
+            "MultiSend calldata is truncated".into(),
+        ));
+    }
+    decode_packed(&calldata[start..end])
+}
+
 /// Build the wrapping `SafeTxInput` for a batch: a delegatecall to the
 /// version-matched `MultiSendCallOnly` carrying the packed calls. The outer
 /// value is zero — sub-call ETH is drawn from the Safe's balance during
@@ -241,6 +331,62 @@ mod tests {
     #[test]
     fn build_input_rejects_empty_batch() {
         assert!(build_multisend_input(&[], "1.4.1").is_err());
+    }
+
+    // ── decode (the sign review reads the batch back out of the blob) ──
+
+    #[test]
+    fn decode_packed_round_trips_every_field() {
+        let a = address!("0x000000000000000000000000000000000000000A");
+        let b = address!("0x000000000000000000000000000000000000000B");
+        // Mixed shapes: value + empty data, then zero-value + odd-length data
+        // (so the walk can't be passing by luck on 32-byte alignment).
+        let calls = [call(a, 5, &[]), call(b, 0, &[0xff; 37])];
+        let out = decode_packed(&encode_packed(&calls)).expect("round trip");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].operation, 0, "MultiSendCallOnly allows CALL only");
+        assert_eq!(out[0].to, a);
+        assert_eq!(out[0].value, U256::from(5u64));
+        assert!(out[0].data.is_empty());
+        assert_eq!(out[1].to, b);
+        assert_eq!(out[1].value, U256::ZERO);
+        assert_eq!(&out[1].data[..], &[0xff; 37]);
+    }
+
+    #[test]
+    fn decode_multisend_calldata_recovers_the_batch_that_was_built() {
+        let a = address!("0x000000000000000000000000000000000000000A");
+        let b = address!("0x000000000000000000000000000000000000000B");
+        let calls = [call(a, 7, &[0x12, 0x34]), call(b, 0, &[0xab])];
+        let input = build_multisend_input(&calls, "1.4.1").unwrap();
+        let out = decode_multisend_calldata(&input.data).expect("round trip");
+        assert_eq!(out.len(), 2);
+        // What the review will display == what the Safe will delegatecall.
+        for (got, want) in out.iter().zip(calls.iter()) {
+            assert_eq!(got.to, want.to);
+            assert_eq!(got.value, want.value);
+            assert_eq!(got.data, want.data);
+        }
+    }
+
+    #[test]
+    fn decode_rejects_a_blob_it_cannot_fully_account_for() {
+        let a = address!("0x000000000000000000000000000000000000000A");
+        let packed = encode_packed(&[call(a, 0, &[0x11, 0x22, 0x33])]);
+        // Cut the payload short: the header still claims 3 data bytes.
+        assert!(decode_packed(&packed[..packed.len() - 1]).is_err());
+        // Cut mid-header.
+        assert!(decode_packed(&packed[..40]).is_err());
+        // A record whose length word is absurd must not be trusted either.
+        let mut lying = packed.clone();
+        lying[53..85].copy_from_slice(&U256::from(u64::MAX).to_be_bytes::<32>());
+        assert!(decode_packed(&lying).is_err());
+    }
+
+    #[test]
+    fn decode_multisend_calldata_rejects_a_foreign_selector() {
+        assert!(decode_multisend_calldata(&[0u8; 100]).is_err());
+        assert!(decode_multisend_calldata(&MULTISEND_SELECTOR).is_err());
     }
 
     #[test]

@@ -423,6 +423,11 @@ pub enum Message {
         seq: u64,
         code: Result<Bytes, String>,
     },
+    /// Transaction Builder: a Read-tab `eth_call` returned `(bytes, verified)`.
+    TxBuilderRead {
+        seq: u64,
+        result: Result<(Bytes, bool), String>,
+    },
     /// Transaction Builder: a batch simulation finished.
     TxBuilderSimulated {
         result: Result<crate::wallet::sim::BatchSimResult, String>,
@@ -1179,6 +1184,18 @@ impl WalletScreen {
             iced::clipboard::write(text).map(|_: ()| Message::ClipboardWritten),
             timer,
         ])
+    }
+
+    /// Copy `text` to the clipboard WITHOUT arming the auto-clear — for public,
+    /// non-sensitive data (e.g. a Transaction-Builder read-query result) the
+    /// user expects to persist until they paste it. Still fires the "Copied!"
+    /// toast, and invalidates any pending clear from a prior sensitive copy so a
+    /// stale timer can't wipe this value.
+    fn copy_without_clear(&mut self, text: String) -> Task<Message> {
+        mark_copied();
+        self.clipboard_clear_gen = self.clipboard_clear_gen.wrapping_add(1);
+        self.clipboard_clear = None;
+        iced::clipboard::write(text).map(|_: ()| Message::ClipboardWritten)
     }
 
     /// True while a send is in flight (the signer has been moved into a
@@ -2099,12 +2116,17 @@ impl WalletScreen {
         match o {
             O::Close => Task::none(),
             O::CopyText(s) => self.arm_clipboard_clear(s),
-            O::ResolveContract { seq, address } => {
-                let (chain, ..) = self.txbuilder_identity();
-                spawn_txbuilder_resolve(self.network.clone(), seq, chain, address)
+            O::CopyPlain(s) => self.copy_without_clear(s),
+            O::ResolveContract {
+                seq,
+                chain,
+                address,
+            } => spawn_txbuilder_resolve(self.network.clone(), seq, chain, address),
+            O::Read { seq, net, to, data } => {
+                spawn_txbuilder_read(self.network.clone(), seq, net, to, data)
             }
-            O::Simulate { calls } => {
-                let (chain, is_safe, ..) = self.txbuilder_identity();
+            O::Simulate { chain, calls } => {
+                let is_safe = self.active_safe_descriptor().is_some();
                 let from = if is_safe {
                     self.active_safe_descriptor()
                         .map(|d| Address::from(d.address))
@@ -2115,6 +2137,12 @@ impl WalletScreen {
                 spawn_txbuilder_simulate(self.network.clone(), chain, from, calls)
             }
             O::Review { calls } => self.open_txbuilder_review(calls),
+            O::PersistTemplates(list) => {
+                if let Err(e) = crate::txbuilder::templates::save(&list) {
+                    warn!(error = %e, "tx-builder: failed to persist templates");
+                }
+                Task::none()
+            }
         }
     }
 
@@ -2133,60 +2161,9 @@ impl WalletScreen {
         };
         self.sign_review_seq += 1;
         let seq = self.sign_review_seq;
-        let (title, subtitle, note, can_execute) = match &req {
-            tx_builder::BatchSignRequest::Safe(s) => (
-                format!("Batch · {} → 1 atomic transaction", s.call_count),
-                Some(format!(
-                    "from Safe {} · {}-of-{} multisig",
-                    short_address(s.safe),
-                    s.threshold,
-                    s.owner_count
-                )),
-                Some(
-                    "Bundled via MultiSendCallOnly — all-or-nothing; if one call reverts, the \
-                     whole batch reverts. Verify the safeTxHash on every device."
-                        .to_string(),
-                ),
-                (s.signable_indices.len() as u32) >= s.threshold,
-            ),
-            tx_builder::BatchSignRequest::Eoa(e) => (
-                e.title(),
-                Some(format!(
-                    "from {} · on {}",
-                    short_address(e.from),
-                    e.chain.display_name()
-                )),
-                Some(if e.is_batch() {
-                    format!(
-                        "{} calls executed atomically from your account via EIP-7702 \
-                         (Simple7702Account) — all-or-nothing. The delegation target is \
-                         shown on the transaction below; on a Ledger this is two \
-                         confirmations. Mainnet only for plain accounts.",
-                        e.calls.len()
-                    )
-                } else {
-                    format!(
-                        "A single transaction from your account, broadcast on {}. \
-                         The Transaction Builder targets Ethereum Mainnet for plain accounts.",
-                        e.chain.display_name()
-                    )
-                }),
-                true,
-            ),
-        };
         // Flash approval: disclose any allowance resets folded into the batch.
         let revoke_n = crate::txbuilder::flash_approval::revoke_count(&calls);
-        let note = note.map(|n| {
-            if revoke_n > 0 {
-                format!(
-                    "{n} Resets {revoke_n} approval{} to 0 in the same transaction \
-                     (flash approval — no allowance is left standing).",
-                    if revoke_n == 1 { "" } else { "s" }
-                )
-            } else {
-                n
-            }
-        });
+        let (title, subtitle, note, can_execute) = txbuilder_review_copy(&req, revoke_n);
         let action = sign_review::SignAction::TxBuilder {
             req: req.clone(),
             can_execute,
@@ -2199,9 +2176,80 @@ impl WalletScreen {
             seq,
             action,
         ));
-        spawn_txbuilder_prepare(self.network.clone(), seq, req)
+        let local_names = build_local_names(&self.accounts, &self.safes, &self.contacts);
+        spawn_txbuilder_prepare(self.network.clone(), seq, req, local_names)
     }
+}
 
+/// The review overlay's header copy for a batch: `(title, subtitle, note,
+/// can_execute)`. Pure — the whole "what does the user read before signing"
+/// surface, so it can be pinned by tests without a live dashboard.
+fn txbuilder_review_copy(
+    req: &tx_builder::BatchSignRequest,
+    revoke_n: usize,
+) -> (String, Option<String>, Option<String>, bool) {
+    let (title, subtitle, note, can_execute) = match req {
+        tx_builder::BatchSignRequest::Safe(s) => (
+            format!("Batch · {} → 1 atomic transaction", s.call_count),
+            Some(format!(
+                "from Safe {} · {}-of-{} multisig",
+                short_address(s.safe),
+                s.threshold,
+                s.owner_count
+            )),
+            Some(
+                "Bundled via MultiSendCallOnly — all-or-nothing; if one call reverts, the \
+                 whole batch reverts. Verify the safeTxHash on every device."
+                    .to_string(),
+            ),
+            (s.signable_indices.len() as u32) >= s.threshold,
+        ),
+        tx_builder::BatchSignRequest::Eoa(e) => (
+            e.title(),
+            Some(format!(
+                "from {} · on {}",
+                short_address(e.from),
+                e.net.display_name()
+            )),
+            Some(if e.is_batch() {
+                format!(
+                    "{} calls executed atomically from your account via EIP-7702 \
+                     (Simple7702Account) — all-or-nothing. The delegation target is \
+                     shown on the transaction below; on a Ledger this is two \
+                     confirmations.",
+                    e.calls.len()
+                )
+            } else if e.net.is_custom() {
+                format!(
+                    "A single transaction from your account, broadcast on {} — an \
+                     unverified custom network. Kao can't light-client-verify this \
+                     chain, so double-check the call below.",
+                    e.net.display_name()
+                )
+            } else {
+                format!(
+                    "A single transaction from your account, broadcast on {}.",
+                    e.net.display_name()
+                )
+            }),
+            true,
+        ),
+    };
+    let note = note.map(|n| {
+        if revoke_n > 0 {
+            format!(
+                "{n} Resets {revoke_n} approval{} to 0 in the same transaction \
+                 (flash approval — no allowance is left standing).",
+                if revoke_n == 1 { "" } else { "s" }
+            )
+        } else {
+            n
+        }
+    });
+    (title, subtitle, note, can_execute)
+}
+
+impl WalletScreen {
     /// Build the sign request: a Safe MultiSend batch (active Safe) or an EOA
     /// single call.
     fn build_txbuilder_request(
@@ -2250,17 +2298,29 @@ impl WalletScreen {
                 if calls.is_empty() {
                     return Err("empty batch".to_string());
                 }
-                // A multi-call EOA batch needs a 7702-capable signer; the UI cap
-                // already enforces this, but guard here too so a stale request
-                // can't reach the delegation path with a hardware/view-only key.
-                if calls.len() > 1 && !self.signer.supports_7702() {
-                    return Err(
-                        "atomic batching needs a software key or a Ledger (EIP-7702)".to_string(),
-                    );
+                // The active network the Builder is composing against — a
+                // built-in chain, or (single call only) a custom network.
+                let net = self.apps.txbuilder_selected_net();
+                // A multi-call EOA batch needs a 7702-capable signer *and* a
+                // built-in chain; the UI cap already enforces this, but guard
+                // here too so a stale request can't reach the delegation path
+                // with a hardware/view-only key or on an unverified network.
+                if calls.len() > 1 {
+                    if !self.signer.supports_7702() {
+                        return Err(
+                            "atomic batching needs a software key or a Ledger (EIP-7702)"
+                                .to_string(),
+                        );
+                    }
+                    if net.is_custom() {
+                        return Err(
+                            "atomic batching isn't available on custom networks".to_string()
+                        );
+                    }
                 }
                 Ok(tx_builder::BatchSignRequest::Eoa(
                     tx_builder::EoaBatchRequest {
-                        chain: Chain::Mainnet,
+                        net,
                         from: self.address,
                         calls: calls.to_vec(),
                     },
@@ -4365,8 +4425,17 @@ impl WalletScreen {
                 // processes a message, so batch-cap / known-contract lookup see
                 // the live chain and whether a Safe is active. Cheap.
                 let (txb_chain, txb_is_safe, txb_ver, txb_can_batch) = self.txbuilder_identity();
-                self.apps
-                    .set_txbuilder_context(txb_chain, txb_is_safe, txb_ver, txb_can_batch);
+                let txb_customs: Vec<(u64, String)> = settings::enabled_custom_networks()
+                    .into_iter()
+                    .map(|n| (n.chain_id, n.name))
+                    .collect();
+                self.apps.set_txbuilder_context(
+                    txb_chain,
+                    txb_is_safe,
+                    txb_ver,
+                    txb_can_batch,
+                    txb_customs,
+                );
                 let outcome = self.apps.update(child);
                 // After pumping the pane, dispatch a forward name resolution if
                 // the Privacy Pools withdrawal target now points at a name-shaped
@@ -4414,6 +4483,9 @@ impl WalletScreen {
             }
             Message::TxBuilderResolved { seq, code } => {
                 self.apps.txbuilder_pane().on_contract_resolved(seq, code);
+            }
+            Message::TxBuilderRead { seq, result } => {
+                self.apps.txbuilder_pane().on_read(seq, result);
             }
             Message::TxBuilderSimulated { result } => {
                 self.apps.txbuilder_pane().on_sim(result);
@@ -6256,6 +6328,44 @@ fn spawn_txbuilder_resolve(
     )
 }
 
+/// Run a Read-tab `eth_call`. Built-in chains go through the Helios-verified
+/// `call` (the returned `verified` flag drives the badge); a custom network
+/// issues a raw `eth_call` against its configured RPC (never verified).
+fn spawn_txbuilder_read(
+    network: Arc<dyn BalanceFetcher>,
+    seq: u64,
+    net: crate::chain::NetworkId,
+    to: Address,
+    data: Bytes,
+) -> Task<Message> {
+    use alloy::providers::Provider;
+    use alloy::rpc::types::{TransactionInput, TransactionRequest};
+    Task::perform(
+        async move {
+            match net.builtin() {
+                Some(chain) => network
+                    .call(to, data, chain)
+                    .await
+                    .map(|r| (r.value, r.verified)),
+                None => {
+                    let provider = provider_for(&network, net)
+                        .await
+                        .ok_or_else(|| "no RPC configured for this network".to_string())?;
+                    let req = TransactionRequest::default()
+                        .to(to)
+                        .input(TransactionInput::new(data));
+                    provider
+                        .call(req)
+                        .await
+                        .map(|bytes| (bytes, false))
+                        .map_err(|e| crate::net::redact_urls(&e.to_string()))
+                }
+            }
+        },
+        move |result| Message::TxBuilderRead { seq, result },
+    )
+}
+
 /// Simulate a batch (from the Safe / EOA) against Helios-verified state.
 fn spawn_txbuilder_simulate(
     network: Arc<dyn BalanceFetcher>,
@@ -6280,134 +6390,253 @@ fn spawn_txbuilder_prepare(
     network: Arc<dyn BalanceFetcher>,
     seq: u64,
     req: tx_builder::BatchSignRequest,
+    local_names: std::collections::HashMap<Address, String>,
 ) -> Task<Message> {
+    Task::perform(
+        async move {
+            (
+                seq,
+                build_txbuilder_steps(network.as_ref(), req, local_names).await,
+            )
+        },
+        |(seq, steps)| Message::SignReviewPrepared { seq, steps },
+    )
+}
+
+/// Clear-sign one call for a review leg, or [`DecodeResult::Empty`] when the
+/// network isn't a verified built-in chain (the ERC-7730 registry lookup and
+/// the proxy walk both need one). Shared by every Builder leg — the outer EOA
+/// call and each decoded sub-call of a batch.
+async fn decode_leg(
+    network: &dyn BalanceFetcher,
+    net: crate::chain::NetworkId,
+    from: Address,
+    to: Address,
+    calldata: Bytes,
+    value: U256,
+    local_names: &std::collections::HashMap<Address, String>,
+) -> crate::decode::clear_sign::DecodeResult {
+    match net.builtin() {
+        Some(chain) => {
+            crate::decode::clear_sign::decode_transaction(
+                network,
+                chain,
+                from,
+                to,
+                calldata,
+                value,
+                local_names.clone(),
+            )
+            .await
+        }
+        None => crate::decode::clear_sign::DecodeResult::Empty,
+    }
+}
+
+/// Recover a batch's sub-calls from the outer calldata that is about to be
+/// signed — `multiSend(bytes)` or `executeBatch(Call[])`, picked by selector —
+/// and clear-sign each one into its own [`ReviewLeg`].
+///
+/// Deriving the panels from the signed bytes (rather than from the
+/// [`QueuedCall`](crate::txbuilder::QueuedCall)s they were encoded from) is the
+/// point: a bug in the encoder, or any drift between the queue and the blob,
+/// shows up in the review instead of hiding behind it. `sender` is the address
+/// each sub-call executes as — the Safe for a MultiSend delegatecall, the
+/// account itself for a 7702 self-call — so decoders that care about `from`
+/// (allowance framing, self-transfer detection) see the truth.
+///
+/// A blob that won't parse is a hard error: the overlay must never present a
+/// batch it can only partly account for.
+async fn decode_batch_sub_legs(
+    network: &dyn BalanceFetcher,
+    net: crate::chain::NetworkId,
+    sender: Address,
+    calldata: &Bytes,
+    local_names: &std::collections::HashMap<Address, String>,
+) -> Result<Vec<sign_review::ReviewLeg>, String> {
+    use crate::txbuilder::{eip7702, multisend};
+
+    // (to, value, data) triples, however this batch shape encodes them.
+    let calls: Vec<(Address, U256, Bytes)> =
+        if calldata.len() >= 4 && calldata[..4] == eip7702::EXECUTE_BATCH_SELECTOR {
+            eip7702::decode_execute_batch(calldata)?
+        } else {
+            multisend::decode_multisend_calldata(calldata)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(|c| (c.to, c.value, c.data))
+                .collect()
+        };
+
+    let total = calls.len();
+    let mut legs = Vec::with_capacity(total);
+    for (i, (to, value, data)) in calls.into_iter().enumerate() {
+        let decoded = decode_leg(network, net, sender, to, data.clone(), value, local_names).await;
+        legs.push(sign_review::ReviewLeg {
+            title: format!("{} of {}", i + 1, total),
+            to,
+            value,
+            net,
+            calldata: data,
+            decoded: Box::new(decoded),
+            sub_legs: Vec::new(),
+        });
+    }
+    Ok(legs)
+}
+
+/// The prepare step's whole body, split out from the [`Task`] wrapper so it can
+/// be driven directly against a mock chain in tests: what the user sees on the
+/// review overlay is exactly what this returns.
+async fn build_txbuilder_steps(
+    network: &dyn BalanceFetcher,
+    req: tx_builder::BatchSignRequest,
+    local_names: std::collections::HashMap<Address, String>,
+) -> Result<Vec<sign_review::SignStep>, String> {
     use crate::safe::tx::{
         build_safe_tx_with_nonce, current_safe_nonce, ensure_signable_version, safe_domain,
         safe_tx_hash, verify_safe_tx_before_signing,
     };
-    Task::perform(
-        async move {
-            match req {
-                tx_builder::BatchSignRequest::Safe(s) => {
-                    let build = async {
-                        if let Some(reason) = s.trust.signing_block_reason() {
-                            return Err(reason.to_string());
-                        }
-                        ensure_signable_version(&s.version)?;
-                        // A delegatecall to a code-less address silently succeeds
-                        // and burns the Safe's nonce — refuse if the MultiSend
-                        // library isn't actually deployed on this chain.
-                        let ms = s.input.to;
-                        let code = network.get_code(ms, s.chain).await?.value;
-                        if code.is_empty() {
-                            return Err(format!(
-                                "MultiSend contract {} is not deployed on {} — cannot batch",
-                                short_address(ms),
-                                s.chain.label(),
-                            ));
-                        }
-                        let nonce = current_safe_nonce(network.as_ref(), s.safe, s.chain).await?;
-                        let tx = build_safe_tx_with_nonce(s.input.clone(), nonce);
-                        let domain = safe_domain(s.safe, s.chain);
-                        let local = safe_tx_hash(&tx, &domain);
-                        verify_safe_tx_before_signing(
-                            network.as_ref(),
-                            &tx,
-                            s.safe,
-                            s.chain,
-                            local,
-                        )
-                        .await?;
-                        Ok::<_, String>((nonce, local))
-                    }
-                    .await;
-                    let (nonce, hash) = match build {
-                        Ok(v) => v,
-                        Err(e) => {
-                            return (seq, Err::<Vec<sign_review::SignStep>, String>(e));
-                        }
-                    };
-                    let tx = build_safe_tx_with_nonce(s.input.clone(), nonce);
-                    let domain = safe_domain(s.safe, s.chain);
-                    let eip712 = crate::sign::digest::Eip712Digests::of(&tx, &domain);
-                    let inner = sign_review::ReviewLeg {
-                        title: format!(
-                            "MultiSend · {} call{}",
-                            s.call_count,
-                            if s.call_count == 1 { "" } else { "s" }
-                        ),
-                        to: s.input.to,
-                        value: s.input.value,
-                        chain: s.chain,
-                        calldata: s.input.data.clone(),
-                        decoded: Box::new(crate::decode::clear_sign::DecodeResult::Empty),
-                    };
-                    let review = sign_review::SafeExecReview {
-                        safe: s.safe,
-                        nonce,
-                        threshold: s.threshold.min(u8::MAX as u32) as u8,
-                        owner_count: s.owner_count.min(u8::MAX as usize) as u8,
-                        safe_tx_hash: hash,
-                        eip712,
-                        inner: Box::new(inner),
-                    };
-                    (seq, Ok(vec![sign_review::SignStep::SafeExec(review)]))
+    match req {
+        tx_builder::BatchSignRequest::Safe(s) => {
+            let build = async {
+                if let Some(reason) = s.trust.signing_block_reason() {
+                    return Err(reason.to_string());
                 }
-                tx_builder::BatchSignRequest::Eoa(e) => {
-                    use crate::txbuilder::eip7702;
-                    let build = async {
-                        if e.calls.len() > 1 {
-                            // Atomic batch → executeBatch on the (to-be-)delegated
-                            // account. If not already delegated to the EF contract,
-                            // a fresh authorization will be signed — refuse early if
-                            // that delegate isn't deployed (a delegation to a
-                            // code-less address would brick the account), mirroring
-                            // the MultiSend deployment check above.
-                            let code = network.get_code(e.from, e.chain).await?.value;
-                            let already_ef = eip7702::delegated_to(&code)
-                                == Some(eip7702::EF_SIMPLE_7702_ACCOUNT);
-                            if !already_ef {
-                                let dcode = network
-                                    .get_code(eip7702::EF_SIMPLE_7702_ACCOUNT, e.chain)
-                                    .await?
-                                    .value;
-                                if dcode.is_empty() {
-                                    return Err(format!(
-                                        "EIP-7702 delegate {} is not deployed on {} — cannot batch",
-                                        short_address(eip7702::EF_SIMPLE_7702_ACCOUNT),
-                                        e.chain.label(),
-                                    ));
-                                }
-                            }
-                            let leg = sign_review::ReviewLeg {
-                                title: format!("executeBatch · {} calls", e.calls.len()),
-                                to: e.from, // self-call into the delegated account
-                                value: U256::ZERO,
-                                chain: e.chain,
-                                calldata: eip7702::encode_execute_batch(&e.calls),
-                                decoded: Box::new(crate::decode::clear_sign::DecodeResult::Empty),
-                            };
-                            Ok(vec![sign_review::SignStep::RawTx(leg)])
-                        } else {
-                            let call = e.calls.first().ok_or_else(|| "empty batch".to_string())?;
-                            let leg = sign_review::ReviewLeg {
-                                title: call.title.clone(),
-                                to: call.to,
-                                value: call.value,
-                                chain: e.chain,
-                                calldata: call.data.clone(),
-                                decoded: Box::new(crate::decode::clear_sign::DecodeResult::Empty),
-                            };
-                            Ok(vec![sign_review::SignStep::RawTx(leg)])
-                        }
-                    }
-                    .await;
-                    (seq, build)
+                ensure_signable_version(&s.version)?;
+                // A delegatecall to a code-less address silently succeeds
+                // and burns the Safe's nonce — refuse if the MultiSend
+                // library isn't actually deployed on this chain.
+                let ms = s.input.to;
+                let code = network.get_code(ms, s.chain).await?.value;
+                if code.is_empty() {
+                    return Err(format!(
+                        "MultiSend contract {} is not deployed on {} — cannot batch",
+                        short_address(ms),
+                        s.chain.label(),
+                    ));
                 }
+                let nonce = current_safe_nonce(network, s.safe, s.chain).await?;
+                let tx = build_safe_tx_with_nonce(s.input.clone(), nonce);
+                let domain = safe_domain(s.safe, s.chain);
+                let local = safe_tx_hash(&tx, &domain);
+                verify_safe_tx_before_signing(network, &tx, s.safe, s.chain, local).await?;
+                Ok::<_, String>((nonce, local))
             }
-        },
-        |(seq, steps)| Message::SignReviewPrepared { seq, steps },
-    )
+            .await;
+            let (nonce, hash) = build?;
+            let tx = build_safe_tx_with_nonce(s.input.clone(), nonce);
+            let domain = safe_domain(s.safe, s.chain);
+            let eip712 = crate::sign::digest::Eip712Digests::of(&tx, &domain);
+            // Clear-sign the batch by unpacking the blob the Safe will
+            // delegatecall and decoding each sub-call. Recovered from
+            // `s.input.data` — the signed bytes — not from the queue it was
+            // packed from, so a desync between the two can't hide a call.
+            // The outer `multiSend(bytes)` itself stays undecoded: its own
+            // decode ("1 argument, N bytes") tells the user nothing.
+            let sub_legs =
+                decode_batch_sub_legs(network, s.chain.into(), s.safe, &s.input.data, &local_names)
+                    .await?;
+            let inner = sign_review::ReviewLeg {
+                title: format!(
+                    "MultiSend · {} call{}",
+                    s.call_count,
+                    if s.call_count == 1 { "" } else { "s" }
+                ),
+                to: s.input.to,
+                value: s.input.value,
+                net: s.chain.into(),
+                calldata: s.input.data.clone(),
+                decoded: Box::new(crate::decode::clear_sign::DecodeResult::Empty),
+                sub_legs,
+            };
+            let review = sign_review::SafeExecReview {
+                safe: s.safe,
+                nonce,
+                threshold: s.threshold.min(u8::MAX as u32) as u8,
+                owner_count: s.owner_count.min(u8::MAX as usize) as u8,
+                safe_tx_hash: hash,
+                eip712,
+                inner: Box::new(inner),
+            };
+            Ok(vec![sign_review::SignStep::SafeExec(review)])
+        }
+        tx_builder::BatchSignRequest::Eoa(e) => {
+            use crate::txbuilder::eip7702;
+            if e.calls.len() > 1 {
+                // Atomic batch → executeBatch on the (to-be-)delegated
+                // account. Only built-in chains verify + delegate; the
+                // UI never queues >1 call on a custom network, but guard
+                // here too so a stale request can't reach the 7702 path.
+                let chain = e.net.builtin().ok_or_else(|| {
+                    "atomic batching is only available on built-in chains".to_string()
+                })?;
+                // If not already delegated to the EF contract, a fresh
+                // authorization will be signed — refuse early if that
+                // delegate isn't deployed (a delegation to a code-less
+                // address would brick the account), mirroring the
+                // MultiSend deployment check above.
+                let code = network.get_code(e.from, chain).await?.value;
+                let already_ef =
+                    eip7702::delegated_to(&code) == Some(eip7702::EF_SIMPLE_7702_ACCOUNT);
+                if !already_ef {
+                    let dcode = network
+                        .get_code(eip7702::EF_SIMPLE_7702_ACCOUNT, chain)
+                        .await?
+                        .value;
+                    if dcode.is_empty() {
+                        return Err(format!(
+                            "EIP-7702 delegate {} is not deployed on {} — cannot batch",
+                            short_address(eip7702::EF_SIMPLE_7702_ACCOUNT),
+                            chain.label(),
+                        ));
+                    }
+                }
+                // As with the Safe batch: the sub-calls the user reads are
+                // decoded back out of the `executeBatch` calldata being signed,
+                // and the outer self-call stays undecoded.
+                let calldata = eip7702::encode_execute_batch(&e.calls);
+                let sub_legs =
+                    decode_batch_sub_legs(network, e.net, e.from, &calldata, &local_names).await?;
+                let leg = sign_review::ReviewLeg {
+                    title: format!("executeBatch · {} calls", e.calls.len()),
+                    to: e.from, // self-call into the delegated account
+                    value: U256::ZERO,
+                    net: e.net,
+                    calldata,
+                    decoded: Box::new(crate::decode::clear_sign::DecodeResult::Empty),
+                    sub_legs,
+                };
+                Ok(vec![sign_review::SignStep::RawTx(leg)])
+            } else {
+                let call = e.calls.first().ok_or_else(|| "empty batch".to_string())?;
+                // Clear-sign the call the same way the Send flow does: ERC-7730
+                // descriptor first, heuristic fallback. Custom networks stay
+                // undecoded — the registries and the proxy walk are keyed by a
+                // verified built-in chain (same guard as `spawn_send_prepare`).
+                let decoded = decode_leg(
+                    network,
+                    e.net,
+                    e.from,
+                    call.to,
+                    call.data.clone(),
+                    call.value,
+                    &local_names,
+                )
+                .await;
+                let leg = sign_review::ReviewLeg {
+                    title: call.title.clone(),
+                    to: call.to,
+                    value: call.value,
+                    net: e.net,
+                    calldata: call.data.clone(),
+                    decoded: Box::new(decoded),
+                    sub_legs: Vec::new(),
+                };
+                Ok(vec![sign_review::SignStep::RawTx(leg)])
+            }
+        }
+    }
 }
 
 /// Sign the MultiSend `SafeTx` with each owner over the pinned hash, assemble,
@@ -6496,8 +6725,9 @@ fn spawn_txbuilder_eoa_send(
     let inner = handoff.clone();
     Task::perform(
         async move {
-            let chain = ereq.chain;
-            let provider = match network.provider(chain).await {
+            // Built-in chains resolve the shared verified-path provider; a custom
+            // network builds a raw provider from its configured RPC.
+            let provider = match provider_for(&network, ereq.net).await {
                 Some(p) => p,
                 None => return Err::<TxHash, String>("no execution RPCs configured".into()),
             };
@@ -6545,8 +6775,7 @@ async fn send_eoa_batch(
     use alloy::providers::Provider;
     use alloy::rpc::types::{TransactionInput, TransactionRequest};
 
-    let chain = req.chain;
-    let chain_id = chain.chain_id();
+    let chain_id = req.net.chain_id();
     let from = signer.address();
     // Wall: the live signer must be the account the review showed as sender.
     // A mismatch (wrong key handed to this task) is refused before signing.
@@ -7127,9 +7356,10 @@ fn spawn_name_prepare(
                 title,
                 to,
                 value,
-                chain: crate::chain::Chain::Mainnet,
+                net: crate::chain::NetworkId::Builtin(crate::chain::Chain::Mainnet),
                 calldata,
                 decoded: Box::new(decoded),
+                sub_legs: Vec::new(),
             }])
         },
         move |legs| Message::SignReviewPrepared {
@@ -7258,9 +7488,10 @@ fn spawn_cow_prepare(
                         title: "Place on-chain order — EthFlow createOrder".to_string(),
                         to: cow::ETHFLOW,
                         value,
-                        chain,
+                        net: chain.into(),
                         calldata,
                         decoded: Box::new(decoded),
+                        sub_legs: Vec::new(),
                     }));
                 } else {
                     let provider =
@@ -7287,9 +7518,10 @@ fn spawn_cow_prepare(
                             title: format!("Approve {} for CoW (vault relayer)", draft.sell_symbol),
                             to: draft.sell_token,
                             value: U256::ZERO,
-                            chain,
+                            net: chain.into(),
                             calldata,
                             decoded: Box::new(decoded),
+                            sub_legs: Vec::new(),
                         }));
                     }
                 }
@@ -7348,9 +7580,10 @@ fn spawn_cow_prepare(
                             title: "Place on-chain order — EthFlow createOrder".to_string(),
                             to: cow::ETHFLOW,
                             value,
-                            chain,
+                            net: chain.into(),
                             calldata,
                             decoded: Box::new(decoded),
+                            sub_legs: Vec::new(),
                         }),
                     },
                 ));
@@ -7402,9 +7635,10 @@ fn spawn_cow_prepare(
                                 ),
                                 to: draft.sell_token,
                                 value: U256::ZERO,
-                                chain,
+                                net: chain.into(),
                                 calldata,
                                 decoded: Box::new(decoded),
+                                sub_legs: Vec::new(),
                             }),
                         },
                     ));
@@ -8475,9 +8709,10 @@ fn spawn_pool_prepare(
                             title: format!("Approve {symbol}"),
                             to: token,
                             value: U256::ZERO,
-                            chain,
+                            net: chain.into(),
                             calldata: appr,
                             decoded: Box::new(decoded),
+                            sub_legs: Vec::new(),
                         });
                     }
                     let decoded = crate::decode::clear_sign::decode_transaction(
@@ -8494,9 +8729,10 @@ fn spawn_pool_prepare(
                         title: format!("Deposit {symbol}"),
                         to,
                         value,
-                        chain,
+                        net: chain.into(),
                         calldata,
                         decoded: Box::new(decoded),
+                        sub_legs: Vec::new(),
                     });
                     Ok::<_, String>(legs)
                 }
@@ -8520,9 +8756,10 @@ fn spawn_pool_prepare(
                         title: format!("Ragequit {symbol}"),
                         to: pool,
                         value: U256::ZERO,
-                        chain,
+                        net: chain.into(),
                         calldata,
                         decoded: Box::new(decoded),
+                        sub_legs: Vec::new(),
                     }])
                 }
             }
@@ -11174,9 +11411,10 @@ mod tests {
                 title: "x".into(),
                 to: addr(2),
                 value: U256::ZERO,
-                chain: Chain::Mainnet,
+                net: crate::chain::NetworkId::Builtin(Chain::Mainnet),
                 calldata: alloy::primitives::Bytes::new(),
                 decoded: Box::new(crate::decode::clear_sign::DecodeResult::Empty),
+                sub_legs: Vec::new(),
             })
         };
         // EOA-shaped steps → no pin.
@@ -11995,5 +12233,681 @@ mod tests {
         );
         let err = rebuild_reviewed_safe_tx(&mock, &req).await.unwrap_err();
         assert!(err.contains("safe hash mismatch"), "{err}");
+    }
+
+    // ── Transaction Builder sign review ──────────────────────────────
+    //
+    // The Builder's clear-sign gate end to end: the copy the user reads
+    // before signing, the steps the overlay renders, and the pin that
+    // makes the reviewed artifact the signed one. Same invariant as the
+    // SafeSend block above — nothing may be signed that wasn't shown, and
+    // a batch that can't be shown safely must refuse before any signer is
+    // touched.
+
+    use crate::txbuilder::{QueuedCall, eip7702, multisend};
+
+    /// A queued call with explicit calldata. `to` / `value` / `data` are
+    /// exactly what a single-call review leg must mirror.
+    fn queued(id: u64, to: Address, value: u64, data: Vec<u8>) -> QueuedCall {
+        QueuedCall {
+            id,
+            to,
+            value: U256::from(value),
+            data: Bytes::from(data),
+            title: format!("Call #{id}"),
+            detail: "detail".into(),
+            signature: None,
+            decoded_args: Vec::new(),
+        }
+    }
+
+    /// `approve(spender, amount)` calldata. `amount == 0` is the
+    /// allowance-reset the flash-approval disclosure counts.
+    fn approve_data(spender: Address, amount: u64) -> Vec<u8> {
+        let mut d = vec![0x09, 0x5e, 0xa7, 0xb3]; // approve(address,uint256)
+        d.extend_from_slice(B256::left_padding_from(spender.as_slice()).as_slice());
+        d.extend_from_slice(&U256::from(amount).to_be_bytes::<32>());
+        d
+    }
+
+    fn safe_batch_req(
+        calls: &[QueuedCall],
+        threshold: u32,
+        signable: Vec<u32>,
+    ) -> tx_builder::SafeBatchRequest {
+        tx_builder::SafeBatchRequest {
+            safe: addr(0x5A),
+            chain: Chain::Mainnet,
+            version: "1.4.1".into(),
+            trust: crate::wallet::SafeTrust::Canonical,
+            threshold,
+            owner_count: 3,
+            signable_indices: signable,
+            input: multisend::build_multisend_input(calls, "1.4.1").expect("multisend wrapper"),
+            call_count: calls.len(),
+            prepared: None,
+        }
+    }
+
+    fn eoa_batch_req(
+        net: crate::chain::NetworkId,
+        calls: Vec<QueuedCall>,
+    ) -> tx_builder::EoaBatchRequest {
+        tx_builder::EoaBatchRequest {
+            net,
+            from: addr(0xE0),
+            calls,
+        }
+    }
+
+    /// The `SafeTx` the prepare step derives from `req` at `nonce`, plus its
+    /// local EIP-712 hash — what the overlay must display and pin.
+    fn expected_batch_tx(
+        req: &tx_builder::SafeBatchRequest,
+        nonce: u64,
+    ) -> (crate::safe::SafeTx, B256) {
+        use crate::safe::tx::{build_safe_tx_with_nonce, safe_domain, safe_tx_hash};
+        let tx = build_safe_tx_with_nonce(req.input.clone(), nonce);
+        let hash = safe_tx_hash(&tx, &safe_domain(req.safe, req.chain));
+        (tx, hash)
+    }
+
+    /// Make the pre-sign cross-checks (`domainSeparator`, on-chain
+    /// `getTransactionHash`) agree with the locally-built tx.
+    fn plant_safe_agreement(mock: &CallMock, safe: Address, tx: &crate::safe::SafeTx, hash: B256) {
+        mock.set_call(
+            safe,
+            Bytes::from(crate::safe::domainSeparatorCall {}.abi_encode()),
+            Bytes::from(
+                crate::safe::tx::safe_domain(safe, Chain::Mainnet)
+                    .separator()
+                    .abi_encode(),
+            ),
+            true,
+        );
+        mock.set_call(
+            safe,
+            Bytes::from(
+                crate::safe::getTransactionHashCall {
+                    to: tx.to,
+                    value: tx.value,
+                    data: tx.data.clone(),
+                    operation: tx.operation,
+                    safeTxGas: tx.safeTxGas,
+                    baseGas: tx.baseGas,
+                    gasPrice: tx.gasPrice,
+                    gasToken: tx.gasToken,
+                    refundReceiver: tx.refundReceiver,
+                    _nonce: tx.nonce,
+                }
+                .abi_encode(),
+            ),
+            Bytes::from(hash.abi_encode()),
+            true,
+        );
+    }
+
+    /// [`build_txbuilder_steps`] with an empty local address book — no test
+    /// here turns on contact naming.
+    async fn prepared_steps(
+        mock: &CallMock,
+        req: tx_builder::BatchSignRequest,
+    ) -> Result<Vec<sign_review::SignStep>, String> {
+        build_txbuilder_steps(mock, req, std::collections::HashMap::new()).await
+    }
+
+    // ── prepare: what the overlay shows ──────────────────────────────
+
+    #[tokio::test]
+    async fn txbuilder_safe_prepare_shows_the_multisend_the_owners_sign() {
+        let calls = vec![
+            queued(1, addr(0xC1), 0, vec![0xde, 0xad, 0xbe, 0xef]),
+            queued(2, addr(0xC2), 5, vec![0xfe, 0xed]),
+        ];
+        let req = safe_batch_req(&calls, 2, vec![0, 1]);
+        let (tx, hash) = expected_batch_tx(&req, 7);
+
+        let mock = CallMock::new();
+        mock.set_code(req.input.to, Bytes::from(vec![0x60u8]), true); // MultiSend deployed
+        plant_safe_nonce(&mock, req.safe, 7);
+        plant_safe_agreement(&mock, req.safe, &tx, hash);
+
+        let steps = prepared_steps(&mock, tx_builder::BatchSignRequest::Safe(req.clone()))
+            .await
+            .expect("prepare succeeds");
+        let [sign_review::SignStep::SafeExec(x)] = steps.as_slice() else {
+            panic!("expected one SafeExec step, got {steps:?}");
+        };
+        assert_eq!(x.safe, req.safe);
+        assert_eq!(x.nonce, 7);
+        assert_eq!(x.threshold, 2);
+        assert_eq!(x.owner_count, 3);
+        // The pinned hash is the hash of the tx that will be signed.
+        assert_eq!(x.safe_tx_hash, hash);
+        // ERC-8213 fingerprints describe that same tx, not a rebuild.
+        assert_eq!(
+            x.eip712,
+            crate::sign::digest::Eip712Digests::of(
+                &tx,
+                &crate::safe::tx::safe_domain(req.safe, req.chain)
+            ),
+        );
+        // The inner leg is the MultiSend delegatecall, byte-for-byte.
+        assert_eq!(x.inner.title, "MultiSend · 2 calls");
+        assert_eq!(x.inner.to, req.input.to);
+        assert_eq!(x.inner.value, U256::ZERO);
+        assert_eq!(x.inner.calldata, req.input.data);
+        assert_eq!(
+            x.inner.net,
+            crate::chain::NetworkId::Builtin(Chain::Mainnet)
+        );
+    }
+
+    #[tokio::test]
+    async fn txbuilder_safe_prepare_singularizes_a_one_call_batch() {
+        let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
+        let req = safe_batch_req(&calls, 1, vec![0]);
+        let (tx, hash) = expected_batch_tx(&req, 0);
+        let mock = CallMock::new();
+        mock.set_code(req.input.to, Bytes::from(vec![0x60u8]), true);
+        plant_safe_nonce(&mock, req.safe, 0);
+        plant_safe_agreement(&mock, req.safe, &tx, hash);
+
+        let steps = prepared_steps(&mock, tx_builder::BatchSignRequest::Safe(req))
+            .await
+            .unwrap();
+        let [sign_review::SignStep::SafeExec(x)] = steps.as_slice() else {
+            panic!("expected SafeExec");
+        };
+        assert_eq!(x.inner.title, "MultiSend · 1 call");
+    }
+
+    #[tokio::test]
+    async fn txbuilder_safe_prepare_refuses_when_multisend_is_not_deployed() {
+        // A delegatecall to a code-less address silently succeeds and burns the
+        // nonce — the review must never be shown for it.
+        let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
+        let mock = CallMock::new(); // nothing has code
+        let err = prepared_steps(
+            &mock,
+            tx_builder::BatchSignRequest::Safe(safe_batch_req(&calls, 1, vec![0])),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("is not deployed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn txbuilder_safe_prepare_refuses_unrecognized_safe_before_any_chain_read() {
+        // Nothing planted: if the trust guard didn't fire first, the MultiSend
+        // code check would fail with a different error.
+        let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
+        let mut req = safe_batch_req(&calls, 1, vec![0]);
+        req.trust = crate::wallet::SafeTrust::UnrecognizedImpl;
+        let err = prepared_steps(&CallMock::new(), tx_builder::BatchSignRequest::Safe(req))
+            .await
+            .unwrap_err();
+        assert!(err.contains("not recognized as canonical"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn txbuilder_safe_prepare_refuses_unsignable_version() {
+        let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
+        let mut req = safe_batch_req(&calls, 1, vec![0]);
+        req.version = "1.1.1".into();
+        let err = prepared_steps(&CallMock::new(), tx_builder::BatchSignRequest::Safe(req))
+            .await
+            .unwrap_err();
+        assert!(err.contains("outside the signable range"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn txbuilder_eoa_single_call_leg_is_the_queued_call_verbatim() {
+        let call = queued(1, addr(0xC1), 42, vec![0xab, 0xcd, 0xef, 0x01]);
+        let req = eoa_batch_req(
+            crate::chain::NetworkId::Builtin(Chain::Mainnet),
+            vec![call.clone()],
+        );
+        let steps = prepared_steps(&CallMock::new(), tx_builder::BatchSignRequest::Eoa(req))
+            .await
+            .unwrap();
+        let [sign_review::SignStep::RawTx(leg)] = steps.as_slice() else {
+            panic!("expected one RawTx leg, got {steps:?}");
+        };
+        assert_eq!(leg.title, call.title);
+        assert_eq!(leg.to, call.to);
+        assert_eq!(leg.value, call.value);
+        assert_eq!(leg.calldata, call.data, "reviewed bytes == queued bytes");
+    }
+
+    /// The function name a leg's decode resolved to, if any.
+    fn decoded_fn(leg: &sign_review::ReviewLeg) -> Option<String> {
+        use crate::decode::clear_sign::DecodeResult as D;
+        match leg.decoded.as_ref() {
+            D::Heuristic(c) | D::Fallback { heuristic: c, .. } => c.function_name.clone(),
+            D::ClearSigned { model, .. } => Some(model.intent.clone()),
+            D::Empty => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn txbuilder_eoa_single_call_is_clear_signed() {
+        // The Builder used to hand every leg `DecodeResult::Empty`, so the
+        // overlay showed raw calldata where the Send flow would have shown a
+        // decoded function. The leg must now carry a real decode.
+        let call = queued(1, addr(0xC1), 0, approve_data(addr(0x5D), 5_000));
+        let req = eoa_batch_req(crate::chain::NetworkId::Builtin(Chain::Mainnet), vec![call]);
+        let steps = prepared_steps(&CallMock::new(), tx_builder::BatchSignRequest::Eoa(req))
+            .await
+            .unwrap();
+        let [sign_review::SignStep::RawTx(leg)] = steps.as_slice() else {
+            panic!("expected one RawTx leg");
+        };
+        assert_eq!(decoded_fn(leg).as_deref(), Some("approve"));
+    }
+
+    #[tokio::test]
+    async fn txbuilder_safe_batch_clear_signs_every_inner_call() {
+        // The outer `multiSend(bytes)` decode says nothing actionable, so the
+        // review fans the batch out: one decoded panel per sub-call, recovered
+        // from the blob the Safe will delegatecall.
+        let token = addr(0xC1);
+        let calls = vec![
+            queued(1, token, 0, approve_data(addr(0x5D), 5_000)),
+            queued(2, token, 0, approve_data(addr(0x5D), 0)), // the revoke
+        ];
+        let req = safe_batch_req(&calls, 1, vec![0]);
+        let (tx, hash) = expected_batch_tx(&req, 0);
+        let mock = CallMock::new();
+        mock.set_code(req.input.to, Bytes::from(vec![0x60u8]), true);
+        plant_safe_nonce(&mock, req.safe, 0);
+        plant_safe_agreement(&mock, req.safe, &tx, hash);
+
+        let steps = prepared_steps(&mock, tx_builder::BatchSignRequest::Safe(req.clone()))
+            .await
+            .unwrap();
+        let [sign_review::SignStep::SafeExec(x)] = steps.as_slice() else {
+            panic!("expected SafeExec");
+        };
+        assert_eq!(x.inner.sub_legs.len(), 2);
+        assert_eq!(x.inner.sub_legs[0].title, "1 of 2");
+        assert_eq!(x.inner.sub_legs[1].title, "2 of 2");
+        for (sub, want) in x.inner.sub_legs.iter().zip(calls.iter()) {
+            assert_eq!(sub.to, want.to);
+            assert_eq!(sub.value, want.value);
+            assert_eq!(sub.calldata, want.data, "sub-leg bytes == packed bytes");
+            assert_eq!(decoded_fn(sub).as_deref(), Some("approve"));
+        }
+    }
+
+    #[tokio::test]
+    async fn txbuilder_7702_batch_clear_signs_every_inner_call() {
+        let calls = vec![
+            queued(1, addr(0xC1), 0, approve_data(addr(0x5D), 5_000)),
+            queued(2, addr(0xC2), 9, vec![]),
+        ];
+        let req = eoa_batch_req(
+            crate::chain::NetworkId::Builtin(Chain::Mainnet),
+            calls.clone(),
+        );
+        let mock = CallMock::new();
+        mock.set_code(
+            eip7702::EF_SIMPLE_7702_ACCOUNT,
+            Bytes::from(vec![0x60u8]),
+            true,
+        );
+        let steps = prepared_steps(&mock, tx_builder::BatchSignRequest::Eoa(req))
+            .await
+            .unwrap();
+        let [sign_review::SignStep::RawTx(leg)] = steps.as_slice() else {
+            panic!("expected one RawTx leg");
+        };
+        assert_eq!(leg.sub_legs.len(), 2);
+        assert_eq!(decoded_fn(&leg.sub_legs[0]).as_deref(), Some("approve"));
+        // A plain value transfer has no calldata to decode.
+        assert_eq!(leg.sub_legs[1].value, U256::from(9u64));
+        assert!(matches!(
+            leg.sub_legs[1].decoded.as_ref(),
+            crate::decode::clear_sign::DecodeResult::Empty
+        ));
+    }
+
+    #[tokio::test]
+    async fn txbuilder_safe_batch_refuses_a_blob_it_cannot_account_for() {
+        // The overlay must never present a batch it can only partly read: if
+        // the packed payload doesn't parse, refuse rather than show the outer
+        // transaction with no visible sub-calls.
+        let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
+        let mut req = safe_batch_req(&calls, 1, vec![0]);
+        req.input.data = Bytes::from(vec![0xde, 0xad, 0xbe, 0xef]);
+        let (tx, hash) = expected_batch_tx(&req, 0);
+        let mock = CallMock::new();
+        mock.set_code(req.input.to, Bytes::from(vec![0x60u8]), true);
+        plant_safe_nonce(&mock, req.safe, 0);
+        plant_safe_agreement(&mock, req.safe, &tx, hash);
+
+        let err = prepared_steps(&mock, tx_builder::BatchSignRequest::Safe(req))
+            .await
+            .unwrap_err();
+        assert!(err.contains("multiSend"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn txbuilder_single_call_leg_has_no_sub_legs() {
+        // Only a batch fans out; an ordinary call keeps the flat card.
+        let call = queued(1, addr(0xC1), 0, approve_data(addr(0x5D), 1));
+        let req = eoa_batch_req(crate::chain::NetworkId::Builtin(Chain::Mainnet), vec![call]);
+        let steps = prepared_steps(&CallMock::new(), tx_builder::BatchSignRequest::Eoa(req))
+            .await
+            .unwrap();
+        let [sign_review::SignStep::RawTx(leg)] = steps.as_slice() else {
+            panic!("expected one RawTx leg");
+        };
+        assert!(leg.sub_legs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn txbuilder_eoa_call_on_a_custom_network_stays_undecoded() {
+        // The ERC-7730 registry and the proxy walk are keyed by a verified
+        // built-in chain, so a custom network gets the raw-calldata view —
+        // same guard the Send flow applies.
+        let call = queued(1, addr(0xC1), 0, approve_data(addr(0x5D), 5_000));
+        let req = eoa_batch_req(crate::chain::NetworkId::Custom(1337), vec![call]);
+        let steps = prepared_steps(&CallMock::new(), tx_builder::BatchSignRequest::Eoa(req))
+            .await
+            .unwrap();
+        let [sign_review::SignStep::RawTx(leg)] = steps.as_slice() else {
+            panic!("expected one RawTx leg");
+        };
+        assert!(matches!(
+            leg.decoded.as_ref(),
+            crate::decode::clear_sign::DecodeResult::Empty
+        ));
+    }
+
+    #[tokio::test]
+    async fn txbuilder_eoa_batch_leg_is_a_self_call_to_execute_batch() {
+        let calls = vec![
+            queued(1, addr(0xC1), 0, vec![0x01]),
+            queued(2, addr(0xC2), 3, vec![0x02]),
+        ];
+        let req = eoa_batch_req(
+            crate::chain::NetworkId::Builtin(Chain::Mainnet),
+            calls.clone(),
+        );
+        let from = req.from;
+        let mock = CallMock::new();
+        mock.set_code(
+            eip7702::EF_SIMPLE_7702_ACCOUNT,
+            Bytes::from(vec![0x60u8]),
+            true,
+        );
+        let steps = prepared_steps(&mock, tx_builder::BatchSignRequest::Eoa(req))
+            .await
+            .unwrap();
+        let [sign_review::SignStep::RawTx(leg)] = steps.as_slice() else {
+            panic!("expected one RawTx leg, got {steps:?}");
+        };
+        assert_eq!(leg.title, "executeBatch · 2 calls");
+        assert_eq!(leg.to, from, "the batch self-calls the delegated account");
+        assert_eq!(leg.value, U256::ZERO);
+        assert_eq!(leg.calldata, eip7702::encode_execute_batch(&calls));
+        assert_eq!(leg.calldata[..4], eip7702::EXECUTE_BATCH_SELECTOR);
+    }
+
+    #[tokio::test]
+    async fn txbuilder_eoa_batch_refuses_when_the_delegate_is_not_deployed() {
+        // Delegating to a code-less address bricks the account — refuse before
+        // the user is asked to authorize anything.
+        let calls = vec![
+            queued(1, addr(0xC1), 0, vec![0x01]),
+            queued(2, addr(0xC2), 0, vec![0x02]),
+        ];
+        let req = eoa_batch_req(crate::chain::NetworkId::Builtin(Chain::Mainnet), calls);
+        let err = prepared_steps(&CallMock::new(), tx_builder::BatchSignRequest::Eoa(req))
+            .await
+            .unwrap_err();
+        assert!(err.contains("is not deployed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn txbuilder_eoa_batch_skips_the_delegate_check_when_already_delegated() {
+        // Account already carries `0xef0100 ‖ EF_SIMPLE_7702_ACCOUNT`: no fresh
+        // authorization is signed, so the delegate's code is never read (it is
+        // deliberately left unplanted — a read would return empty and error).
+        let calls = vec![
+            queued(1, addr(0xC1), 0, vec![0x01]),
+            queued(2, addr(0xC2), 0, vec![0x02]),
+        ];
+        let req = eoa_batch_req(crate::chain::NetworkId::Builtin(Chain::Mainnet), calls);
+        let mock = CallMock::new();
+        let mut code = vec![0xef, 0x01, 0x00];
+        code.extend_from_slice(eip7702::EF_SIMPLE_7702_ACCOUNT.as_slice());
+        mock.set_code(req.from, Bytes::from(code), true);
+        let steps = prepared_steps(&mock, tx_builder::BatchSignRequest::Eoa(req))
+            .await
+            .expect("an already-delegated account batches without the delegate check");
+        assert!(matches!(
+            steps.as_slice(),
+            [sign_review::SignStep::RawTx(_)]
+        ));
+    }
+
+    #[tokio::test]
+    async fn txbuilder_eoa_batch_refuses_on_a_custom_network() {
+        // The UI caps custom networks at one call; a stale request must not
+        // reach the 7702 path on an unverifiable chain.
+        let calls = vec![
+            queued(1, addr(0xC1), 0, vec![0x01]),
+            queued(2, addr(0xC2), 0, vec![0x02]),
+        ];
+        let req = eoa_batch_req(crate::chain::NetworkId::Custom(1337), calls);
+        let err = prepared_steps(&CallMock::new(), tx_builder::BatchSignRequest::Eoa(req))
+            .await
+            .unwrap_err();
+        assert!(err.contains("only available on built-in chains"), "{err}");
+    }
+
+    // ── the copy the user reads before signing ───────────────────────
+
+    #[test]
+    fn safe_review_copy_names_the_batch_and_the_multisig() {
+        let calls = vec![
+            queued(1, addr(0xC1), 0, vec![0x01]),
+            queued(2, addr(0xC2), 0, vec![0x02]),
+        ];
+        let req = tx_builder::BatchSignRequest::Safe(safe_batch_req(&calls, 2, vec![0, 1]));
+        let (title, subtitle, note, can_execute) = txbuilder_review_copy(&req, 0);
+        assert_eq!(title, "Batch · 2 → 1 atomic transaction");
+        assert!(subtitle.as_deref().unwrap().contains("2-of-3 multisig"));
+        let note = note.unwrap();
+        assert!(note.contains("all-or-nothing"), "{note}");
+        assert!(note.contains("safeTxHash"), "{note}");
+        assert!(can_execute, "2 signable owners meet a threshold of 2");
+    }
+
+    #[test]
+    fn safe_review_copy_blocks_execute_below_the_threshold() {
+        let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
+        let req = tx_builder::BatchSignRequest::Safe(safe_batch_req(&calls, 2, vec![0]));
+        let (_, _, _, can_execute) = txbuilder_review_copy(&req, 0);
+        assert!(!can_execute, "1 signable owner can't meet a threshold of 2");
+    }
+
+    #[test]
+    fn eoa_review_copy_distinguishes_single_call_batch_and_custom_network() {
+        let one = vec![queued(1, addr(0xC1), 0, vec![0x01])];
+        let two = vec![
+            queued(1, addr(0xC1), 0, vec![0x01]),
+            queued(2, addr(0xC2), 0, vec![0x02]),
+        ];
+        let mainnet = crate::chain::NetworkId::Builtin(Chain::Mainnet);
+
+        let (title, _, note, can_execute) = txbuilder_review_copy(
+            &tx_builder::BatchSignRequest::Eoa(eoa_batch_req(mainnet, one.clone())),
+            0,
+        );
+        assert_eq!(title, "Call #1", "a lone call keeps its own title");
+        assert!(note.unwrap().contains("A single transaction"));
+        assert!(can_execute, "an EOA always signs for itself");
+
+        let (title, _, note, _) = txbuilder_review_copy(
+            &tx_builder::BatchSignRequest::Eoa(eoa_batch_req(mainnet, two)),
+            0,
+        );
+        assert_eq!(title, "Batch · 2 calls");
+        assert!(note.unwrap().contains("EIP-7702"));
+
+        let (_, subtitle, note, _) = txbuilder_review_copy(
+            &tx_builder::BatchSignRequest::Eoa(eoa_batch_req(
+                crate::chain::NetworkId::Custom(1337),
+                one,
+            )),
+            0,
+        );
+        let note = note.unwrap();
+        assert!(note.contains("unverified custom network"), "{note}");
+        assert!(subtitle.unwrap().contains("on "));
+    }
+
+    #[test]
+    fn review_copy_discloses_folded_in_flash_approval_revokes() {
+        let spender = addr(0x5D);
+        let calls = vec![
+            queued(1, addr(0xC1), 0, approve_data(spender, 5_000)),
+            queued(2, addr(0xC1), 0, approve_data(spender, 0)), // the revoke
+        ];
+        // The count the coordinator passes comes from the batch itself.
+        assert_eq!(crate::txbuilder::flash_approval::revoke_count(&calls), 1);
+        let req = tx_builder::BatchSignRequest::Safe(safe_batch_req(&calls, 1, vec![0]));
+
+        let plain = txbuilder_review_copy(&req, 0).2.unwrap();
+        assert!(!plain.contains("flash approval"), "{plain}");
+
+        let one = txbuilder_review_copy(&req, 1).2.unwrap();
+        assert!(one.contains("Resets 1 approval to 0"), "{one}");
+        let many = txbuilder_review_copy(&req, 3).2.unwrap();
+        assert!(many.contains("Resets 3 approvals to 0"), "{many}");
+    }
+
+    // ── overlay: pin on prepare, refuse to sign without it ───────────
+
+    /// A screen sitting on an open, still-preparing Builder review.
+    fn screen_with_txbuilder_review(req: tx_builder::SafeBatchRequest) -> WalletScreen {
+        let mut s = screen_for(addr(0xAA), new_cache());
+        s.sign_review_seq = 1;
+        s.sign_review = Some(sign_review::SignReview::pending(
+            "Batch".into(),
+            None,
+            Vec::new(),
+            None,
+            1,
+            sign_review::SignAction::TxBuilder {
+                req: tx_builder::BatchSignRequest::Safe(req),
+                can_execute: true,
+            },
+        ));
+        s
+    }
+
+    fn safe_exec_step(nonce: u64, hash: B256) -> sign_review::SignStep {
+        sign_review::SignStep::SafeExec(sign_review::SafeExecReview {
+            safe: addr(0x5A),
+            nonce,
+            threshold: 1,
+            owner_count: 3,
+            safe_tx_hash: hash,
+            eip712: crate::sign::digest::Eip712Digests::from_parts(B256::ZERO, B256::ZERO),
+            inner: Box::new(sign_review::ReviewLeg {
+                title: "MultiSend · 1 call".into(),
+                to: addr(0x40),
+                value: U256::ZERO,
+                net: crate::chain::NetworkId::Builtin(Chain::Mainnet),
+                calldata: Bytes::new(),
+                decoded: Box::new(crate::decode::clear_sign::DecodeResult::Empty),
+                sub_legs: Vec::new(),
+            }),
+        })
+    }
+
+    #[test]
+    fn txbuilder_prepared_pins_the_displayed_nonce_and_hash() {
+        let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
+        let mut s = screen_with_txbuilder_review(safe_batch_req(&calls, 1, vec![0]));
+        let hash = B256::repeat_byte(0xAB);
+
+        s.update(Message::SignReviewPrepared {
+            seq: 1,
+            steps: Ok(vec![safe_exec_step(11, hash)]),
+        });
+
+        let review = s.sign_review.as_ref().expect("overlay stays open");
+        assert!(!review.legs_loading, "the steps are ready to review");
+        let sign_review::SignAction::TxBuilder {
+            req: tx_builder::BatchSignRequest::Safe(sreq),
+            ..
+        } = &review.action
+        else {
+            panic!("expected a Safe TxBuilder action");
+        };
+        assert_eq!(
+            sreq.prepared,
+            Some((11, hash)),
+            "the owners sign exactly the artifact the overlay displayed",
+        );
+    }
+
+    #[test]
+    fn txbuilder_prepare_failure_keeps_the_overlay_with_the_error() {
+        let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
+        let mut s = screen_with_txbuilder_review(safe_batch_req(&calls, 1, vec![0]));
+
+        s.update(Message::SignReviewPrepared {
+            seq: 1,
+            steps: Err("MultiSend contract 0x40…40 is not deployed on Ethereum".into()),
+        });
+
+        let review = s
+            .sign_review
+            .as_ref()
+            .expect("the overlay stays up so the user can read the failure");
+        assert!(review.error.as_deref().unwrap().contains("not deployed"));
+        assert!(review.confirm_disabled, "a failed prepare can't be signed");
+        assert!(!review.legs_loading);
+    }
+
+    #[test]
+    fn txbuilder_confirm_refuses_to_sign_an_unpinned_batch() {
+        // Prepare never landed → no `(nonce, safeTxHash)` pin → confirming must
+        // not start a ceremony over an unreviewed artifact.
+        let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
+        let mut s = screen_with_txbuilder_review(safe_batch_req(&calls, 1, vec![0]));
+        let _ = s.confirm_sign_review();
+        let review = s.sign_review.as_ref().expect("overlay stays open");
+        assert!(
+            review.signing_since.is_none(),
+            "no signature is requested without a reviewed hash",
+        );
+    }
+
+    #[test]
+    fn txbuilder_confirm_refuses_when_no_signable_owner_is_linked() {
+        // The pin is in place, but the signable indices dangle (owners were
+        // unlinked while the review was open) — surface it on the overlay
+        // instead of dispatching a ceremony that can't reach the threshold.
+        let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
+        let mut req = safe_batch_req(&calls, 1, vec![9]); // index 9: no such account
+        req.prepared = Some((3, B256::repeat_byte(0xCD)));
+        let mut s = screen_with_txbuilder_review(req);
+        let _ = s.confirm_sign_review();
+        let review = s.sign_review.as_ref().expect("overlay stays open");
+        assert!(review.signing_since.is_none());
+        assert!(
+            review
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Not enough signable owners"),
+        );
     }
 }

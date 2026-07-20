@@ -31,6 +31,7 @@ pub mod encode;
 pub mod flash_approval;
 pub mod multisend;
 pub mod sim;
+pub mod templates;
 
 use alloy::primitives::{Address, Bytes, U256};
 

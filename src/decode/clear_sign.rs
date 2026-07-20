@@ -25,7 +25,7 @@ use clear_signing::{
 
 use crate::chain::Chain;
 use crate::decode::proxy;
-use crate::decode::render::{DecodedCall, decode_call, read_token_meta};
+use crate::decode::render::{DecodedCall, ResolutionState, decode_call, read_token_meta};
 use crate::net::BalanceFetcher;
 
 // ---------------------------------------------------------------------------
@@ -205,6 +205,127 @@ pub enum DecodeResult {
     Heuristic(DecodedCall),
     /// Native ETH transfer -- no calldata.
     Empty,
+}
+
+/// The one line that says what a transaction *does*, lifted out of whichever
+/// decode produced it: the ERC-7730 intent when a descriptor matched, the
+/// resolved function name otherwise.
+///
+/// This is the top of the review's information hierarchy — *what it does* →
+/// *who it touches* → *the exact bytes* — so it is rendered by the caller
+/// above the destination rows, not buried inside the calldata panel. Every
+/// signing surface reads it from here so the same call can't headline
+/// differently in two places.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Headline {
+    pub text: String,
+    /// Where the name came from, when that qualifies it — "decoded from
+    /// bytecode · no name" for a types-only resolve, "unverified call" when
+    /// nothing resolved the selector at all.
+    pub note: Option<String>,
+    /// The call lands on a proxy and was decoded through its implementation.
+    pub via_proxy: bool,
+    /// Why the headline can't be taken at face value, if it can't: an on-chain
+    /// read fell back to unverified RPC, or the selector matched several
+    /// signatures so the name is a guess. Callers mute the line and render this
+    /// alongside it — never behind a toggle, since it qualifies the one thing
+    /// that is always on screen.
+    pub caution: Option<String>,
+    /// A descriptor matched, so the headline is an authored intent rather than
+    /// a decoded function name. Reviews collapse their mechanical detail behind
+    /// a toggle in this case — the intent already says what the call does.
+    pub clear_signed: bool,
+}
+
+/// Shown when interpolated names/amounts came from an RPC Helios couldn't
+/// verify — the values in the headline may be attacker-chosen.
+const UNVERIFIED_READS: &str =
+    "⚠ Some on-chain reads fell back to unverified RPC — names and amounts may be spoofed.";
+
+impl DecodeResult {
+    /// The headline for this decode, or `None` for a bare value transfer (no
+    /// calldata) or a decode that resolved nothing nameable.
+    pub fn headline(&self) -> Option<Headline> {
+        match self {
+            Self::ClearSigned {
+                model,
+                proxy_hops,
+                all_verified,
+                ..
+            } => Some(Headline {
+                text: model
+                    .interpolated_intent
+                    .as_deref()
+                    .unwrap_or(&model.intent)
+                    .to_string(),
+                note: None,
+                via_proxy: !proxy_hops.is_empty(),
+                caution: (!all_verified).then(|| UNVERIFIED_READS.to_string()),
+                clear_signed: true,
+            }),
+            Self::Fallback {
+                model,
+                all_verified,
+                heuristic,
+                ..
+            } => Some(Headline {
+                text: model
+                    .interpolated_intent
+                    .as_deref()
+                    .unwrap_or(&model.intent)
+                    .to_string(),
+                note: None,
+                via_proxy: !heuristic.proxy_hops.is_empty(),
+                // A partial descriptor match is only as trustworthy as the
+                // heuristic it was cross-referenced against.
+                caution: (!(*all_verified && heuristic.all_verified))
+                    .then(|| UNVERIFIED_READS.to_string()),
+                clear_signed: true,
+            }),
+            Self::Heuristic(d) => {
+                if matches!(d.state, ResolutionState::Empty) {
+                    return None;
+                }
+                let text = match &d.function_name {
+                    Some(name) => format!("{name}(…)"),
+                    // Nothing resolved the selector — the raw 4 bytes are the
+                    // most honest headline available.
+                    None => format!(
+                        "0x{:02x}{:02x}{:02x}{:02x}",
+                        d.selector[0], d.selector[1], d.selector[2], d.selector[3]
+                    ),
+                };
+                // Provenance the old panel header carried as a subtitle; it
+                // qualifies the name, so it travels with it.
+                let note = match d.state {
+                    ResolutionState::TypesOnly => Some("decoded from bytecode · no name".into()),
+                    ResolutionState::Unknown => Some("unverified call".into()),
+                    // Ambiguous is spelled out by its own warning strip in the
+                    // panel below — a duplicate note would split attention.
+                    _ => None,
+                };
+                let caution = if !d.all_verified {
+                    Some(UNVERIFIED_READS.to_string())
+                } else if matches!(d.state, ResolutionState::Ambiguous) {
+                    Some(
+                        "⚠ Several functions share this selector — the name below is a guess."
+                            .to_string(),
+                    )
+                } else {
+                    None
+                };
+                Some(Headline {
+                    text,
+                    note,
+                    via_proxy: !d.proxy_hops.is_empty(),
+                    caution,
+                    // No descriptor: the user gets the full decode, unfolded.
+                    clear_signed: false,
+                })
+            }
+            Self::Empty => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -562,5 +683,162 @@ mod tests {
         assert!(provider.resolve_token(999_999, &token).await.is_none());
         assert!(net.called_chains().is_empty());
         assert!(provider.all_verified());
+    }
+
+    // ── headline ─────────────────────────────────────────────────────
+    //
+    // The single line every signing surface leads with. It has to say the
+    // same thing everywhere (the Send pill and the sign-review card both read
+    // it from here) and it must never claim more confidence than the decode
+    // earned.
+
+    fn model(intent: &str, interpolated: Option<&str>) -> DisplayModel {
+        DisplayModel {
+            intent: intent.into(),
+            interpolated_intent: interpolated.map(Into::into),
+            entries: Vec::new(),
+            owner: None,
+            contract_name: Some("USDC".into()),
+        }
+    }
+
+    fn call(state: ResolutionState, name: Option<&str>) -> DecodedCall {
+        DecodedCall {
+            to: Address::repeat_byte(0x11),
+            selector: [0x09, 0x5e, 0xa7, 0xb3],
+            raw_calldata: Bytes::new(),
+            function_name: name.map(Into::into),
+            args: Vec::new(),
+            state,
+            warnings: Vec::new(),
+            proxy_hops: Vec::new(),
+            all_verified: true,
+            target_token: None,
+            target_token_verified: true,
+        }
+    }
+
+    #[test]
+    fn headline_prefers_the_interpolated_intent() {
+        // The interpolated form carries the resolved amounts/names — it's what
+        // the descriptor meant to say.
+        let h = DecodeResult::ClearSigned {
+            model: model("Approve {token}", Some("Approve 5,000 USDC for Aave")),
+            diagnostics: Vec::new(),
+            proxy_hops: Vec::new(),
+            all_verified: true,
+        }
+        .headline()
+        .unwrap();
+        assert_eq!(h.text, "Approve 5,000 USDC for Aave");
+        assert_eq!(h.caution, None);
+        assert!(h.clear_signed, "a descriptor matched");
+        assert!(!h.via_proxy);
+    }
+
+    #[test]
+    fn headline_falls_back_to_the_raw_intent_and_flags_proxies() {
+        let h = DecodeResult::ClearSigned {
+            model: model("Approve token", None),
+            diagnostics: Vec::new(),
+            proxy_hops: vec![Address::repeat_byte(0x22)],
+            all_verified: true,
+        }
+        .headline()
+        .unwrap();
+        assert_eq!(h.text, "Approve token");
+        assert!(h.via_proxy);
+    }
+
+    #[test]
+    fn headline_is_provisional_when_a_read_fell_back_to_unverified_rpc() {
+        // Interpolated names/amounts may be spoofed — the caller mutes the
+        // line and pairs it with the caution strip.
+        let h = DecodeResult::ClearSigned {
+            model: model("Approve", Some("Approve 5,000 EVIL")),
+            diagnostics: Vec::new(),
+            proxy_hops: Vec::new(),
+            all_verified: false,
+        }
+        .headline()
+        .unwrap();
+        assert!(
+            h.caution.is_some_and(|c| c.contains("unverified RPC")),
+            "an unverified read must be called out beside the headline",
+        );
+    }
+
+    #[test]
+    fn fallback_headline_is_only_as_trusted_as_its_heuristic() {
+        // The descriptor's own reads verified, but the heuristic it was
+        // cross-referenced against didn't — the pair is provisional.
+        let mut heuristic = call(ResolutionState::Resolved, Some("approve"));
+        heuristic.all_verified = false;
+        let h = DecodeResult::Fallback {
+            model: model("Approve", None),
+            reason: clear_signing::FallbackReason::FormatNotFound,
+            diagnostics: Vec::new(),
+            all_verified: true,
+            heuristic,
+        }
+        .headline()
+        .unwrap();
+        assert!(h.caution.is_some());
+        assert!(h.clear_signed);
+    }
+
+    #[test]
+    fn heuristic_headline_names_the_function_or_shows_the_selector() {
+        let named = DecodeResult::Heuristic(call(ResolutionState::Resolved, Some("approve")))
+            .headline()
+            .unwrap();
+        assert_eq!(named.text, "approve(…)");
+        assert_eq!(named.note, None);
+        assert_eq!(named.caution, None);
+        assert!(
+            !named.clear_signed,
+            "no descriptor — the review shows the full decode, unfolded",
+        );
+
+        // Nothing resolved the selector: the raw 4 bytes are the honest
+        // headline, and it says so.
+        let unknown = DecodeResult::Heuristic(call(ResolutionState::Unknown, None))
+            .headline()
+            .unwrap();
+        assert_eq!(unknown.text, "0x095ea7b3");
+        assert_eq!(unknown.note.as_deref(), Some("unverified call"));
+    }
+
+    #[test]
+    fn heuristic_headline_marks_types_only_and_ambiguous() {
+        let types_only = DecodeResult::Heuristic(call(ResolutionState::TypesOnly, None))
+            .headline()
+            .unwrap();
+        assert_eq!(
+            types_only.note.as_deref(),
+            Some("decoded from bytecode · no name")
+        );
+
+        // One of several colliding signatures — the name is a guess, so the
+        // headline must not render at full confidence.
+        let ambiguous = DecodeResult::Heuristic(call(ResolutionState::Ambiguous, Some("transfer")))
+            .headline()
+            .unwrap();
+        assert!(
+            ambiguous
+                .caution
+                .is_some_and(|c| c.contains("share this selector")),
+        );
+        assert_eq!(ambiguous.text, "transfer(…)");
+    }
+
+    #[test]
+    fn value_transfers_have_no_headline() {
+        assert!(DecodeResult::Empty.headline().is_none());
+        assert!(
+            DecodeResult::Heuristic(call(ResolutionState::Empty, None))
+                .headline()
+                .is_none()
+        );
     }
 }

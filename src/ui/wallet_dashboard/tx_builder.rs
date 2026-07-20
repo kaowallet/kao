@@ -9,22 +9,48 @@
 
 use iced::Element;
 
+use alloy::dyn_abi::DynSolValue;
 use alloy::primitives::{Address, B256, Bytes, U256};
 
-use crate::chain::Chain;
+use crate::chain::{Chain, NetworkId};
 use crate::portfolio::format_token_balance;
 use crate::safe::tx::SafeTxInput;
-use crate::txbuilder::abi::{self, LoadedContract};
+use crate::txbuilder::abi::{self, AbiMethod, LoadedContract};
 use crate::txbuilder::sim::BatchSimResult;
+use crate::txbuilder::templates::Template;
 use crate::txbuilder::{QueuedCall, bundle, encode, flash_approval};
 use crate::ui::kao_theme::KaoTheme;
 use crate::wallet::SafeTrust;
 
-/// Which composer mode is active.
+/// Which composer mode is active. `Write` composes a state-changing call,
+/// `Read` queries a `view`/`pure` method via `eth_call`, `Raw` sends custom
+/// calldata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    Call,
+    Write,
+    Read,
     Raw,
+}
+
+/// A single decoded return value of a Read-tab query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadRow {
+    pub name: String,
+    pub ty: String,
+    pub value: String,
+}
+
+/// The result of a Read-tab `eth_call`, retained for display until the next
+/// query. `raw` is the `0x…` return data (copyable); `rows` is its typed decode
+/// against the method's declared outputs (empty when the outputs don't decode).
+#[derive(Debug, Clone)]
+pub enum ReadOutcome {
+    Ok {
+        rows: Vec<ReadRow>,
+        raw: String,
+        verified: bool,
+    },
+    Err(String),
 }
 
 /// The JSON import/export overlay, if any.
@@ -39,6 +65,9 @@ enum Modal {
 pub enum Message {
     Close,
     SetMode(Mode),
+    // network switcher
+    ToggleNetworkMenu,
+    SetNetwork(NetworkId),
     // contract-call composer
     AddrChanged(String),
     ShowAbiPaste,
@@ -49,12 +78,21 @@ pub enum Message {
     ArgChanged(usize, String),
     BoolArg(usize, bool),
     ValueChanged(String),
+    // read composer
+    ToggleReadMethodMenu,
+    PickReadMethod(usize),
+    ReadArgChanged(usize, String),
+    ReadBoolArg(usize, bool),
+    Query,
+    CopyReadRaw,
+    CopyReadValue(usize),
     // raw composer
     RawToChanged(String),
     RawValueChanged(String),
     RawDataChanged(String),
     // add / batch ops
     AddToBatch,
+    SendSingle,
     RemoveCall(u64),
     MoveUp(u64),
     MoveDown(u64),
@@ -62,6 +100,15 @@ pub enum Message {
     ClearBatch,
     LoadSample,
     ToggleAutoRevoke(bool),
+    // templates
+    ToggleTemplateMenu,
+    LoadTemplate(usize),
+    SaveTemplate,
+    DeleteTemplate(usize),
+    StartRename(usize),
+    RenameChanged(String),
+    CommitRename,
+    CancelRename,
     // simulate / review
     Simulate,
     Review,
@@ -81,6 +128,8 @@ impl Message {
         match self {
             Message::Close => "Close",
             Message::SetMode(_) => "SetMode",
+            Message::ToggleNetworkMenu => "ToggleNetworkMenu",
+            Message::SetNetwork(_) => "SetNetwork",
             Message::AddrChanged(_) => "AddrChanged",
             Message::ShowAbiPaste => "ShowAbiPaste",
             Message::AbiPasteChanged(_) => "AbiPasteChanged",
@@ -90,10 +139,18 @@ impl Message {
             Message::ArgChanged(..) => "ArgChanged",
             Message::BoolArg(..) => "BoolArg",
             Message::ValueChanged(_) => "ValueChanged",
+            Message::ToggleReadMethodMenu => "ToggleReadMethodMenu",
+            Message::PickReadMethod(_) => "PickReadMethod",
+            Message::ReadArgChanged(..) => "ReadArgChanged",
+            Message::ReadBoolArg(..) => "ReadBoolArg",
+            Message::Query => "Query",
+            Message::CopyReadRaw => "CopyReadRaw",
+            Message::CopyReadValue(_) => "CopyReadValue",
             Message::RawToChanged(_) => "RawToChanged",
             Message::RawValueChanged(_) => "RawValueChanged",
             Message::RawDataChanged(_) => "RawDataChanged",
             Message::AddToBatch => "AddToBatch",
+            Message::SendSingle => "SendSingle",
             Message::RemoveCall(_) => "RemoveCall",
             Message::MoveUp(_) => "MoveUp",
             Message::MoveDown(_) => "MoveDown",
@@ -101,6 +158,14 @@ impl Message {
             Message::ClearBatch => "ClearBatch",
             Message::LoadSample => "LoadSample",
             Message::ToggleAutoRevoke(_) => "ToggleAutoRevoke",
+            Message::ToggleTemplateMenu => "ToggleTemplateMenu",
+            Message::LoadTemplate(_) => "LoadTemplate",
+            Message::SaveTemplate => "SaveTemplate",
+            Message::DeleteTemplate(_) => "DeleteTemplate",
+            Message::StartRename(_) => "StartRename",
+            Message::RenameChanged(_) => "RenameChanged",
+            Message::CommitRename => "CommitRename",
+            Message::CancelRename => "CancelRename",
             Message::Simulate => "Simulate",
             Message::Review => "Review",
             Message::OpenSave => "OpenSave",
@@ -119,15 +184,42 @@ impl Message {
 pub enum Outcome {
     /// Step back to the Apps launcher.
     Close,
-    /// Fetch the runtime bytecode of `address` so the composer can recover
-    /// its ABI. Answered via [`TxBuilderApp::on_contract_resolved`].
-    ResolveContract { seq: u64, address: Address },
-    /// Simulate the batch. Answered via [`TxBuilderApp::on_sim`].
-    Simulate { calls: Vec<QueuedCall> },
-    /// Open the sign-review overlay for the batch.
+    /// Fetch the runtime bytecode of `address` on `chain` so the composer can
+    /// recover its ABI. Only bubbled for built-in chains; custom networks fall
+    /// straight to the paste-ABI prompt. Answered via
+    /// [`TxBuilderApp::on_contract_resolved`].
+    ResolveContract {
+        seq: u64,
+        chain: Chain,
+        address: Address,
+    },
+    /// Run a Read-tab `eth_call` on `net` and hand the raw return data back via
+    /// [`TxBuilderApp::on_read`].
+    Read {
+        seq: u64,
+        net: NetworkId,
+        to: Address,
+        data: Bytes,
+    },
+    /// Simulate the batch on `chain` (built-in only). Answered via
+    /// [`TxBuilderApp::on_sim`].
+    Simulate {
+        chain: Chain,
+        calls: Vec<QueuedCall>,
+    },
+    /// Open the sign-review overlay for the batch (built-in batch / Safe) or a
+    /// single call (custom-network send). The coordinator reads the app's
+    /// selected network to build the request.
     Review { calls: Vec<QueuedCall> },
-    /// Copy text (exported JSON) to the clipboard.
+    /// Persist the user's template list to redb.
+    PersistTemplates(Vec<Template>),
+    /// Copy text (exported JSON) to the clipboard, armed for the usual 10s
+    /// auto-clear.
     CopyText(String),
+    /// Copy public read-query output (a decoded value / raw return data) to the
+    /// clipboard WITHOUT the auto-clear — it's not sensitive and the user
+    /// wants it to survive until they paste it.
+    CopyPlain(String),
 }
 
 impl Outcome {
@@ -135,17 +227,19 @@ impl Outcome {
         match self {
             Outcome::Close => "Close",
             Outcome::ResolveContract { .. } => "ResolveContract",
+            Outcome::Read { .. } => "Read",
             Outcome::Simulate { .. } => "Simulate",
             Outcome::Review { .. } => "Review",
+            Outcome::PersistTemplates(_) => "PersistTemplates",
             Outcome::CopyText(_) => "CopyText",
+            Outcome::CopyPlain(_) => "CopyPlain",
         }
     }
 }
 
 /// External context the coordinator refreshes before each message.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct Ctx {
-    chain: Chain,
     /// Whether the active identity is a Safe (atomic batching via MultiSend).
     is_safe: bool,
     /// The active Safe's contract version, for the MultiSend routing hint.
@@ -155,17 +249,8 @@ struct Ctx {
     /// delegation (Local / Ledger) and therefore batch N calls atomically.
     /// Trezor / view-only cannot, and stay capped at a single call.
     eoa_can_batch: bool,
-}
-
-impl Default for Ctx {
-    fn default() -> Self {
-        Self {
-            chain: Chain::Mainnet,
-            is_safe: false,
-            safe_version: None,
-            eoa_can_batch: false,
-        }
-    }
+    /// Enabled custom networks `(chain_id, name)` offered by the switcher.
+    custom_networks: Vec<(u64, String)>,
 }
 
 #[derive(Debug)]
@@ -173,6 +258,12 @@ pub struct TxBuilderApp {
     #[allow(dead_code)]
     owner: Address,
     ctx: Ctx,
+
+    /// The active network. A plain EOA drives this via the switcher; a Safe
+    /// keeps it pinned to `ctx.chain`. Custom networks collapse the UI to the
+    /// single-transaction composer (no batching).
+    net: NetworkId,
+    net_menu_open: bool,
 
     mode: Mode,
 
@@ -192,6 +283,14 @@ pub struct TxBuilderApp {
     args: Vec<String>,
     value_input: String,
 
+    // ── read composer ──
+    read_idx: usize,
+    read_menu_open: bool,
+    read_args: Vec<String>,
+    read_seq: u64,
+    read_busy: bool,
+    read_result: Option<ReadOutcome>,
+
     // ── raw composer ──
     raw_to: String,
     raw_value: String,
@@ -209,6 +308,14 @@ pub struct TxBuilderApp {
     sim: Option<BatchSimResult>,
     sim_busy: bool,
 
+    // ── templates ──
+    templates: Vec<Template>,
+    template_menu_open: bool,
+    /// Index of the template currently being renamed inline, plus the edit
+    /// buffer; `None` when no rename is in flight.
+    rename_idx: Option<usize>,
+    rename_buf: String,
+
     // ── JSON modal ──
     modal: Modal,
     json_text: String,
@@ -222,7 +329,9 @@ impl TxBuilderApp {
         Self {
             owner,
             ctx: Ctx::default(),
-            mode: Mode::Call,
+            net: NetworkId::default(),
+            net_menu_open: false,
+            mode: Mode::Write,
             addr_input: String::new(),
             loaded: None,
             resolving: false,
@@ -235,6 +344,12 @@ impl TxBuilderApp {
             method_menu_open: false,
             args: Vec::new(),
             value_input: "0".into(),
+            read_idx: 0,
+            read_menu_open: false,
+            read_args: Vec::new(),
+            read_seq: 0,
+            read_busy: false,
+            read_result: None,
             raw_to: String::new(),
             raw_value: "0".into(),
             raw_data: String::new(),
@@ -244,11 +359,26 @@ impl TxBuilderApp {
             auto_revoke: false,
             sim: None,
             sim_busy: false,
+            templates: Vec::new(),
+            template_menu_open: false,
+            rename_idx: None,
+            rename_buf: String::new(),
             modal: Modal::None,
             json_text: String::new(),
             json_error: None,
             error: None,
         }
+    }
+
+    /// Adopt the user's saved templates (loaded from redb by the coordinator).
+    pub fn set_templates(&mut self, templates: Vec<Template>) {
+        self.templates = templates;
+    }
+
+    /// The active network the coordinator should resolve / simulate / broadcast
+    /// against.
+    pub fn selected_net(&self) -> NetworkId {
+        self.net
     }
 
     /// Coordinator refreshes chain / Safe context before dispatching a
@@ -260,18 +390,29 @@ impl TxBuilderApp {
         is_safe: bool,
         safe_version: Option<String>,
         eoa_can_batch: bool,
+        custom_networks: Vec<(u64, String)>,
     ) {
-        // A chain change invalidates a resolved contract (known addresses
-        // are per-chain).
-        if self.ctx.chain != chain {
-            self.reset_composer();
-        }
         self.ctx = Ctx {
-            chain,
             is_safe,
             safe_version,
             eoa_can_batch,
+            custom_networks,
         };
+        // A Safe can only transact on its own chain — pin the selector there.
+        if is_safe {
+            let pinned = NetworkId::Builtin(chain);
+            if self.net != pinned {
+                self.net = pinned;
+                self.on_network_reset();
+            }
+        } else if let NetworkId::Custom(id) = self.net {
+            // A plain EOA keeps its selection across context refreshes, except
+            // when the selected custom network was removed underneath it.
+            if !self.ctx.custom_networks.iter().any(|(cid, _)| *cid == id) {
+                self.net = NetworkId::Builtin(Chain::Mainnet);
+                self.on_network_reset();
+            }
+        }
     }
 
     // ── coordinator callbacks ─────────────────────────────────────────
@@ -301,6 +442,35 @@ impl TxBuilderApp {
         self.sim = Some(result.unwrap_or_else(|_| BatchSimResult::unavailable()));
     }
 
+    /// A Read-tab `eth_call` returned. `seq` guards against a stale query
+    /// (the user changed the method / params before this landed). The raw
+    /// return bytes are decoded here against the queried method's outputs.
+    pub fn on_read(&mut self, seq: u64, result: Result<(Bytes, bool), String>) {
+        if seq != self.read_seq {
+            return; // stale — a newer query superseded this one
+        }
+        self.read_busy = false;
+        self.read_result = Some(match result {
+            Ok((bytes, verified)) => {
+                let raw = if bytes.is_empty() {
+                    "0x".to_string()
+                } else {
+                    format!("0x{}", alloy::hex::encode(&bytes))
+                };
+                let rows = self
+                    .selected_read_method()
+                    .map(|m| decode_read_rows(m, &bytes))
+                    .unwrap_or_default();
+                ReadOutcome::Ok {
+                    rows,
+                    raw,
+                    verified,
+                }
+            }
+            Err(e) => ReadOutcome::Err(e),
+        });
+    }
+
     /// The batch was executed successfully — clear it so the composer is
     /// ready for the next one.
     pub fn on_executed(&mut self) {
@@ -326,6 +496,22 @@ impl TxBuilderApp {
             Message::SetMode(m) => {
                 self.mode = m;
                 self.error = None;
+                self.method_menu_open = false;
+                self.read_menu_open = false;
+            }
+            Message::ToggleNetworkMenu => {
+                // A Safe pins the network — the switcher is inert.
+                if !self.ctx.is_safe {
+                    self.net_menu_open = !self.net_menu_open;
+                    self.template_menu_open = false;
+                }
+            }
+            Message::SetNetwork(net) => {
+                self.net_menu_open = false;
+                if self.net != net {
+                    self.net = net;
+                    self.on_network_reset();
+                }
             }
             Message::AddrChanged(v) => return self.on_addr_changed(v),
             Message::ShowAbiPaste => {
@@ -363,10 +549,43 @@ impl TxBuilderApp {
                 }
             }
             Message::ValueChanged(v) => self.value_input = v,
+            Message::ToggleReadMethodMenu => self.read_menu_open = !self.read_menu_open,
+            Message::PickReadMethod(i) => {
+                self.read_idx = i;
+                self.read_menu_open = false;
+                self.reset_read_args();
+                self.read_result = None;
+            }
+            Message::ReadArgChanged(i, v) => {
+                if let Some(slot) = self.read_args.get_mut(i) {
+                    *slot = v;
+                }
+                self.read_result = None;
+            }
+            Message::ReadBoolArg(i, b) => {
+                if let Some(slot) = self.read_args.get_mut(i) {
+                    *slot = b.to_string();
+                }
+                self.read_result = None;
+            }
+            Message::Query => return self.on_query(),
+            Message::CopyReadRaw => {
+                if let Some(ReadOutcome::Ok { raw, .. }) = &self.read_result {
+                    return Some(Outcome::CopyPlain(raw.clone()));
+                }
+            }
+            Message::CopyReadValue(i) => {
+                if let Some(ReadOutcome::Ok { rows, .. }) = &self.read_result
+                    && let Some(r) = rows.get(i)
+                {
+                    return Some(Outcome::CopyPlain(r.value.clone()));
+                }
+            }
             Message::RawToChanged(v) => self.raw_to = v,
             Message::RawValueChanged(v) => self.raw_value = v,
             Message::RawDataChanged(v) => self.raw_data = v,
             Message::AddToBatch => self.add_to_batch(),
+            Message::SendSingle => return self.send_single(),
             Message::RemoveCall(id) => {
                 self.batch.retain(|c| c.id != id);
                 self.invalidate_sim();
@@ -395,10 +614,12 @@ impl TxBuilderApp {
                 self.invalidate_sim();
             }
             Message::Simulate => {
-                if !self.batch.is_empty() {
+                // Simulation is a verified-path preflight — built-in chains only.
+                if let (false, Some(chain)) = (self.batch.is_empty(), self.net.builtin()) {
                     self.sim_busy = true;
                     self.sim = None;
                     return Some(Outcome::Simulate {
+                        chain,
                         calls: self.effective_calls(),
                     });
                 }
@@ -410,9 +631,44 @@ impl TxBuilderApp {
                     });
                 }
             }
+            Message::ToggleTemplateMenu => {
+                self.template_menu_open = !self.template_menu_open;
+                self.net_menu_open = false;
+                self.cancel_rename();
+            }
+            Message::LoadTemplate(i) => {
+                if let Some(t) = self.templates.get(i).cloned() {
+                    self.load_template(&t);
+                }
+            }
+            Message::SaveTemplate => {
+                if !self.batch.is_empty() {
+                    self.cancel_rename();
+                    let t = Template::from_batch("Untitled batch", "(｡•̀ᴗ-)✧", &self.batch);
+                    self.templates.push(t);
+                    self.template_menu_open = true;
+                    return Some(Outcome::PersistTemplates(self.templates.clone()));
+                }
+            }
+            Message::DeleteTemplate(i) => {
+                if i < self.templates.len() {
+                    self.cancel_rename();
+                    self.templates.remove(i);
+                    return Some(Outcome::PersistTemplates(self.templates.clone()));
+                }
+            }
+            Message::StartRename(i) => {
+                if let Some(t) = self.templates.get(i) {
+                    self.rename_buf = t.name.clone();
+                    self.rename_idx = Some(i);
+                }
+            }
+            Message::RenameChanged(v) => self.rename_buf = v,
+            Message::CommitRename => return self.commit_rename(),
+            Message::CancelRename => self.cancel_rename(),
             Message::OpenSave => {
                 self.json_text = bundle::export(
-                    self.ctx.chain,
+                    self.net.builtin().unwrap_or(Chain::Mainnet),
                     self.ctx.is_safe.then_some(self.owner),
                     &self.batch,
                 );
@@ -457,16 +713,29 @@ impl TxBuilderApp {
                 }
                 self.reset_composer_keep_addr();
                 self.resolve_target = Some(addr);
-                if let Some(loaded) = abi::known_by_address(self.ctx.chain, addr) {
-                    self.set_loaded(loaded);
-                    None
-                } else {
-                    self.resolving = true;
-                    self.resolve_seq += 1;
-                    Some(Outcome::ResolveContract {
-                        seq: self.resolve_seq,
-                        address: addr,
-                    })
+                match self.net.builtin() {
+                    // Built-in chain: curated registry first, else fetch the
+                    // verified bytecode and recover the ABI.
+                    Some(chain) => {
+                        if let Some(loaded) = abi::known_by_address(chain, addr) {
+                            self.set_loaded(loaded);
+                            None
+                        } else {
+                            self.resolving = true;
+                            self.resolve_seq += 1;
+                            Some(Outcome::ResolveContract {
+                                seq: self.resolve_seq,
+                                chain,
+                                address: addr,
+                            })
+                        }
+                    }
+                    // Custom (unverified) network: no verified-bytecode fetch and
+                    // no curated registry — prompt straight for a pasted ABI.
+                    None => {
+                        self.not_found = true;
+                        None
+                    }
                 }
             }
             Err(_) => {
@@ -483,8 +752,12 @@ impl TxBuilderApp {
         self.resolve_target = Some(loaded.address);
         self.method_idx = 0;
         self.method_menu_open = false;
+        self.read_idx = 0;
+        self.read_menu_open = false;
+        self.read_result = None;
         self.loaded = Some(loaded);
         self.reset_args();
+        self.reset_read_args();
     }
 
     fn reset_args(&mut self) {
@@ -496,6 +769,14 @@ impl TxBuilderApp {
             .unwrap_or(0);
         self.args = vec![String::new(); n];
         self.value_input = "0".into();
+    }
+
+    fn reset_read_args(&mut self) {
+        let n = self
+            .selected_read_method()
+            .map(|m| m.inputs.len())
+            .unwrap_or(0);
+        self.read_args = vec![String::new(); n];
     }
 
     fn reset_composer(&mut self) {
@@ -513,6 +794,24 @@ impl TxBuilderApp {
         self.method_menu_open = false;
         self.args.clear();
         self.value_input = "0".into();
+        self.read_idx = 0;
+        self.read_menu_open = false;
+        self.read_args.clear();
+        self.read_result = None;
+    }
+
+    /// A network change invalidates every resolved-contract / query / sim piece
+    /// of state — known contracts are per-chain and a call result is per-network.
+    fn on_network_reset(&mut self) {
+        self.net_menu_open = false;
+        self.reset_composer();
+        self.invalidate_sim();
+        // Custom networks have no batch surface; drop any queued calls so the
+        // single-transaction composer starts clean.
+        if self.net.is_custom() {
+            self.batch.clear();
+            self.expanded = None;
+        }
     }
 
     fn invalidate_sim(&mut self) {
@@ -556,16 +855,62 @@ impl TxBuilderApp {
         self.invalidate_sim();
     }
 
-    fn selected_method(&self) -> Option<&abi::AbiMethod> {
+    fn selected_method(&self) -> Option<&AbiMethod> {
         self.loaded
             .as_ref()
             .and_then(|c| c.methods.get(self.method_idx))
     }
 
-    /// Whether the currently-composed call is valid and can be queued.
+    fn selected_read_method(&self) -> Option<&AbiMethod> {
+        self.loaded
+            .as_ref()
+            .and_then(|c| c.read_methods.get(self.read_idx))
+    }
+
+    /// Whether the active network is a user-defined (unverified) custom network.
+    fn is_custom(&self) -> bool {
+        self.net.is_custom()
+    }
+
+    /// Whether the two-pane batch layout applies. Custom networks collapse to
+    /// the single-transaction composer (per the send-only, no-batch rule), so
+    /// the batch pane is hidden there.
+    fn batch_layout(&self) -> bool {
+        !self.is_custom()
+    }
+
+    /// Human label for the active network (built-in display name, or the custom
+    /// network's configured name).
+    fn net_display_name(&self) -> String {
+        match self.net {
+            NetworkId::Builtin(c) => c.display_name().to_string(),
+            NetworkId::Custom(id) => self
+                .ctx
+                .custom_networks
+                .iter()
+                .find(|(cid, _)| *cid == id)
+                .map(|(_, n)| n.clone())
+                .unwrap_or_else(|| format!("Chain {id}")),
+        }
+    }
+
+    /// The switcher's options: the three built-ins, then any enabled custom
+    /// networks.
+    fn network_options(&self) -> Vec<(NetworkId, String)> {
+        let mut out: Vec<(NetworkId, String)> = Chain::ALL
+            .iter()
+            .map(|c| (NetworkId::Builtin(*c), c.display_name().to_string()))
+            .collect();
+        for (id, name) in &self.ctx.custom_networks {
+            out.push((NetworkId::Custom(*id), name.clone()));
+        }
+        out
+    }
+
+    /// Whether the currently-composed call is valid and can be queued / sent.
     fn compose_valid(&self) -> bool {
         match self.mode {
-            Mode::Call => {
+            Mode::Write => {
                 let Some(m) = self.selected_method() else {
                     return false;
                 };
@@ -581,6 +926,51 @@ impl TxBuilderApp {
                 args_ok && value_ok
             }
             Mode::Raw => encode::parse_address(&self.raw_to).is_ok(),
+            Mode::Read => false,
+        }
+    }
+
+    /// Whether the composed read query is valid (method selected, params coerce).
+    fn read_valid(&self) -> bool {
+        let Some(m) = self.selected_read_method() else {
+            return false;
+        };
+        self.read_args.len() == m.inputs.len()
+            && m.inputs
+                .iter()
+                .zip(&self.read_args)
+                .all(|(inp, v)| encode::is_valid(&inp.ty, v))
+    }
+
+    /// Build the currently-composed call (Write or Raw). Never called in Read
+    /// mode (reads are queried, not queued).
+    fn compose_call(&self) -> Result<QueuedCall, crate::txbuilder::TxBuilderError> {
+        use crate::txbuilder::TxBuilderError;
+        match self.mode {
+            Mode::Write => {
+                let m = self
+                    .selected_method()
+                    .cloned()
+                    .ok_or_else(|| TxBuilderError::Input("no method selected".into()))?;
+                let (name, addr) = self
+                    .loaded
+                    .as_ref()
+                    .map(|c| (c.name.clone(), c.address))
+                    .unwrap_or_default();
+                encode::build_contract_call(
+                    self.next_id,
+                    addr,
+                    &name,
+                    &m,
+                    &self.args,
+                    &self.value_input,
+                )
+            }
+            Mode::Raw => {
+                let to = encode::parse_address(&self.raw_to).map_err(TxBuilderError::Input)?;
+                encode::build_raw_call(self.next_id, to, &self.raw_value, &self.raw_data)
+            }
+            Mode::Read => Err(TxBuilderError::Input("read methods are not sent".into())),
         }
     }
 
@@ -596,42 +986,7 @@ impl TxBuilderApp {
             );
             return;
         }
-        let built = match self.mode {
-            Mode::Call => {
-                let Some(m) = self.selected_method().cloned() else {
-                    return;
-                };
-                let name = self
-                    .loaded
-                    .as_ref()
-                    .map(|c| c.name.clone())
-                    .unwrap_or_default();
-                let addr = self
-                    .loaded
-                    .as_ref()
-                    .map(|c| c.address)
-                    .unwrap_or(Address::ZERO);
-                encode::build_contract_call(
-                    self.next_id,
-                    addr,
-                    &name,
-                    &m,
-                    &self.args,
-                    &self.value_input,
-                )
-            }
-            Mode::Raw => {
-                let to = match encode::parse_address(&self.raw_to) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        self.error = Some(e);
-                        return;
-                    }
-                };
-                encode::build_raw_call(self.next_id, to, &self.raw_value, &self.raw_data)
-            }
-        };
-        match built {
+        match self.compose_call() {
             Ok(call) => {
                 self.next_id += 1;
                 self.batch.push(call);
@@ -639,16 +994,88 @@ impl TxBuilderApp {
                 self.error = None;
                 // Reset params but keep the contract loaded for rapid batching.
                 match self.mode {
-                    Mode::Call => {
-                        self.reset_args();
-                    }
-                    Mode::Raw => {
-                        self.raw_data.clear();
-                    }
+                    Mode::Write => self.reset_args(),
+                    Mode::Raw => self.raw_data.clear(),
+                    Mode::Read => {}
                 }
             }
             Err(e) => self.error = Some(e.to_string()),
         }
+    }
+
+    /// Custom-network "Send transaction": build the single composed call and
+    /// hand it straight to the review overlay (no batch queue on custom nets).
+    fn send_single(&mut self) -> Option<Outcome> {
+        match self.compose_call() {
+            Ok(call) => {
+                self.error = None;
+                Some(Outcome::Review { calls: vec![call] })
+            }
+            Err(e) => {
+                self.error = Some(e.to_string());
+                None
+            }
+        }
+    }
+
+    /// Fire the composed read query as an `eth_call` on the active network.
+    fn on_query(&mut self) -> Option<Outcome> {
+        if !self.read_valid() {
+            return None;
+        }
+        let m = self.selected_read_method()?.clone();
+        let to = self.loaded.as_ref()?.address;
+        let data = match encode::encode_call(&m, &self.read_args) {
+            Ok(d) => d,
+            Err(e) => {
+                self.error = Some(e.to_string());
+                return None;
+            }
+        };
+        self.read_busy = true;
+        self.read_result = None;
+        self.read_seq += 1;
+        Some(Outcome::Read {
+            seq: self.read_seq,
+            net: self.net,
+            to,
+            data,
+        })
+    }
+
+    /// Replace the batch with a template's calls, renumbered into the session.
+    fn load_template(&mut self, t: &Template) {
+        match t.calls(self.next_id) {
+            Ok(calls) => {
+                self.next_id += calls.len() as u64;
+                self.batch = calls;
+                self.invalidate_sim();
+                self.expanded = None;
+                self.template_menu_open = false;
+                self.cancel_rename();
+                self.error = None;
+            }
+            Err(e) => self.error = Some(e.to_string()),
+        }
+    }
+
+    /// Commit an in-flight inline rename: trim, apply, persist. A blank name is
+    /// rejected (keeps the rename open so the user can fix it).
+    fn commit_rename(&mut self) -> Option<Outcome> {
+        let idx = self.rename_idx?;
+        let name = self.rename_buf.trim().to_string();
+        if name.is_empty() {
+            return None;
+        }
+        let t = self.templates.get_mut(idx)?;
+        t.name = name;
+        self.cancel_rename();
+        Some(Outcome::PersistTemplates(self.templates.clone()))
+    }
+
+    fn cancel_rename(&mut self) {
+        self.rename_idx = None;
+        self.rename_buf.clear();
     }
 
     // ── view (in tx_builder_view.rs-style helpers below) ──────────────
@@ -700,7 +1127,10 @@ pub struct SafeBatchRequest {
 /// a delegation authorization first.
 #[derive(Debug, Clone)]
 pub struct EoaBatchRequest {
-    pub chain: Chain,
+    /// The network to broadcast on. A [`NetworkId`] so the same request shape
+    /// covers a built-in chain and a user-defined custom network (single call
+    /// only on custom — atomic batching is built-in-chains only).
+    pub net: NetworkId,
     pub from: Address,
     pub calls: Vec<QueuedCall>,
 }
@@ -774,6 +1204,58 @@ fn wei_to_eth(v: U256) -> String {
     format_token_balance(v, 18).0
 }
 
+/// Decode an `eth_call` result into typed [`ReadRow`]s against a method's
+/// declared outputs. Returns empty when the method has no outputs or the bytes
+/// don't decode (a malformed / reverted response) — the raw hex is still shown.
+fn decode_read_rows(m: &AbiMethod, bytes: &[u8]) -> Vec<ReadRow> {
+    let Some(ty) = m.output_tuple() else {
+        return Vec::new();
+    };
+    // Return data is ABI-encoded as function params (head-tail, no outer
+    // offset), so decode against the output tuple with `abi_decode_params`.
+    let vals = match ty.abi_decode_params(bytes) {
+        Ok(DynSolValue::Tuple(vals)) => vals,
+        _ => return Vec::new(),
+    };
+    m.outputs
+        .iter()
+        .zip(vals)
+        .enumerate()
+        .map(|(i, (out, val))| ReadRow {
+            name: if out.name.is_empty() {
+                format!("out{i}")
+            } else {
+                out.name.clone()
+            },
+            ty: out.ty_str.clone(),
+            value: format_sol_value(&val),
+        })
+        .collect()
+}
+
+/// Humanise a decoded [`DynSolValue`] for the read-result panel: checksummed
+/// address, decimal integer, `0x…` hex, or a bracketed list for compounds.
+fn format_sol_value(v: &DynSolValue) -> String {
+    match v {
+        DynSolValue::Address(a) => a.to_checksum(None),
+        DynSolValue::Bool(b) => b.to_string(),
+        DynSolValue::Int(i, _) => i.to_string(),
+        DynSolValue::Uint(u, _) => u.to_string(),
+        DynSolValue::FixedBytes(b, sz) => format!("0x{}", alloy::hex::encode(&b[..(*sz).min(32)])),
+        DynSolValue::Bytes(b) => format!("0x{}", alloy::hex::encode(b)),
+        DynSolValue::String(s) => s.clone(),
+        DynSolValue::Array(items) | DynSolValue::FixedArray(items) => {
+            let inner: Vec<String> = items.iter().map(format_sol_value).collect();
+            format!("[{}]", inner.join(", "))
+        }
+        DynSolValue::Tuple(items) => {
+            let inner: Vec<String> = items.iter().map(format_sol_value).collect();
+            format!("({})", inner.join(", "))
+        }
+        other => format!("{other:?}"),
+    }
+}
+
 // The view is large; split into its own module for readability.
 mod view;
 
@@ -784,7 +1266,13 @@ mod tests {
 
     fn safe_app() -> TxBuilderApp {
         let mut app = TxBuilderApp::new(Address::repeat_byte(0x5a));
-        app.set_context(Chain::Mainnet, true, Some("1.4.1".into()), false);
+        app.set_context(
+            Chain::Mainnet,
+            true,
+            Some("1.4.1".into()),
+            false,
+            Vec::new(),
+        );
         app
     }
 
@@ -834,7 +1322,7 @@ mod tests {
     #[test]
     fn eoa_without_7702_caps_batch_at_one() {
         let mut app = TxBuilderApp::new(Address::repeat_byte(0x11));
-        app.set_context(Chain::Mainnet, false, None, false); // EOA, can't delegate
+        app.set_context(Chain::Mainnet, false, None, false, Vec::new()); // EOA, cannot delegate
         app.update(Message::AddrChanged(usdc().to_string()));
         let to = address!("0x000000000000000000000000000000000000dEaD");
         app.update(Message::ArgChanged(0, to.to_string()));
@@ -852,7 +1340,7 @@ mod tests {
     #[test]
     fn eoa_with_7702_can_batch_multiple() {
         let mut app = TxBuilderApp::new(Address::repeat_byte(0x11));
-        app.set_context(Chain::Mainnet, false, None, true); // EOA, Local/Ledger
+        app.set_context(Chain::Mainnet, false, None, true, Vec::new()); // EOA, Local/Ledger
         let to = address!("0x000000000000000000000000000000000000dEaD");
         app.update(Message::AddrChanged(usdc().to_string()));
         app.update(Message::ArgChanged(0, to.to_string()));
@@ -897,7 +1385,7 @@ mod tests {
         assert_eq!(eff[1].to, usdc);
         assert_eq!(U256::from_be_slice(&eff[1].data[36..68]), U256::ZERO);
         // A non-batching EOA never appends (nothing to batch into).
-        app.set_context(Chain::Mainnet, false, None, false);
+        app.set_context(Chain::Mainnet, false, None, false, Vec::new());
         assert_eq!(app.effective_calls().len(), 1, "no batching → no revoke");
     }
 
@@ -920,7 +1408,7 @@ mod tests {
         let mut app = safe_app();
         app.batch = sample_batch(&mut app.next_id, app.owner);
         match app.update(Message::Simulate) {
-            Some(Outcome::Simulate { calls }) => assert_eq!(calls.len(), 2),
+            Some(Outcome::Simulate { calls, .. }) => assert_eq!(calls.len(), 2),
             other => panic!("expected Simulate, got {other:?}"),
         }
         assert!(app.sim_busy);
@@ -943,5 +1431,210 @@ mod tests {
         app.on_contract_resolved(stale_seq, Ok(Bytes::new()));
         assert!(!app.not_found, "stale resolve result ignored");
         assert_eq!(app.resolve_target, Some(b));
+    }
+
+    // ── Network switcher ─────────────────────────────────────────────────
+
+    fn eoa_app() -> TxBuilderApp {
+        let mut app = TxBuilderApp::new(Address::repeat_byte(0x11));
+        // EOA, 7702-capable, with one enabled custom network (Sepolia).
+        app.set_context(
+            Chain::Mainnet,
+            false,
+            None,
+            true,
+            vec![(11155111, "Sepolia".into())],
+        );
+        app
+    }
+
+    #[test]
+    fn eoa_can_switch_builtin_network() {
+        let mut app = eoa_app();
+        assert_eq!(app.selected_net(), NetworkId::Builtin(Chain::Mainnet));
+        app.update(Message::SetNetwork(NetworkId::Builtin(Chain::Base)));
+        assert_eq!(app.selected_net(), NetworkId::Builtin(Chain::Base));
+        assert!(app.batch_layout(), "built-in nets keep the batch layout");
+    }
+
+    #[test]
+    fn safe_pins_network_and_ignores_switch() {
+        let mut app = TxBuilderApp::new(Address::repeat_byte(0x5a));
+        app.set_context(Chain::Base, true, Some("1.4.1".into()), false, Vec::new());
+        assert_eq!(app.selected_net(), NetworkId::Builtin(Chain::Base));
+        // A Safe pins the network — the switcher is inert.
+        app.update(Message::ToggleNetworkMenu);
+        assert!(!app.net_menu_open, "Safe never opens the switcher");
+        app.update(Message::SetNetwork(NetworkId::Builtin(Chain::Optimism)));
+        // set_context runs before every message and re-pins to the Safe's chain.
+        app.set_context(Chain::Base, true, Some("1.4.1".into()), false, Vec::new());
+        assert_eq!(app.selected_net(), NetworkId::Builtin(Chain::Base));
+    }
+
+    #[test]
+    fn custom_network_hides_batch_and_single_sends() {
+        let mut app = eoa_app();
+        app.update(Message::SetNetwork(NetworkId::Custom(11155111)));
+        assert!(app.is_custom());
+        assert!(!app.batch_layout(), "custom nets drop the batch UI");
+        // Compose a raw call and "Send transaction" → a one-call review, no batch.
+        app.update(Message::SetMode(Mode::Raw));
+        let to = address!("0x000000000000000000000000000000000000dEaD");
+        app.update(Message::RawToChanged(to.to_string()));
+        match app.update(Message::SendSingle) {
+            Some(Outcome::Review { calls }) => assert_eq!(calls.len(), 1),
+            other => panic!("expected single-call Review, got {other:?}"),
+        }
+        assert!(app.batch.is_empty(), "single send never touches the batch");
+    }
+
+    #[test]
+    fn removed_custom_network_falls_back_to_mainnet() {
+        let mut app = eoa_app();
+        app.update(Message::SetNetwork(NetworkId::Custom(11155111)));
+        assert!(app.is_custom());
+        // Next context refresh no longer lists that custom network.
+        app.set_context(Chain::Mainnet, false, None, true, Vec::new());
+        assert_eq!(app.selected_net(), NetworkId::Builtin(Chain::Mainnet));
+    }
+
+    // ── Read tab ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn read_query_bubbles_eth_call_and_decodes() {
+        let mut app = eoa_app();
+        app.update(Message::AddrChanged(usdc().to_string())); // known → read_methods present
+        app.update(Message::SetMode(Mode::Read));
+        // read_methods[0] = balanceOf(address) -> uint256
+        let holder = address!("0x000000000000000000000000000000000000bEEF");
+        app.update(Message::ReadArgChanged(0, holder.to_string()));
+        assert!(app.read_valid());
+        let seq = match app.update(Message::Query) {
+            Some(Outcome::Read { seq, net, to, .. }) => {
+                assert_eq!(net, NetworkId::Builtin(Chain::Mainnet));
+                assert_eq!(to, usdc());
+                seq
+            }
+            other => panic!("expected Read outcome, got {other:?}"),
+        };
+        assert!(app.read_busy);
+        // Feed a decoded uint256 return of 12345.
+        let ret = U256::from(12_345u64).to_be_bytes::<32>();
+        app.on_read(seq, Ok((Bytes::from(ret.to_vec()), true)));
+        assert!(!app.read_busy);
+        match &app.read_result {
+            Some(ReadOutcome::Ok {
+                rows,
+                raw,
+                verified,
+            }) => {
+                assert!(*verified);
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].ty, "uint256");
+                assert_eq!(rows[0].value, "12345");
+                assert!(raw.starts_with("0x"));
+            }
+            other => panic!("expected decoded read result, got {other:?}"),
+        }
+
+        // Read output is public — copies use the no-auto-clear path so the value
+        // survives in the clipboard until the user pastes it.
+        match app.update(Message::CopyReadValue(0)) {
+            Some(Outcome::CopyPlain(v)) => assert_eq!(v, "12345"),
+            other => panic!("expected CopyPlain, got {other:?}"),
+        }
+        assert!(matches!(
+            app.update(Message::CopyReadRaw),
+            Some(Outcome::CopyPlain(_))
+        ));
+    }
+
+    #[test]
+    fn stale_read_result_is_dropped() {
+        let mut app = eoa_app();
+        app.update(Message::AddrChanged(usdc().to_string()));
+        app.update(Message::SetMode(Mode::Read));
+        app.update(Message::ReadArgChanged(
+            0,
+            Address::repeat_byte(1).to_string(),
+        ));
+        app.update(Message::Query);
+        let stale = app.read_seq;
+        // A newer query supersedes it.
+        app.update(Message::ReadArgChanged(
+            0,
+            Address::repeat_byte(2).to_string(),
+        ));
+        app.update(Message::Query);
+        app.on_read(stale, Ok((Bytes::new(), true)));
+        // The stale answer must not populate the result.
+        assert!(app.read_busy, "still awaiting the current query");
+    }
+
+    // ── Templates ────────────────────────────────────────────────────────
+
+    #[test]
+    fn save_current_batch_persists_and_load_restores() {
+        let mut app = safe_app();
+        app.batch = sample_batch(&mut app.next_id, app.owner);
+        let n = app.batch.len();
+        let out = app.update(Message::SaveTemplate);
+        match out {
+            Some(Outcome::PersistTemplates(list)) => {
+                assert_eq!(list.len(), 1);
+                assert_eq!(list[0].call_count, n);
+            }
+            other => panic!("expected PersistTemplates, got {other:?}"),
+        }
+        assert_eq!(app.templates.len(), 1);
+        // Clear then reload the saved template → the batch comes back.
+        app.update(Message::ClearBatch);
+        assert!(app.batch.is_empty());
+        app.update(Message::LoadTemplate(0));
+        assert_eq!(app.batch.len(), n);
+    }
+
+    #[test]
+    fn delete_template_persists_removal() {
+        let mut app = safe_app();
+        app.batch = sample_batch(&mut app.next_id, app.owner);
+        app.update(Message::SaveTemplate);
+        assert_eq!(app.templates.len(), 1);
+        match app.update(Message::DeleteTemplate(0)) {
+            Some(Outcome::PersistTemplates(list)) => assert!(list.is_empty()),
+            other => panic!("expected PersistTemplates, got {other:?}"),
+        }
+        assert!(app.templates.is_empty());
+    }
+
+    #[test]
+    fn rename_template_commits_and_persists() {
+        let mut app = safe_app();
+        app.batch = sample_batch(&mut app.next_id, app.owner);
+        app.update(Message::SaveTemplate);
+        assert_eq!(app.templates[0].name, "Untitled batch");
+
+        app.update(Message::StartRename(0));
+        assert_eq!(app.rename_idx, Some(0));
+        app.update(Message::RenameChanged("  Payroll run  ".into()));
+        match app.update(Message::CommitRename) {
+            Some(Outcome::PersistTemplates(list)) => assert_eq!(list[0].name, "Payroll run"),
+            other => panic!("expected PersistTemplates, got {other:?}"),
+        }
+        assert_eq!(app.templates[0].name, "Payroll run", "trimmed + applied");
+        assert!(app.rename_idx.is_none(), "rename cleared after commit");
+    }
+
+    #[test]
+    fn blank_rename_is_rejected() {
+        let mut app = safe_app();
+        app.batch = sample_batch(&mut app.next_id, app.owner);
+        app.update(Message::SaveTemplate);
+        app.update(Message::StartRename(0));
+        app.update(Message::RenameChanged("   ".into()));
+        // A blank name doesn't commit and keeps the rename open to fix.
+        assert!(app.update(Message::CommitRename).is_none());
+        assert_eq!(app.templates[0].name, "Untitled batch");
+        assert_eq!(app.rename_idx, Some(0));
     }
 }

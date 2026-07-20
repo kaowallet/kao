@@ -4,12 +4,13 @@
 
 use iced::border::Radius;
 use iced::widget::text::Wrapping;
-use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
+use iced::widget::{Column, Space, button, column, container, row, scrollable, text, text_input};
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
 use super::abi::AbiSource;
-use super::{Message, Modal, Mode, TxBuilderApp, encode, wei_to_eth};
+use super::{Message, Modal, Mode, ReadOutcome, TxBuilderApp, encode, wei_to_eth};
 use crate::txbuilder::sim::BatchOutcome;
+use crate::txbuilder::templates::Template;
 use crate::ui::kao_theme::{KaoTheme, with_alpha};
 use crate::ui::kao_widgets::{
     avatar, black, bold, ghost_button, kao_checkbox, kao_scrollable_style, mono, mono_bold,
@@ -21,7 +22,13 @@ pub(super) fn root(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
         return modal_view(app, t);
     }
 
-    let header = column![
+    let subtitle = if app.batch_layout() {
+        "compose · simulate · sign — batch many calls into one atomic transaction"
+    } else {
+        "compose · read · send — one transaction at a time on this custom network"
+    };
+
+    let mut header = column![
         ghost_button(t, text("← Apps").size(13).color(t.sub).font(bold())).on_press(Message::Close),
         Space::new().height(10),
         row![
@@ -46,24 +53,41 @@ pub(super) fn root(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
         ]
         .align_y(Alignment::Center)
         .width(Length::Fill),
-        Space::new().height(4),
-        text("compose · simulate · sign — batch many calls into one atomic transaction")
-            .size(11)
-            .color(t.sub)
-            .font(mono()),
     ]
     .width(Length::Fill);
 
-    // Two matched columns: identical width (each `Fill` → an even 50/50 split at
-    // every window size) and identical height (each `Fill` against the bounded
-    // pane height). Each card scrolls its own overflow internally — see
-    // `pane_card` — which is why the Transaction Builder opts out of the shared
-    // page scroll (apps.rs); that scroll would hand the row an unbounded height
-    // and collapse the equal-height fill.
-    let panes = row![composer_pane(app, t), batch_pane(app, t)]
-        .spacing(16)
-        .width(Length::Fill)
-        .height(Length::Fill);
+    // The switcher's menu expands inline beneath the header chips (iced has no
+    // floating overlay here — same pattern as the method picker).
+    if app.net_menu_open {
+        header = header
+            .push(Space::new().height(8))
+            .push(network_menu(app, t));
+    }
+
+    header = header.push(Space::new().height(4)).push(
+        text(subtitle.to_string())
+            .size(11)
+            .color(t.sub)
+            .font(mono()),
+    );
+
+    // Built-in chains / Safes get the two-pane compose+batch layout; a custom
+    // network collapses to the single-transaction composer (no batching).
+    let panes: Element<'_, Message> = if app.batch_layout() {
+        // Two matched columns: identical width (each `Fill` → an even 50/50
+        // split) and identical height (each `Fill` against the bounded pane
+        // height). Each card scrolls its own overflow internally — see
+        // `pane_card` — which is why the Transaction Builder opts out of the
+        // shared page scroll (apps.rs); that scroll would hand the row an
+        // unbounded height and collapse the equal-height fill.
+        row![composer_pane(app, t), batch_pane(app, t)]
+            .spacing(16)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    } else {
+        composer_pane(app, t)
+    };
 
     let mut col = column![header, Space::new().height(16), panes]
         .width(Length::Fill)
@@ -80,38 +104,157 @@ pub(super) fn root(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
 // Header chips
 // ============================================================================
 
-fn network_chip<'a>(app: &TxBuilderApp, t: KaoTheme) -> Element<'a, Message> {
+/// Colour of the network dot: a warm accent for unverified custom networks,
+/// the "up" green for the three Helios-verified built-ins.
+fn net_dot_color(app: &TxBuilderApp, t: KaoTheme) -> Color {
+    if app.net.is_custom() { t.a3 } else { t.up }
+}
+
+/// The header network chip. For a plain EOA it's a button that opens the
+/// switcher; a Safe pins the network to its own chain, so it renders inert
+/// (no caret, no press).
+fn network_chip(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
+    let dot_color = net_dot_color(app, t);
     let dot = container(Space::new())
         .width(8)
         .height(8)
         .style(move |_| container::Style {
-            background: Some(Background::Color(t.up)),
+            background: Some(Background::Color(dot_color)),
             border: Border {
                 radius: Radius::from(4),
                 ..Default::default()
             },
             ..Default::default()
         });
-    chip(
-        t,
-        row![
+    let pinned = app.ctx.is_safe;
+    let mut inner = row![
+        dot,
+        Space::new().width(8),
+        text(app.net_display_name())
+            .size(12)
+            .color(t.text)
+            .font(bold())
+            .wrapping(Wrapping::None),
+        Space::new().width(8),
+        text(format!("chain {}", app.net.chain_id()))
+            .size(11)
+            .color(t.sub)
+            .font(mono()),
+    ]
+    .align_y(Alignment::Center);
+    inner = inner.push(Space::new().width(8)).push(
+        text(if pinned {
+            "🔒"
+        } else if app.net_menu_open {
+            "▲"
+        } else {
+            "▼"
+        })
+        .size(10)
+        .color(t.sub),
+    );
+
+    if pinned {
+        // Inert — a Safe can only transact on its own chain.
+        return chip(t, inner.into(), t.card_alt, t.border);
+    }
+
+    button(inner)
+        .padding(Padding::from([7, 12]))
+        .on_press(Message::ToggleNetworkMenu)
+        .style(move |_, status| button::Style {
+            background: Some(Background::Color(match status {
+                button::Status::Hovered => with_alpha(t.text, 0.04),
+                _ => t.card_alt,
+            })),
+            text_color: t.text,
+            border: Border {
+                color: if app.net_menu_open { t.a1 } else { t.border },
+                width: 1.0,
+                radius: Radius::from(11),
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+/// The inline switcher menu: the three built-ins, then any enabled custom
+/// networks. Rendered beneath the header when open.
+fn network_menu(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
+    let mut menu = column![].spacing(2).width(Length::Fill);
+    let options = app.network_options();
+    for (net, name) in options {
+        let on = net == app.net;
+        let custom = net.is_custom();
+        let dot_color = if custom { t.a3 } else { t.up };
+        let dot = container(Space::new())
+            .width(7)
+            .height(7)
+            .style(move |_| container::Style {
+                background: Some(Background::Color(dot_color)),
+                border: Border {
+                    radius: Radius::from(4),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        let mut labels = row![
             dot,
-            Space::new().width(8),
-            text(app.ctx.chain.display_name().to_string())
-                .size(12)
-                .color(t.text)
+            Space::new().width(9),
+            text(name)
+                .size(13)
+                .color(if on { t.a1 } else { t.text })
                 .font(bold()),
-            Space::new().width(8),
-            text(format!("chain {}", app.ctx.chain.chain_id()))
+        ]
+        .align_y(Alignment::Center)
+        .width(Length::Fill);
+        if custom {
+            labels = labels
+                .push(Space::new().width(7))
+                .push(pill(t, "unverified", t.a3));
+        }
+        labels = labels.push(Space::new().width(Length::Fill)).push(
+            text(format!("{}", net.chain_id()))
                 .size(11)
                 .color(t.sub)
                 .font(mono()),
-        ]
-        .align_y(Alignment::Center)
-        .into(),
-        t.card_alt,
-        t.border,
-    )
+        );
+        menu = menu.push(
+            button(labels)
+                .padding(Padding::from([9, 11]))
+                .width(Length::Fill)
+                .on_press(Message::SetNetwork(net))
+                .style(move |_, status| button::Style {
+                    background: Some(Background::Color(if on {
+                        with_alpha(t.a1, 0.12)
+                    } else {
+                        match status {
+                            button::Status::Hovered => with_alpha(t.text, 0.04),
+                            _ => Color::TRANSPARENT,
+                        }
+                    })),
+                    text_color: t.text,
+                    border: Border {
+                        radius: Radius::from(9),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+        );
+    }
+    container(menu)
+        .padding(6)
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(t.card)),
+            border: Border {
+                color: t.border,
+                width: 1.0,
+                radius: Radius::from(12),
+            },
+            ..Default::default()
+        })
+        .into()
 }
 
 fn identity_chip<'a>(app: &TxBuilderApp, t: KaoTheme) -> Element<'a, Message> {
@@ -141,9 +284,15 @@ fn composer_pane(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
     let tabs = row![
         mode_tab(
             t,
-            "Contract call",
-            app.mode == Mode::Call,
-            Message::SetMode(Mode::Call)
+            "Write",
+            app.mode == Mode::Write,
+            Message::SetMode(Mode::Write)
+        ),
+        mode_tab(
+            t,
+            "Read",
+            app.mode == Mode::Read,
+            Message::SetMode(Mode::Read)
         ),
         mode_tab(
             t,
@@ -174,39 +323,73 @@ fn composer_pane(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
     .width(Length::Fill);
 
     let body = match app.mode {
-        Mode::Call => call_composer(app, t),
+        Mode::Write => call_composer(app, t),
+        Mode::Read => read_composer(app, t),
         Mode::Raw => raw_composer(app, t),
     };
 
-    let add_enabled = app.compose_valid();
-    let add_btn = primary_button(t, "+ Add to batch", add_enabled)
-        .width(Length::Fill)
-        .on_press_maybe(add_enabled.then_some(Message::AddToBatch));
-
-    let inner = column![
+    let mut inner = column![
         head,
         Space::new().height(14),
         divider(t),
         Space::new().height(16),
         body,
-        Space::new().height(16),
-        divider(t),
-        Space::new().height(14),
-        add_btn,
     ]
     .width(Length::Fill);
+
+    // Footer. Read mode has its own inline Query button + a "nothing queued"
+    // note; Write / Raw show the add-to-batch (or single-send) CTA.
+    inner = inner.push(Space::new().height(16)).push(divider(t));
+    if app.mode == Mode::Read {
+        inner = inner.push(Space::new().height(12)).push(
+            container(
+                text("read-only query · nothing is added to the batch")
+                    .size(11)
+                    .color(t.sub)
+                    .font(mono()),
+            )
+            .center_x(Length::Fill),
+        );
+    } else {
+        inner = inner
+            .push(Space::new().height(14))
+            .push(compose_cta(app, t));
+    }
 
     pane_card(t, inner.into())
 }
 
-fn call_composer(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
+/// The composer's primary action: "Add to batch" in the two-pane layout, or
+/// "Send transaction" on a custom network (single-transaction composer).
+fn compose_cta(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
+    let enabled = app.compose_valid();
+    let (label, msg) = if app.is_custom() {
+        ("↑ Send transaction", Message::SendSingle)
+    } else {
+        ("+ Add to batch", Message::AddToBatch)
+    };
+    primary_button(t, label, enabled)
+        .width(Length::Fill)
+        .on_press_maybe(enabled.then_some(msg))
+        .into()
+}
+
+/// Shared composer scaffold: the address field plus the resolving / loaded-
+/// banner / not-found / empty-hint status, common to the Write and Read tabs.
+/// The caller appends the method-specific UI when a contract is loaded.
+fn contract_head(app: &TxBuilderApp, t: KaoTheme) -> Column<'_, Message> {
     let addr_invalid =
         !app.addr_input.trim().is_empty() && encode::parse_address(&app.addr_input).is_err();
+    let placeholder = if app.is_custom() {
+        "0x… contract address (paste its ABI to load)"
+    } else {
+        "0x… paste a verified contract"
+    };
 
     let addr_field = labelled(
         t,
         "Contract address",
-        text_input("0x… paste a verified contract", &app.addr_input)
+        text_input(placeholder, &app.addr_input)
             .on_input(Message::AddrChanged)
             .padding(Padding::from([11, 13]))
             .size(13)
@@ -232,7 +415,30 @@ fn call_composer(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
     } else if let Some(c) = &app.loaded {
         col = col
             .push(Space::new().height(14))
-            .push(contract_banner(t, c))
+            .push(contract_banner(t, c));
+    } else if app.not_found {
+        col = col
+            .push(Space::new().height(14))
+            .push(not_found_box(app, t));
+    } else if app.addr_input.trim().is_empty() {
+        let hint = if app.is_custom() {
+            "Paste a contract address, then its ABI — Kao can't fetch a verified ABI on a custom network."
+        } else {
+            "Paste a verified contract address to load its ABI."
+        };
+        col = col
+            .push(Space::new().height(22))
+            .push(container(text(hint.to_string()).size(13).color(t.sub)).center_x(Length::Fill));
+    }
+
+    col
+}
+
+fn call_composer(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
+    let mut col = contract_head(app, t);
+
+    if !app.resolving && app.loaded.is_some() {
+        col = col
             .push(Space::new().height(16))
             .push(method_picker(app, t));
 
@@ -271,23 +477,73 @@ fn call_composer(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
                         &inp.ty_str,
                         &inp.ty,
                         &val,
+                        false,
                     ));
                 }
             }
         }
-    } else if app.not_found {
-        col = col
-            .push(Space::new().height(14))
-            .push(not_found_box(app, t));
-    } else if app.addr_input.trim().is_empty() {
-        col = col.push(Space::new().height(22)).push(
-            container(
-                text("Paste a verified contract address to load its ABI.")
-                    .size(13)
-                    .color(t.sub),
-            )
-            .center_x(Length::Fill),
-        );
+    }
+
+    col.into()
+}
+
+/// The Read tab: pick a `view`/`pure` method, fill its params, and `Query`
+/// (`eth_call`). The typed return + raw hex are shown below, both copyable.
+fn read_composer(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
+    let mut col = contract_head(app, t);
+
+    if !app.resolving
+        && let Some(c) = &app.loaded
+    {
+        if c.read_methods.is_empty() {
+            col = col.push(Space::new().height(16)).push(info_box(
+                t,
+                "No read methods on this ABI. Paste an ABI with view/pure functions to query.",
+                t.sub,
+            ));
+        } else {
+            col = col
+                .push(Space::new().height(16))
+                .push(read_method_picker(app, t));
+
+            if let Some(m) = app.selected_read_method() {
+                if !m.inputs.is_empty() {
+                    col = col
+                        .push(Space::new().height(16))
+                        .push(section_label(t, "Parameters"));
+                    for (i, inp) in m.inputs.iter().enumerate() {
+                        let val = app.read_args.get(i).cloned().unwrap_or_default();
+                        col = col.push(Space::new().height(12)).push(param_row(
+                            t,
+                            i,
+                            &inp.display_name(i),
+                            &inp.ty_str,
+                            &inp.ty,
+                            &val,
+                            true,
+                        ));
+                    }
+                }
+
+                let ready = app.read_valid() && !app.read_busy;
+                let query_label = if app.read_busy {
+                    "Querying…"
+                } else {
+                    "◈ Query"
+                };
+                col = col.push(Space::new().height(16)).push(query_button(
+                    t,
+                    query_label,
+                    ready.then_some(Message::Query),
+                ));
+
+                if let Some(res) = &app.read_result {
+                    col = col
+                        .push(Space::new().height(16))
+                        .push(read_result_panel(t, res));
+                }
+            }
+        }
     }
 
     col.into()
@@ -452,6 +708,8 @@ fn method_picker(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
     col.into()
 }
 
+/// A labelled parameter input. `read` swaps the emitted messages so the same
+/// widget drives either the Write composer args or the Read query args.
 fn param_row<'a>(
     t: KaoTheme,
     index: usize,
@@ -459,6 +717,7 @@ fn param_row<'a>(
     ty_str: &str,
     ty: &alloy::dyn_abi::DynSolType,
     value: &str,
+    read: bool,
 ) -> Element<'a, Message> {
     let touched = !value.trim().is_empty();
     let ok = encode::is_valid(ty, value);
@@ -489,18 +748,31 @@ fn param_row<'a>(
     .align_y(Alignment::Center)
     .width(Length::Fill);
 
+    let bool_msg = move |b: bool| {
+        if read {
+            Message::ReadBoolArg(index, b)
+        } else {
+            Message::BoolArg(index, b)
+        }
+    };
     let input: Element<'a, Message> = if ty_str == "bool" {
         row![
-            bool_btn(t, "true", value == "true", Message::BoolArg(index, true)),
+            bool_btn(t, "true", value == "true", bool_msg(true)),
             Space::new().width(7),
-            bool_btn(t, "false", value == "false", Message::BoolArg(index, false)),
+            bool_btn(t, "false", value == "false", bool_msg(false)),
         ]
         .width(Length::Fill)
         .into()
     } else {
         let invalid = touched && !ok;
         text_input(&encode::type_hint(ty_str), value)
-            .on_input(move |v| Message::ArgChanged(index, v))
+            .on_input(move |v| {
+                if read {
+                    Message::ReadArgChanged(index, v)
+                } else {
+                    Message::ArgChanged(index, v)
+                }
+            })
             .padding(Padding::from([11, 13]))
             .size(13)
             .font(mono())
@@ -520,23 +792,523 @@ fn param_row<'a>(
 }
 
 // ============================================================================
+// Read tab (view methods)
+// ============================================================================
+
+fn read_method_picker(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
+    let Some(contract) = &app.loaded else {
+        return Space::new().into();
+    };
+    let (name, params) = app
+        .selected_read_method()
+        .map(|m| {
+            let types = m
+                .inputs
+                .iter()
+                .map(|p| p.ty_str.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            (m.name.clone(), format!("({types})"))
+        })
+        .unwrap_or_else(|| (String::new(), String::new()));
+
+    let head = button(
+        row![
+            text(name).size(14).color(t.text).font(mono_bold()),
+            Space::new().width(7),
+            container(
+                text(params)
+                    .size(13)
+                    .color(t.sub)
+                    .font(mono())
+                    .wrapping(Wrapping::None),
+            )
+            .width(Length::Fill)
+            .clip(true),
+            Space::new().width(8),
+            text(if app.read_menu_open { "▲" } else { "▼" })
+                .size(11)
+                .color(t.sub),
+        ]
+        .align_y(Alignment::Center)
+        .width(Length::Fill),
+    )
+    .padding(Padding::from([11, 13]))
+    .width(Length::Fill)
+    .on_press(Message::ToggleReadMethodMenu)
+    .style(move |_, _| field_button_style(t, app.read_menu_open));
+
+    let mut col = column![
+        section_label(t, "View method (read-only · no gas)"),
+        Space::new().height(8),
+        head
+    ]
+    .width(Length::Fill);
+
+    if app.read_menu_open {
+        let mut menu = column![].spacing(2).width(Length::Fill);
+        for (i, m) in contract.read_methods.iter().enumerate() {
+            let on = i == app.read_idx;
+            menu = menu.push(
+                button(
+                    text(m.signature.replace(',', ", "))
+                        .size(13)
+                        .color(if on { t.a1 } else { t.text })
+                        .font(mono())
+                        .width(Length::Fill),
+                )
+                .padding(Padding::from([9, 10]))
+                .width(Length::Fill)
+                .on_press(Message::PickReadMethod(i))
+                .style(move |_, status| button::Style {
+                    background: Some(Background::Color(if on {
+                        with_alpha(t.a1, 0.12)
+                    } else {
+                        match status {
+                            button::Status::Hovered => with_alpha(t.text, 0.04),
+                            _ => Color::TRANSPARENT,
+                        }
+                    })),
+                    text_color: t.text,
+                    border: Border {
+                        radius: Radius::from(9),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+            );
+        }
+        col = col.push(Space::new().height(6)).push(
+            container(menu)
+                .padding(5)
+                .width(Length::Fill)
+                .style(move |_| container::Style {
+                    background: Some(Background::Color(t.card)),
+                    border: Border {
+                        color: t.border,
+                        width: 1.0,
+                        radius: Radius::from(12),
+                    },
+                    ..Default::default()
+                }),
+        );
+    }
+
+    col.into()
+}
+
+/// The `Query` button — a full-width bordered action that fires the `eth_call`.
+fn query_button<'a>(t: KaoTheme, label: &'a str, msg: Option<Message>) -> Element<'a, Message> {
+    let enabled = msg.is_some();
+    let mut b = button(
+        container(
+            text(label.to_string())
+                .size(15)
+                .color(if enabled { t.a1 } else { t.sub })
+                .font(bold()),
+        )
+        .center_x(Length::Fill),
+    )
+    .padding(Padding::from([13, 16]))
+    .width(Length::Fill)
+    .style(move |_, status| button::Style {
+        background: Some(Background::Color(match status {
+            button::Status::Hovered if enabled => with_alpha(t.a1, 0.06),
+            _ => Color::TRANSPARENT,
+        })),
+        text_color: if enabled { t.a1 } else { t.sub },
+        border: Border {
+            color: if enabled {
+                with_alpha(t.a1, 0.5)
+            } else {
+                t.border
+            },
+            width: 1.5,
+            radius: Radius::from(12),
+        },
+        ..Default::default()
+    });
+    if let Some(m) = msg {
+        b = b.on_press(m);
+    }
+    b.into()
+}
+
+/// The result of the last query: a decoded-value block plus the raw return
+/// data in a copyable terminal box (or the error).
+fn read_result_panel<'a>(t: KaoTheme, res: &'a ReadOutcome) -> Element<'a, Message> {
+    match res {
+        ReadOutcome::Err(e) => info_box(t, e, t.down),
+        ReadOutcome::Ok {
+            rows,
+            raw,
+            verified,
+        } => {
+            let head = row![
+                section_label(t, "Returned"),
+                Space::new().width(9),
+                pill(t, "✓ eth_call", t.up),
+                Space::new().width(7),
+                pill(
+                    t,
+                    if *verified { "verified" } else { "unverified" },
+                    if *verified { t.up } else { t.a3 }
+                ),
+            ]
+            .align_y(Alignment::Center)
+            .width(Length::Fill);
+
+            let mut col = column![head].width(Length::Fill);
+
+            // Decoded, typed values — each copyable.
+            if rows.is_empty() {
+                col = col.push(Space::new().height(10)).push(
+                    text("returns no decodable value — see the raw data below")
+                        .size(11)
+                        .color(t.sub)
+                        .font(mono()),
+                );
+            } else {
+                for (i, r) in rows.iter().enumerate() {
+                    col = col
+                        .push(Space::new().height(10))
+                        .push(read_value_row(t, i, r));
+                }
+            }
+
+            // Raw return data — a dark terminal box with a copy affordance.
+            let raw_box = container(
+                column![
+                    row![
+                        text("// raw return data")
+                            .size(11)
+                            .color(terminal_muted(t))
+                            .font(mono()),
+                        Space::new().width(Length::Fill),
+                        copy_link(t, Message::CopyReadRaw),
+                    ]
+                    .align_y(Alignment::Center)
+                    .width(Length::Fill),
+                    Space::new().height(6),
+                    text(raw.clone())
+                        .size(11)
+                        .color(terminal_fg(t))
+                        .font(mono())
+                        .wrapping(Wrapping::WordOrGlyph)
+                        .width(Length::Fill),
+                ]
+                .padding(Padding::from([11, 13]))
+                .width(Length::Fill),
+            )
+            .width(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(Background::Color(terminal_bg(t))),
+                border: Border {
+                    color: t.border,
+                    width: 1.0,
+                    radius: Radius::from(10),
+                },
+                ..Default::default()
+            });
+
+            col.push(Space::new().height(12)).push(raw_box).into()
+        }
+    }
+}
+
+/// One decoded return value: `type` pill + `name ≈ value` in a soft green box,
+/// with a copy button for the value.
+fn read_value_row<'a>(t: KaoTheme, index: usize, r: &'a super::ReadRow) -> Element<'a, Message> {
+    let body = row![
+        pill(t, &r.ty, t.a2),
+        Space::new().width(9),
+        text(format!("{} = {}", r.name, r.value))
+            .size(13)
+            .color(t.text)
+            .font(mono_bold())
+            .wrapping(Wrapping::WordOrGlyph)
+            .width(Length::Fill),
+        Space::new().width(8),
+        copy_link(t, Message::CopyReadValue(index)),
+    ]
+    .align_y(Alignment::Center)
+    .width(Length::Fill);
+
+    container(body.padding(Padding::from([10, 13])))
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(with_alpha(t.up, 0.10))),
+            border: Border {
+                color: with_alpha(t.up, 0.3),
+                width: 1.0,
+                radius: Radius::from(10),
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+/// A small "copy" text button.
+fn copy_link<'a>(t: KaoTheme, msg: Message) -> Element<'a, Message> {
+    button(text("copy").size(10).color(t.a1).font(mono_bold()))
+        .padding(Padding::from([3, 7]))
+        .on_press(msg)
+        .style(move |_, status| button::Style {
+            background: Some(Background::Color(match status {
+                button::Status::Hovered => with_alpha(t.a1, 0.12),
+                _ => with_alpha(t.a1, 0.06),
+            })),
+            text_color: t.a1,
+            border: Border {
+                radius: Radius::from(6),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+// ============================================================================
+// Templates
+// ============================================================================
+
+/// The "★ Templates" toggle in the batch-pane header.
+fn templates_button(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
+    let open = app.template_menu_open;
+    button(
+        row![
+            text("★").size(12).color(if open { t.a1 } else { t.sub }),
+            Space::new().width(6),
+            text("Templates")
+                .size(12)
+                .color(if open { t.a1 } else { t.text })
+                .font(bold()),
+        ]
+        .align_y(Alignment::Center),
+    )
+    .padding(Padding::from([6, 11]))
+    .on_press(Message::ToggleTemplateMenu)
+    .style(move |_, status| button::Style {
+        background: Some(Background::Color(if open {
+            with_alpha(t.a1, 0.10)
+        } else {
+            match status {
+                button::Status::Hovered => with_alpha(t.text, 0.04),
+                _ => Color::TRANSPARENT,
+            }
+        })),
+        text_color: t.text,
+        border: Border {
+            color: if open {
+                with_alpha(t.a1, 0.5)
+            } else {
+                t.border
+            },
+            width: 1.0,
+            radius: Radius::from(10),
+        },
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The templates dropdown: the user's saved templates (load / rename / delete)
+/// and a "Save current batch" action.
+fn templates_menu(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
+    let mut col = column![section_label(
+        t,
+        &format!("Your templates · {}", app.templates.len())
+    )]
+    .spacing(4)
+    .width(Length::Fill);
+
+    if app.templates.is_empty() {
+        col = col.push(Space::new().height(6)).push(
+            text("Save the current batch below to reuse it later.")
+                .size(11)
+                .color(t.sub)
+                .font(mono()),
+        );
+    } else {
+        for (i, tpl) in app.templates.iter().enumerate() {
+            let renaming = (app.rename_idx == Some(i)).then_some(app.rename_buf.as_str());
+            col = col
+                .push(Space::new().height(2))
+                .push(template_row(t, i, tpl, renaming));
+        }
+    }
+
+    // Save action.
+    let count = app.batch.len();
+    let save_enabled = count > 0;
+    let save_label = if save_enabled {
+        format!("+ Save current batch · {count} calls")
+    } else {
+        "+ Save current batch · queue is empty".to_string()
+    };
+    let save_btn = button(
+        container(
+            text(save_label)
+                .size(14)
+                .color(if save_enabled { t.up } else { t.sub })
+                .font(bold()),
+        )
+        .center_x(Length::Fill),
+    )
+    .padding(Padding::from([13, 14]))
+    .width(Length::Fill)
+    .on_press_maybe(save_enabled.then_some(Message::SaveTemplate))
+    .style(move |_, status| button::Style {
+        background: Some(Background::Color(match status {
+            button::Status::Hovered if save_enabled => with_alpha(t.up, 0.06),
+            _ => Color::TRANSPARENT,
+        })),
+        text_color: if save_enabled { t.up } else { t.sub },
+        border: Border {
+            color: if save_enabled {
+                with_alpha(t.up, 0.5)
+            } else {
+                t.border
+            },
+            width: 1.5,
+            radius: Radius::from(12),
+        },
+        ..Default::default()
+    });
+
+    col = col
+        .push(Space::new().height(12))
+        .push(divider(t))
+        .push(Space::new().height(12))
+        .push(save_btn);
+
+    container(col.padding(Padding::from([14, 16])))
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(t.card)),
+            border: Border {
+                color: t.border,
+                width: 1.0,
+                radius: Radius::from(16),
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+/// One saved-template entry. Normally a clickable load row with rename (✎) and
+/// delete (✕) buttons; while `renaming` is `Some(buf)` the name becomes an
+/// inline text input with commit (✓) / cancel (✕) actions.
+fn template_row<'a>(
+    t: KaoTheme,
+    index: usize,
+    tpl: &Template,
+    renaming: Option<&str>,
+) -> Element<'a, Message> {
+    let subtitle = format!(
+        "{} call{} · {}",
+        tpl.call_count,
+        if tpl.call_count == 1 { "" } else { "s" },
+        tpl.note
+    );
+    let kao = container(text(tpl.kaomoji.clone()).size(15).color(t.a1).font(mono()))
+        .width(Length::Fixed(46.0));
+
+    match renaming {
+        Some(buf) => {
+            let field = column![
+                text_input("template name", buf)
+                    .on_input(Message::RenameChanged)
+                    .on_submit(Message::CommitRename)
+                    .padding(Padding::from([6, 9]))
+                    .size(13)
+                    .style(move |_, s| text_input_style(t, s)),
+                text(subtitle).size(11).color(t.sub).font(mono()),
+            ]
+            .spacing(3)
+            .width(Length::Fill);
+            row![
+                kao,
+                Space::new().width(6),
+                field,
+                Space::new().width(4),
+                icon_btn(t, "✓", true, true, Message::CommitRename),
+                icon_btn(t, "✕", true, false, Message::CancelRename),
+            ]
+            .align_y(Alignment::Center)
+            .width(Length::Fill)
+            .into()
+        }
+        None => {
+            let load_btn = button(
+                row![
+                    kao,
+                    Space::new().width(6),
+                    column![
+                        text(tpl.name.clone()).size(13).color(t.text).font(bold()),
+                        text(subtitle).size(11).color(t.sub).font(mono()),
+                    ]
+                    .spacing(1)
+                    .width(Length::Fill),
+                ]
+                .align_y(Alignment::Center)
+                .width(Length::Fill),
+            )
+            .padding(Padding::from([8, 9]))
+            .width(Length::Fill)
+            .on_press(Message::LoadTemplate(index))
+            .style(move |_, status| button::Style {
+                background: Some(Background::Color(match status {
+                    button::Status::Hovered => with_alpha(t.text, 0.04),
+                    _ => Color::TRANSPARENT,
+                })),
+                text_color: t.text,
+                border: Border {
+                    radius: Radius::from(10),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            row![
+                load_btn,
+                Space::new().width(4),
+                icon_btn(t, "✎", true, false, Message::StartRename(index)),
+                icon_btn(t, "✕", true, false, Message::DeleteTemplate(index)),
+            ]
+            .align_y(Alignment::Center)
+            .width(Length::Fill)
+            .into()
+        }
+    }
+}
+
+// ============================================================================
 // Batch pane (right)
 // ============================================================================
 
 fn batch_pane(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
     let count = app.batch.len();
-    let mut head = row![
+    let head = row![
         text("Batch").size(18).color(t.text).font(bold()),
         Space::new().width(9),
         count_chip(t, count),
+        Space::new().width(Length::Fill),
+        templates_button(app, t),
+        Space::new().width(8),
+        ghost_button(t, text("clear").size(11).color(t.sub).font(mono()))
+            .on_press_maybe((count > 0).then_some(Message::ClearBatch)),
     ]
     .align_y(Alignment::Center)
     .width(Length::Fill);
-    if count > 0 {
-        head = head.push(Space::new().width(Length::Fill)).push(
-            ghost_button(t, text("clear all").size(11).color(t.sub).font(mono()))
-                .on_press(Message::ClearBatch),
-        );
+
+    let mut inner = column![head].width(Length::Fill);
+
+    // The template menu expands inline beneath the header (same pattern as the
+    // network switcher / method picker).
+    if app.template_menu_open {
+        inner = inner
+            .push(Space::new().height(10))
+            .push(templates_menu(app, t));
     }
 
     let list: Element<'_, Message> = if app.batch.is_empty() {
@@ -549,7 +1321,7 @@ fn batch_pane(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
         col.into()
     };
 
-    let mut inner = column![head, Space::new().height(14), list].width(Length::Fill);
+    inner = inner.push(Space::new().height(14)).push(list);
 
     if let Some(sim) = &app.sim
         && !app.batch.is_empty()
@@ -919,7 +1691,7 @@ fn empty_state(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
     .align_x(Alignment::Center)
     .width(Length::Fill);
     // Sample only makes sense on Mainnet (uses Mainnet known contracts).
-    if app.ctx.chain == crate::chain::Chain::Mainnet && app.ctx.is_safe {
+    if app.net.builtin() == Some(crate::chain::Chain::Mainnet) && app.ctx.is_safe {
         col = col.push(Space::new().height(14)).push(ghost_secondary(
             t,
             "Load a sample batch",
@@ -1393,10 +2165,11 @@ fn contract_banner<'a>(t: KaoTheme, c: &'a super::LoadedContract) -> Element<'a,
         AbiSource::Pasted => pill(t, "pasted ABI", t.a2),
         AbiSource::Bytecode => pill(t, "from bytecode", t.a3),
     };
+    let counts = format!("{} write · {} read", c.methods.len(), c.read_methods.len());
     let subtitle = if c.label.is_empty() {
-        format!("{} write methods", c.methods.len())
+        counts
     } else {
-        format!("{} · {} write methods", c.label, c.methods.len())
+        format!("{} · {counts}", c.label)
     };
     let info = column![
         row![

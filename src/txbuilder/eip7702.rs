@@ -72,6 +72,48 @@ pub fn encode_execute_batch(calls: &[QueuedCall]) -> Bytes {
     Bytes::from(out)
 }
 
+/// Recover the `Call[]` from `executeBatch` calldata — the inverse of
+/// [`encode_execute_batch`], decoded through the same alloy type so the round
+/// trip is exact.
+///
+/// The sign review builds its per-call clear-signing panels from *this*, not
+/// from the queue the calldata was encoded from: what the user reads is derived
+/// from the bytes that will actually be executed.
+pub fn decode_execute_batch(calldata: &[u8]) -> Result<Vec<(Address, U256, Bytes)>, String> {
+    use alloy::dyn_abi::DynSolType;
+    if calldata.len() < 4 || calldata[..4] != EXECUTE_BATCH_SELECTOR {
+        return Err("not an executeBatch(Call[]) call".into());
+    }
+    let ty = DynSolType::Array(Box::new(DynSolType::Tuple(vec![
+        DynSolType::Address,
+        DynSolType::Uint(256),
+        DynSolType::Bytes,
+    ])));
+    let decoded = DynSolType::Tuple(vec![ty])
+        .abi_decode_params(&calldata[4..])
+        .map_err(|e| format!("malformed executeBatch calldata: {e}"))?;
+    let DynSolValue::Tuple(mut outer) = decoded else {
+        return Err("malformed executeBatch calldata".into());
+    };
+    let Some(DynSolValue::Array(items)) = outer.pop() else {
+        return Err("malformed executeBatch calldata".into());
+    };
+    items
+        .into_iter()
+        .map(|item| match item {
+            DynSolValue::Tuple(fields) => match fields.as_slice() {
+                [
+                    DynSolValue::Address(to),
+                    DynSolValue::Uint(value, _),
+                    DynSolValue::Bytes(data),
+                ] => Ok((*to, *value, Bytes::from(data.clone()))),
+                _ => Err("unexpected executeBatch call shape".to_string()),
+            },
+            _ => Err("unexpected executeBatch call shape".to_string()),
+        })
+        .collect()
+}
+
 /// Build the authorization tuple to sign for delegating `authority`'s account
 /// to the EF delegate on `chain_id`.
 ///
@@ -167,6 +209,30 @@ mod tests {
             }
             other => panic!("expected call tuple, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn decode_execute_batch_recovers_what_was_encoded() {
+        // The sign review builds its per-call panels from this decode, so a
+        // drift between encoder and decoder would show the user the wrong
+        // batch. Round-trip every field.
+        let a = address!("0x000000000000000000000000000000000000000A");
+        let b = address!("0x000000000000000000000000000000000000000B");
+        let calls = vec![call(a, 5, &[0x12, 0x34]), call(b, 0, &[])];
+        let out = decode_execute_batch(&encode_execute_batch(&calls)).expect("round trip");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], (a, U256::from(5u64), Bytes::from(vec![0x12, 0x34])));
+        assert_eq!(out[1], (b, U256::ZERO, Bytes::new()));
+    }
+
+    #[test]
+    fn decode_execute_batch_rejects_foreign_and_malformed_calldata() {
+        assert!(decode_execute_batch(&[]).is_err());
+        assert!(decode_execute_batch(&[0xde, 0xad, 0xbe, 0xef]).is_err());
+        // Right selector, garbage body.
+        let mut bad = EXECUTE_BATCH_SELECTOR.to_vec();
+        bad.extend_from_slice(&[0xff; 16]);
+        assert!(decode_execute_batch(&bad).is_err());
     }
 
     #[test]

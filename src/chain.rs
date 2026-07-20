@@ -201,6 +201,18 @@ impl NetworkId {
         matches!(self, NetworkId::Custom(_))
     }
 
+    /// Human-friendly network label for review screens. Built-ins delegate to
+    /// [`Chain::display_name`]; a custom network resolves its configured name
+    /// from settings, falling back to `Chain {id}` if it was removed.
+    pub fn display_name(self) -> String {
+        match self {
+            NetworkId::Builtin(c) => c.display_name().to_string(),
+            NetworkId::Custom(id) => crate::settings::custom_network(id)
+                .map(|n| n.name)
+                .unwrap_or_else(|| format!("Chain {id}")),
+        }
+    }
+
     /// Whether the send flow runs local revm preflight on this network.
     /// Custom networks skip it — preflight reads verified state through the
     /// Helios-aware path, which a custom RPC can't provide, and sim is only

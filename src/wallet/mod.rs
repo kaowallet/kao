@@ -568,27 +568,49 @@ impl KaoSigner {
     ///
     /// `Trezor` has no 7702 APDU in `alloy-signer-trezor` yet, and
     /// `ViewOnly` has no key → both `UnsupportedOperation`.
+    ///
+    /// The recovered authority is checked against this signer's own address
+    /// before the signature is returned. An authorization whose signature
+    /// doesn't recover to the account it delegates is not a loud failure on
+    /// chain — the authorization list entry is simply *skipped*, the account
+    /// keeps no code, and the batch that follows becomes a call into a
+    /// code-less address, which **succeeds while doing nothing**. Every caller
+    /// inherits the check from here rather than re-deriving it.
     pub async fn sign_authorization(
         &self,
         auth: &Authorization,
     ) -> Result<SignedAuthorization, alloy::signers::Error> {
-        match self {
+        let signed = match self {
             KaoSigner::Local(s) => {
                 let sig = s.sign_hash(&auth.signature_hash()).await?;
-                Ok(auth.clone().into_signed(sig))
+                auth.clone().into_signed(sig)
             }
             KaoSigner::Ledger(s) => {
                 let sig = s
                     .sign_auth(auth)
                     .await
                     .map_err(alloy::signers::Error::other)?;
-                Ok(auth.clone().into_signed(sig))
+                auth.clone().into_signed(sig)
             }
             KaoSigner::Trezor(_) | KaoSigner::ViewOnly(_) => {
-                Err(alloy::signers::Error::UnsupportedOperation(
+                return Err(alloy::signers::Error::UnsupportedOperation(
                     alloy::signers::UnsupportedSignerOperation::SignHash,
-                ))
+                ));
             }
+        };
+        let expected = self.address();
+        match signed.recover_authority() {
+            Ok(got) if got == expected => Ok(signed),
+            Ok(got) => {
+                tracing::warn!(%expected, recovered = %got, "7702: authorization recovers to the wrong authority");
+                Err(alloy::signers::Error::other(format!(
+                    "authorization signature recovers to {got}, not {expected} — refusing to \
+                     delegate"
+                )))
+            }
+            Err(e) => Err(alloy::signers::Error::other(format!(
+                "could not recover the authority from the authorization signature: {e}"
+            ))),
         }
     }
 
@@ -1496,6 +1518,47 @@ mod tests {
             uint256 x;
             address y;
         }
+    }
+
+    /// An EIP-7702 authorization whose signature recovers to anything other
+    /// than the delegating account is not a loud failure on chain — the entry
+    /// is skipped, the account keeps no code, and the batch that follows
+    /// becomes a call into a code-less address, which succeeds while doing
+    /// nothing. `sign_authorization` checks the recovery so every caller
+    /// inherits it; this pins the happy path so the check can't silently start
+    /// rejecting good signatures.
+    #[tokio::test]
+    async fn sign_authorization_recovers_to_the_signing_account() {
+        let parent = derive_parent_key(HARDHAT_PHRASE).unwrap();
+        let (_, signer) = &derive_accounts_from(&parent, 0, 1).unwrap()[0];
+        let ks = KaoSigner::Local(signer.clone());
+        let auth = Authorization {
+            chain_id: U256::from(1u64),
+            address: Address::repeat_byte(0x4c),
+            nonce: 7,
+        };
+        let signed = ks.sign_authorization(&auth).await.expect("local signs");
+        assert_eq!(
+            signed.recover_authority().expect("recoverable"),
+            ks.address(),
+            "the authority must be the account being delegated"
+        );
+        assert_eq!(signed.address, auth.address, "the delegate is unchanged");
+        assert_eq!(signed.nonce, auth.nonce);
+    }
+
+    /// View-only and Trezor have no 7702 path, and must fail before producing
+    /// anything that looks like an authorization.
+    #[tokio::test]
+    async fn sign_authorization_refuses_a_signer_without_a_7702_path() {
+        let ks = KaoSigner::ViewOnly(Address::repeat_byte(0x11));
+        let auth = Authorization {
+            chain_id: U256::from(1u64),
+            address: Address::repeat_byte(0x4c),
+            nonce: 0,
+        };
+        assert!(ks.sign_authorization(&auth).await.is_err());
+        assert!(!ks.supports_7702());
     }
 
     #[tokio::test]

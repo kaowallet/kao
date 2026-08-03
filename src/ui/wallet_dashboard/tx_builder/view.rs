@@ -1210,11 +1210,21 @@ fn template_row<'a>(
     tpl: &Template,
     renaming: Option<&str>,
 ) -> Element<'a, Message> {
+    // The chain is on the row because it is load-blocking: a template only
+    // loads on the network it was composed for, and the user should be able to
+    // see which that is before clicking rather than after the refusal. One
+    // saved before the chain was recorded says exactly that — naming a chain it
+    // never recorded would be the same false assertion the load path refuses.
     let subtitle = format!(
         "{} call{} · {}",
         tpl.call_count,
         if tpl.call_count == 1 { "" } else { "s" },
-        tpl.note
+        tpl.chain().map_or_else(
+            || "network not recorded".to_string(),
+            |c| crate::chain::NetworkId::Builtin(c)
+                .display_name()
+                .to_string()
+        ),
     );
     let kao = container(text(tpl.kaomoji.clone()).size(15).color(t.a1).font(mono()))
         .width(Length::Fixed(46.0));

@@ -22,6 +22,35 @@ use super::{DecodedArg, QueuedCall};
 /// `keccak256("approve(address,uint256)")[..4]`.
 pub const APPROVE_SELECTOR: [u8; 4] = [0x09, 0x5e, 0xa7, 0xb3];
 
+/// `keccak256("increaseAllowance(address,uint256)")[..4]`. Not something the
+/// wrapper appends, but it raises an allowance just as `approve` does, so the
+/// verdict below has to see it — otherwise a batch ending in
+/// `increaseAllowance` could still be described as leaving nothing standing.
+pub const INCREASE_ALLOWANCE_SELECTOR: [u8; 4] = [0x39, 0x50, 0x93, 0x51];
+
+/// Approval-granting calls the verdict recognises but cannot **score**, and so
+/// cannot promise anything about.
+///
+/// The flash-approval guarantee is an absolute claim ("every allowance this
+/// batch grants is reset before it ends"), and an absolute claim is only worth
+/// making if the scan behind it is exhaustive. It isn't: it reads ERC-20
+/// `approve`/`increaseAllowance` and nothing else. A batch pairing
+/// `approve(USDC, router, 1000)` with `setApprovalForAll(attacker, true)` over
+/// an NFT collection would score `standing = []`, and the review would print
+/// the guarantee over a permanent blanket operator approval.
+///
+/// Rather than chase every approval shape, the ones below are detected purely
+/// so the guarantee can be **withheld** — they land in
+/// [`AllowanceVerdict::unmodelled`] and the copy drops to naming them.
+const UNMODELLED_GRANTS: [([u8; 4], &str); 3] = [
+    // setApprovalForAll(address,bool) — ERC-721/1155 blanket operator rights.
+    ([0xa2, 0x2c, 0xb4, 0x65], "setApprovalForAll"),
+    // permit(address,address,uint256,uint256,uint8,bytes32,bytes32) — EIP-2612.
+    ([0xd5, 0x05, 0xac, 0xcf], "permit"),
+    // DAI-style permit(address,address,uint256,uint256,bool,uint8,bytes32,bytes32).
+    ([0x8f, 0xcb, 0xaf, 0x0c], "permit"),
+];
+
 /// If `data` is a non-zero `approve(address,uint256)` call, return its
 /// `spender`; otherwise `None`. Zero-amount approvals (revokes) and non-approve
 /// or malformed (<68-byte) calldata return `None`.
@@ -53,19 +82,177 @@ pub fn revoke_targets(calls: &[QueuedCall]) -> Vec<(Address, Address)> {
     out
 }
 
-/// Count the `approve(_, 0)` (allowance-reset) calls in a batch — the
-/// disclosure the review shows ("resets N approval(s) to 0"). Counts any
-/// zero-amount approval, whether appended by [`wrap_with_revoke`] or composed
-/// by hand.
-pub fn revoke_count(calls: &[QueuedCall]) -> usize {
-    calls
+/// What a batch does to ERC-20 allowances, as the review should describe it.
+///
+/// This replaces a bare count of `approve(_, 0)` calls. A count is not a
+/// verdict: it says nothing about *which* allowances were reset, so a batch
+/// holding `approve(USDC, attacker, MAX)` alongside an unrelated hand-composed
+/// `approve(DAI, x, 0)` counted 1 and earned the sentence "no allowance is
+/// left standing" — a false safety assertion on the last screen before a
+/// signature.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AllowanceVerdict {
+    /// `(token, spender)` pairs this batch leaves holding a non-zero
+    /// allowance when it ends. Non-empty ⇒ the flash-approval guarantee does
+    /// not hold and the survivors have to be named.
+    pub standing: Vec<(Address, Address)>,
+    /// `(token, spender)` pairs the batch ends at zero — whether the revoke
+    /// was appended by [`wrap_with_revoke`] or composed by hand.
+    pub reset: Vec<(Address, Address)>,
+    /// `(target, call name)` for approval grants this scan recognises but
+    /// can't score (see [`UNMODELLED_GRANTS`]). Any entry here withholds the
+    /// absolute guarantee: the batch grants something the verdict cannot
+    /// promise was reset.
+    pub unmodelled: Vec<(Address, &'static str)>,
+}
+
+impl AllowanceVerdict {
+    /// True when the batch touches no approval this scan recognises — nothing
+    /// to disclose.
+    pub fn is_empty(&self) -> bool {
+        self.standing.is_empty() && self.reset.is_empty() && self.unmodelled.is_empty()
+    }
+
+    /// The disclosure line for the review, or `None` when the batch grants and
+    /// resets nothing. The absolute claim is made *only* when nothing stands
+    /// **and** nothing unscoreable was granted.
+    pub fn disclosure(&self) -> Option<String> {
+        if self.is_empty() {
+            return None;
+        }
+        // An unscoreable grant is not evidence of danger — it is the absence of
+        // evidence of safety, so it withholds the guarantee rather than
+        // sharpening the warning.
+        if self.standing.is_empty() && !self.unmodelled.is_empty() {
+            let what = self
+                .unmodelled
+                .iter()
+                .map(|(t, n)| format!("{n} on {}", crate::wallet::short_address(*t)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Some(format!(
+                "⚠ This batch grants approvals this wallet can't account for ({what}), so it \
+                 can't promise nothing is left standing — read those calls yourself."
+            ));
+        }
+        let names = |pairs: &[(Address, Address)]| {
+            pairs
+                .iter()
+                .map(|(t, s)| {
+                    format!(
+                        "{} → {}",
+                        crate::wallet::short_address(*t),
+                        crate::wallet::short_address(*s)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        if self.standing.is_empty() {
+            return Some(format!(
+                "Resets {} approval{} to 0 in the same transaction (flash approval — every \
+                 allowance this batch grants is reset before it ends): {}.",
+                self.reset.len(),
+                if self.reset.len() == 1 { "" } else { "s" },
+                names(&self.reset),
+            ));
+        }
+        let mut s = format!(
+            "⚠ {} approval{} still standing when this batch ends: {}.",
+            self.standing.len(),
+            if self.standing.len() == 1 {
+                " is"
+            } else {
+                "s are"
+            },
+            names(&self.standing),
+        );
+        if !self.reset.is_empty() {
+            s.push_str(&format!(
+                " ({} other{} reset to 0: {}.)",
+                self.reset.len(),
+                if self.reset.len() == 1 { "" } else { "s" },
+                names(&self.reset),
+            ));
+        }
+        Some(s)
+    }
+}
+
+/// The allowance each `(token, spender)` pair the batch touches is left at.
+///
+/// Walks the calls in execution order and keeps the **last** allowance-setting
+/// call per pair, which is what survives an atomic batch: a later
+/// `approve(spender, 0)` resets an earlier grant, and a later grant (whether
+/// `approve` or `increaseAllowance`) undoes an earlier reset. Selector-based,
+/// so it reads raw-hex and ABI-composed calls alike.
+///
+/// Scope, stated because the review's copy leans on it: this accounts for the
+/// ERC-20 allowances *this batch* sets. An allowance granted in some earlier
+/// transaction and never touched here is outside what a batch can speak to.
+/// Approval grants of other shapes are collected into
+/// [`AllowanceVerdict::unmodelled`] so the copy can decline to make a promise
+/// rather than make one it can't keep.
+pub fn allowance_verdict(calls: &[QueuedCall]) -> AllowanceVerdict {
+    // (token, spender) → whether the last call left it non-zero, in
+    // first-seen order so the disclosure reads in batch order.
+    let mut seen: Vec<((Address, Address), bool)> = Vec::new();
+    let mut v = AllowanceVerdict::default();
+    for c in calls {
+        if let Some(what) = unmodelled_grant(&c.data) {
+            let entry = (c.to, what);
+            if !v.unmodelled.contains(&entry) {
+                v.unmodelled.push(entry);
+            }
+            continue;
+        }
+        let Some((spender, nonzero)) = allowance_effect(&c.data) else {
+            continue;
+        };
+        let pair = (c.to, spender);
+        match seen.iter_mut().find(|(p, _)| *p == pair) {
+            Some((_, state)) => *state = nonzero,
+            None => seen.push((pair, nonzero)),
+        }
+    }
+    for (pair, nonzero) in seen {
+        if nonzero {
+            v.standing.push(pair);
+        } else {
+            v.reset.push(pair);
+        }
+    }
+    v
+}
+
+/// The name of the approval-granting call `data` makes, when it is one this
+/// scan recognises but cannot score. `None` for everything else — including
+/// ordinary non-approval calls, which are simply not approvals.
+fn unmodelled_grant(data: &[u8]) -> Option<&'static str> {
+    let sel: [u8; 4] = data.get(..4)?.try_into().ok()?;
+    UNMODELLED_GRANTS
         .iter()
-        .filter(|c| {
-            c.data.len() >= 4 + 64
-                && c.data[..4] == APPROVE_SELECTOR
-                && U256::from_be_slice(&c.data[4 + 32..4 + 64]).is_zero()
-        })
-        .count()
+        .find(|(s, _)| *s == sel)
+        .map(|(_, name)| *name)
+}
+
+/// `(spender, leaves_a_non_zero_allowance)` for an allowance-setting call.
+/// `None` when the call doesn't set an allowance at all.
+///
+/// `increaseAllowance` is treated as leaving a non-zero allowance: its amount
+/// word is a *delta*, so a zero delta leaves whatever was already there, which
+/// this can't know and must not claim is zero.
+fn allowance_effect(data: &[u8]) -> Option<(Address, bool)> {
+    if data.len() < 4 + 64 {
+        return None;
+    }
+    let spender = Address::from_slice(&data[4 + 12..4 + 32]);
+    let amount = U256::from_be_slice(&data[4 + 32..4 + 64]);
+    match data[..4].try_into().ok()? {
+        APPROVE_SELECTOR => Some((spender, !amount.is_zero())),
+        INCREASE_ALLOWANCE_SELECTOR => Some((spender, true)),
+        _ => None,
+    }
 }
 
 /// ABI-encode `approve(spender, 0)` calldata: `selector ‖ spender(32) ‖ 0(32)`.
@@ -154,6 +341,83 @@ mod tests {
         assert_eq!(&hash[..4], &APPROVE_SELECTOR);
     }
 
+    /// Every selector this module keys safety copy off is pinned to its own
+    /// keccak preimage — a mistyped byte here would silently stop detecting
+    /// the thing it names, and the failure mode is a false guarantee.
+    #[test]
+    fn every_watched_selector_is_canonical() {
+        for (sig, sel) in [
+            (
+                "increaseAllowance(address,uint256)".as_bytes(),
+                INCREASE_ALLOWANCE_SELECTOR,
+            ),
+            (
+                "setApprovalForAll(address,bool)".as_bytes(),
+                UNMODELLED_GRANTS[0].0,
+            ),
+            (
+                "permit(address,address,uint256,uint256,uint8,bytes32,bytes32)".as_bytes(),
+                UNMODELLED_GRANTS[1].0,
+            ),
+            (
+                "permit(address,address,uint256,uint256,bool,uint8,bytes32,bytes32)".as_bytes(),
+                UNMODELLED_GRANTS[2].0,
+            ),
+        ] {
+            assert_eq!(
+                &keccak256(sig)[..4],
+                &sel,
+                "selector drifted for {}",
+                std::str::from_utf8(sig).unwrap()
+            );
+        }
+    }
+
+    /// The guarantee is absolute, so the scan behind it has to be exhaustive —
+    /// and it isn't. A batch pairing a fully-revoked ERC-20 approve with an
+    /// NFT `setApprovalForAll` must not earn it.
+    #[test]
+    fn an_unscoreable_grant_withholds_the_guarantee() {
+        let nft = address!("0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D");
+        let mut blanket = approve("0");
+        blanket.to = nft;
+        let mut data = Vec::from(UNMODELLED_GRANTS[0].0); // setApprovalForAll
+        data.extend_from_slice(&[0u8; 12]);
+        data.extend_from_slice(SPENDER.as_slice());
+        data.extend_from_slice(&U256::from(1u64).to_be_bytes::<32>()); // true
+        blanket.data = Bytes::from(data);
+
+        // The ERC-20 side is spotless: granted and revoked in the same batch.
+        let batch = wrap_with_revoke(&[approve("5000000000")], 50);
+        let v = allowance_verdict(&[batch, vec![blanket]].concat());
+
+        assert_eq!(v.standing, vec![], "the ERC-20 grant really is reset");
+        assert_eq!(v.reset, vec![(USDC, SPENDER)]);
+        assert_eq!(v.unmodelled, vec![(nft, "setApprovalForAll")]);
+        let d = v.disclosure().unwrap();
+        assert!(
+            !d.contains("every allowance this batch grants is reset"),
+            "an unscoreable grant must withhold the guarantee: {d}"
+        );
+        assert!(
+            d.contains("setApprovalForAll"),
+            "and name what it can't score: {d}"
+        );
+    }
+
+    #[test]
+    fn an_eip2612_permit_also_withholds_the_guarantee() {
+        let token = address!("0x6B175474E89094C44Da98b954EedeAC495271d0F");
+        let mut p = approve("0");
+        p.to = token;
+        let mut data = Vec::from(UNMODELLED_GRANTS[1].0); // permit
+        data.extend_from_slice(&[0u8; 64]);
+        p.data = Bytes::from(data);
+        let v = allowance_verdict(&[p]);
+        assert_eq!(v.unmodelled, vec![(token, "permit")]);
+        assert!(v.disclosure().unwrap().contains("can't account for"));
+    }
+
     #[test]
     fn nonzero_approve_appends_one_revoke() {
         let batch = vec![approve("5000000000")];
@@ -175,21 +439,72 @@ mod tests {
     }
 
     #[test]
-    fn revoke_count_counts_zero_approvals() {
+    fn verdict_tracks_the_last_allowance_per_pair() {
+        // A bare non-zero approve leaves an allowance standing.
         let batch = vec![approve("5000000000")];
-        assert_eq!(
-            revoke_count(&batch),
-            0,
-            "a non-zero approve is not a revoke"
+        let v = allowance_verdict(&batch);
+        assert_eq!(v.standing, vec![(USDC, SPENDER)]);
+        assert!(v.reset.is_empty());
+
+        // Wrapped, the appended approve(_,0) is the last word on that pair.
+        let v = allowance_verdict(&wrap_with_revoke(&batch, 1));
+        assert!(v.standing.is_empty());
+        assert_eq!(v.reset, vec![(USDC, SPENDER)]);
+        assert!(
+            v.disclosure()
+                .unwrap()
+                .contains("every allowance this batch grants is reset"),
+            "a fully-revoked batch earns the guarantee"
         );
-        let wrapped = wrap_with_revoke(&batch, 1);
+    }
+
+    /// The regression this type exists for: a count of zero-approvals said "1"
+    /// for a batch whose *other* approval was left at MAX, and the review
+    /// printed "no allowance is left standing" over it.
+    #[test]
+    fn unrelated_revoke_does_not_earn_the_guarantee() {
+        let dai = address!("0x6B175474E89094C44Da98b954EedeAC495271d0F");
+        let other = address!("0x1111111111111111111111111111111111111111");
+        let mut zero_on_dai = approve("0");
+        zero_on_dai.to = dai;
+        zero_on_dai.data = revoke_calldata(other);
+
+        let v = allowance_verdict(&[approve("5000000000"), zero_on_dai]);
         assert_eq!(
-            revoke_count(&wrapped),
-            1,
-            "the appended approve(_,0) counts"
+            v.standing,
+            vec![(USDC, SPENDER)],
+            "the MAX approve survives"
         );
-        // A hand-composed approve(_, 0) also counts.
-        assert_eq!(revoke_count(&[approve("0")]), 1);
+        assert_eq!(v.reset, vec![(dai, other)]);
+        let d = v.disclosure().unwrap();
+        assert!(d.starts_with("⚠ 1 approval is still standing"), "got {d}");
+        assert!(
+            !d.contains("every allowance this batch grants is reset"),
+            "the guarantee must not be claimed while an allowance stands: {d}"
+        );
+    }
+
+    /// `increaseAllowance` raises an allowance without ever writing a non-zero
+    /// `approve`, so a verdict blind to it would call the batch clean.
+    #[test]
+    fn increase_allowance_after_a_revoke_leaves_it_standing() {
+        let mut inc = approve("0");
+        let mut data = Vec::from(INCREASE_ALLOWANCE_SELECTOR);
+        data.extend_from_slice(&[0u8; 12]);
+        data.extend_from_slice(SPENDER.as_slice());
+        data.extend_from_slice(&U256::from(1u64).to_be_bytes::<32>());
+        inc.data = Bytes::from(data);
+
+        let v = allowance_verdict(&[approve("5000000000"), approve("0"), inc]);
+        assert_eq!(v.standing, vec![(USDC, SPENDER)]);
+        assert!(v.reset.is_empty());
+    }
+
+    #[test]
+    fn a_batch_touching_no_allowance_discloses_nothing() {
+        let v = allowance_verdict(&[]);
+        assert!(v.is_empty());
+        assert!(v.disclosure().is_none());
     }
 
     #[test]

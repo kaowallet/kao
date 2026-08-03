@@ -433,8 +433,12 @@ pub enum Message {
         seq: u64,
         result: Result<(Bytes, bool), String>,
     },
-    /// Transaction Builder: a batch simulation finished.
+    /// Transaction Builder: a batch simulation finished. `seq` retires a run
+    /// the user has since superseded by editing the queue, switching network,
+    /// or switching account — its verdict drives the review's confirm button,
+    /// so applying a stale one is not cosmetic.
     TxBuilderSimulated {
+        seq: u64,
         result: Result<crate::wallet::sim::BatchSimResult, String>,
     },
     /// Names app: reverse-lookup discovery finished. `owner` is the account the
@@ -2097,22 +2101,31 @@ impl WalletScreen {
 
     // ── Transaction Builder ──────────────────────────────────────────────
 
-    /// Chain + Safe context for the Transaction Builder: the active Safe's
-    /// chain/version when in Safe mode, else Mainnet/EOA. The EOA builder is
-    /// Mainnet-oriented in v1 (its known-contract picker and single-call
-    /// broadcast target Ethereum).
-    /// `(chain, is_safe, safe_version, eoa_can_batch)`. `eoa_can_batch` is
-    /// whether the active plain-EOA signer can authorize an EIP-7702
-    /// delegation (Local / Ledger) — the gate for atomic EOA batching.
-    fn txbuilder_identity(&self) -> (Chain, bool, Option<String>, bool) {
+    /// Identity + chain context for the Transaction Builder:
+    /// `(address, chain, is_safe, safe_version, eoa_can_batch)`.
+    ///
+    /// `address` is who the batch executes **as** — the active Safe, or the
+    /// plain EOA. The builder compares it against the previous refresh and
+    /// drops the queue when it moves, so a batch composed as one account can
+    /// never be re-shaped under another. `eoa_can_batch` is whether the active
+    /// plain-EOA signer can authorize an EIP-7702 delegation (Local / Ledger)
+    /// — the gate for atomic EOA batching.
+    fn txbuilder_identity(&self) -> (Address, Chain, bool, Option<String>, bool) {
         match self.active_safe_descriptor() {
             Some(d) => (
+                Address::from(d.address),
                 Chain::from_chain_id(d.chain_id).unwrap_or(Chain::Mainnet),
                 true,
                 Some(d.version.clone()),
                 false,
             ),
-            None => (Chain::Mainnet, false, None, self.signer.supports_7702()),
+            None => (
+                self.address,
+                Chain::Mainnet,
+                false,
+                None,
+                self.signer.supports_7702(),
+            ),
         }
     }
 
@@ -2130,16 +2143,11 @@ impl WalletScreen {
             O::Read { seq, net, to, data } => {
                 spawn_txbuilder_read(self.network.clone(), seq, net, to, data)
             }
-            O::Simulate { chain, calls } => {
-                let is_safe = self.active_safe_descriptor().is_some();
-                let from = if is_safe {
-                    self.active_safe_descriptor()
-                        .map(|d| Address::from(d.address))
-                        .unwrap_or(self.address)
-                } else {
-                    self.address
-                };
-                spawn_txbuilder_simulate(self.network.clone(), chain, from, calls)
+            O::Simulate { seq, chain, calls } => {
+                let from = self
+                    .active_safe_descriptor()
+                    .map_or(self.address, |d| Address::from(d.address));
+                spawn_txbuilder_simulate(self.network.clone(), seq, chain, from, calls)
             }
             O::Review { calls, preflight } => self.open_txbuilder_review(calls, preflight),
             O::PersistTemplates(list) => {
@@ -2175,9 +2183,12 @@ impl WalletScreen {
         };
         self.sign_review_seq += 1;
         let seq = self.sign_review_seq;
-        // Flash approval: disclose any allowance resets folded into the batch.
-        let revoke_n = crate::txbuilder::flash_approval::revoke_count(&calls);
-        let (title, subtitle, note, can_execute) = txbuilder_review_copy(&req, revoke_n);
+        // What this batch leaves standing in allowance terms. A verdict, not a
+        // count: the count could not distinguish a revoke that closes one of
+        // *this batch's* grants from an unrelated one, so it printed the
+        // flash-approval guarantee over batches that left MAX standing.
+        let allowances = crate::txbuilder::flash_approval::allowance_verdict(&calls);
+        let (title, subtitle, note, can_execute) = txbuilder_review_copy(&req, &allowances);
         // A failed or absent preflight leads the note: it's the one thing here
         // that says this batch is expected not to work.
         let note = match (preflight.warning(), note) {
@@ -2209,7 +2220,7 @@ impl WalletScreen {
 /// surface, so it can be pinned by tests without a live dashboard.
 fn txbuilder_review_copy(
     req: &tx_builder::BatchSignRequest,
-    revoke_n: usize,
+    allowances: &crate::txbuilder::flash_approval::AllowanceVerdict,
 ) -> (String, Option<String>, Option<String>, bool) {
     let (title, subtitle, note, can_execute) = match req {
         tx_builder::BatchSignRequest::Safe(s) => {
@@ -2283,17 +2294,14 @@ fn txbuilder_review_copy(
             true,
         ),
     };
-    let note = note.map(|n| {
-        if revoke_n > 0 {
-            format!(
-                "{n} Resets {revoke_n} approval{} to 0 in the same transaction \
-                 (flash approval — no allowance is left standing).",
-                if revoke_n == 1 { "" } else { "s" }
-            )
-        } else {
-            n
-        }
-    });
+    // Allowance disclosure. Appended for a standing allowance as well as a
+    // reset one — the note used to speak up only when something was revoked,
+    // which meant the batches worth warning about were the quiet ones.
+    let note = match (note, allowances.disclosure()) {
+        (Some(n), Some(d)) => Some(format!("{n} {d}")),
+        (Some(n), None) => Some(n),
+        (None, d) => d,
+    };
     (title, subtitle, note, can_execute)
 }
 
@@ -2310,21 +2318,33 @@ impl WalletScreen {
                     .ok_or_else(|| "Safe is on an unsupported chain".to_string())?;
                 let input = crate::txbuilder::multisend::build_multisend_input(calls, &d.version)
                     .map_err(|e| e.to_string())?;
-                // Owners the wallet can actually sign with (Local / Ledger /
-                // Trezor); view-only owners never count.
+                // Owners the wallet can actually sign with: a key kind that can
+                // produce a signature (Local / Ledger / Trezor) **and** an
+                // address that is still in the Safe's owner set.
+                //
+                // `linked_signer_indices` is the user's linkage choice, not an
+                // ownership fact — an account stays linked after the owners
+                // remove it. Counting such a key toward the threshold made the
+                // review promise "this wallet holds N of the M owner keys" on
+                // a key the Safe would reject, and sent every device to sign a
+                // transaction that could only revert GS026.
+                let owner_set: std::collections::HashSet<Address> =
+                    d.owners.iter().map(|o| Address::from(*o)).collect();
                 let signable_indices: Vec<u32> = d
                     .linked_signer_indices
                     .iter()
                     .copied()
                     .filter(|&idx| {
+                        let Some(acct) = self.accounts.get(idx as usize) else {
+                            return false;
+                        };
                         matches!(
-                            self.accounts.get(idx as usize),
-                            Some(
-                                AccountDescriptor::Local { .. }
-                                    | AccountDescriptor::Ledger { .. }
-                                    | AccountDescriptor::Trezor { .. }
-                            )
-                        )
+                            acct,
+                            AccountDescriptor::Local { .. }
+                                | AccountDescriptor::Ledger { .. }
+                                | AccountDescriptor::Trezor { .. }
+                        ) && crate::wallet::account_address(acct)
+                            .is_some_and(|a| owner_set.contains(&a))
                     })
                     .collect();
                 Ok(tx_builder::BatchSignRequest::Safe(
@@ -2372,6 +2392,9 @@ impl WalletScreen {
                         net,
                         from: self.address,
                         calls: calls.to_vec(),
+                        // Filled in from the prepared Delegation card; a
+                        // multi-call dispatch with this still `None` is refused.
+                        prepared: None,
                     },
                 ))
             }
@@ -2480,6 +2503,17 @@ impl WalletScreen {
                 // action must not fall through into a silent broadcast.
                 if !execute {
                     warn!("tx-builder: EOA dispatch dropped — no propose path for a plain account");
+                    return Task::none();
+                }
+                // Same gate the Safe arm applies to its pinned hash: a batch
+                // that delegates must not dispatch before the review has told
+                // us which delegation decision the user actually saw.
+                if ereq.is_batch() && ereq.prepared.is_none() {
+                    warn!("tx-builder: EOA batch dispatch dropped — delegation not prepared");
+                    if let Some(r) = self.sign_review.as_mut() {
+                        r.error =
+                            Some("still preparing the delegation — try again in a moment".into());
+                    }
                     return Task::none();
                 }
                 let desc = self.active_signer_descriptor();
@@ -4544,12 +4578,14 @@ impl WalletScreen {
                 // Refresh the Transaction Builder's identity context before it
                 // processes a message, so batch-cap / known-contract lookup see
                 // the live chain and whether a Safe is active. Cheap.
-                let (txb_chain, txb_is_safe, txb_ver, txb_can_batch) = self.txbuilder_identity();
+                let (txb_addr, txb_chain, txb_is_safe, txb_ver, txb_can_batch) =
+                    self.txbuilder_identity();
                 let txb_customs: Vec<(u64, String)> = settings::enabled_custom_networks()
                     .into_iter()
                     .map(|n| (n.chain_id, n.name))
                     .collect();
                 self.apps.set_txbuilder_context(
+                    txb_addr,
                     txb_chain,
                     txb_is_safe,
                     txb_ver,
@@ -4607,8 +4643,8 @@ impl WalletScreen {
             Message::TxBuilderRead { seq, result } => {
                 self.apps.txbuilder_pane().on_read(seq, result);
             }
-            Message::TxBuilderSimulated { result } => {
-                self.apps.txbuilder_pane().on_sim(result);
+            Message::TxBuilderSimulated { seq, result } => {
+                self.apps.txbuilder_pane().on_sim(seq, result);
             }
             Message::SignReview(child) => match child {
                 sign_review::Message::Confirm => {
@@ -4759,6 +4795,27 @@ impl WalletScreen {
                                     .to_string(),
                                 );
                             }
+                        }
+                        // Transaction Builder EOA batch: pin the delegation
+                        // decision the Delegation card just showed, so the send
+                        // task checks it against chain instead of deciding it a
+                        // second time from a different data source.
+                        let txb_delegation = review.steps.iter().find_map(|s| match s {
+                            sign_review::SignStep::Delegation(d) => {
+                                Some(tx_builder::PreparedDelegation {
+                                    delegate: d.delegate,
+                                    already_active: d.already_active,
+                                })
+                            }
+                            _ => None,
+                        });
+                        if let Some(pin) = txb_delegation
+                            && let sign_review::SignAction::TxBuilder {
+                                req: tx_builder::BatchSignRequest::Eoa(ereq),
+                                ..
+                            } = &mut review.action
+                        {
+                            ereq.prepared = Some(pin);
                         }
                         // Transaction Builder Safe batch: pin the reviewed
                         // `(nonce, safeTxHash)` from the SafeExec step into the
@@ -6564,6 +6621,7 @@ fn spawn_txbuilder_read(
 /// Simulate a batch (from the Safe / EOA) against Helios-verified state.
 fn spawn_txbuilder_simulate(
     network: Arc<dyn BalanceFetcher>,
+    seq: u64,
     chain: Chain,
     from: Address,
     calls: Vec<crate::txbuilder::QueuedCall>,
@@ -6575,7 +6633,7 @@ fn spawn_txbuilder_simulate(
                 .await
                 .map_err(|e| e.to_string())
         },
-        |result| Message::TxBuilderSimulated { result },
+        move |result| Message::TxBuilderSimulated { seq, result },
     )
 }
 
@@ -6652,16 +6710,31 @@ async fn decode_batch_sub_legs(
     use crate::txbuilder::{eip7702, multisend};
 
     // (to, value, data) triples, however this batch shape encodes them.
-    let calls: Vec<(Address, U256, Bytes)> =
-        if calldata.len() >= 4 && calldata[..4] == eip7702::EXECUTE_BATCH_SELECTOR {
-            eip7702::decode_execute_batch(calldata)?
-        } else {
-            multisend::decode_multisend_calldata(calldata)
-                .map_err(|e| e.to_string())?
-                .into_iter()
-                .map(|c| (c.to, c.value, c.data))
-                .collect()
-        };
+    let calls: Vec<(Address, U256, Bytes)> = if calldata.len() >= 4
+        && calldata[..4] == eip7702::EXECUTE_BATCH_SELECTOR
+    {
+        eip7702::decode_execute_batch(calldata)?
+    } else {
+        let packed = multisend::decode_multisend_calldata(calldata).map_err(|e| e.to_string())?;
+        // `PackedCall.operation` is decoded so a foreign blob can be shown
+        // for what it is — and was then dropped here, its only consumer.
+        // A sub-call with operation != 0 is a nested delegatecall running
+        // as the Safe, which the leg card does not and should not try to
+        // render as an ordinary call. Refuse the whole review: a batch the
+        // overlay can only partly account for must not reach a device.
+        if let Some(c) = packed.iter().find(|c| c.operation != 0) {
+            return Err(format!(
+                "batch contains a sub-call to {} with operation {} (delegatecall) — refusing \
+                     to review a nested delegatecall",
+                short_address(c.to),
+                c.operation,
+            ));
+        }
+        packed
+            .into_iter()
+            .map(|c| (c.to, c.value, c.data))
+            .collect()
+    };
 
     let total = calls.len();
     let mut legs = Vec::with_capacity(total);
@@ -6716,10 +6789,15 @@ async fn build_txbuilder_steps(
                 let domain = safe_domain(s.safe, s.chain);
                 let local = safe_tx_hash(&tx, &domain);
                 verify_safe_tx_before_signing(network, &tx, s.safe, s.chain, local).await?;
-                Ok::<_, String>((nonce, local))
+                // Live, not off the descriptor: that one learns about guards
+                // once, at unlock, and the guard a user most needs named is the
+                // one installed since — silence here reads as "no guard", and
+                // the preflight can't see one either.
+                let guard = crate::safe::read_guard_live(network, s.chain, s.safe).await?;
+                Ok::<_, String>((nonce, local, guard))
             }
             .await;
-            let (nonce, hash) = build?;
+            let (nonce, hash, guard) = build?;
             let tx = build_safe_tx_with_nonce(s.input.clone(), nonce);
             let domain = safe_domain(s.safe, s.chain);
             let eip712 = crate::sign::digest::Eip712Digests::of(&tx, &domain);
@@ -6753,6 +6831,13 @@ async fn build_txbuilder_steps(
                 safe_tx_hash: hash,
                 eip712,
                 inner: Box::new(inner),
+                // The byte the device will show. A MultiSend batch is always
+                // DELEGATECALL — that is what makes the Safe, rather than the
+                // library, the `msg.sender` of every sub-call — and the review
+                // has to say so out loud rather than let the user meet it for
+                // the first time on a Ledger screen.
+                operation: s.input.operation as u8,
+                guard,
             };
             Ok(vec![sign_review::SignStep::SafeExec(review)])
         }
@@ -6915,6 +7000,14 @@ async fn execute_txbuilder_safe_batch(
                 },
             )
             .await?;
+            // The owner set and threshold the review counted against came from
+            // a descriptor refreshed at unlock. A co-owner can rotate keys or
+            // raise the threshold at any point in a long session, and neither
+            // the pinned nonce nor the pinned hash commits to either — so
+            // without this read the drift stays invisible until
+            // `execTransaction` reverts, with every device already prompted and
+            // the gas already spent. Also ahead of the provider lookup.
+            check_safe_owner_drift(network.as_ref(), &sreq, &signer_owners).await?;
             let provider = match network.provider(chain).await {
                 Some(p) => p,
                 None => return Err("no execution RPCs configured".into()),
@@ -6957,6 +7050,51 @@ async fn execute_txbuilder_safe_batch(
             execute_safe_tx(&provider, executor, sreq.safe, chain, tx, packed).await
         }
     }
+}
+
+/// Refuse a Safe batch whose owner set or threshold moved since the review.
+///
+/// Two things are checked against a live `getOwners()` / `getThreshold()`,
+/// both before the first device prompt:
+///
+/// 1. The threshold the review promised to meet is still the threshold. Any
+///    change aborts, including a *lower* one — the review said "2-of-3", and
+///    that statement is part of what the user approved.
+/// 2. Every key about to be asked for a signature is still an owner.
+///
+/// "Enough keys to meet the threshold" is deliberately not re-checked here:
+/// `dispatch_txbuilder` already truncates `signer_owners` to exactly
+/// `threshold` entries and refuses below it, and the signature loop re-checks
+/// the count it actually collected.
+///
+/// The reviewed `(nonce, safeTxHash)` pin says nothing about any of this — the
+/// owner set is not part of the signed payload — so it has to be read.
+async fn check_safe_owner_drift(
+    network: &dyn BalanceFetcher,
+    sreq: &tx_builder::SafeBatchRequest,
+    signer_owners: &[AccountDescriptor],
+) -> Result<(), String> {
+    let (owners, threshold) = crate::safe::read_owner_set(network, sreq.chain, sreq.safe).await?;
+    if threshold != sreq.threshold {
+        return Err(format!(
+            "This Safe's threshold changed since you reviewed ({} → {threshold}) — go back and \
+             review again",
+            sreq.threshold,
+        ));
+    }
+    let owner_set: std::collections::HashSet<Address> = owners.into_iter().collect();
+    if let Some(gone) = signer_owners
+        .iter()
+        .filter_map(crate::wallet::account_address)
+        .find(|a| !owner_set.contains(a))
+    {
+        warn!(key = %gone, safe = %sreq.safe, "tx-builder: signing key is no longer a Safe owner");
+        return Err(format!(
+            "{} is no longer an owner of this Safe — go back and review again",
+            short_address(gone),
+        ));
+    }
+    Ok(())
 }
 
 /// Broadcast a plain-EOA batch (one call as a normal tx, or N calls atomically
@@ -7045,15 +7183,39 @@ async fn send_eoa_batch(
     // original target/value/data.
     let mut signed_auth: Option<alloy::eips::eip7702::SignedAuthorization> = None;
     let (to, value, data) = if req.calls.len() > 1 {
+        // The delegation decision was made and shown at review time. Do not
+        // make it again — re-read the account's code and check the answer
+        // against the pin, then act on the *reviewed* decision.
+        let pinned = req
+            .prepared
+            .ok_or_else(|| "batch not prepared — refusing to delegate".to_string())?;
         let code = provider
             .get_code_at(from)
             .await
             .map_err(|e| format!("get_code: {}", crate::net::redact_urls(&e.to_string())))?;
-        let already_ef = eip7702::delegated_to(&code) == Some(eip7702::EF_SIMPLE_7702_ACCOUNT);
-        if !already_ef {
+        let live_delegate = eip7702::delegated_to(&code);
+        let live_already = live_delegate == Some(pinned.delegate);
+        if live_already != pinned.already_active {
+            // Both directions abort. Signing an authorization the review said
+            // would not be signed is the worse one — its effect outlives this
+            // transaction — but the other direction is a silent no-op batch, so
+            // neither gets to pick a side on the user's behalf.
+            warn!(
+                reviewed = pinned.already_active,
+                live = live_already,
+                "tx-builder: 7702 delegation state changed between review and send"
+            );
+            return Err(
+                "This account's EIP-7702 delegation changed since you reviewed this batch — go \
+                 back and review again"
+                    .to_string(),
+            );
+        }
+        if !pinned.already_active {
             // Self-sponsored: the outer tx consumes `nonce`, so the
             // authorization commits to `nonce + 1`. Signed first (device
             // prompt #1 on hardware, where it clear-signs the delegate).
+            // `sign_authorization` verifies the recovered authority is `from`.
             let auth = eip7702::build_authorization(chain_id, nonce + 1);
             let s = signer
                 .sign_authorization(&auth)
@@ -7061,6 +7223,13 @@ async fn send_eoa_batch(
                 .map_err(|e| crate::wallet::friendly_signer_error(&e))?;
             signed_auth = Some(s);
         }
+        // No separate "is there code?" check: reaching here with
+        // `already_active` means `live_delegate == Some(pinned.delegate)`,
+        // which `delegated_to` can only return for a non-empty delegation
+        // designator. The disagreement abort above is what actually stops an
+        // `executeBatch` into a code-less account — and that failure is worth
+        // stopping precisely because it doesn't revert: a call to an address
+        // with no code succeeds having executed nothing.
         // Self-call into the (to-be-)delegated account.
         (from, U256::ZERO, eip7702::encode_execute_batch(&req.calls))
     } else {
@@ -7821,6 +7990,11 @@ fn spawn_cow_prepare(
                         owner_count: ctx.owner_count,
                         safe_tx_hash: hash,
                         eip712: crate::sign::digest::Eip712Digests::of(&tx, &domain),
+                        // A CoW Safe leg is a plain CALL; the guard is not
+                        // threaded here because this path runs no preflight
+                        // whose accuracy a guard would qualify.
+                        operation: tx.operation,
+                        guard: None,
                         inner: Box::new(sign_review::ReviewLeg {
                             title: "Place on-chain order — EthFlow createOrder".to_string(),
                             to: cow::ETHFLOW,
@@ -7873,6 +8047,8 @@ fn spawn_cow_prepare(
                             owner_count: ctx.owner_count,
                             safe_tx_hash: hash,
                             eip712: crate::sign::digest::Eip712Digests::of(&tx, &domain),
+                            operation: tx.operation,
+                            guard: None,
                             inner: Box::new(sign_review::ReviewLeg {
                                 title: format!(
                                     "Approve {} for CoW (vault relayer)",
@@ -8302,6 +8478,11 @@ async fn propose_txbuilder_safe_batch(
         },
     )
     .await?;
+    // Same gate the execute path runs, and for the same reason: the
+    // Transaction Service rejects a confirmation from a non-owner, so without
+    // this the user is prompted on their device only to have the proposal
+    // bounce. Ahead of `build_owner_signer` so no device is touched.
+    check_safe_owner_drift(network.as_ref(), &sreq, std::slice::from_ref(&owner_desc)).await?;
     let signer = crate::wallet::build_owner_signer(&owner_desc).await?;
     let owner_sig = sign_owner(&signer, &tx, &domain, local_hash).await?;
     crate::safe::service::propose(
@@ -11794,6 +11975,8 @@ mod tests {
                     B256::repeat_byte(0xD1),
                 ),
                 inner: leg(),
+                operation: 0,
+                guard: None,
             }),
             sign_review::SignStep::SafeMessage(sign_review::SafeMessageReview {
                 order: sign_review::OrderReview {
@@ -12426,6 +12609,23 @@ mod tests {
         (tx, hash)
     }
 
+    /// The live owner set + threshold `check_safe_owner_drift` reads before it
+    /// lets a Safe batch reach the first device.
+    fn plant_safe_owner_set(mock: &CallMock, safe: Address, owners: &[Address], threshold: u32) {
+        mock.set_call(
+            safe,
+            alloy::primitives::Bytes::from(crate::safe::getOwnersCall {}.abi_encode()),
+            alloy::primitives::Bytes::from(owners.to_vec().abi_encode()),
+            true,
+        );
+        mock.set_call(
+            safe,
+            alloy::primitives::Bytes::from(crate::safe::getThresholdCall {}.abi_encode()),
+            alloy::primitives::Bytes::from(U256::from(threshold).abi_encode()),
+            true,
+        );
+    }
+
     fn plant_safe_nonce(mock: &CallMock, safe: Address, nonce: u64) {
         mock.set_call(
             safe,
@@ -12732,6 +12932,7 @@ mod tests {
             net,
             from: addr(0xE0),
             calls,
+            prepared: None,
         }
     }
 
@@ -12792,6 +12993,123 @@ mod tests {
     }
 
     // ── prepare: what the overlay shows ──────────────────────────────
+
+    /// The one field the Safe threat model turns on. A MultiSend batch is
+    /// always `DELEGATECALL`, the device shows `operation: 1`, and the overlay
+    /// used to carry no operation at all — so there was nothing on the host to
+    /// check that screen against.
+    #[tokio::test]
+    async fn txbuilder_safe_prepare_carries_the_delegatecall_operation_and_guard() {
+        let calls = vec![queued(1, addr(0xC1), 0, vec![0xde, 0xad, 0xbe, 0xef])];
+        let req = safe_batch_req(&calls, 1, vec![0]);
+        let (tx, hash) = expected_batch_tx(&req, 0);
+
+        let mock = CallMock::new();
+        mock.set_code(req.input.to, Bytes::from(vec![0x60u8]), true);
+        plant_safe_nonce(&mock, req.safe, 0);
+        plant_safe_agreement(&mock, req.safe, &tx, hash);
+        // The guard is read LIVE at prepare, not off the cached descriptor —
+        // one installed since unlock is exactly the one worth naming.
+        mock.set_storage(
+            req.safe,
+            crate::safe::guard_storage_slot(),
+            addr(0x9D).into_word(),
+            true,
+        );
+
+        let steps = prepared_steps(&mock, tx_builder::BatchSignRequest::Safe(req.clone()))
+            .await
+            .expect("prepare succeeds");
+        let [sign_review::SignStep::SafeExec(x)] = steps.as_slice() else {
+            panic!("expected one SafeExec step, got {steps:?}");
+        };
+        assert_eq!(x.operation, 1, "a MultiSend batch is a delegatecall");
+        assert_eq!(
+            x.operation, tx.operation,
+            "the reviewed operation is the signed operation"
+        );
+        assert_eq!(
+            x.guard,
+            Some(addr(0x9D)),
+            "an installed guard has to reach the screen where the batch is approved"
+        );
+    }
+
+    /// `PackedCall.operation` was decoded and then dropped by its only
+    /// consumer. A nested delegatecall inside the blob would have rendered as
+    /// an ordinary sub-call.
+    #[tokio::test]
+    async fn txbuilder_prepare_refuses_a_nested_delegatecall_sub_call() {
+        use crate::txbuilder::multisend;
+        // Hand-pack a blob whose single sub-call declares operation = 1.
+        let mut packed = vec![1u8]; // operation: DELEGATECALL
+        packed.extend_from_slice(addr(0xC1).as_slice());
+        packed.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+        packed.extend_from_slice(&U256::from(4u64).to_be_bytes::<32>());
+        packed.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        let blob = multisend::encode_multisend_calldata(&packed);
+
+        let mock = CallMock::new();
+        let err = decode_batch_sub_legs(
+            &mock,
+            crate::chain::NetworkId::Builtin(Chain::Mainnet),
+            addr(0x5A),
+            &blob,
+            &std::collections::HashMap::new(),
+        )
+        .await
+        .expect_err("a nested delegatecall must not be reviewable");
+        assert!(err.contains("delegatecall"), "{err}");
+    }
+
+    // ── execute: owner-set drift ─────────────────────────────────────
+
+    /// The descriptor is refreshed at unlock; a co-owner can change the Safe
+    /// mid-session and neither the pinned nonce nor the pinned hash commits to
+    /// the owner set.
+    #[tokio::test]
+    async fn batch_execute_refuses_a_threshold_that_moved_since_review() {
+        let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
+        let mut req = safe_batch_req(&calls, 1, vec![0]);
+        let (tx, hash) = expected_batch_tx(&req, 4);
+        req.prepared = Some((4, hash));
+        let mock = CallMock::new();
+        plant_safe_agreement(&mock, req.safe, &tx, hash);
+        plant_safe_nonce(&mock, req.safe, 4);
+        // The owners raised it to 2 after the review was built.
+        plant_safe_owner_set(&mock, req.safe, &[addr(0x01), addr(0x02)], 2);
+        let err = execute_txbuilder_safe_batch(Arc::new(mock), req, Vec::new(), None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("threshold changed since you reviewed"),
+            "the drift must stop this before any device is prompted: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_execute_refuses_a_signing_key_that_is_no_longer_an_owner() {
+        let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
+        let mut req = safe_batch_req(&calls, 1, vec![0]);
+        let (tx, hash) = expected_batch_tx(&req, 4);
+        req.prepared = Some((4, hash));
+        let removed = crate::wallet::AccountDescriptor::ViewOnly {
+            name: None,
+            address: addr(0xDE).into_array(),
+        };
+        let mock = CallMock::new();
+        plant_safe_agreement(&mock, req.safe, &tx, hash);
+        plant_safe_nonce(&mock, req.safe, 4);
+        // 0xDE is gone from the owner set.
+        plant_safe_owner_set(&mock, req.safe, &[addr(0x01)], 1);
+        let err = execute_txbuilder_safe_batch(Arc::new(mock), req, vec![removed], None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("no longer an owner"),
+            "a de-owned key must not be sent to a device: {err}"
+        );
+    }
 
     #[tokio::test]
     async fn txbuilder_safe_prepare_shows_the_multisend_the_owners_sign() {
@@ -13210,7 +13528,7 @@ mod tests {
             queued(2, addr(0xC2), 0, vec![0x02]),
         ];
         let req = tx_builder::BatchSignRequest::Safe(safe_batch_req(&calls, 2, vec![0, 1]));
-        let (title, subtitle, note, can_execute) = txbuilder_review_copy(&req, 0);
+        let (title, subtitle, note, can_execute) = txbuilder_review_copy(&req, &Default::default());
         assert_eq!(title, "Batch · 2 → 1 atomic transaction");
         assert!(subtitle.as_deref().unwrap().contains("2-of-3 multisig"));
         let note = note.unwrap();
@@ -13223,7 +13541,7 @@ mod tests {
     fn safe_review_copy_blocks_execute_below_the_threshold() {
         let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
         let req = tx_builder::BatchSignRequest::Safe(safe_batch_req(&calls, 2, vec![0]));
-        let (_, _, _, can_execute) = txbuilder_review_copy(&req, 0);
+        let (_, _, _, can_execute) = txbuilder_review_copy(&req, &Default::default());
         assert!(!can_execute, "1 signable owner can't meet a threshold of 2");
     }
 
@@ -13234,7 +13552,7 @@ mod tests {
         // primary button silently changes meaning.
         let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
         let req = tx_builder::BatchSignRequest::Safe(safe_batch_req(&calls, 2, vec![0]));
-        let (_, _, note, can_execute) = txbuilder_review_copy(&req, 0);
+        let (_, _, note, can_execute) = txbuilder_review_copy(&req, &Default::default());
         assert!(!can_execute);
         let note = note.unwrap();
         assert!(note.contains("co-signers"), "{note}");
@@ -13251,7 +13569,7 @@ mod tests {
             crate::chain::NetworkId::Builtin(Chain::Mainnet),
             calls,
         ));
-        let (_, _, note, _) = txbuilder_review_copy(&req, 0);
+        let (_, _, note, _) = txbuilder_review_copy(&req, &Default::default());
         let note = note.unwrap();
         assert!(note.contains("delegation"), "points at the card: {note}");
         assert!(
@@ -13276,7 +13594,7 @@ mod tests {
         // path this wallet can't take.
         let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
         let req = tx_builder::BatchSignRequest::Safe(safe_batch_req(&calls, 2, vec![]));
-        let (_, _, note, can_execute) = txbuilder_review_copy(&req, 0);
+        let (_, _, note, can_execute) = txbuilder_review_copy(&req, &Default::default());
         assert!(!can_execute);
         let note = note.unwrap();
         assert!(note.contains("neither execute nor propose"), "{note}");
@@ -13435,6 +13753,7 @@ mod tests {
         let mock = CallMock::new();
         plant_safe_agreement(&mock, req.safe, &tx, hash);
         plant_safe_nonce(&mock, req.safe, 4);
+        plant_safe_owner_set(&mock, req.safe, &[addr(0x01)], req.threshold);
         let err = execute_txbuilder_safe_batch(Arc::new(mock), req, Vec::new(), None)
             .await
             .unwrap_err();
@@ -13573,7 +13892,7 @@ mod tests {
 
         let (title, _, note, can_execute) = txbuilder_review_copy(
             &tx_builder::BatchSignRequest::Eoa(eoa_batch_req(mainnet, one.clone())),
-            0,
+            &Default::default(),
         );
         assert_eq!(title, "Call #1", "a lone call keeps its own title");
         assert!(note.unwrap().contains("A single transaction"));
@@ -13581,7 +13900,7 @@ mod tests {
 
         let (title, _, note, _) = txbuilder_review_copy(
             &tx_builder::BatchSignRequest::Eoa(eoa_batch_req(mainnet, two)),
-            0,
+            &Default::default(),
         );
         assert_eq!(title, "Batch · 2 calls");
         assert!(note.unwrap().contains("EIP-7702"));
@@ -13591,7 +13910,7 @@ mod tests {
                 crate::chain::NetworkId::Custom(1337),
                 one,
             )),
-            0,
+            &Default::default(),
         );
         let note = note.unwrap();
         assert!(note.contains("unverified custom network"), "{note}");
@@ -13600,22 +13919,54 @@ mod tests {
 
     #[test]
     fn review_copy_discloses_folded_in_flash_approval_revokes() {
+        use crate::txbuilder::flash_approval::allowance_verdict;
         let spender = addr(0x5D);
         let calls = vec![
             queued(1, addr(0xC1), 0, approve_data(spender, 5_000)),
             queued(2, addr(0xC1), 0, approve_data(spender, 0)), // the revoke
         ];
-        // The count the coordinator passes comes from the batch itself.
-        assert_eq!(crate::txbuilder::flash_approval::revoke_count(&calls), 1);
         let req = tx_builder::BatchSignRequest::Safe(safe_batch_req(&calls, 1, vec![0]));
 
-        let plain = txbuilder_review_copy(&req, 0).2.unwrap();
+        // No allowance touched at all → nothing to disclose.
+        let plain = txbuilder_review_copy(&req, &Default::default()).2.unwrap();
         assert!(!plain.contains("flash approval"), "{plain}");
 
-        let one = txbuilder_review_copy(&req, 1).2.unwrap();
+        // Granted then reset in the same batch → the guarantee is earned.
+        let one = txbuilder_review_copy(&req, &allowance_verdict(&calls))
+            .2
+            .unwrap();
         assert!(one.contains("Resets 1 approval to 0"), "{one}");
-        let many = txbuilder_review_copy(&req, 3).2.unwrap();
-        assert!(many.contains("Resets 3 approvals to 0"), "{many}");
+        assert!(
+            one.contains("every allowance this batch grants is reset"),
+            "{one}"
+        );
+    }
+
+    /// The regression: the disclosure used to be driven by a *count* of
+    /// zero-approvals, so a batch holding a live MAX approval alongside an
+    /// unrelated hand-composed revoke printed the flash-approval guarantee.
+    #[test]
+    fn review_copy_refuses_the_guarantee_while_an_allowance_stands() {
+        use crate::txbuilder::flash_approval::allowance_verdict;
+        let attacker = addr(0x5D);
+        let calls = vec![
+            // The dangerous one, never reset.
+            queued(1, addr(0xC1), 0, approve_data(attacker, u64::MAX)),
+            // An unrelated revoke on a different token — the old count saw 1.
+            queued(2, addr(0xC2), 0, approve_data(addr(0x77), 0)),
+        ];
+        let req = tx_builder::BatchSignRequest::Safe(safe_batch_req(&calls, 1, vec![0]));
+        let note = txbuilder_review_copy(&req, &allowance_verdict(&calls))
+            .2
+            .unwrap();
+        assert!(
+            note.contains("1 approval is still standing"),
+            "the survivor must be named: {note}"
+        );
+        assert!(
+            !note.contains("every allowance this batch grants is reset"),
+            "the guarantee must not be claimed over a standing MAX approval: {note}"
+        );
     }
 
     // ── overlay: pin on prepare, refuse to sign without it ───────────
@@ -13667,6 +14018,8 @@ mod tests {
                 decoded: Box::new(crate::decode::clear_sign::DecodeResult::Empty),
                 sub_legs: Vec::new(),
             }),
+            operation: 1,
+            guard: None,
         })
     }
 
@@ -13694,6 +14047,67 @@ mod tests {
             sreq.prepared,
             Some((11, hash)),
             "the owners sign exactly the artifact the overlay displayed",
+        );
+    }
+
+    /// The EOA mirror of the pin above. The delegation decision used to be
+    /// made twice — once at prepare (Helios-verified) and again in the send
+    /// task (raw RPC) — with nothing comparing the answers, so the review's
+    /// "no new authorization is signed" and the send's behaviour could differ.
+    #[test]
+    fn txbuilder_prepared_pins_the_reviewed_delegation_decision() {
+        use crate::txbuilder::eip7702;
+        let calls = vec![
+            queued(1, addr(0xC1), 0, vec![0x01]),
+            queued(2, addr(0xC2), 0, vec![0x02]),
+        ];
+        let mut s = screen_for(addr(0xAA), new_cache());
+        s.sign_review_seq = 1;
+        s.sign_review = Some(sign_review::SignReview::pending(
+            "Batch".into(),
+            None,
+            Vec::new(),
+            None,
+            1,
+            sign_review::SignAction::TxBuilder {
+                req: tx_builder::BatchSignRequest::Eoa(eoa_batch_req(
+                    crate::chain::NetworkId::Builtin(Chain::Mainnet),
+                    calls,
+                )),
+                can_execute: true,
+                preflight: tx_builder::Preflight::Passed,
+            },
+        ));
+
+        s.update(Message::SignReviewPrepared {
+            seq: 1,
+            steps: Ok(vec![sign_review::SignStep::Delegation(
+                sign_review::DelegationReview {
+                    delegate: eip7702::EF_SIMPLE_7702_ACCOUNT,
+                    delegate_label: "EF".into(),
+                    authority: addr(0xE0),
+                    chain_id: 1,
+                    net: crate::chain::NetworkId::Builtin(Chain::Mainnet),
+                    already_active: true,
+                    replacing: None,
+                },
+            )]),
+        });
+
+        let sign_review::SignAction::TxBuilder {
+            req: tx_builder::BatchSignRequest::Eoa(ereq),
+            ..
+        } = &s.sign_review.as_ref().expect("overlay stays open").action
+        else {
+            panic!("expected an EOA TxBuilder action");
+        };
+        assert_eq!(
+            ereq.prepared,
+            Some(tx_builder::PreparedDelegation {
+                delegate: eip7702::EF_SIMPLE_7702_ACCOUNT,
+                already_active: true,
+            }),
+            "the send must act on the decision the user was shown, not re-derive it",
         );
     }
 

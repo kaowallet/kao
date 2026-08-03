@@ -42,6 +42,20 @@ pub struct Meta {
     pub tx_builder_version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub safe: Option<String>,
+    /// The chain id, restated under a key only this wallet writes.
+    ///
+    /// The standard `chainId` field can't distinguish "composed on Mainnet"
+    /// from "written by a version that stamped Mainnet unconditionally", and
+    /// [`super::templates`] did exactly that before the chain became binding.
+    /// A stored template lacking this key is chain-*unknown*, not Mainnet, and
+    /// refuses to load anywhere rather than loading wrongly on one chain.
+    /// Ignored on import — the standard `chainId` remains authoritative there.
+    #[serde(
+        default,
+        rename = "kaoChainId",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub kao_chain_id: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -149,6 +163,7 @@ pub fn export(chain: Chain, safe: Option<Address>, calls: &[QueuedCall]) -> Stri
             name: "Kao batch".into(),
             tx_builder_version: concat!("kao-", env!("CARGO_PKG_VERSION")).into(),
             safe: safe.map(|s| s.to_string()),
+            kao_chain_id: Some(chain.chain_id()),
         },
         transactions,
     };
@@ -198,8 +213,12 @@ fn tx_from_call(c: &QueuedCall) -> BundleTx {
 /// [`QueuedCall`] carries only `to`, and the same contract lives at a different
 /// address on every chain, so importing a Mainnet bundle while composing on
 /// Base would queue calls aimed at whatever occupies those addresses there.
-/// `None` skips the check — see [`super::templates`], whose stored bundles are
-/// stamped Mainnet unconditionally.
+/// [`super::templates`] always passes a chain. The JSON modal passes
+/// `net.builtin()`, which is `None` on a custom network — there is no `Chain`
+/// to compare against there, and the check is skipped. That is reachable only
+/// if a custom network ever gets the batch pane the modal lives in (it is
+/// composer-only today, so there is no batch to export or import); if that
+/// changes, this is the wall that has to be re-hung on the chain id itself.
 pub fn import(
     json: &str,
     start_id: u64,
@@ -293,14 +312,21 @@ fn call_from_tx(tx: &BundleTx, id: u64) -> Result<QueuedCall, TxBuilderError> {
                 // the bytes are derived from the metadata and agree with it by
                 // construction.
                 None => {
-                    let values: Vec<String> = method
-                        .inputs
-                        .iter()
-                        .enumerate()
-                        .map(|(i, p)| {
+                    // `contractInputsValues` is keyed by the bundle's own
+                    // parameter names, so the lookup has to use them — but it
+                    // reads them straight off `cm.inputs` rather than off
+                    // `method`, which deliberately no longer carries them (see
+                    // `method_from_meta`). Metadata keyed by metadata: a name
+                    // used here only ever chooses which value gets encoded, and
+                    // the resulting bytes are decoded back and re-checked
+                    // below, so a wrong name surfaces as a wrong *value* on the
+                    // card rather than as a plausible label over other bytes.
+                    let values: Vec<String> = (0..method.inputs.len())
+                        .map(|i| {
+                            let key = cm.inputs.get(i).map(|p| p.name.as_str()).unwrap_or("");
                             tx.contract_inputs_values
                                 .as_ref()
-                                .and_then(|m| m.get(&p.display_name(i)).or_else(|| m.get(&p.name)))
+                                .and_then(|m| m.get(key).or_else(|| m.get(&format!("arg{i}"))))
                                 .unwrap_or("")
                                 .to_string()
                         })
@@ -389,6 +415,21 @@ fn decode_args(m: &AbiMethod, data: &[u8]) -> Option<Vec<DecodedArg>> {
     )
 }
 
+/// Rebuild the [`AbiMethod`] a bundle's `contractMethod` block claims.
+///
+/// The function *name* and the parameter *types* survive the trip because the
+/// selector is derived from them and cross-checked against the calldata's own
+/// first four bytes by the caller — claim `approve(address,uint256)` over
+/// `transfer` bytes and the import is refused.
+///
+/// Parameter **names** get no such binding: they are not in the selector
+/// preimage, so nothing in the bundle constrains them and nothing in the
+/// calldata can contradict them. A hostile bundle could label an honest
+/// `approve(spender, MAX)` as `revokedSpender` / `newLimit` and the queue card
+/// — the screen where a user actually vets a batch — would render it. So they
+/// are dropped here and [`AbiParam::display_name`] falls back to positional
+/// `arg0` / `arg1`. Less pretty, but every label on that card is then derived
+/// from something the bytes commit to.
 fn method_from_meta(cm: &ContractMethod) -> Result<AbiMethod, TxBuilderError> {
     let inputs = cm
         .inputs
@@ -398,7 +439,7 @@ fn method_from_meta(cm: &ContractMethod) -> Result<AbiMethod, TxBuilderError> {
                 TxBuilderError::Assembly(format!("bad param type {:?}: {e}", inp.ty))
             })?;
             Ok(AbiParam {
-                name: inp.name.clone(),
+                name: String::new(),
                 ty_str: ty.sol_type_name().into_owned(),
                 ty,
             })
@@ -505,6 +546,51 @@ mod tests {
                 .starts_with("0x")
         );
         assert_eq!(v["transactions"][0]["contractMethod"]["name"], "approve");
+    }
+
+    /// Parameter names are not in the selector preimage, so nothing in a
+    /// bundle binds them to the calldata. A hostile bundle could label an
+    /// honest `approve(spender, MAX)` as `revokedSpender` / `newLimit` and the
+    /// queue card — the screen where a batch is actually vetted — rendered it.
+    #[test]
+    fn import_ignores_attacker_supplied_parameter_names() {
+        // Real `approve(0xdEaD, 2^256-1)` calldata, honestly encoded.
+        let data = format!(
+            "0x095ea7b3{}{}",
+            "000000000000000000000000000000000000000000000000000000000000dead",
+            "f".repeat(64),
+        );
+        let json = format!(
+            r#"{{
+            "version":"1.0","chainId":"1",
+            "meta":{{"name":"x","txBuilderVersion":"other"}},
+            "transactions":[{{
+                "to":"0x000000000000000000000000000000000000dEaD","value":"0",
+                "data":"{data}",
+                "contractMethod":{{"name":"approve","payable":false,"inputs":[
+                    {{"name":"revokedSpender","type":"address"}},
+                    {{"name":"newLimit","type":"uint256"}}]}}
+            }}]
+        }}"#
+        );
+        let calls = import(&json, 1, None).unwrap();
+        let names: Vec<&str> = calls[0]
+            .decoded_args
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["arg0", "arg1"],
+            "unbindable labels must not be rendered over trusted bytes"
+        );
+        // The function name and types *are* bound — the selector commits to
+        // both — so they survive, and so do the values decoded from calldata.
+        assert_eq!(
+            calls[0].signature.as_deref(),
+            Some("approve(address,uint256)")
+        );
+        assert_eq!(calls[0].decoded_args[1].value, U256::MAX.to_string());
     }
 
     #[test]

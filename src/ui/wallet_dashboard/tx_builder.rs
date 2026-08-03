@@ -272,6 +272,7 @@ pub enum Outcome {
     /// Simulate the batch on `chain` (built-in only). Answered via
     /// [`TxBuilderApp::on_sim`].
     Simulate {
+        seq: u64,
         chain: Chain,
         calls: Vec<QueuedCall>,
     },
@@ -314,6 +315,16 @@ impl Outcome {
 /// External context the coordinator refreshes before each message.
 #[derive(Debug, Clone, Default)]
 struct Ctx {
+    /// The address the batch will execute **as**: the active Safe, or the
+    /// plain EOA. `None` before the first `set_context`.
+    ///
+    /// Tracked because the queue is only meaningful for one sender. The reset
+    /// used to key on the network alone, so a Mainnet EOA -> Mainnet Safe flip
+    /// (or Safe A -> Safe B, which never changes chain) left the calls standing
+    /// and simply re-shaped them with a different `from` — an `approve` +
+    /// `supply` composed against the EOA's balances would run, and spend, from
+    /// the Safe.
+    identity: Option<Address>,
     /// Whether the active identity is a Safe (atomic batching via MultiSend).
     is_safe: bool,
     /// The active Safe's contract version, for the MultiSend routing hint.
@@ -329,7 +340,11 @@ struct Ctx {
 
 #[derive(Debug)]
 pub struct TxBuilderApp {
-    #[allow(dead_code)]
+    /// The address the composer is acting as — the active Safe when one is
+    /// selected, else the plain EOA. Refreshed by [`Self::set_context`]; it
+    /// used to be written once at construction and never again, so the
+    /// identity chip rendered "Safe multisig" over the *EOA's* address, which
+    /// is exactly the affordance that would have shown the switch above.
     owner: Address,
     ctx: Ctx,
 
@@ -386,6 +401,12 @@ pub struct TxBuilderApp {
     // ── simulation strip ──
     sim: Option<BatchSimResult>,
     sim_busy: bool,
+    /// Retires an in-flight simulation, exactly as `resolve_seq` / `read_seq`
+    /// do for their queries. Without it `on_sim` adopted whatever landed:
+    /// edit the queue mid-simulation and the previous batch's verdict became
+    /// this batch's `Preflight::Passed`, which is what the review's confirm
+    /// button reads.
+    sim_seq: u64,
 
     // ── templates ──
     templates: Vec<Template>,
@@ -439,6 +460,7 @@ impl TxBuilderApp {
             auto_revoke: false,
             sim: None,
             sim_busy: false,
+            sim_seq: 0,
             templates: Vec::new(),
             template_menu_open: false,
             rename_idx: None,
@@ -464,27 +486,53 @@ impl TxBuilderApp {
     /// Coordinator refreshes chain / Safe context before dispatching a
     /// message, so message-time logic (known-contract lookup, batch cap)
     /// sees the live identity.
+    ///
+    /// `identity` is the address the batch will execute as — the active Safe,
+    /// or the plain EOA. A change to it drops the queue for the same reason a
+    /// network change does: the calls were composed for one sender's balances,
+    /// allowances and permissions, and nothing in a [`QueuedCall`] records
+    /// which.
+    #[allow(clippy::too_many_arguments)]
     pub fn set_context(
         &mut self,
+        identity: Address,
         chain: Chain,
         is_safe: bool,
         safe_version: Option<String>,
         eoa_can_batch: bool,
         custom_networks: Vec<(u64, String)>,
     ) {
+        let prev_identity = self.ctx.identity;
         self.ctx = Ctx {
+            identity: Some(identity),
             is_safe,
             safe_version,
             eoa_can_batch,
             custom_networks,
         };
+        self.owner = identity;
+        // Identity first: a Safe->EOA flip usually moves the network too, and
+        // the identity notice is the one that explains the drop.
+        let mut explained = false;
+        if let Some(prev) = prev_identity
+            && prev != identity
+        {
+            explained = self.on_identity_reset(prev, identity);
+        }
         // A Safe can only transact on its own chain — pin the selector there.
+        //
+        // Selecting a Safe usually moves both axes at once. The identity reset
+        // above has already dropped the queue and explained why, so re-running
+        // the network reset here would find nothing to drop and clear that
+        // explanation on its way past — the drop would go unexplained in the
+        // one case where the most has changed. When the identity moved, the
+        // network re-pin does its housekeeping silently instead.
         if is_safe {
             let pinned = NetworkId::Builtin(chain);
             if self.net != pinned {
                 let from = self.net;
                 self.net = pinned;
-                self.on_network_reset(from);
+                self.repin_network(from, explained);
             }
         } else if let NetworkId::Custom(id) = self.net {
             // A plain EOA keeps its selection across context refreshes, except
@@ -492,8 +540,21 @@ impl TxBuilderApp {
             if !self.ctx.custom_networks.iter().any(|(cid, _)| *cid == id) {
                 let from = self.net;
                 self.net = NetworkId::Builtin(Chain::Mainnet);
-                self.on_network_reset(from);
+                self.repin_network(from, explained);
             }
+        }
+    }
+
+    /// The network moved underneath the composer. `already_explained` is set
+    /// when an identity reset in the same refresh has already cleared the queue
+    /// and put its own (more specific) notice on screen.
+    fn repin_network(&mut self, from: NetworkId, already_explained: bool) {
+        if already_explained {
+            self.net_menu_open = false;
+            self.reset_composer();
+            self.invalidate_sim();
+        } else {
+            self.on_network_reset(from);
         }
     }
 
@@ -522,8 +583,14 @@ impl TxBuilderApp {
         }
     }
 
-    /// Batch simulation result (or failure → treated as unavailable).
-    pub fn on_sim(&mut self, result: Result<BatchSimResult, String>) {
+    /// Batch simulation result (or failure → treated as unavailable). `seq`
+    /// guards against a stale run: the batch, the network, or the acting
+    /// account may all have changed since it was dispatched, and this verdict
+    /// is what the review's confirm button is derived from.
+    pub fn on_sim(&mut self, seq: u64, result: Result<BatchSimResult, String>) {
+        if seq != self.sim_seq {
+            return; // stale — a newer batch superseded this run
+        }
         self.sim_busy = false;
         self.sim = Some(result.unwrap_or_else(|_| BatchSimResult::unavailable()));
     }
@@ -703,9 +770,12 @@ impl TxBuilderApp {
             Message::Simulate => {
                 // Simulation is a verified-path preflight — built-in chains only.
                 if let (false, Some(chain)) = (self.batch.is_empty(), self.net.builtin()) {
+                    // Retire any earlier run before claiming the new sequence,
+                    // so a slower predecessor can't answer for this batch.
+                    self.invalidate_sim();
                     self.sim_busy = true;
-                    self.sim = None;
                     return Some(Outcome::Simulate {
+                        seq: self.sim_seq,
                         chain,
                         calls: self.effective_calls(),
                     });
@@ -730,9 +800,13 @@ impl TxBuilderApp {
                 }
             }
             Message::SaveTemplate => {
-                if !self.batch.is_empty() {
+                // Built-in chains only: the stored bundle stamps the chain and
+                // the load path enforces it, and a custom network has no
+                // `Chain` to stamp. Custom nets are composer-only anyway (no
+                // batch, so nothing to save).
+                if let (false, Some(chain)) = (self.batch.is_empty(), self.net.builtin()) {
                     self.cancel_rename();
-                    let t = Template::from_batch("Untitled batch", "(｡•̀ᴗ-)✧", &self.batch);
+                    let t = Template::from_batch("Untitled batch", "(｡•̀ᴗ-)✧", chain, &self.batch);
                     self.templates.push(t);
                     self.template_menu_open = true;
                     return Some(Outcome::PersistTemplates(self.templates.clone()));
@@ -755,11 +829,22 @@ impl TxBuilderApp {
             Message::CommitRename => return self.commit_rename(),
             Message::CancelRename => self.cancel_rename(),
             Message::OpenSave => {
-                self.json_text = bundle::export(
-                    self.net.builtin().unwrap_or(Chain::Mainnet),
-                    self.ctx.is_safe.then_some(self.owner),
-                    &self.batch,
-                );
+                // Built-in only, for the reason `SaveTemplate` is: a bundle
+                // stamped with a chain it wasn't composed on imports cleanly
+                // somewhere it shouldn't. A custom network has no `Chain` to
+                // stamp, and stamping Mainnet by default would manufacture
+                // exactly that. (Unreachable today — the export button lives in
+                // the batch pane, which custom networks don't get.)
+                let Some(chain) = self.net.builtin() else {
+                    self.error = Some(format!(
+                        "A batch composed on {} can't be exported — the bundle format identifies \
+                         its network by chain id, and this one isn't a network Kao verifies.",
+                        self.net.display_name(),
+                    ));
+                    return None;
+                };
+                self.json_text =
+                    bundle::export(chain, self.ctx.is_safe.then_some(self.owner), &self.batch);
                 self.modal = Modal::Save;
             }
             Message::OpenLoad => {
@@ -958,14 +1043,56 @@ impl TxBuilderApp {
         }
     }
 
+    /// Drop the queue because the account it was composed for changed.
+    ///
+    /// Same safety property as [`Self::on_network_reset`], one axis over: a
+    /// [`QueuedCall`] records `to`/`value`/`data` and nothing about who
+    /// executes them. Re-shaping the same calls under a different sender
+    /// silently re-aims every balance, allowance and permission they depend
+    /// on — and any preflight already run described the old sender's state.
+    /// Returns whether it put a notice on screen — the caller uses that to keep
+    /// a following network re-pin from clearing it.
+    fn on_identity_reset(&mut self, from: Address, to: Address) -> bool {
+        self.reset_composer();
+        self.invalidate_sim();
+        let dropped = self.batch.len();
+        self.batch.clear();
+        self.expanded = None;
+        self.net_menu_open = false;
+        self.template_menu_open = false;
+        self.cancel_rename();
+        self.error = None;
+        if dropped == 0 {
+            return false;
+        }
+        self.error = Some(format!(
+            "Batch cleared — {dropped} call{} composed for {} can't be reused as {}: they'd run \
+             against a different account's balances and approvals.",
+            if dropped == 1 { "" } else { "s" },
+            crate::wallet::short_address(from),
+            crate::wallet::short_address(to),
+        ));
+        true
+    }
+
+    /// Retire any simulation still in flight, along with its verdict.
+    ///
+    /// The third of the three guards (`resolve_seq`, `read_seq`, `sim_seq`),
+    /// and the one that was missing: `on_sim` adopted whatever landed, so a
+    /// result for the previous batch became the current batch's verdict — and
+    /// the review reads that verdict to decide whether Confirm says
+    /// "Sign & execute now" or warns. Clearing `sim_busy` here also lets the
+    /// user re-run immediately; the superseded result can no longer land.
     fn invalidate_sim(&mut self) {
         self.sim = None;
         self.sim_busy = false;
+        self.sim_seq += 1;
     }
 
     /// The preflight verdict for the batch as it currently stands, for the
     /// review overlay. `sim` is cleared by [`Self::invalidate_sim`] on every
-    /// edit, so a present result always describes the current queue.
+    /// edit — and any in-flight run is retired with it — so a present result
+    /// always describes the current queue.
     fn preflight(&self) -> Preflight {
         let Some(sim) = &self.sim else {
             // No verdict. On a chain we *can* simulate that's a gap worth
@@ -1239,8 +1366,22 @@ impl TxBuilderApp {
     }
 
     /// Replace the batch with a template's calls, renumbered into the session.
+    ///
+    /// Refused on a custom network and on any chain other than the one the
+    /// template was composed on — the same wall `bundle::import` puts in front
+    /// of the JSON path, which templates used to route around.
     fn load_template(&mut self, t: &Template) {
-        match t.calls(self.next_id) {
+        let Some(chain) = self.net.builtin() else {
+            self.error = Some(format!(
+                "\"{}\" was composed on a built-in chain and can't be loaded on {} — contract \
+                 addresses don't carry across networks.",
+                t.name,
+                self.net.display_name(),
+            ));
+            self.template_menu_open = false;
+            return;
+        };
+        match t.calls(self.next_id, chain) {
             Ok(calls) => {
                 self.next_id += calls.len() as u64;
                 self.batch = calls;
@@ -1319,11 +1460,10 @@ pub struct SafeBatchRequest {
 /// - N calls from a 7702-capable signer are wrapped as
 ///   `Simple7702Account.executeBatch` and run atomically.
 ///
-/// Whether a fresh EIP-7702 authorization is signed is decided in the send
-/// task from the account's live on-chain code (authoritative at signing
-/// time): if the account is already delegated to the EF `Simple7702Account`,
-/// the batch is a plain call to the delegated code; otherwise the send signs
-/// a delegation authorization first.
+/// Whether a fresh EIP-7702 authorization is signed is decided at **prepare**,
+/// from the account's Helios-verified on-chain code, and pinned into
+/// [`Self::prepared`] — see [`PreparedDelegation`] for why the send path must
+/// not decide it a second time.
 #[derive(Debug, Clone)]
 pub struct EoaBatchRequest {
     /// The network to broadcast on. A [`NetworkId`] so the same request shape
@@ -1332,6 +1472,42 @@ pub struct EoaBatchRequest {
     pub net: NetworkId,
     pub from: Address,
     pub calls: Vec<QueuedCall>,
+    /// The reviewed delegation decision, pinned from the prepared
+    /// [`sign_review::SignStep::Delegation`] card. `None` until prepare lands,
+    /// and a multi-call dispatch with `None` here is refused — the same gate
+    /// [`SafeBatchRequest::prepared`] already applies to the Safe arm.
+    ///
+    /// Always `None` for a single call: nothing delegates, so there is no
+    /// decision to pin.
+    pub prepared: Option<PreparedDelegation>,
+}
+
+/// The EIP-7702 delegation decision as the user reviewed it.
+///
+/// This exists because the decision used to be made twice, from two different
+/// sources: prepare read the account's code through the Helios-verified
+/// fetcher, and the send task read it again over a raw RPC provider. Both
+/// dropped the `verified` flag, and nothing compared the two answers. Either
+/// direction of disagreement is bad, and neither is loud:
+///
+/// - The review says "already in place, so no new authorization is signed" and
+///   the send signs one anyway — the one signature in this wallet whose effect
+///   outlives its transaction, produced against a promise that it wouldn't be.
+/// - The send wrongly concludes the account is already delegated, signs no
+///   authorization, and broadcasts `executeBatch(Call[])` to an account with
+///   no code. That does not revert: a call to a code-less address **succeeds**,
+///   so the batch silently does nothing while the UI reports success and
+///   clears the queue.
+///
+/// So the decision is made once, shown, pinned here, and re-checked against
+/// chain before signing — a disagreement aborts rather than picks a side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreparedDelegation {
+    /// The delegate the reviewed authorization points at.
+    pub delegate: Address,
+    /// True when the account already ran `delegate`'s code at review time, so
+    /// the review told the user no new authorization would be signed.
+    pub already_active: bool,
 }
 
 impl EoaBatchRequest {
@@ -1440,9 +1616,15 @@ mod tests {
     use super::*;
     use alloy::primitives::address;
 
+    /// The two identities the tests act as. Distinct because `set_context` now
+    /// drops the queue when the acting address moves.
+    const SAFE: Address = address!("0x5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a");
+    const EOA: Address = address!("0x1111111111111111111111111111111111111111");
+
     fn safe_app() -> TxBuilderApp {
-        let mut app = TxBuilderApp::new(Address::repeat_byte(0x5a));
+        let mut app = TxBuilderApp::new(SAFE);
         app.set_context(
+            SAFE,
             Chain::Mainnet,
             true,
             Some("1.4.1".into()),
@@ -1497,8 +1679,8 @@ mod tests {
 
     #[test]
     fn eoa_without_7702_caps_batch_at_one() {
-        let mut app = TxBuilderApp::new(Address::repeat_byte(0x11));
-        app.set_context(Chain::Mainnet, false, None, false, Vec::new()); // EOA, cannot delegate
+        let mut app = TxBuilderApp::new(EOA);
+        app.set_context(EOA, Chain::Mainnet, false, None, false, Vec::new()); // EOA, cannot delegate
         app.update(Message::AddrChanged(usdc().to_string()));
         let to = address!("0x000000000000000000000000000000000000dEaD");
         app.update(Message::ArgChanged(0, to.to_string()));
@@ -1515,8 +1697,8 @@ mod tests {
 
     #[test]
     fn eoa_with_7702_can_batch_multiple() {
-        let mut app = TxBuilderApp::new(Address::repeat_byte(0x11));
-        app.set_context(Chain::Mainnet, false, None, true, Vec::new()); // EOA, Local/Ledger
+        let mut app = TxBuilderApp::new(EOA);
+        app.set_context(EOA, Chain::Mainnet, false, None, true, Vec::new()); // EOA, Local/Ledger
         let to = address!("0x000000000000000000000000000000000000dEaD");
         app.update(Message::AddrChanged(usdc().to_string()));
         app.update(Message::ArgChanged(0, to.to_string()));
@@ -1560,8 +1742,11 @@ mod tests {
         assert_eq!(eff.len(), 2);
         assert_eq!(eff[1].to, usdc);
         assert_eq!(U256::from_be_slice(&eff[1].data[36..68]), U256::ZERO);
-        // A non-batching EOA never appends (nothing to batch into).
-        app.set_context(Chain::Mainnet, false, None, false, Vec::new());
+        // A non-batching EOA never appends (nothing to batch into). Switching
+        // identity drops the queue by design, so re-compose it as the EOA.
+        app.set_context(EOA, Chain::Mainnet, false, None, false, Vec::new());
+        assert!(app.batch.is_empty(), "the identity switch drops the batch");
+        app.batch = vec![eff[0].clone()];
         assert_eq!(app.effective_calls().len(), 1, "no batching → no revoke");
     }
 
@@ -1603,16 +1788,19 @@ mod tests {
     fn review_carries_a_failing_preflight_across_to_the_overlay() {
         let mut app = safe_app();
         app.batch = sample_batch(&mut app.next_id, app.owner);
-        app.on_sim(Ok(BatchSimResult {
-            outcome: BatchOutcome::Revert {
-                step: 1,
-                reason: "ERC20: transfer amount exceeds balance".into(),
-            },
-            gas_used: 41_000,
-            transfers: Vec::new(),
-            verified: true,
-            base_fee_per_gas: 1,
-        }));
+        app.on_sim(
+            app.sim_seq,
+            Ok(BatchSimResult {
+                outcome: BatchOutcome::Revert {
+                    step: 1,
+                    reason: "ERC20: transfer amount exceeds balance".into(),
+                },
+                gas_used: 41_000,
+                transfers: Vec::new(),
+                verified: true,
+                base_fee_per_gas: 1,
+            }),
+        );
         let Some(Outcome::Review { preflight, .. }) = app.update(Message::Review) else {
             panic!("expected Review");
         };
@@ -1634,13 +1822,16 @@ mod tests {
     fn review_reports_a_passing_preflight_without_softening() {
         let mut app = safe_app();
         app.batch = sample_batch(&mut app.next_id, app.owner);
-        app.on_sim(Ok(BatchSimResult {
-            outcome: BatchOutcome::Success,
-            gas_used: 41_000,
-            transfers: Vec::new(),
-            verified: true,
-            base_fee_per_gas: 1,
-        }));
+        app.on_sim(
+            app.sim_seq,
+            Ok(BatchSimResult {
+                outcome: BatchOutcome::Success,
+                gas_used: 41_000,
+                transfers: Vec::new(),
+                verified: true,
+                base_fee_per_gas: 1,
+            }),
+        );
         let Some(Outcome::Review { preflight, .. }) = app.update(Message::Review) else {
             panic!("expected Review");
         };
@@ -1655,13 +1846,16 @@ mod tests {
         // an unsimulated batch must not inherit the old verdict's clean button.
         let mut app = safe_app();
         app.batch = sample_batch(&mut app.next_id, app.owner);
-        app.on_sim(Ok(BatchSimResult {
-            outcome: BatchOutcome::Success,
-            gas_used: 41_000,
-            transfers: Vec::new(),
-            verified: true,
-            base_fee_per_gas: 1,
-        }));
+        app.on_sim(
+            app.sim_seq,
+            Ok(BatchSimResult {
+                outcome: BatchOutcome::Success,
+                gas_used: 41_000,
+                transfers: Vec::new(),
+                verified: true,
+                base_fee_per_gas: 1,
+            }),
+        );
         let removed = app.batch[0].id;
         app.update(Message::RemoveCall(removed));
         let Some(Outcome::Review { preflight, .. }) = app.update(Message::Review) else {
@@ -1841,9 +2035,10 @@ mod tests {
     // ── Network switcher ─────────────────────────────────────────────────
 
     fn eoa_app() -> TxBuilderApp {
-        let mut app = TxBuilderApp::new(Address::repeat_byte(0x11));
+        let mut app = TxBuilderApp::new(EOA);
         // EOA, 7702-capable, with one enabled custom network (Sepolia).
         app.set_context(
+            EOA,
             Chain::Mainnet,
             false,
             None,
@@ -1898,13 +2093,172 @@ mod tests {
         // Selecting a Safe re-pins the network on the next context refresh —
         // the same re-homing as an explicit switch, and just as unsafe to let
         // Mainnet-composed calls ride through.
-        app.set_context(Chain::Base, true, Some("1.4.1".into()), false, Vec::new());
+        app.set_context(
+            SAFE,
+            Chain::Base,
+            true,
+            Some("1.4.1".into()),
+            false,
+            Vec::new(),
+        );
 
         assert_eq!(app.selected_net(), NetworkId::Builtin(Chain::Base));
         assert!(
             app.batch.is_empty(),
             "an implicit re-pin drops the queue too"
         );
+    }
+
+    /// The gap the chain-only reset left: an EOA→Safe flip on the *same*
+    /// chain never touched the network, so the queue rode through and
+    /// `build_txbuilder_request` re-shaped the same calls with a different
+    /// `from` — spending the Safe's balances and allowances instead.
+    #[test]
+    fn switching_identity_on_the_same_chain_drops_the_batch() {
+        let mut app = eoa_app();
+        app.batch = sample_batch(&mut app.next_id, app.owner);
+        assert!(!app.batch.is_empty());
+
+        app.set_context(
+            SAFE,
+            Chain::Mainnet, // same chain — the network reset never fires
+            true,
+            Some("1.4.1".into()),
+            false,
+            Vec::new(),
+        );
+
+        assert_eq!(
+            app.selected_net(),
+            NetworkId::Builtin(Chain::Mainnet),
+            "the network did not move"
+        );
+        assert!(app.batch.is_empty(), "the identity did, so the queue drops");
+        let e = app.error.clone().expect("the drop is explained");
+        assert!(e.contains("different account's balances"), "{e}");
+    }
+
+    /// Selecting a Safe on another chain moves both axes at once. The queue
+    /// still drops, and the notice explaining it must survive the network
+    /// re-pin that follows — that reset finds an empty queue and would
+    /// otherwise clear the banner on its way past.
+    #[test]
+    fn an_identity_and_network_switch_together_still_explains_the_drop() {
+        let mut app = eoa_app();
+        app.batch = sample_batch(&mut app.next_id, app.owner);
+        app.set_context(
+            SAFE,
+            Chain::Base,
+            true,
+            Some("1.4.1".into()),
+            false,
+            Vec::new(),
+        );
+        assert_eq!(app.selected_net(), NetworkId::Builtin(Chain::Base));
+        assert!(app.batch.is_empty());
+        let e = app.error.clone().expect("the drop must still be explained");
+        assert!(e.contains("different account's balances"), "{e}");
+    }
+
+    /// Safe A → Safe B never changes chain at all.
+    #[test]
+    fn switching_between_safes_drops_the_batch() {
+        let mut app = safe_app();
+        app.batch = sample_batch(&mut app.next_id, app.owner);
+        let other = address!("0xB0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0");
+        app.set_context(
+            other,
+            Chain::Mainnet,
+            true,
+            Some("1.4.1".into()),
+            false,
+            Vec::new(),
+        );
+        assert!(app.batch.is_empty());
+        assert_eq!(
+            app.owner, other,
+            "the identity chip follows the active Safe"
+        );
+    }
+
+    /// A refresh that changes nothing must not clear a queue the user is
+    /// building — `set_context` runs before every message.
+    #[test]
+    fn an_unchanged_context_refresh_keeps_the_batch() {
+        let mut app = eoa_app();
+        app.batch = sample_batch(&mut app.next_id, app.owner);
+        let n = app.batch.len();
+        for _ in 0..3 {
+            app.set_context(
+                EOA,
+                Chain::Mainnet,
+                false,
+                None,
+                true,
+                vec![(11155111, "Sepolia".into())],
+            );
+        }
+        assert_eq!(app.batch.len(), n);
+        assert!(app.error.is_none());
+    }
+
+    /// `on_sim` was the one async callback with no staleness check, so a
+    /// verdict for the previous batch became this batch's — and `preflight()`
+    /// is what decides whether Confirm reads "Sign & execute now".
+    #[test]
+    fn a_superseded_simulation_result_is_dropped() {
+        let mut app = safe_app();
+        app.batch = sample_batch(&mut app.next_id, app.owner);
+
+        // Dispatch a run and capture its sequence.
+        let Some(Outcome::Simulate { seq, .. }) = app.update(Message::Simulate) else {
+            panic!("simulate should bubble");
+        };
+        assert!(app.sim_busy);
+
+        // The user edits the queue while it is in flight.
+        let victim = app.batch[0].id;
+        app.update(Message::RemoveCall(victim));
+
+        // The old run lands with a clean bill of health.
+        app.on_sim(
+            seq,
+            Ok(BatchSimResult {
+                outcome: BatchOutcome::Success,
+                gas_used: 41_000,
+                base_fee_per_gas: 0,
+                transfers: Vec::new(),
+                verified: true,
+            }),
+        );
+
+        assert!(app.sim.is_none(), "a stale verdict must not be adopted");
+        assert_eq!(
+            app.preflight(),
+            Preflight::Missing,
+            "the edited batch has no verdict, and the review must say so"
+        );
+    }
+
+    #[test]
+    fn a_current_simulation_result_is_kept() {
+        let mut app = safe_app();
+        app.batch = sample_batch(&mut app.next_id, app.owner);
+        let Some(Outcome::Simulate { seq, .. }) = app.update(Message::Simulate) else {
+            panic!("simulate should bubble");
+        };
+        app.on_sim(
+            seq,
+            Ok(BatchSimResult {
+                outcome: BatchOutcome::Success,
+                gas_used: 41_000,
+                base_fee_per_gas: 0,
+                transfers: Vec::new(),
+                verified: true,
+            }),
+        );
+        assert_eq!(app.preflight(), Preflight::Passed);
+        assert!(!app.sim_busy);
     }
 
     #[test]
@@ -1920,15 +2274,29 @@ mod tests {
 
     #[test]
     fn safe_pins_network_and_ignores_switch() {
-        let mut app = TxBuilderApp::new(Address::repeat_byte(0x5a));
-        app.set_context(Chain::Base, true, Some("1.4.1".into()), false, Vec::new());
+        let mut app = TxBuilderApp::new(SAFE);
+        app.set_context(
+            SAFE,
+            Chain::Base,
+            true,
+            Some("1.4.1".into()),
+            false,
+            Vec::new(),
+        );
         assert_eq!(app.selected_net(), NetworkId::Builtin(Chain::Base));
         // A Safe pins the network — the switcher is inert.
         app.update(Message::ToggleNetworkMenu);
         assert!(!app.net_menu_open, "Safe never opens the switcher");
         app.update(Message::SetNetwork(NetworkId::Builtin(Chain::Optimism)));
         // set_context runs before every message and re-pins to the Safe's chain.
-        app.set_context(Chain::Base, true, Some("1.4.1".into()), false, Vec::new());
+        app.set_context(
+            SAFE,
+            Chain::Base,
+            true,
+            Some("1.4.1".into()),
+            false,
+            Vec::new(),
+        );
         assert_eq!(app.selected_net(), NetworkId::Builtin(Chain::Base));
     }
 
@@ -1962,7 +2330,7 @@ mod tests {
         app.update(Message::SetNetwork(NetworkId::Custom(11155111)));
         assert!(app.is_custom());
         // Next context refresh no longer lists that custom network.
-        app.set_context(Chain::Mainnet, false, None, true, Vec::new());
+        app.set_context(EOA, Chain::Mainnet, false, None, true, Vec::new());
         assert_eq!(app.selected_net(), NetworkId::Builtin(Chain::Mainnet));
     }
 

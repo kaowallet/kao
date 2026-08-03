@@ -163,20 +163,28 @@ impl AppsPane {
         &mut self.tx_builder
     }
 
-    /// Refresh the builder's identity context (active chain + whether a Safe
-    /// is active + enabled custom networks) before it processes a message, so
-    /// batch-cap, known-contract lookup, and the network switcher see the live
-    /// identity.
+    /// Refresh the builder's identity context (the acting address + active
+    /// chain + whether a Safe is active + enabled custom networks) before it
+    /// processes a message, so batch-cap, known-contract lookup, the network
+    /// switcher and the identity chip all see the live identity.
+    #[allow(clippy::too_many_arguments)]
     pub fn set_txbuilder_context(
         &mut self,
+        identity: alloy::primitives::Address,
         chain: crate::chain::Chain,
         is_safe: bool,
         safe_version: Option<String>,
         eoa_can_batch: bool,
         custom_networks: Vec<(u64, String)>,
     ) {
-        self.tx_builder
-            .set_context(chain, is_safe, safe_version, eoa_can_batch, custom_networks);
+        self.tx_builder.set_context(
+            identity,
+            chain,
+            is_safe,
+            safe_version,
+            eoa_can_batch,
+            custom_networks,
+        );
     }
 
     /// The network the Transaction Builder is composing against — read by the

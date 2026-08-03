@@ -10,9 +10,21 @@
 //!
 //! A template's calls are stored as a Safe-compatible [`bundle`] JSON string —
 //! the same shape the Save/Load JSON modal already round-trips — so the
-//! reconstruction path is shared and battle-tested. The stored `chainId` is
-//! cosmetic: loading a template only reads the `to`/`value`/`data` triples and
-//! renumbers ids into the live batch, exactly like the JSON import.
+//! reconstruction path is shared and battle-tested. The chain a template was
+//! composed on is **binding**, not cosmetic: a [`QueuedCall`] carries only
+//! `to`, and the same contract sits at a different address on every chain, so
+//! an Optimism batch reloaded while composing on Mainnet would queue calls
+//! aimed at whatever occupies those addresses there. The JSON import has
+//! refused that since it was written; templates were the one path around it.
+//!
+//! Templates saved before the chain was recorded are chain-**unknown**, not
+//! Mainnet. Their bundles carry `"chainId":"1"` because the old `from_batch`
+//! stamped it unconditionally, so trusting that field would let a Base-composed
+//! template load cleanly on Mainnet — the exact retargeting this exists to
+//! prevent, in the one direction a naive check misses. The chain is therefore
+//! read from `meta.kaoChainId`, a key only [`bundle::export`] writes; absent, it
+//! is `None`, the row says so, and loading is refused on every chain until the
+//! user re-saves the batch on the network they meant.
 
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
@@ -42,14 +54,26 @@ pub struct Template {
     pub call_count: usize,
     /// The batch serialized as a Safe-compatible bundle (see [`bundle::export`]).
     pub bundle_json: String,
+    /// The chain the batch was composed on, parsed out of `bundle_json` once
+    /// so the picker row can show it without re-parsing every frame.
+    ///
+    /// `#[serde(skip)]` deliberately: the on-disk rows are non-self-describing
+    /// postcard, so an added field would make every previously-saved template
+    /// undecodable — and `load_from` drops undecodable rows, which would read
+    /// as silent data loss. The authoritative copy stays inside the bundle
+    /// JSON, where it always was; this is a cache, repopulated on load.
+    #[serde(skip)]
+    pub chain_id: Option<u64>,
 }
 
 impl Template {
     /// Snapshot the current batch as a template. `name`/`note` are user/UI
-    /// supplied; the calls are frozen into a bundle JSON.
+    /// supplied; the calls are frozen into a bundle JSON stamped with the chain
+    /// they were composed on, which [`Self::calls`] then enforces.
     pub fn from_batch(
         name: impl Into<String>,
         kaomoji: impl Into<String>,
+        chain: Chain,
         calls: &[QueuedCall],
     ) -> Self {
         Self {
@@ -57,17 +81,50 @@ impl Template {
             kaomoji: kaomoji.into(),
             note: "saved".into(),
             call_count: calls.len(),
-            // Chain is cosmetic in the stored bundle; the reload path ignores it.
-            bundle_json: bundle::export(Chain::Mainnet, None, calls),
+            bundle_json: bundle::export(chain, None, calls),
+            chain_id: Some(chain.chain_id()),
         }
     }
 
     /// Reconstruct the template's calls, renumbering ids from `start_id`.
-    pub fn calls(&self, start_id: u64) -> Result<Vec<QueuedCall>, TxBuilderError> {
-        // `None`: a stored template's chain id is the cosmetic `Chain::Mainnet`
-        // stamped by `from_batch`, not the chain it was composed on. Scoping
-        // templates per network is a separate, larger change.
-        bundle::import(&self.bundle_json, start_id, None)
+    ///
+    /// `on` is the chain the composer is currently pointed at; a template
+    /// stamped for a different one is refused rather than silently retargeting
+    /// its addresses. A template with **no** recorded chain is refused on every
+    /// chain — see the module note on why its `chainId` can't stand in.
+    pub fn calls(&self, start_id: u64, on: Chain) -> Result<Vec<QueuedCall>, TxBuilderError> {
+        let Some(chain) = self.chain() else {
+            return Err(TxBuilderError::Assembly(format!(
+                "\"{}\" was saved before Kao recorded which network a template was composed for, \
+                 so its addresses can't be trusted on any chain — rebuild and re-save it",
+                self.name,
+            )));
+        };
+        if chain != on {
+            return Err(TxBuilderError::Assembly(format!(
+                "\"{}\" was composed on {} but you're composing on {} — the same contract has a \
+                 different address on each chain",
+                self.name,
+                chain.label(),
+                on.label(),
+            )));
+        }
+        bundle::import(&self.bundle_json, start_id, Some(on))
+    }
+
+    /// The chain this template was composed on, or `None` for one saved before
+    /// the chain was recorded — which is *not* the same as Mainnet, and is why
+    /// this reads `meta.kaoChainId` rather than the bundle's own `chainId`.
+    pub fn chain(&self) -> Option<Chain> {
+        self.chain_id.and_then(Chain::from_chain_id)
+    }
+
+    /// Re-read the cached `chain_id` out of the stored bundle JSON. Called on
+    /// load, where the field always arrives `None` (it is never serialized).
+    fn hydrate_chain(&mut self) {
+        self.chain_id = serde_json::from_str::<bundle::Bundle>(&self.bundle_json)
+            .ok()
+            .and_then(|b| b.meta.kao_chain_id);
     }
 }
 
@@ -101,7 +158,10 @@ fn load_from(path: &PathBuf) -> Vec<Template> {
     let mut rows: Vec<(u32, Template)> = Vec::new();
     for entry in iter.flatten() {
         let (k, v) = entry;
-        if let Ok(t) = postcard::from_bytes::<Template>(v.value()) {
+        if let Ok(mut t) = postcard::from_bytes::<Template>(v.value()) {
+            // `chain_id` is not on disk (see the field's note) — recover it
+            // from the bundle the row does carry.
+            t.hydrate_chain();
             rows.push((k.value(), t));
         }
     }
@@ -177,7 +237,7 @@ mod tests {
     }
 
     fn sample_template(name: &str) -> Template {
-        Template::from_batch(name, "(°ᴗ°)", &sample_calls())
+        Template::from_batch(name, "(°ᴗ°)", Chain::Mainnet, &sample_calls())
     }
 
     #[test]
@@ -205,10 +265,75 @@ mod tests {
     #[test]
     fn from_batch_captures_calls() {
         let calls = sample_calls();
-        let t = Template::from_batch("My batch", "(°ᴗ°)", &calls);
+        let t = Template::from_batch("My batch", "(°ᴗ°)", Chain::Mainnet, &calls);
         assert_eq!(t.name, "My batch");
         assert_eq!(t.note, "saved");
         assert_eq!(t.call_count, calls.len());
-        assert_eq!(t.calls(10).unwrap().len(), calls.len());
+        assert_eq!(t.calls(10, Chain::Mainnet).unwrap().len(), calls.len());
+    }
+
+    /// The hole templates were: the JSON import has always refused a
+    /// cross-chain bundle, and `from_batch` used to throw the chain away, so
+    /// loading a template on another network retargeted its addresses.
+    #[test]
+    fn a_template_refuses_to_load_on_another_chain() {
+        let t = Template::from_batch("opt batch", "(°ᴗ°)", Chain::Optimism, &sample_calls());
+        assert_eq!(t.chain(), Some(Chain::Optimism));
+        let err = t
+            .calls(1, Chain::Mainnet)
+            .expect_err("an Optimism template must not load on Mainnet");
+        assert!(
+            err.to_string().contains("different address on each chain"),
+            "got {err}"
+        );
+        assert!(t.calls(1, Chain::Optimism).is_ok(), "its own chain loads");
+    }
+
+    /// A template written before the chain was recorded carries `chainId: "1"`
+    /// from the old unconditional stamp. Trusting that would let a
+    /// Base-composed template load cleanly on Mainnet — the retargeting this
+    /// whole mechanism exists to stop, in the one direction a naive
+    /// chainId-vs-chainId check misses. It must be refused everywhere.
+    #[test]
+    fn a_template_with_no_recorded_chain_is_refused_on_every_chain() {
+        let mut legacy = sample_template("legacy");
+        // Strip the marker the way a pre-fix save would have left it: the
+        // bundle still says chainId 1, but nothing says Kao recorded it.
+        legacy.bundle_json = legacy.bundle_json.replace("\"kaoChainId\": 1,", "");
+        legacy.bundle_json = legacy.bundle_json.replace("\"kaoChainId\": 1", "");
+        legacy.hydrate_chain();
+        assert!(
+            legacy.bundle_json.contains("\"chainId\": \"1\""),
+            "still stamped Mainnet"
+        );
+        assert_eq!(
+            legacy.chain(),
+            None,
+            "an unmarked template is chain-unknown"
+        );
+
+        for on in [Chain::Mainnet, Chain::Base, Chain::Optimism] {
+            let err = legacy
+                .calls(1, on)
+                .expect_err("a chain-unknown template must not load anywhere");
+            assert!(
+                err.to_string()
+                    .contains("before Kao recorded which network"),
+                "on {on:?}: {err}"
+            );
+        }
+    }
+
+    /// `chain_id` is `#[serde(skip)]`, so it has to come back off the bundle.
+    #[test]
+    fn chain_survives_a_save_load_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("templates.redb");
+        let t = Template::from_batch("base batch", "(°ᴗ°)", Chain::Base, &sample_calls());
+        save_to(&path, std::slice::from_ref(&t)).unwrap();
+        let back = load_from(&path);
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].chain(), Some(Chain::Base));
+        assert_eq!(back[0], t, "hydration restores the skipped field exactly");
     }
 }

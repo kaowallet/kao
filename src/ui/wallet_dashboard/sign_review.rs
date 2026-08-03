@@ -240,6 +240,20 @@ pub struct SafeExecReview {
     /// The decoded inner call the Safe will `execTransaction`. Always a raw tx, so
     /// it reuses [`ReviewLeg`] and its `leg_card` renderer verbatim.
     pub inner: Box<ReviewLeg>,
+    /// The `SafeTx.operation` byte being signed: `0` = CALL, `1` = DELEGATECALL.
+    ///
+    /// The single field the Safe threat model turns on, and the overlay used
+    /// to omit it — while `safe_tx_detail` has always shown co-signers a red
+    /// banner for exactly this byte on exactly these transactions. A Ledger
+    /// displays `operation: 1` on its screen; without this there was nothing
+    /// on the host to compare it against.
+    pub operation: u8,
+    /// The Safe's transaction guard, when one is installed. A guard can reject
+    /// any transaction at execution time and the revm preflight never runs it
+    /// (see `txbuilder::sim::to_steps`), so a batch can read "preflight passed"
+    /// and still revert after every owner has signed. Naming it is the honest
+    /// minimum.
+    pub guard: Option<Address>,
 }
 
 /// A CoW ERC-20 order authorized via EIP-1271 (a Safe `SafeMessage`). The order
@@ -1002,7 +1016,40 @@ fn safe_exec_panel<'a>(
     .width(Length::Fill);
     col = col.push(addr_kv(t, "Safe", x.safe));
     col = col.push(kv(t, "Nonce", x.nonce.to_string()));
+    // The operation byte, always — a row that only appeared for delegatecall
+    // would teach the user nothing about what its absence means.
+    col = col.push(kv(
+        t,
+        "Operation",
+        match x.operation {
+            0 => "0 (call)".to_string(),
+            1 => "1 (delegatecall)".to_string(),
+            other => format!("{other} (unknown)"),
+        },
+    ));
+    // A guard is not part of the signed payload, so it cannot be read off the
+    // hash — but it can veto this transaction at execution time and the
+    // preflight never runs it. Say so where the batch is being approved.
+    if let Some(g) = x.guard {
+        col = col.push(addr_kv(t, "Transaction guard", g));
+    }
     col = col.push(Space::new().height(8));
+    if x.operation != 0 {
+        col = col.push(operation_banner(t, x.operation, x.inner.to));
+        col = col.push(Space::new().height(8));
+    }
+    if x.guard.is_some() {
+        col = col.push(
+            text(
+                "This Safe has a transaction guard installed. A guard can reject this \
+                 transaction when it executes, and the preflight simulation does not run it — \
+                 a passing preflight is not a promise that the guard will allow this.",
+            )
+            .size(11)
+            .color(t.sub),
+        );
+        col = col.push(Space::new().height(8));
+    }
     col = col.push(text("Safe will execute").size(11).color(t.sub).font(bold()));
     col = col.push(Space::new().height(4));
     col = col.push(leg_card(t, x.inner.as_ref(), show_detail));
@@ -1013,6 +1060,76 @@ fn safe_exec_panel<'a>(
         x.safe_tx_hash,
     ));
     card(t, col.into())
+}
+
+/// The red banner for a non-CALL `SafeTx.operation`. Deliberately makes the
+/// same claim `safe_tx_detail::operation_warning` makes to a co-signer
+/// reviewing an incoming proposal — arbitrary code running as the Safe, able to
+/// change owners, drain funds, or replace the implementation — so the same
+/// transaction doesn't read as more dangerous when someone else built it than
+/// when this wallet did. The wording differs because the situations do: there
+/// the question is whether to trust a proposer, here it is whether the target
+/// is the library this wallet meant to use.
+///
+/// `to` is named because a delegatecall's danger is entirely a function of
+/// whose code runs — the canonical `MultiSendCallOnly` libraries are labelled
+/// so the expected case is legible as the expected case.
+fn operation_banner<'a>(t: KaoTheme, operation: u8, to: Address) -> Element<'a, Message> {
+    use crate::txbuilder::multisend::{MULTISEND_CALL_ONLY_1_3_0, MULTISEND_CALL_ONLY_1_4_1};
+    let (title, msg) = if operation == 1 {
+        let target = match to {
+            MULTISEND_CALL_ONLY_1_3_0 => {
+                "The target is the canonical Safe MultiSendCallOnly 1.3.0 library, which can \
+                 only make plain calls — this is the expected shape for a batch."
+                    .to_string()
+            }
+            MULTISEND_CALL_ONLY_1_4_1 => {
+                "The target is the canonical Safe MultiSendCallOnly 1.4.1 library, which can \
+                 only make plain calls — this is the expected shape for a batch."
+                    .to_string()
+            }
+            other => format!(
+                "The target {} is NOT a canonical Safe MultiSend library. Do not sign unless \
+                 you know exactly what code lives there.",
+                crate::wallet::short_address(other)
+            ),
+        };
+        (
+            "⚠ DELEGATECALL",
+            format!(
+                "This transaction runs the target's code AS the Safe. Code reached this way can \
+                 change owners, drain all funds, or replace the Safe's implementation. {target}"
+            ),
+        )
+    } else {
+        (
+            "⚠ MALFORMED OPERATION",
+            format!(
+                "operation = {operation} is neither CALL (0) nor DELEGATECALL (1). Refuse this \
+                 transaction."
+            ),
+        )
+    };
+    let col = column![
+        text(title).size(12).color(t.down).font(bold()),
+        Space::new().height(3),
+        text(msg).size(11).color(t.text),
+    ]
+    .spacing(0)
+    .width(Length::Fill);
+    container(col)
+        .padding(10)
+        .width(Length::Fill)
+        .style(move |_: &iced::Theme| container::Style {
+            background: Some(t.card_alt.into()),
+            border: iced::Border {
+                color: t.down,
+                width: 1.0,
+                radius: 8.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
 }
 
 /// The EIP-7702 authorization card. Deliberately leads with what changes about
@@ -1692,6 +1809,8 @@ mod tests {
             safe_tx_hash: d.digest,
             eip712: d,
             inner: Box::new(leg_with(inner.clone())),
+            operation: 1,
+            guard: None,
         };
         let rows = erc8213_rows(&SignStep::SafeExec(x));
         assert_eq!(

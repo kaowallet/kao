@@ -6864,16 +6864,33 @@ fn spawn_txbuilder_safe_execute(
     signer_owners: Vec<AccountDescriptor>,
     local_executor_key: Option<B256>,
 ) -> Task<Message> {
-    use crate::safe::tx::{assemble_signatures, execute_safe_tx, sign_owner};
     Task::perform(
-        async move {
+        execute_txbuilder_safe_batch(network, sreq, signer_owners, local_executor_key),
+        |result| Message::Signed {
+            tag: SignTag::TxBuilderExecute,
+            signer: None,
+            result: result.map(SignOutcome::Tx),
+        },
+    )
+}
+
+/// The body of [`spawn_txbuilder_safe_execute`], as a named function so tests
+/// can drive it against a mock chain. Extracted for the same reason
+/// `build_txbuilder_steps` was: the ordering here — that the reviewed==signed
+/// gate runs *before* any owner is prompted — is the property worth pinning,
+/// and it isn't observable through a `Task`.
+async fn execute_txbuilder_safe_batch(
+    network: Arc<dyn BalanceFetcher>,
+    sreq: tx_builder::SafeBatchRequest,
+    signer_owners: Vec<AccountDescriptor>,
+    local_executor_key: Option<B256>,
+) -> Result<TxHash, String> {
+    use crate::safe::tx::{assemble_signatures, execute_safe_tx, sign_owner};
+    {
+        {
             let chain = sreq.chain;
             let Some((nonce, pinned_hash)) = sreq.prepared else {
                 return Err::<TxHash, String>("batch not prepared".into());
-            };
-            let provider = match network.provider(chain).await {
-                Some(p) => p,
-                None => return Err("no execution RPCs configured".into()),
             };
             // Re-read the live nonce, rebuild at the pin, and re-run the
             // on-chain cross-checks before any owner is asked to sign — the
@@ -6881,6 +6898,10 @@ fn spawn_txbuilder_safe_execute(
             // nonce against the pin alone would be tautological; the check that
             // earns its keep is the live nonce, which a co-signer's transaction
             // can move between review and confirm.
+            //
+            // Deliberately ahead of the provider lookup: a batch that can no
+            // longer execute should be refused on its own terms, not masked by
+            // an RPC-configuration error.
             let (tx, domain, local_hash) = rebuild_pinned_safe_tx(
                 network.as_ref(),
                 PinnedSafeTx {
@@ -6894,6 +6915,10 @@ fn spawn_txbuilder_safe_execute(
                 },
             )
             .await?;
+            let provider = match network.provider(chain).await {
+                Some(p) => p,
+                None => return Err("no execution RPCs configured".into()),
+            };
             let needed = sreq.threshold as usize;
             let mut sigs = Vec::with_capacity(needed);
             let mut live_owners = Vec::with_capacity(needed);
@@ -6930,13 +6955,8 @@ fn spawn_txbuilder_safe_execute(
                 }
             };
             execute_safe_tx(&provider, executor, sreq.safe, chain, tx, packed).await
-        },
-        |result| Message::Signed {
-            tag: SignTag::TxBuilderExecute,
-            signer: None,
-            result: result.map(SignOutcome::Tx),
-        },
-    )
+        }
+    }
 }
 
 /// Broadcast a plain-EOA batch (one call as a normal tx, or N calls atomically
@@ -8247,45 +8267,54 @@ fn spawn_txbuilder_propose_task(
     owner_desc: AccountDescriptor,
     sreq: tx_builder::SafeBatchRequest,
 ) -> Task<Message> {
-    use crate::safe::tx::sign_owner;
     Task::perform(
-        async move {
-            let Some((nonce, pinned_hash)) = sreq.prepared else {
-                return Err::<(), String>("batch not prepared".into());
-            };
-            let (tx, domain, local_hash) = rebuild_pinned_safe_tx(
-                network.as_ref(),
-                PinnedSafeTx {
-                    trust: &sreq.trust,
-                    version: &sreq.version,
-                    safe: sreq.safe,
-                    chain: sreq.chain,
-                    input: sreq.input.clone(),
-                    nonce,
-                    hash: pinned_hash,
-                },
-            )
-            .await?;
-            let signer = crate::wallet::build_owner_signer(&owner_desc).await?;
-            let owner_sig = sign_owner(&signer, &tx, &domain, local_hash).await?;
-            crate::safe::service::propose(
-                &sreq.service_base,
-                sreq.safe,
-                sreq.chain,
-                &tx,
-                local_hash,
-                &owner_sig,
-                Some("Kao"),
-            )
-            .await?;
-            Ok(())
-        },
+        propose_txbuilder_safe_batch(network, owner_desc, sreq),
         |result: Result<(), String>| Message::Signed {
             tag: SignTag::TxBuilderPropose,
             signer: None,
             result: result.map(|()| SignOutcome::Unit),
         },
     )
+}
+
+/// The body of [`spawn_txbuilder_propose_task`], named for the same reason as
+/// [`execute_txbuilder_safe_batch`]: the gate must run before the owner signs,
+/// and that ordering is only testable outside a `Task`.
+async fn propose_txbuilder_safe_batch(
+    network: Arc<dyn BalanceFetcher>,
+    owner_desc: AccountDescriptor,
+    sreq: tx_builder::SafeBatchRequest,
+) -> Result<(), String> {
+    use crate::safe::tx::sign_owner;
+    let Some((nonce, pinned_hash)) = sreq.prepared else {
+        return Err("batch not prepared".into());
+    };
+    let (tx, domain, local_hash) = rebuild_pinned_safe_tx(
+        network.as_ref(),
+        PinnedSafeTx {
+            trust: &sreq.trust,
+            version: &sreq.version,
+            safe: sreq.safe,
+            chain: sreq.chain,
+            input: sreq.input.clone(),
+            nonce,
+            hash: pinned_hash,
+        },
+    )
+    .await?;
+    let signer = crate::wallet::build_owner_signer(&owner_desc).await?;
+    let owner_sig = sign_owner(&signer, &tx, &domain, local_hash).await?;
+    crate::safe::service::propose(
+        &sreq.service_base,
+        sreq.safe,
+        sreq.chain,
+        &tx,
+        local_hash,
+        &owner_sig,
+        Some("Kao"),
+    )
+    .await?;
+    Ok(())
 }
 
 /// Load full detail (reconstructed `SafeTx` + per-owner signatures) for
@@ -13365,6 +13394,92 @@ mod tests {
             "{:?}",
             review.error,
         );
+    }
+
+    // ── the gate runs before anyone is asked to sign ─────────────────
+    //
+    // These drive the broadcast/propose bodies themselves, not the gate in
+    // isolation: the property is the *ordering*. Each passes an empty or
+    // unusable owner set, so a run that reaches the signing stage fails with a
+    // recognisably different error than a run the gate stopped. Dropping the
+    // gate therefore changes the error, and these tests notice.
+
+    #[tokio::test]
+    async fn batch_execute_refuses_a_moved_nonce_before_prompting_any_owner() {
+        let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
+        let mut req = safe_batch_req(&calls, 1, vec![0]);
+        let (tx, hash) = expected_batch_tx(&req, 0);
+        req.prepared = Some((0, hash));
+        let mock = CallMock::new();
+        plant_safe_agreement(&mock, req.safe, &tx, hash);
+        plant_safe_nonce(&mock, req.safe, 1); // a co-signer executed meanwhile
+        let err = execute_txbuilder_safe_batch(Arc::new(mock), req, Vec::new(), None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("nonce advanced"),
+            "the gate must stop this before the owner loop: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_execute_continues_past_the_gate_on_a_matching_nonce() {
+        // The mirror of the test above: with a matching nonce the gate must let
+        // the run through, so it fails at the next step instead (the mock has
+        // no provider). Without this, a gate that always refused would satisfy
+        // the refusal test.
+        let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
+        let mut req = safe_batch_req(&calls, 1, vec![0]);
+        let (tx, hash) = expected_batch_tx(&req, 4);
+        req.prepared = Some((4, hash));
+        let mock = CallMock::new();
+        plant_safe_agreement(&mock, req.safe, &tx, hash);
+        plant_safe_nonce(&mock, req.safe, 4);
+        let err = execute_txbuilder_safe_batch(Arc::new(mock), req, Vec::new(), None)
+            .await
+            .unwrap_err();
+        assert!(
+            !err.contains("nonce advanced") && !err.contains("refusing to sign"),
+            "a matching pin must not be refused: {err}"
+        );
+        assert!(
+            err.contains("no execution RPCs configured"),
+            "the run continued to the step after the gate: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_propose_refuses_a_moved_nonce_before_the_owner_signs() {
+        let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
+        let mut req = safe_batch_req(&calls, 2, vec![0]);
+        let (tx, hash) = expected_batch_tx(&req, 0);
+        req.prepared = Some((0, hash));
+        let mock = CallMock::new();
+        plant_safe_agreement(&mock, req.safe, &tx, hash);
+        plant_safe_nonce(&mock, req.safe, 9);
+        // A view-only descriptor can't produce a signature, so reaching the
+        // signing stage would surface an unsupported-operation error instead.
+        let err = propose_txbuilder_safe_batch(
+            Arc::new(mock),
+            AccountDescriptor::ViewOnly {
+                name: None,
+                address: addr(0x0B).into(),
+            },
+            req,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("nonce advanced"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn batch_execute_refuses_before_the_gate_when_nothing_was_pinned() {
+        let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
+        let req = safe_batch_req(&calls, 1, vec![0]); // `prepared` still None
+        let err = execute_txbuilder_safe_batch(Arc::new(CallMock::new()), req, Vec::new(), None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("not prepared"), "{err}");
     }
 
     // ── the reviewed==signed gate a batch passes before any owner signs ──

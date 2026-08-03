@@ -16,7 +16,7 @@ use crate::chain::{Chain, NetworkId};
 use crate::portfolio::format_token_balance;
 use crate::safe::tx::SafeTxInput;
 use crate::txbuilder::abi::{self, AbiMethod, AbiSource, LoadedContract};
-use crate::txbuilder::sim::BatchSimResult;
+use crate::txbuilder::sim::{BatchOutcome, BatchSimResult};
 use crate::txbuilder::templates::Template;
 use crate::txbuilder::{QueuedCall, bundle, encode, flash_approval};
 use crate::ui::kao_theme::KaoTheme;
@@ -196,6 +196,57 @@ pub struct ResolvedCode {
     pub all_verified: bool,
 }
 
+/// What the batch simulation said about the calls being sent for review.
+///
+/// The composer runs a real revm preflight, but running it was never a
+/// precondition for signing and the overlay never saw the result — so a batch
+/// that reverted at step 3 opened with a plain, enabled confirm button. This
+/// carries the verdict across the boundary. It is *advisory*: a reverting
+/// preflight makes the button say so rather than blocking the signature, since
+/// the simulation is a sequential approximation and can diverge from chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Preflight {
+    /// Simulated on a verified chain; every call succeeded.
+    Passed,
+    /// Simulated and it fails. `step` is 0-based over the *effective* calls
+    /// (the queue plus any appended flash-approval revokes), matching what was
+    /// submitted to the simulator.
+    Fails { step: usize, reason: String },
+    /// Simulation is available on this network but hasn't produced a verdict
+    /// for the batch as it currently stands — never run, or it errored.
+    Missing,
+    /// The network has no simulation at all (a custom, unverified chain). Not
+    /// a warning in its own right: the review's own copy already says the
+    /// chain can't be light-client-verified.
+    Unsupported,
+}
+
+impl Preflight {
+    /// Whether the confirm button should read as a deliberate override rather
+    /// than a routine confirmation.
+    pub fn softens_confirm(&self) -> bool {
+        matches!(self, Self::Fails { .. } | Self::Missing)
+    }
+
+    /// A line for the review note when the preflight is something the user
+    /// should weigh before signing. `None` when there's nothing to add.
+    pub fn warning(&self) -> Option<String> {
+        match self {
+            Self::Passed | Self::Unsupported => None,
+            Self::Fails { step, reason } => Some(format!(
+                "⚠ Preflight FAILED at call #{}: {reason}. The batch is atomic, so on-chain \
+                 this reverts as a whole and costs gas for nothing.",
+                step + 1
+            )),
+            Self::Missing => Some(
+                "⚠ This batch has not been simulated. Go back and run the preflight to see \
+                 whether it succeeds before committing a signature to it."
+                    .to_string(),
+            ),
+        }
+    }
+}
+
 /// Requests bubbled to the coordinator.
 #[derive(Debug, Clone)]
 pub enum Outcome {
@@ -227,7 +278,13 @@ pub enum Outcome {
     /// Open the sign-review overlay for the batch (built-in batch / Safe) or a
     /// single call (custom-network send). The coordinator reads the app's
     /// selected network to build the request.
-    Review { calls: Vec<QueuedCall> },
+    Review {
+        calls: Vec<QueuedCall>,
+        /// What the preflight found, carried across so the overlay's confirm
+        /// button can't read as a routine "sign this" over a batch the user
+        /// just watched revert.
+        preflight: Preflight,
+    },
     /// Persist the user's template list to redb.
     PersistTemplates(Vec<Template>),
     /// Copy text (exported JSON) to the clipboard, armed for the usual 10s
@@ -658,6 +715,7 @@ impl TxBuilderApp {
                 if !self.batch.is_empty() {
                     return Some(Outcome::Review {
                         calls: self.effective_calls(),
+                        preflight: self.preflight(),
                     });
                 }
             }
@@ -903,6 +961,53 @@ impl TxBuilderApp {
         self.sim_busy = false;
     }
 
+    /// The preflight verdict for the batch as it currently stands, for the
+    /// review overlay. `sim` is cleared by [`Self::invalidate_sim`] on every
+    /// edit, so a present result always describes the current queue.
+    fn preflight(&self) -> Preflight {
+        let Some(sim) = &self.sim else {
+            // No verdict. On a chain we *can* simulate that's a gap worth
+            // flagging; on a custom network there was never anything to run.
+            return if self.net.builtin().is_some() {
+                Preflight::Missing
+            } else {
+                Preflight::Unsupported
+            };
+        };
+        match &sim.outcome {
+            BatchOutcome::Success => Preflight::Passed,
+            BatchOutcome::Revert { step, reason } | BatchOutcome::Halt { step, reason } => {
+                Preflight::Fails {
+                    step: *step,
+                    reason: reason.clone(),
+                }
+            }
+            // The simulator ran and couldn't reach a verdict — on a built-in
+            // chain that's a failed preflight, not an absent one.
+            BatchOutcome::Unavailable => {
+                if self.net.builtin().is_some() {
+                    Preflight::Missing
+                } else {
+                    Preflight::Unsupported
+                }
+            }
+        }
+    }
+
+    /// Surface a coordinator-side failure on the pane's error banner. Without
+    /// this the builder had no error channel back from the dashboard: a request
+    /// that couldn't be built was logged and dropped, so the primary button
+    /// registered the click and nothing on screen changed.
+    pub fn set_error(&mut self, msg: String) {
+        self.error = Some(msg);
+    }
+
+    /// The pane's current error banner text, for the coordinator's tests.
+    #[cfg(test)]
+    pub(crate) fn error_text(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
     /// The calls to simulate / review / sign: the queue, plus flash-approval
     /// revokes appended when the toggle is on. Revokes are derived here (never
     /// stored in `batch`) so the queue stays editable and reorder-safe.
@@ -1093,7 +1198,12 @@ impl TxBuilderApp {
         match self.compose_call() {
             Ok(call) => {
                 self.error = None;
-                Some(Outcome::Review { calls: vec![call] })
+                Some(Outcome::Review {
+                    calls: vec![call],
+                    // This path only exists on custom networks, where there is
+                    // no simulator to have run.
+                    preflight: Preflight::Unsupported,
+                })
             }
             Err(e) => {
                 self.error = Some(e.to_string());
@@ -1500,9 +1610,86 @@ mod tests {
         }
         assert!(app.sim_busy);
         match app.update(Message::Review) {
-            Some(Outcome::Review { calls }) => assert_eq!(calls.len(), 2),
+            Some(Outcome::Review { calls, preflight }) => {
+                assert_eq!(calls.len(), 2);
+                // Simulate was fired but hasn't landed — the review must not
+                // present an unsimulated batch as if it had passed.
+                assert_eq!(preflight, Preflight::Missing);
+            }
             other => panic!("expected Review, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn review_carries_a_failing_preflight_across_to_the_overlay() {
+        let mut app = safe_app();
+        app.batch = sample_batch(&mut app.next_id, app.owner);
+        app.on_sim(Ok(BatchSimResult {
+            outcome: BatchOutcome::Revert {
+                step: 1,
+                reason: "ERC20: transfer amount exceeds balance".into(),
+            },
+            gas_used: 41_000,
+            transfers: Vec::new(),
+            verified: true,
+            base_fee_per_gas: 1,
+        }));
+        let Some(Outcome::Review { preflight, .. }) = app.update(Message::Review) else {
+            panic!("expected Review");
+        };
+        assert_eq!(
+            preflight,
+            Preflight::Fails {
+                step: 1,
+                reason: "ERC20: transfer amount exceeds balance".into(),
+            },
+        );
+        assert!(preflight.softens_confirm(), "the button must say so");
+        let w = preflight.warning().expect("a warning line");
+        // Steps are 0-based internally and 1-based on screen, matching the cards.
+        assert!(w.contains("call #2"), "{w}");
+        assert!(w.contains("exceeds balance"), "{w}");
+    }
+
+    #[test]
+    fn review_reports_a_passing_preflight_without_softening() {
+        let mut app = safe_app();
+        app.batch = sample_batch(&mut app.next_id, app.owner);
+        app.on_sim(Ok(BatchSimResult {
+            outcome: BatchOutcome::Success,
+            gas_used: 41_000,
+            transfers: Vec::new(),
+            verified: true,
+            base_fee_per_gas: 1,
+        }));
+        let Some(Outcome::Review { preflight, .. }) = app.update(Message::Review) else {
+            panic!("expected Review");
+        };
+        assert_eq!(preflight, Preflight::Passed);
+        assert!(!preflight.softens_confirm());
+        assert!(preflight.warning().is_none(), "nothing to warn about");
+    }
+
+    #[test]
+    fn editing_the_batch_downgrades_a_passing_preflight_to_missing() {
+        // The sim describes the queue it ran against. Once that queue changes,
+        // an unsimulated batch must not inherit the old verdict's clean button.
+        let mut app = safe_app();
+        app.batch = sample_batch(&mut app.next_id, app.owner);
+        app.on_sim(Ok(BatchSimResult {
+            outcome: BatchOutcome::Success,
+            gas_used: 41_000,
+            transfers: Vec::new(),
+            verified: true,
+            base_fee_per_gas: 1,
+        }));
+        let removed = app.batch[0].id;
+        app.update(Message::RemoveCall(removed));
+        let Some(Outcome::Review { preflight, .. }) = app.update(Message::Review) else {
+            panic!("expected Review");
+        };
+        assert_eq!(preflight, Preflight::Missing);
+        assert!(preflight.softens_confirm());
     }
 
     /// A resolve answer for a plain (non-proxy) address: the code is the
@@ -1777,7 +1964,14 @@ mod tests {
         let to = address!("0x000000000000000000000000000000000000dEaD");
         app.update(Message::RawToChanged(to.to_string()));
         match app.update(Message::SendSingle) {
-            Some(Outcome::Review { calls }) => assert_eq!(calls.len(), 1),
+            Some(Outcome::Review { calls, preflight }) => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(
+                    preflight,
+                    Preflight::Unsupported,
+                    "no simulator on a custom net"
+                );
+            }
             other => panic!("expected single-call Review, got {other:?}"),
         }
         assert!(app.batch.is_empty(), "single send never touches the batch");

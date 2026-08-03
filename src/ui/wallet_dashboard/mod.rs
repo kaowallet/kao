@@ -2141,7 +2141,7 @@ impl WalletScreen {
                 };
                 spawn_txbuilder_simulate(self.network.clone(), chain, from, calls)
             }
-            O::Review { calls } => self.open_txbuilder_review(calls),
+            O::Review { calls, preflight } => self.open_txbuilder_review(calls, preflight),
             O::PersistTemplates(list) => {
                 if let Err(e) = crate::txbuilder::templates::save(&list) {
                     warn!(error = %e, "tx-builder: failed to persist templates");
@@ -2153,14 +2153,23 @@ impl WalletScreen {
 
     /// Snapshot the batch request from the active identity and open the
     /// sign-review overlay (reviewed == signed).
-    fn open_txbuilder_review(&mut self, calls: Vec<crate::txbuilder::QueuedCall>) -> Task<Message> {
+    fn open_txbuilder_review(
+        &mut self,
+        calls: Vec<crate::txbuilder::QueuedCall>,
+        preflight: tx_builder::Preflight,
+    ) -> Task<Message> {
         if self.sign_review.is_some() || calls.is_empty() {
             return Task::none();
         }
         let req = match self.build_txbuilder_request(&calls) {
             Ok(r) => r,
             Err(e) => {
+                // Drive the reason onto the pane the user is looking at. A bare
+                // `warn!` here meant the primary button registered the click and
+                // nothing on screen changed — indistinguishable from a hang, and
+                // permanent for a Safe too old to have a MultiSend deployment.
                 warn!(error = %e, "tx-builder: refusing to open review");
+                self.apps.txbuilder_pane().set_error(e);
                 return Task::none();
             }
         };
@@ -2169,18 +2178,27 @@ impl WalletScreen {
         // Flash approval: disclose any allowance resets folded into the batch.
         let revoke_n = crate::txbuilder::flash_approval::revoke_count(&calls);
         let (title, subtitle, note, can_execute) = txbuilder_review_copy(&req, revoke_n);
+        // A failed or absent preflight leads the note: it's the one thing here
+        // that says this batch is expected not to work.
+        let note = match (preflight.warning(), note) {
+            (Some(w), Some(n)) => Some(format!("{w} {n}")),
+            (Some(w), None) => Some(w),
+            (None, n) => n,
+        };
         let action = sign_review::SignAction::TxBuilder {
             req: req.clone(),
             can_execute,
+            preflight: preflight.clone(),
         };
-        self.sign_review = Some(sign_review::SignReview::pending(
-            title,
-            subtitle,
-            Vec::new(),
-            note,
-            seq,
-            action,
-        ));
+        let mut review =
+            sign_review::SignReview::pending(title, subtitle, Vec::new(), note, seq, action);
+        // The Safe arm re-derives its label once the prepare pins the hash (it
+        // needs the execute/propose fork); the EOA arm has no such pass, so its
+        // override is set here and never revisited.
+        if matches!(req, tx_builder::BatchSignRequest::Eoa(_)) && preflight.softens_confirm() {
+            review.confirm_label = Some("Sign anyway ⚠".to_string());
+        }
+        self.sign_review = Some(review);
         let local_names = build_local_names(&self.accounts, &self.safes, &self.contacts);
         spawn_txbuilder_prepare(self.network.clone(), seq, req, local_names)
     }
@@ -4753,9 +4771,14 @@ impl WalletScreen {
                             && let sign_review::SignAction::TxBuilder {
                                 req: tx_builder::BatchSignRequest::Safe(sreq),
                                 can_execute,
+                                preflight,
                             } = &mut review.action
                         {
                             sreq.prepared = Some((nonce, hash));
+                            // Same softening the Safe send applies: a batch the
+                            // user watched revert must not offer a button that
+                            // reads like routine confirmation.
+                            let soften = preflight.softens_confirm();
                             // Same execute-or-propose fork the Safe send offers:
                             // with the threshold covered locally, Confirm signs
                             // and executes and the second action queues it for
@@ -4763,8 +4786,22 @@ impl WalletScreen {
                             // only thing this wallet can do, so it becomes the
                             // primary action rather than a dead Confirm.
                             if *can_execute {
-                                review.confirm_label = Some("Sign & execute now".to_string());
-                                review.secondary_label = Some("Propose to co-signers".to_string());
+                                review.confirm_label = Some(
+                                    if soften {
+                                        "Execute anyway ⚠"
+                                    } else {
+                                        "Sign & execute now"
+                                    }
+                                    .to_string(),
+                                );
+                                review.secondary_label = Some(
+                                    if soften {
+                                        "Propose anyway ⚠"
+                                    } else {
+                                        "Propose to co-signers"
+                                    }
+                                    .to_string(),
+                                );
                             } else if sreq.signable_indices.is_empty() {
                                 // Proposing still costs one owner signature. With
                                 // no owner key at all, offering the button would
@@ -4773,7 +4810,14 @@ impl WalletScreen {
                                     Some("No owner key for this Safe".to_string());
                                 review.confirm_disabled = true;
                             } else {
-                                review.confirm_label = Some("Propose to co-signers".to_string());
+                                review.confirm_label = Some(
+                                    if soften {
+                                        "Propose anyway ⚠"
+                                    } else {
+                                        "Propose to co-signers"
+                                    }
+                                    .to_string(),
+                                );
                             }
                         }
                     }
@@ -13210,6 +13254,49 @@ mod tests {
         assert!(!note.contains("queued for the remaining"), "{note}");
     }
 
+    #[test]
+    fn txbuilder_review_failure_lands_on_the_pane_not_just_the_log() {
+        // A view-only signer can't authorize a 7702 delegation, so a 2-call
+        // batch has no request to build. This used to `warn!` and return
+        // `Task::none()`: the button registered the click, the overlay never
+        // opened, and nothing on screen changed.
+        let mut s = screen_for(addr(0xAA), new_cache());
+        let calls = vec![
+            queued(1, addr(0xC1), 0, vec![0x01]),
+            queued(2, addr(0xC2), 0, vec![0x02]),
+        ];
+        let _ = s.open_txbuilder_review(calls, tx_builder::Preflight::Passed);
+        assert!(s.sign_review.is_none(), "no overlay opened");
+        let err = s
+            .apps
+            .txbuilder_pane()
+            .error_text()
+            .expect("the pane says why")
+            .to_string();
+        assert!(err.contains("EIP-7702"), "{err}");
+    }
+
+    #[test]
+    fn txbuilder_review_note_leads_with_a_failing_preflight() {
+        let mut s = screen_for(addr(0xAA), new_cache());
+        let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
+        let _ = s.open_txbuilder_review(
+            calls,
+            tx_builder::Preflight::Fails {
+                step: 0,
+                reason: "reverted".into(),
+            },
+        );
+        let review = s.sign_review.as_ref().expect("overlay opened");
+        let note = review.note.as_deref().expect("a note");
+        assert!(note.starts_with("⚠ Preflight FAILED"), "{note}");
+        assert_eq!(
+            review.confirm_label.as_deref(),
+            Some("Sign anyway ⚠"),
+            "an EOA leg softens at open — it has no prepare-time label pass",
+        );
+    }
+
     // ── the execute-or-propose fork ──────────────────────────────────
 
     #[test]
@@ -13423,6 +13510,14 @@ mod tests {
         req: tx_builder::SafeBatchRequest,
         can_execute: bool,
     ) -> WalletScreen {
+        screen_with_txbuilder_preflight(req, can_execute, tx_builder::Preflight::Passed)
+    }
+
+    fn screen_with_txbuilder_preflight(
+        req: tx_builder::SafeBatchRequest,
+        can_execute: bool,
+        preflight: tx_builder::Preflight,
+    ) -> WalletScreen {
         let mut s = screen_for(addr(0xAA), new_cache());
         s.sign_review_seq = 1;
         s.sign_review = Some(sign_review::SignReview::pending(
@@ -13434,6 +13529,7 @@ mod tests {
             sign_review::SignAction::TxBuilder {
                 req: tx_builder::BatchSignRequest::Safe(req),
                 can_execute,
+                preflight,
             },
         ));
         s
@@ -13484,6 +13580,64 @@ mod tests {
             Some((11, hash)),
             "the owners sign exactly the artifact the overlay displayed",
         );
+    }
+
+    #[test]
+    fn txbuilder_prepared_labels_read_as_routine_on_a_clean_preflight() {
+        let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
+        let mut s = screen_with_txbuilder_review(safe_batch_req(&calls, 1, vec![0]), true);
+        s.update(Message::SignReviewPrepared {
+            seq: 1,
+            steps: Ok(vec![safe_exec_step(11, B256::repeat_byte(0xAB))]),
+        });
+        let review = s.sign_review.as_ref().unwrap();
+        assert_eq!(review.confirm_label.as_deref(), Some("Sign & execute now"));
+        assert_eq!(
+            review.secondary_label.as_deref(),
+            Some("Propose to co-signers")
+        );
+    }
+
+    #[test]
+    fn txbuilder_prepared_labels_soften_on_a_failing_preflight() {
+        // The batch reverted in preflight. Both actions still work — the
+        // simulation is advisory — but neither may read like a routine
+        // confirmation.
+        let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
+        let mut s = screen_with_txbuilder_preflight(
+            safe_batch_req(&calls, 1, vec![0]),
+            true,
+            tx_builder::Preflight::Fails {
+                step: 0,
+                reason: "reverted".into(),
+            },
+        );
+        s.update(Message::SignReviewPrepared {
+            seq: 1,
+            steps: Ok(vec![safe_exec_step(11, B256::repeat_byte(0xAB))]),
+        });
+        let review = s.sign_review.as_ref().unwrap();
+        assert_eq!(review.confirm_label.as_deref(), Some("Execute anyway ⚠"));
+        assert_eq!(review.secondary_label.as_deref(), Some("Propose anyway ⚠"));
+        assert!(!review.confirm_disabled, "advisory, not a block");
+    }
+
+    #[test]
+    fn txbuilder_prepared_propose_label_softens_on_an_unsimulated_batch() {
+        // Below the threshold, so propose is the primary action — and it
+        // softens on a missing preflight the same way execute does.
+        let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
+        let mut s = screen_with_txbuilder_preflight(
+            safe_batch_req(&calls, 2, vec![0]),
+            false,
+            tx_builder::Preflight::Missing,
+        );
+        s.update(Message::SignReviewPrepared {
+            seq: 1,
+            steps: Ok(vec![safe_exec_step(11, B256::repeat_byte(0xAB))]),
+        });
+        let review = s.sign_review.as_ref().unwrap();
+        assert_eq!(review.confirm_label.as_deref(), Some("Propose anyway ⚠"));
     }
 
     #[test]

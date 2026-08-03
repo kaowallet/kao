@@ -361,6 +361,10 @@ pub enum SignAction {
     TxBuilder {
         req: super::tx_builder::BatchSignRequest,
         can_execute: bool,
+        /// What the composer's revm preflight found. Advisory, but it decides
+        /// whether the confirm button reads as a routine confirmation or as a
+        /// deliberate override of a batch that is expected to revert.
+        preflight: super::tx_builder::Preflight,
     },
 }
 

@@ -175,6 +175,7 @@ impl AppsPane {
         is_safe: bool,
         safe_version: Option<String>,
         eoa_can_batch: bool,
+        can_sign: bool,
         custom_networks: Vec<(u64, String)>,
     ) {
         self.tx_builder.set_context(
@@ -183,6 +184,7 @@ impl AppsPane {
             is_safe,
             safe_version,
             eoa_can_batch,
+            can_sign,
             custom_networks,
         );
     }
@@ -297,15 +299,27 @@ impl AppsPane {
                     key: keyboard::Key::Named(keyboard::key::Named::Escape),
                     ..
                 } = event
-                    && matches!(
-                        self.view,
-                        AppsView::Swap
-                            | AppsView::Names
-                            | AppsView::PrivacyPools
-                            | AppsView::TxBuilder
-                    )
                 {
-                    self.view = AppsView::Launcher;
+                    match self.view {
+                        // The Builder gets first refusal: with its JSON overlay
+                        // open, stepping back to the launcher throws the user
+                        // out *and* leaves `modal` set, so re-entering lands
+                        // back inside the overlay. It closes the modal and eats
+                        // the key, or bubbles `Close` when there's none.
+                        AppsView::TxBuilder => {
+                            return match self.tx_builder.update(tx_builder::Message::Escape) {
+                                Some(tx_builder::Outcome::Close) => {
+                                    self.view = AppsView::Launcher;
+                                    None
+                                }
+                                other => other.map(Outcome::TxBuilder),
+                            };
+                        }
+                        AppsView::Swap | AppsView::Names | AppsView::PrivacyPools => {
+                            self.view = AppsView::Launcher;
+                        }
+                        AppsView::Launcher => {}
+                    }
                 }
                 None
             }
@@ -329,7 +343,7 @@ impl AppsPane {
                 keyboard::listen().map(Message::Key),
                 self.pool.subscription().map(Message::Pool),
             ]),
-            // Esc steps back to the launcher.
+            // Esc closes the JSON overlay if one is open, else steps back.
             AppsView::TxBuilder => keyboard::listen().map(Message::Key),
             AppsView::Launcher => Subscription::none(),
         }

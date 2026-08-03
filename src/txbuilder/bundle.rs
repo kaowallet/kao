@@ -20,13 +20,29 @@ use super::abi::{AbiMethod, AbiParam};
 use super::encode::{encode_call, format_sol_value};
 use super::{DecodedArg, QueuedCall, TxBuilderError};
 
+/// The bundle-format major version this wallet reads and writes.
+///
+/// `version` used to be written as `"1.0"` and never read back, which made the
+/// field decoration rather than a contract: a future `2.x` bundle — whatever it
+/// changed about how `data`, an operation byte, or the meta block are meant to
+/// be interpreted — would have been parsed under v1 rules and queued as
+/// something other than what it describes. A differing *minor* is fine (added
+/// fields deserialize away); an unknown major is refused.
+const FORMAT_MAJOR: u32 = 1;
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Bundle {
+    #[serde(default)]
     pub version: String,
     #[serde(rename = "chainId")]
     pub chain_id: String,
     #[serde(default, rename = "createdAt", skip_serializing_if = "is_zero_u64")]
     pub created_at: u64,
+    /// Provenance. Optional on import: it carries no part of what executes, so
+    /// a bundle from a tool that doesn't write one is still a perfectly good
+    /// batch — it used to be rejected outright with serde's "missing field
+    /// `meta`", which reads as a malformed file rather than an absent label.
+    #[serde(default)]
     pub meta: Meta,
     pub transactions: Vec<BundleTx>,
 }
@@ -35,7 +51,37 @@ fn is_zero_u64(v: &u64) -> bool {
     *v == 0
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// Seconds since the Unix epoch, for [`Bundle::created_at`]. Saturates to 0
+/// (i.e. "not stamped") if the host clock is before 1970.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Refuse a bundle whose format major version this wallet doesn't implement.
+fn check_version(raw: &str) -> Result<(), TxBuilderError> {
+    let v = raw.trim();
+    match v.split('.').next().unwrap_or("").trim().parse::<u32>() {
+        Ok(FORMAT_MAJOR) => Ok(()),
+        Ok(other) => Err(TxBuilderError::Assembly(format!(
+            "bundle is format version {v}, and this wallet reads {FORMAT_MAJOR}.x — a version \
+             {other} batch may encode its calls differently, so importing it under {FORMAT_MAJOR}.x \
+             rules could queue something other than what it describes",
+        ))),
+        Err(_) => Err(TxBuilderError::Assembly(format!(
+            "bundle doesn't say which format version it is ({}) — refusing to guess",
+            if v.is_empty() {
+                "no `version` field".to_string()
+            } else {
+                format!("`version` is {v:?}")
+            },
+        ))),
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Meta {
     pub name: String,
     #[serde(rename = "txBuilderVersion")]
@@ -156,9 +202,9 @@ pub mod indexmap_lite {
 pub fn export(chain: Chain, safe: Option<Address>, calls: &[QueuedCall]) -> String {
     let transactions = calls.iter().map(tx_from_call).collect();
     let bundle = Bundle {
-        version: "1.0".into(),
+        version: format!("{FORMAT_MAJOR}.0"),
         chain_id: chain.chain_id().to_string(),
-        created_at: 0,
+        created_at: now_secs(),
         meta: Meta {
             name: "Kao batch".into(),
             tx_builder_version: concat!("kao-", env!("CARGO_PKG_VERSION")).into(),
@@ -226,6 +272,7 @@ pub fn import(
 ) -> Result<Vec<QueuedCall>, TxBuilderError> {
     let bundle: Bundle = serde_json::from_str(json.trim())
         .map_err(|e| TxBuilderError::Assembly(format!("not a batch bundle — {e}")))?;
+    check_version(&bundle.version)?;
     if bundle.transactions.is_empty() {
         return Err(TxBuilderError::Assembly(
             "bundle has no transactions".into(),
@@ -749,5 +796,73 @@ mod tests {
     fn import_rejects_garbage() {
         assert!(import("not json", 1, None).is_err());
         assert!(import(r#"{"version":"1.0","chainId":"1","meta":{"name":"x","txBuilderVersion":"y"},"transactions":[]}"#, 1, None).is_err());
+    }
+
+    /// One well-formed v1 transaction, as JSON, with `version` left open so the
+    /// version gate can be driven directly.
+    fn one_tx_bundle(version: &str) -> String {
+        format!(
+            r#"{{"version":"{version}","chainId":"1",
+                "meta":{{"name":"x","txBuilderVersion":"y"}},
+                "transactions":[{{"to":"0x000000000000000000000000000000000000dEaD",
+                                  "value":"0","data":"0x"}}]}}"#
+        )
+    }
+
+    /// `version` was written and never read, so a future major would have been
+    /// parsed under v1 rules — whatever it changed about how the calls are
+    /// encoded — and queued as something other than what it describes.
+    #[test]
+    fn import_refuses_an_unknown_format_major() {
+        let err = import(&one_tx_bundle("2.0"), 1, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("format version 2.0"), "{err}");
+        assert!(err.contains("reads 1.x"), "{err}");
+    }
+
+    #[test]
+    fn import_accepts_a_newer_minor() {
+        // Additive fields deserialize away, so a differing minor is readable.
+        assert!(import(&one_tx_bundle("1.7"), 1, None).is_ok());
+    }
+
+    #[test]
+    fn import_refuses_a_bundle_that_names_no_version() {
+        for v in ["", "banana"] {
+            let err = import(&one_tx_bundle(v), 1, None).unwrap_err().to_string();
+            assert!(err.contains("refusing to guess"), "for {v:?}: {err}");
+        }
+    }
+
+    /// `meta` is provenance, not part of what executes. Requiring it turned
+    /// every bundle from a tool that writes none into serde's "missing field
+    /// `meta`", which reads as a corrupt file rather than an absent label.
+    #[test]
+    fn import_accepts_a_bundle_with_no_meta_block() {
+        let json = r#"{"version":"1.0","chainId":"1",
+            "transactions":[{"to":"0x000000000000000000000000000000000000dEaD",
+                             "value":"0","data":"0x"}]}"#;
+        let calls = import(json, 1, None).expect("provenance is optional");
+        assert_eq!(calls.len(), 1);
+    }
+
+    /// A chain-unknown bundle stays chain-unknown when `meta` defaults, so the
+    /// template wall keeps failing closed rather than assuming Mainnet.
+    #[test]
+    fn a_defaulted_meta_carries_no_kao_chain_id() {
+        let json = r#"{"version":"1.0","chainId":"1",
+            "transactions":[{"to":"0x000000000000000000000000000000000000dEaD",
+                             "value":"0","data":"0x"}]}"#;
+        let b: Bundle = serde_json::from_str(json).unwrap();
+        assert_eq!(b.meta.kao_chain_id, None);
+    }
+
+    #[test]
+    fn export_stamps_a_creation_time_and_the_format_version() {
+        let json = export(Chain::Mainnet, None, &[]);
+        let b: Bundle = serde_json::from_str(&json).unwrap();
+        assert_eq!(b.version, "1.0");
+        assert!(b.created_at > 1_700_000_000, "got {}", b.created_at);
     }
 }

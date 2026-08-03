@@ -298,13 +298,16 @@ impl Database for HeliosDb {
     }
 
     fn block_hash(&mut self, number: u64) -> Result<B256, DbError> {
-        // No send-flow tx (native ETH, ERC-20 transfer) reads
-        // BLOCKHASH. A general-purpose simulation path would need to
-        // service this via a verified `eth_getBlockByNumber`; in v1 we
-        // surface the gap rather than silently returning zero (which
-        // would be a wrong execution, not a missing one).
+        // Servicing this needs a verified `eth_getBlockByNumber`, which
+        // `BalanceFetcher` does not expose. Surfacing the gap is deliberate:
+        // returning zero would be a *wrong* execution rather than a missing
+        // one, and a preflight that quietly computes the wrong answer is worse
+        // than one that declines. The caller renders this string, so it is
+        // written for the person reading it — the batch composer, who can hit
+        // it through any callee that reads BLOCKHASH.
         Err(DbError(format!(
-            "block_hash({number}) unsupported — no send-flow tx reads BLOCKHASH"
+            "this batch reads the hash of block {number}, which Kao's preflight can't supply — \
+             the simulation can't run, but the batch itself may be fine"
         )))
     }
 }
@@ -482,6 +485,15 @@ pub enum BatchOutcome {
     Revert { step: usize, reason: String },
     /// Sub-call `step` halted (out of gas / invalid opcode / …).
     Halt { step: usize, reason: String },
+    /// The simulator could not produce a verdict, and here is why.
+    ///
+    /// Distinct from [`Self::Unavailable`], which says only "no answer". The
+    /// error string used to be dropped on the floor by the caller, so a Helios
+    /// outage, a `BLOCKHASH` read the db can't service, and a batch whose value
+    /// exceeds the sender's balance all rendered as the same shrug — followed
+    /// by advice to re-run a preflight that, for most of those, can never
+    /// succeed.
+    Error(String),
     /// Simulation couldn't run (unsupported chain / upstream error).
     Unavailable,
 }
@@ -500,6 +512,11 @@ pub struct BatchSimResult {
     pub transfers: Vec<TokenTransfer>,
     pub verified: bool,
     pub base_fee_per_gas: u64,
+    /// The block this ran against. A verdict is only a statement about the
+    /// state at one height; without the height, a "Simulation passed" from
+    /// twenty minutes and a hundred blocks ago is indistinguishable from one
+    /// taken a second before the review opened.
+    pub block: u64,
 }
 
 impl BatchSimResult {
@@ -510,6 +527,15 @@ impl BatchSimResult {
             transfers: Vec::new(),
             verified: false,
             base_fee_per_gas: 0,
+            block: 0,
+        }
+    }
+
+    /// The simulator failed outright — `reason` is what to tell the user.
+    pub fn errored(reason: impl Into<String>) -> Self {
+        Self {
+            outcome: BatchOutcome::Error(reason.into()),
+            ..Self::unavailable()
         }
     }
 
@@ -557,6 +583,7 @@ pub async fn simulate_batch(
     let block = latest.value;
     let chain_id = chain.chain_id();
     let base_fee_per_gas = block.base_fee_per_gas;
+    let block_number = block.number;
     let handle = Handle::current();
 
     let result = tokio::task::spawn_blocking(move || -> Result<BatchSimResult, SimError> {
@@ -574,9 +601,27 @@ pub async fn simulate_batch(
         let mut outcome = BatchOutcome::Success;
         for (i, step) in steps.iter().enumerate() {
             let tx_env = build_tx_env(from, step.to, step.value, step.input.clone(), 0, chain_id);
-            let res = evm
-                .transact_commit(tx_env)
-                .map_err(|e| SimError::Evm(format!("{e:?}")))?;
+            let res = match evm.transact_commit(tx_env) {
+                Ok(r) => r,
+                // revm refuses a step whose `value` exceeds the sender's
+                // balance in its upfront check, before the EVM runs, and
+                // reports it as an *error* rather than a Revert. It is a real
+                // prediction about this batch — the chain would do the same —
+                // so it belongs in the outcome, not in the error channel where
+                // it degrades to "simulation unavailable". Mirrors the same
+                // translation in `safe::sim::simulate_safe_inner`.
+                Err(e) => {
+                    let msg = format!("{e:?}");
+                    if msg.contains("LackOfFund") {
+                        outcome = BatchOutcome::Revert {
+                            step: i,
+                            reason: "sender's balance is below this call's value".to_string(),
+                        };
+                        break;
+                    }
+                    return Err(SimError::Evm(msg));
+                }
+            };
             gas_used = gas_used.saturating_add(res.gas_used());
             match res {
                 ExecutionResult::Success { logs, .. } => {
@@ -613,6 +658,7 @@ pub async fn simulate_batch(
             transfers,
             verified,
             base_fee_per_gas,
+            block: block_number,
         })
     })
     .await

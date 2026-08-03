@@ -53,6 +53,21 @@ pub enum ReadOutcome {
     Err(String),
 }
 
+/// What became of the last batch this pane dispatched.
+///
+/// The pane used to learn only that *something* finished: the overlay closed
+/// and the queue emptied, which is exactly what a cancel looks like, and the
+/// transaction hash was bound to `_hash` and dropped. A successful propose was
+/// the worst of the three — indistinguishable from an accidental dismissal, so
+/// the natural response was to propose the same batch a second time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Settled {
+    /// Mined with `status == 1`. The hash is kept so the user can look it up.
+    Executed { hash: B256 },
+    /// Filed on the Transaction Service at `nonce`, awaiting co-signers.
+    Proposed { nonce: u64 },
+}
+
 /// The JSON import/export overlay, if any.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Modal {
@@ -70,6 +85,7 @@ pub enum Message {
     SetNetwork(NetworkId),
     // contract-call composer
     AddrChanged(String),
+    RetryResolve,
     ShowAbiPaste,
     AbiPasteChanged(String),
     LoadPastedAbi,
@@ -119,7 +135,12 @@ pub enum Message {
     JsonChanged(String),
     CopyJson,
     ImportJson,
+    // settled batch
+    CopySettledHash,
+    DismissSettled,
     // misc
+    /// Esc was pressed while the Builder is open.
+    Escape,
     DismissError,
 }
 
@@ -131,6 +152,7 @@ impl Message {
             Message::ToggleNetworkMenu => "ToggleNetworkMenu",
             Message::SetNetwork(_) => "SetNetwork",
             Message::AddrChanged(_) => "AddrChanged",
+            Message::RetryResolve => "RetryResolve",
             Message::ShowAbiPaste => "ShowAbiPaste",
             Message::AbiPasteChanged(_) => "AbiPasteChanged",
             Message::LoadPastedAbi => "LoadPastedAbi",
@@ -174,6 +196,9 @@ impl Message {
             Message::JsonChanged(_) => "JsonChanged",
             Message::CopyJson => "CopyJson",
             Message::ImportJson => "ImportJson",
+            Message::CopySettledHash => "CopySettledHash",
+            Message::DismissSettled => "DismissSettled",
+            Message::Escape => "Escape",
             Message::DismissError => "DismissError",
         }
     }
@@ -206,14 +231,23 @@ pub struct ResolvedCode {
 /// the simulation is a sequential approximation and can diverge from chain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Preflight {
-    /// Simulated on a verified chain; every call succeeded.
-    Passed,
-    /// Simulated and it fails. `step` is 0-based over the *effective* calls
-    /// (the queue plus any appended flash-approval revokes), matching what was
-    /// submitted to the simulator.
-    Fails { step: usize, reason: String },
+    /// Simulated on a verified chain; every call succeeded. `stale` is set when
+    /// the chain has moved far enough past the simulated block that the verdict
+    /// is no longer a statement about the state the batch will meet; `verified`
+    /// is false when some read behind it fell through to raw RPC.
+    Passed { stale: bool, verified: bool },
+    /// Simulated and it fails. `at` names the failing call the way the user can
+    /// point at it — the simulator indexes the *effective* calls (the queue
+    /// wrapped in flash-approval resets), which is not the numbering on the
+    /// queue cards.
+    Fails { at: String, reason: String },
+    /// The simulator itself failed, and this is why. Distinct from
+    /// [`Self::Missing`]: "go back and run the preflight" is useless advice for
+    /// a batch whose preflight cannot succeed, and it was the advice given for
+    /// every upstream error because the reason was discarded unread.
+    Errored { reason: String },
     /// Simulation is available on this network but hasn't produced a verdict
-    /// for the batch as it currently stands — never run, or it errored.
+    /// for the batch as it currently stands — never run.
     Missing,
     /// The network has no simulation at all (a custom, unverified chain). Not
     /// a warning in its own right: the review's own copy already says the
@@ -221,22 +255,61 @@ pub enum Preflight {
     Unsupported,
 }
 
+/// How long a preflight verdict stands before it stops being a claim about the
+/// state the batch will actually meet.
+///
+/// Measured on the wall clock rather than in blocks: the app would have to
+/// re-read the head to count blocks, and the property being bounded — "someone
+/// else could have moved a balance or an allowance since this ran" — is a
+/// function of elapsed time on every chain Kao supports. Three minutes is ~15
+/// Mainnet blocks and considerably more on Base and Optimism, which is the
+/// direction a staleness bound should err in.
+pub const PREFLIGHT_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(180);
+
 impl Preflight {
     /// Whether the confirm button should read as a deliberate override rather
     /// than a routine confirmation.
     pub fn softens_confirm(&self) -> bool {
-        matches!(self, Self::Fails { .. } | Self::Missing)
+        match self {
+            Self::Fails { .. } | Self::Errored { .. } | Self::Missing => true,
+            // A verdict taken a hundred blocks ago, or one resting on reads
+            // that fell through to unverified RPC, is not the clean pass the
+            // routine label promises.
+            Self::Passed { stale, verified } => *stale || !*verified,
+            Self::Unsupported => false,
+        }
     }
 
     /// A line for the review note when the preflight is something the user
     /// should weigh before signing. `None` when there's nothing to add.
     pub fn warning(&self) -> Option<String> {
         match self {
-            Self::Passed | Self::Unsupported => None,
-            Self::Fails { step, reason } => Some(format!(
-                "⚠ Preflight FAILED at call #{}: {reason}. The batch is atomic, so on-chain \
-                 this reverts as a whole and costs gas for nothing.",
-                step + 1
+            Self::Unsupported => None,
+            Self::Passed {
+                stale: false,
+                verified: true,
+            } => None,
+            Self::Passed { stale, verified } => {
+                let mut why: Vec<&str> = Vec::new();
+                if *stale {
+                    why.push("the chain has moved on since it ran");
+                }
+                if !*verified {
+                    why.push("some of the state it read couldn't be light-client-verified");
+                }
+                Some(format!(
+                    "⚠ The preflight passed, but {} — re-run it before signing if this batch \
+                     depends on balances or allowances that others can move.",
+                    why.join(" and "),
+                ))
+            }
+            Self::Fails { at, reason } => Some(format!(
+                "⚠ Preflight FAILED at {at}: {reason}. The batch is atomic, so on-chain this \
+                 reverts as a whole and costs gas for nothing."
+            )),
+            Self::Errored { reason } => Some(format!(
+                "⚠ The preflight couldn't run: {reason}. That is a gap in what this wallet can \
+                 predict, not a verdict on the batch — nothing here says whether it succeeds."
             )),
             Self::Missing => Some(
                 "⚠ This batch has not been simulated. Go back and run the preflight to see \
@@ -287,7 +360,17 @@ pub enum Outcome {
         preflight: Preflight,
     },
     /// Persist the user's template list to redb.
-    PersistTemplates(Vec<Template>),
+    ///
+    /// The in-memory list is *already* mutated by the time this is bubbled, so
+    /// `rollback` carries what it looked like before. This was the one outcome
+    /// with no failure path at all — a read-only data dir or a held redb lock
+    /// made every save, rename and delete a silent no-op that only surfaced
+    /// next session, and a failed *delete* was worse than a no-op: the template
+    /// came back.
+    PersistTemplates {
+        list: Vec<Template>,
+        rollback: Vec<Template>,
+    },
     /// Copy text (exported JSON) to the clipboard, armed for the usual 10s
     /// auto-clear.
     CopyText(String),
@@ -305,7 +388,7 @@ impl Outcome {
             Outcome::Read { .. } => "Read",
             Outcome::Simulate { .. } => "Simulate",
             Outcome::Review { .. } => "Review",
-            Outcome::PersistTemplates(_) => "PersistTemplates",
+            Outcome::PersistTemplates { .. } => "PersistTemplates",
             Outcome::CopyText(_) => "CopyText",
             Outcome::CopyPlain(_) => "CopyPlain",
         }
@@ -334,6 +417,15 @@ struct Ctx {
     /// delegation (Local / Ledger) and therefore batch N calls atomically.
     /// Trezor / view-only cannot, and stay capped at a single call.
     eoa_can_batch: bool,
+    /// Whether the active identity can produce a signature at all.
+    ///
+    /// False for a watch-only account. The Builder's EOA arm never consulted
+    /// `build_eoa_context`, so such an account got the whole clear-sign
+    /// ceremony — overlay, decode, delegation card, three RPC round-trips —
+    /// before the signer itself finally refused. Safe mode leaves this true:
+    /// there the question is which *owner keys* are linked, which the review's
+    /// own copy already answers.
+    can_sign: bool,
     /// Enabled custom networks `(chain_id, name)` offered by the switcher.
     custom_networks: Vec<(u64, String)>,
 }
@@ -362,6 +454,16 @@ pub struct TxBuilderApp {
     resolving: bool,
     /// Set when a resolve found no ABI — prompts the paste-ABI fallback.
     not_found: bool,
+    /// Set when the last resolve *failed* rather than came back empty.
+    ///
+    /// Kept apart from `not_found` because the two want opposite responses: no
+    /// ABI is a fact about the contract and the answer is to paste one; a
+    /// light-client hiccup is a fact about the connection and the answer is to
+    /// try again. Collapsing them steered users into hand-pasting an ABI (or
+    /// dropping to raw hex) for a well-known verified contract, and re-entering
+    /// the same address did nothing at all — the dedup guard treated the failed
+    /// state as settled.
+    resolve_error: Option<String>,
     /// Set when the last resolve hit a proxy slot it could only read over
     /// unverified RPC. The pointer wasn't followed, so the ABI on screen is the
     /// proxy stub's — worth saying out loud rather than leaving the user to
@@ -400,6 +502,9 @@ pub struct TxBuilderApp {
 
     // ── simulation strip ──
     sim: Option<BatchSimResult>,
+    /// When the held verdict landed, for the staleness check. `None` for a
+    /// result planted directly by a test.
+    sim_at: Option<std::time::Instant>,
     sim_busy: bool,
     /// Retires an in-flight simulation, exactly as `resolve_seq` / `read_seq`
     /// do for their queries. Without it `on_sim` adopted whatever landed:
@@ -421,6 +526,11 @@ pub struct TxBuilderApp {
     json_text: String,
     json_error: Option<String>,
 
+    /// The last batch this pane got a definitive answer about. Persists until
+    /// dismissed — a receipt is the only thing that distinguishes a batch that
+    /// worked from one that reverted, and neither used to leave a trace.
+    settled: Option<Settled>,
+
     error: Option<String>,
 }
 
@@ -436,6 +546,7 @@ impl TxBuilderApp {
             loaded: None,
             resolving: false,
             not_found: false,
+            resolve_error: None,
             proxy_unverified: false,
             paste_open: false,
             abi_paste: String::new(),
@@ -459,6 +570,7 @@ impl TxBuilderApp {
             expanded: None,
             auto_revoke: false,
             sim: None,
+            sim_at: None,
             sim_busy: false,
             sim_seq: 0,
             templates: Vec::new(),
@@ -468,6 +580,7 @@ impl TxBuilderApp {
             modal: Modal::None,
             json_text: String::new(),
             json_error: None,
+            settled: None,
             error: None,
         }
     }
@@ -500,6 +613,7 @@ impl TxBuilderApp {
         is_safe: bool,
         safe_version: Option<String>,
         eoa_can_batch: bool,
+        can_sign: bool,
         custom_networks: Vec<(u64, String)>,
     ) {
         let prev_identity = self.ctx.identity;
@@ -508,6 +622,7 @@ impl TxBuilderApp {
             is_safe,
             safe_version,
             eoa_can_batch,
+            can_sign,
             custom_networks,
         };
         self.owner = identity;
@@ -579,7 +694,9 @@ impl TxBuilderApp {
                     None => self.not_found = true,
                 }
             }
-            Err(_) => self.not_found = true,
+            // A failed *fetch* says nothing about whether this contract has a
+            // recoverable ABI, so it must not be reported as "no verified ABI".
+            Err(e) => self.resolve_error = Some(e),
         }
     }
 
@@ -592,7 +709,16 @@ impl TxBuilderApp {
             return; // stale — a newer batch superseded this run
         }
         self.sim_busy = false;
-        self.sim = Some(result.unwrap_or_else(|_| BatchSimResult::unavailable()));
+        // The failure reason used to be discarded here (`unwrap_or_else(|_|
+        // …unavailable())`), which is how a Helios outage, an unservicable
+        // `BLOCKHASH` read and a batch that can never simulate all came out as
+        // the same "Simulation unavailable" — followed by advice to go and run
+        // the preflight again.
+        self.sim = Some(match result {
+            Ok(r) => r,
+            Err(e) => BatchSimResult::errored(e),
+        });
+        self.sim_at = Some(std::time::Instant::now());
     }
 
     /// A Read-tab `eth_call` returned. `seq` guards against a stale query
@@ -624,12 +750,31 @@ impl TxBuilderApp {
         });
     }
 
-    /// The batch was executed successfully — clear it so the composer is
-    /// ready for the next one.
-    pub fn on_executed(&mut self) {
+    /// The batch was **mined successfully** — `hash` had `status == 1`. Clears
+    /// the queue and leaves the hash on screen.
+    ///
+    /// Only reached from a receipt, never from a broadcast. A bare hash says a
+    /// node accepted the transaction and nothing else: a status-0 receipt, a
+    /// guard rejection and a GS013 all broadcast exactly as cleanly as a win,
+    /// and this used to clear the queue for all of them with no record and
+    /// nothing to retry from.
+    pub fn on_executed(&mut self, hash: B256) {
         self.batch.clear();
-        self.sim = None;
+        self.invalidate_sim();
         self.expanded = None;
+        self.error = None;
+        self.settled = Some(Settled::Executed { hash });
+    }
+
+    /// The batch was filed on the Transaction Service for co-signers. Not an
+    /// execution: it clears the composer the same way, but says so differently,
+    /// because "queued" and "done" are not the same claim.
+    pub fn on_proposed(&mut self, nonce: u64) {
+        self.batch.clear();
+        self.invalidate_sim();
+        self.expanded = None;
+        self.error = None;
+        self.settled = Some(Settled::Proposed { nonce });
     }
 
     pub fn update(&mut self, msg: Message) -> Option<Outcome> {
@@ -668,6 +813,7 @@ impl TxBuilderApp {
                 }
             }
             Message::AddrChanged(v) => return self.on_addr_changed(v),
+            Message::RetryResolve => return self.retry_resolve(),
             Message::ShowAbiPaste => {
                 self.paste_open = true;
             }
@@ -782,12 +928,17 @@ impl TxBuilderApp {
                 }
             }
             Message::Review => {
-                if !self.batch.is_empty() {
-                    return Some(Outcome::Review {
-                        calls: self.effective_calls(),
-                        preflight: self.preflight(),
-                    });
+                if self.batch.is_empty() {
+                    return None;
                 }
+                if let Some(why) = self.no_signer_reason() {
+                    self.error = Some(why);
+                    return None;
+                }
+                return Some(Outcome::Review {
+                    calls: self.effective_calls(),
+                    preflight: self.preflight(),
+                });
             }
             Message::ToggleTemplateMenu => {
                 self.template_menu_open = !self.template_menu_open;
@@ -806,17 +957,19 @@ impl TxBuilderApp {
                 // batch, so nothing to save).
                 if let (false, Some(chain)) = (self.batch.is_empty(), self.net.builtin()) {
                     self.cancel_rename();
+                    let rollback = self.templates.clone();
                     let t = Template::from_batch("Untitled batch", "(｡•̀ᴗ-)✧", chain, &self.batch);
                     self.templates.push(t);
                     self.template_menu_open = true;
-                    return Some(Outcome::PersistTemplates(self.templates.clone()));
+                    return Some(self.persist(rollback));
                 }
             }
             Message::DeleteTemplate(i) => {
                 if i < self.templates.len() {
                     self.cancel_rename();
+                    let rollback = self.templates.clone();
                     self.templates.remove(i);
-                    return Some(Outcome::PersistTemplates(self.templates.clone()));
+                    return Some(self.persist(rollback));
                 }
             }
             Message::StartRename(i) => {
@@ -852,7 +1005,19 @@ impl TxBuilderApp {
                 self.json_error = None;
                 self.modal = Modal::Load;
             }
-            Message::CloseModal => self.modal = Modal::None,
+            Message::CloseModal => self.close_modal(),
+            // The app-level Esc handler steps back to the launcher; with a
+            // modal open that is never what the user meant, and `root()`
+            // short-circuits to `modal_view` whenever `modal != None`, so
+            // re-entering the Builder landed straight back inside it. Esc
+            // closes the modal and consumes the key.
+            Message::Escape => {
+                if self.modal != Modal::None {
+                    self.close_modal();
+                } else {
+                    return Some(Outcome::Close);
+                }
+            }
             Message::JsonChanged(v) => {
                 self.json_text = v;
                 self.json_error = None;
@@ -860,15 +1025,22 @@ impl TxBuilderApp {
             Message::CopyJson => return Some(Outcome::CopyText(self.json_text.clone())),
             Message::ImportJson => {
                 match bundle::import(&self.json_text, self.next_id, self.net.builtin()) {
-                    Ok(calls) => {
-                        self.next_id += calls.len() as u64;
-                        self.batch = calls;
-                        self.invalidate_sim();
-                        self.modal = Modal::None;
-                    }
+                    Ok(calls) => match self.adopt_batch(calls) {
+                        Ok(()) => self.modal = Modal::None,
+                        // Stays in the modal with the reason: the JSON is still
+                        // in the box, so the user can take it somewhere that
+                        // can run it rather than losing it to a closed overlay.
+                        Err(e) => self.json_error = Some(e),
+                    },
                     Err(e) => self.json_error = Some(e.to_string()),
                 }
             }
+            Message::CopySettledHash => {
+                if let Some(Settled::Executed { hash, .. }) = &self.settled {
+                    return Some(Outcome::CopyPlain(format!("{hash:#x}")));
+                }
+            }
+            Message::DismissSettled => self.settled = None,
             Message::DismissError => self.error = None,
         }
         None
@@ -881,6 +1053,9 @@ impl TxBuilderApp {
         match trimmed.parse::<Address>() {
             Ok(addr) => {
                 // Already resolved / resolving this exact address — no-op.
+                // A *failed* resolve is deliberately not in this list: it is
+                // the one settled state worth leaving, so re-entering the same
+                // address retries instead of doing nothing.
                 if self.resolve_target == Some(addr)
                     && (self.loaded.is_some() || self.resolving || self.not_found)
                 {
@@ -922,6 +1097,23 @@ impl TxBuilderApp {
         }
     }
 
+    /// Re-issue the bytecode fetch for the address already in the box, after
+    /// one failed. Only reachable from the Retry affordance the failed state
+    /// puts on screen.
+    fn retry_resolve(&mut self) -> Option<Outcome> {
+        let addr = self.resolve_target?;
+        let chain = self.net.builtin()?;
+        self.resolve_error = None;
+        self.not_found = false;
+        self.invalidate_resolve();
+        self.resolving = true;
+        Some(Outcome::ResolveContract {
+            seq: self.resolve_seq,
+            chain,
+            address: addr,
+        })
+    }
+
     fn set_loaded(&mut self, loaded: LoadedContract) {
         // Installing a contract retires any resolve still in flight. Without
         // this, a curated-registry hit or a pasted ABI (neither of which issues
@@ -931,6 +1123,7 @@ impl TxBuilderApp {
         self.invalidate_resolve();
         self.resolving = false;
         self.not_found = false;
+        self.resolve_error = None;
         // A curated or pasted ABI is authoritative for the address regardless
         // of what the proxy walk could or couldn't read, so the caution retires
         // with it; a bytecode load keeps it (that ABI *is* the stub's).
@@ -978,6 +1171,7 @@ impl TxBuilderApp {
         self.loaded = None;
         self.resolving = false;
         self.not_found = false;
+        self.resolve_error = None;
         self.proxy_unverified = false;
         self.paste_open = false;
         self.resolve_target = None;
@@ -1085,6 +1279,7 @@ impl TxBuilderApp {
     /// user re-run immediately; the superseded result can no longer land.
     fn invalidate_sim(&mut self) {
         self.sim = None;
+        self.sim_at = None;
         self.sim_busy = false;
         self.sim_seq += 1;
     }
@@ -1104,13 +1299,24 @@ impl TxBuilderApp {
             };
         };
         match &sim.outcome {
-            BatchOutcome::Success => Preflight::Passed,
+            // A pass is only as good as when it was taken and what it could
+            // verify. Both used to be dropped on the way to the overlay, so a
+            // twenty-minute-old verdict resting on unverified RPC reads
+            // produced exactly the same unsoftened confirm as one taken a
+            // second ago against Helios-verified state.
+            BatchOutcome::Success => Preflight::Passed {
+                stale: self.sim_is_stale(),
+                verified: sim.verified,
+            },
             BatchOutcome::Revert { step, reason } | BatchOutcome::Halt { step, reason } => {
                 Preflight::Fails {
-                    step: *step,
+                    at: self.describe_step(*step),
                     reason: reason.clone(),
                 }
             }
+            BatchOutcome::Error(reason) => Preflight::Errored {
+                reason: reason.clone(),
+            },
             // The simulator ran and couldn't reach a verdict — on a built-in
             // chain that's a failed preflight, not an absent one.
             BatchOutcome::Unavailable => {
@@ -1121,6 +1327,15 @@ impl TxBuilderApp {
                 }
             }
         }
+    }
+
+    /// Whether the held verdict has aged past [`PREFLIGHT_STALE_AFTER`]. No
+    /// timestamp (a result planted by a test, or none held) reads as fresh —
+    /// staleness is an extra caution, never the only thing keeping a batch off
+    /// a device.
+    fn sim_is_stale(&self) -> bool {
+        self.sim_at
+            .is_some_and(|t| t.elapsed() >= PREFLIGHT_STALE_AFTER)
     }
 
     /// Surface a coordinator-side failure on the pane's error banner. Without
@@ -1137,14 +1352,43 @@ impl TxBuilderApp {
         self.error.as_deref()
     }
 
-    /// The calls to simulate / review / sign: the queue, plus flash-approval
-    /// revokes appended when the toggle is on. Revokes are derived here (never
-    /// stored in `batch`) so the queue stays editable and reorder-safe.
+    /// The calls to simulate / review / sign: the queue, wrapped in
+    /// flash-approval zero-resets (before *and* after) when the toggle is on.
+    /// The resets are derived here and never stored in `batch`, so the queue
+    /// stays editable and reorder-safe.
     fn effective_calls(&self) -> Vec<QueuedCall> {
-        if self.auto_revoke && self.can_batch() {
-            flash_approval::wrap_with_revoke(&self.batch, self.next_id)
+        if self.flash_wrapped() {
+            flash_approval::wrap_with_flash_approval(&self.batch, self.next_id)
         } else {
             self.batch.clone()
+        }
+    }
+
+    /// Whether [`Self::effective_calls`] is currently wrapping the queue.
+    fn flash_wrapped(&self) -> bool {
+        self.auto_revoke && self.can_batch()
+    }
+
+    /// Name the effective-call at `step` in terms the user can point at.
+    ///
+    /// The simulator indexes [`Self::effective_calls`], while the queue cards
+    /// are numbered over `batch` — two different index spaces that the revert
+    /// strip and the review note both used to print as a bare `#step + 1`.
+    /// With flash approval on that number could name a call the user cannot
+    /// see, inspect or remove, and the prepended resets shift *every* queue
+    /// position, so the mismatch is no longer just off the end.
+    fn describe_step(&self, step: usize) -> String {
+        if !self.flash_wrapped() {
+            return format!("call #{}", step + 1);
+        }
+        let opens = flash_approval::prepend_count(&self.batch);
+        let queued = self.batch.len();
+        if step < opens {
+            "the allowance reset flash approval runs before the batch".to_string()
+        } else if step < opens + queued {
+            format!("call #{}", step - opens + 1)
+        } else {
+            "the approval revoke flash approval runs after the batch".to_string()
         }
     }
 
@@ -1292,6 +1536,14 @@ impl TxBuilderApp {
         }
     }
 
+    /// Whether this identity can carry a batch to a signature at all. False
+    /// only for a watch-only account, which can compose and simulate — both
+    /// useful on their own — but must not be walked through a signing ceremony
+    /// that ends in the signer refusing.
+    fn can_sign(&self) -> bool {
+        self.ctx.is_safe || self.ctx.can_sign
+    }
+
     fn add_to_batch(&mut self) {
         // A plain EOA batches atomically only when its signer can authorize an
         // EIP-7702 delegation (Local / Ledger). Trezor / view-only cannot, so
@@ -1324,6 +1576,10 @@ impl TxBuilderApp {
     /// Custom-network "Send transaction": build the single composed call and
     /// hand it straight to the review overlay (no batch queue on custom nets).
     fn send_single(&mut self) -> Option<Outcome> {
+        if let Some(why) = self.no_signer_reason() {
+            self.error = Some(why);
+            return None;
+        }
         match self.compose_call() {
             Ok(call) => {
                 self.error = None;
@@ -1339,6 +1595,18 @@ impl TxBuilderApp {
                 None
             }
         }
+    }
+
+    /// Why this batch can't be taken to a signature, if it can't. `None` when
+    /// the active identity can sign.
+    fn no_signer_reason(&self) -> Option<String> {
+        (!self.can_sign()).then(|| {
+            format!(
+                "{} is watch-only — Kao holds no key for it, so this batch can't be signed. \
+                 Compose and simulate freely; to send it, switch to an account with a key.",
+                crate::wallet::short_address(self.owner),
+            )
+        })
     }
 
     /// Fire the composed read query as an `eth_call` on the active network.
@@ -1381,18 +1649,55 @@ impl TxBuilderApp {
             self.template_menu_open = false;
             return;
         };
-        match t.calls(self.next_id, chain) {
-            Ok(calls) => {
-                self.next_id += calls.len() as u64;
-                self.batch = calls;
-                self.invalidate_sim();
-                self.expanded = None;
+        let calls = match t.calls(self.next_id, chain) {
+            Ok(c) => c,
+            Err(e) => {
+                self.error = Some(e.to_string());
+                return;
+            }
+        };
+        match self.adopt_batch(calls) {
+            Ok(()) => {
                 self.template_menu_open = false;
                 self.cancel_rename();
-                self.error = None;
             }
-            Err(e) => self.error = Some(e.to_string()),
+            Err(e) => self.error = Some(e),
         }
+    }
+
+    /// Replace the queue with `calls`, applying the same rules
+    /// [`Self::add_to_batch`] applies one call at a time.
+    ///
+    /// Both wholesale paths — JSON import and template load — used to assign
+    /// `self.batch` directly, which walked straight past the atomic-batching
+    /// cap. A Trezor or view-only account could import six calls, simulate them
+    /// green, and only learn at Review that this wallet can't sign more than
+    /// one; every multi-call template was silently unusable the same way.
+    /// Replacing a non-empty queue is also called out rather than done
+    /// silently, since there is no undo for it.
+    fn adopt_batch(&mut self, calls: Vec<QueuedCall>) -> Result<(), String> {
+        if calls.is_empty() {
+            return Err("that batch has no calls in it".to_string());
+        }
+        if calls.len() > 1 && !self.can_batch() {
+            return Err(format!(
+                "This batch has {} calls, and this account sends one at a time — atomic \
+                 batching needs a software key or a Ledger (EIP-7702), or a Safe.",
+                calls.len(),
+            ));
+        }
+        let replaced = self.batch.len();
+        self.next_id += calls.len() as u64;
+        self.batch = calls;
+        self.invalidate_sim();
+        self.expanded = None;
+        self.error = (replaced > 0).then(|| {
+            format!(
+                "Replaced the {replaced} call{} you had queued.",
+                if replaced == 1 { "" } else { "s" },
+            )
+        });
+        Ok(())
     }
 
     /// Commit an in-flight inline rename: trim, apply, persist. A blank name is
@@ -1403,10 +1708,28 @@ impl TxBuilderApp {
         if name.is_empty() {
             return None;
         }
+        let rollback = self.templates.clone();
         let t = self.templates.get_mut(idx)?;
         t.name = name;
         self.cancel_rename();
-        Some(Outcome::PersistTemplates(self.templates.clone()))
+        Some(self.persist(rollback))
+    }
+
+    /// Ask the coordinator to write the template list, handing it the
+    /// pre-mutation snapshot to restore if the write fails.
+    fn persist(&self, rollback: Vec<Template>) -> Outcome {
+        Outcome::PersistTemplates {
+            list: self.templates.clone(),
+            rollback,
+        }
+    }
+
+    /// Dismiss the JSON overlay and drop what was in it. `Close` never cleared
+    /// `modal`, so the flag outlived the view that owned it.
+    fn close_modal(&mut self) {
+        self.modal = Modal::None;
+        self.json_text.clear();
+        self.json_error = None;
     }
 
     fn cancel_rename(&mut self) {
@@ -1447,6 +1770,14 @@ pub struct SafeBatchRequest {
     pub input: SafeTxInput,
     pub call_count: usize,
     pub prepared: Option<(u64, B256)>,
+    /// Nonces already claimed by proposals sitting on this Safe's Transaction
+    /// Service queue, as the dashboard last fetched them.
+    ///
+    /// The batch used to be pinned at the live on-chain nonce unconditionally,
+    /// so proposing over an already-queued slot filed a silent competitor:
+    /// whichever of the two executes voids the other, and neither the review
+    /// nor the queue said a word. The prepare step pins past these instead.
+    pub queued_nonces: Vec<u64>,
     /// Safe Transaction Service base URL for this Safe, so a batch that can't
     /// meet the threshold from locally-held keys can still be proposed for the
     /// remaining co-signers to confirm.
@@ -1508,6 +1839,12 @@ pub struct PreparedDelegation {
     /// True when the account already ran `delegate`'s code at review time, so
     /// the review told the user no new authorization would be signed.
     pub already_active: bool,
+    /// The nonce the reviewed authorization committed to, and therefore the
+    /// nonce its displayed ERC-8213 digest was taken over. `None` when
+    /// `already_active` — nothing is signed. The send path re-derives it from
+    /// the live account nonce and aborts on disagreement, so the digest the
+    /// user checked against their device is the digest that gets signed.
+    pub auth_nonce: Option<u64>,
 }
 
 impl EoaBatchRequest {
@@ -1618,6 +1955,14 @@ mod tests {
 
     /// The two identities the tests act as. Distinct because `set_context` now
     /// drops the queue when the acting address moves.
+    /// A preflight that passed, fresh and fully verified — what every one of
+    /// these tests plants, and the only shape that leaves the confirm button
+    /// reading as routine.
+    const PASSED_CLEAN: Preflight = Preflight::Passed {
+        stale: false,
+        verified: true,
+    };
+
     const SAFE: Address = address!("0x5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a");
     const EOA: Address = address!("0x1111111111111111111111111111111111111111");
 
@@ -1629,9 +1974,333 @@ mod tests {
             true,
             Some("1.4.1".into()),
             false,
+            true,
             Vec::new(),
         );
         app
+    }
+
+    /// A watch-only account: composes and simulates, but must never be walked
+    /// into a signing ceremony.
+    fn view_only_app() -> TxBuilderApp {
+        let mut app = TxBuilderApp::new(EOA);
+        app.set_context(
+            EOA,
+            Chain::Mainnet,
+            false,
+            None,
+            /* eoa_can_batch */ false,
+            /* can_sign */ false,
+            Vec::new(),
+        );
+        app
+    }
+
+    // ── 2.5 · a simulator failure is a reason, not a shrug ──────────────
+
+    /// The Err string used to be dropped by `unwrap_or_else`, so a Helios
+    /// outage and an unservicable `BLOCKHASH` both came out as "Simulation
+    /// unavailable" — and then as advice to go and run the preflight again,
+    /// which for most of those can never succeed.
+    #[test]
+    fn a_failed_simulation_carries_its_reason_to_the_review() {
+        let mut app = safe_app();
+        app.batch = sample_batch(&mut app.next_id, app.owner);
+        let Some(Outcome::Simulate { seq, .. }) = app.update(Message::Simulate) else {
+            panic!("expected a Simulate");
+        };
+        app.on_sim(seq, Err("light client is still syncing".into()));
+
+        let Preflight::Errored { reason } = app.preflight() else {
+            panic!("expected Errored, got {:?}", app.preflight());
+        };
+        assert_eq!(reason, "light client is still syncing");
+        let w = app.preflight().warning().expect("a warning");
+        assert!(w.contains("light client is still syncing"), "{w}");
+        assert!(
+            !w.contains("Go back and run the preflight"),
+            "must not tell the user to retry something that can't succeed: {w}"
+        );
+        assert!(app.preflight().softens_confirm());
+        assert!(!app.sim_busy, "the spinner has to come down either way");
+    }
+
+    // ── 2.3 · a pass is only as good as when it was taken ───────────────
+
+    #[test]
+    fn a_pass_over_unverified_state_does_not_read_as_routine() {
+        let mut app = safe_app();
+        app.batch = sample_batch(&mut app.next_id, app.owner);
+        let Some(Outcome::Simulate { seq, .. }) = app.update(Message::Simulate) else {
+            panic!("expected a Simulate");
+        };
+        app.on_sim(
+            seq,
+            Ok(BatchSimResult {
+                outcome: BatchOutcome::Success,
+                gas_used: 1,
+                transfers: Vec::new(),
+                verified: false, // fell through to raw RPC
+                base_fee_per_gas: 1,
+                block: 21_000_000,
+            }),
+        );
+        let p = app.preflight();
+        assert_eq!(
+            p,
+            Preflight::Passed {
+                stale: false,
+                verified: false
+            }
+        );
+        assert!(
+            p.softens_confirm(),
+            "an unverified pass is not a clean pass"
+        );
+        assert!(p.warning().unwrap().contains("light-client-verified"));
+    }
+
+    #[test]
+    fn a_pass_goes_stale_on_the_clock() {
+        let mut app = safe_app();
+        app.batch = sample_batch(&mut app.next_id, app.owner);
+        let Some(Outcome::Simulate { seq, .. }) = app.update(Message::Simulate) else {
+            panic!("expected a Simulate");
+        };
+        app.on_sim(
+            seq,
+            Ok(BatchSimResult {
+                outcome: BatchOutcome::Success,
+                gas_used: 1,
+                transfers: Vec::new(),
+                verified: true,
+                base_fee_per_gas: 1,
+                block: 21_000_000,
+            }),
+        );
+        assert_eq!(app.preflight(), PASSED_CLEAN, "fresh out of the simulator");
+
+        // Wind the verdict back past the bound.
+        app.sim_at = Some(std::time::Instant::now() - PREFLIGHT_STALE_AFTER);
+        let p = app.preflight();
+        assert_eq!(
+            p,
+            Preflight::Passed {
+                stale: true,
+                verified: true
+            }
+        );
+        assert!(p.softens_confirm());
+        assert!(p.warning().unwrap().contains("moved on since it ran"));
+    }
+
+    // ── 2.6 · a failed fetch is not "no verified ABI" ───────────────────
+
+    /// Pasting a hand-written ABI is a lot of work, and the wrong work, when
+    /// the real problem was a light-client hiccup on a verified contract.
+    #[test]
+    fn a_failed_resolve_is_reported_as_a_failed_resolve() {
+        let mut app = safe_app();
+        let addr = address!("0x1111111111111111111111111111111111111111");
+        let Some(Outcome::ResolveContract { seq, .. }) =
+            app.update(Message::AddrChanged(addr.to_string()))
+        else {
+            panic!("expected a ResolveContract");
+        };
+        app.on_contract_resolved(seq, Err("light client timed out".into()));
+
+        assert_eq!(app.resolve_error.as_deref(), Some("light client timed out"));
+        assert!(
+            !app.not_found,
+            "a fetch that failed says nothing about whether an ABI exists"
+        );
+    }
+
+    /// The dedup guard treated the failed state as settled, so re-entering the
+    /// same address did nothing at all — the one state where retrying is the
+    /// obvious move was the one state that couldn't.
+    #[test]
+    fn a_failed_resolve_can_be_retried() {
+        let mut app = safe_app();
+        let addr = address!("0x1111111111111111111111111111111111111111");
+        let Some(Outcome::ResolveContract { seq, .. }) =
+            app.update(Message::AddrChanged(addr.to_string()))
+        else {
+            panic!("expected a ResolveContract");
+        };
+        app.on_contract_resolved(seq, Err("light client timed out".into()));
+
+        let Some(Outcome::ResolveContract {
+            seq: seq2, address, ..
+        }) = app.update(Message::RetryResolve)
+        else {
+            panic!("Retry must re-issue the fetch");
+        };
+        assert_eq!(address, addr);
+        assert_ne!(
+            seq2, seq,
+            "the retired attempt must not answer for this one"
+        );
+        assert!(app.resolving);
+        assert!(app.resolve_error.is_none());
+    }
+
+    // ── 2.8 · the batching cap applies however the queue is filled ──────
+
+    /// A Trezor / view-only account used to import six calls, simulate them
+    /// green, and only learn at Review that this wallet signs one at a time.
+    #[test]
+    fn import_respects_the_single_call_cap() {
+        let mut app = TxBuilderApp::new(EOA);
+        app.set_context(EOA, Chain::Mainnet, false, None, false, true, Vec::new());
+        let dead = "0x000000000000000000000000000000000000dEaD";
+        app.update(Message::OpenLoad);
+        app.update(Message::JsonChanged(format!(
+            r#"{{"version":"1.0","chainId":"1","meta":{{"name":"x","txBuilderVersion":"y"}},
+                 "transactions":[{{"to":"{dead}","value":"0","data":"0x"}},
+                                 {{"to":"{dead}","value":"0","data":"0x"}}]}}"#
+        )));
+        app.update(Message::ImportJson);
+
+        assert!(app.batch.is_empty(), "the cap has to bite before the queue");
+        let e = app.json_error.as_deref().expect("and say why");
+        assert!(e.contains("one at a time"), "{e}");
+        assert_eq!(
+            app.modal,
+            Modal::Load,
+            "the JSON stays where the user can get it"
+        );
+    }
+
+    #[test]
+    fn replacing_a_non_empty_queue_says_so() {
+        let mut app = safe_app();
+        app.batch = sample_batch(&mut app.next_id, app.owner);
+        let had = app.batch.len();
+        let dead = "0x000000000000000000000000000000000000dEaD";
+        app.json_text = format!(
+            r#"{{"version":"1.0","chainId":"1","meta":{{"name":"x","txBuilderVersion":"y"}},
+                 "transactions":[{{"to":"{dead}","value":"0","data":"0x"}}]}}"#
+        );
+        app.update(Message::ImportJson);
+
+        assert_eq!(app.batch.len(), 1);
+        let e = app
+            .error
+            .as_deref()
+            .expect("a replaced queue is not undoable");
+        assert!(e.contains(&format!("{had} call")), "{e}");
+    }
+
+    // ── 2.9 · a watch-only account never reaches a ceremony ─────────────
+
+    #[test]
+    fn a_watch_only_account_cannot_open_the_review() {
+        let mut app = view_only_app();
+        app.batch = vec![sample_batch(&mut app.next_id, app.owner).remove(0)];
+        assert!(
+            app.update(Message::Review).is_none(),
+            "no review may be built for a signer that can't sign"
+        );
+        let e = app.error.as_deref().expect("and it must say why");
+        assert!(e.contains("watch-only"), "{e}");
+    }
+
+    #[test]
+    fn a_watch_only_account_can_still_compose_and_simulate() {
+        let mut app = view_only_app();
+        app.batch = vec![sample_batch(&mut app.next_id, app.owner).remove(0)];
+        assert!(
+            matches!(
+                app.update(Message::Simulate),
+                Some(Outcome::Simulate { .. })
+            ),
+            "composing and simulating are useful on their own"
+        );
+    }
+
+    // ── 2.13 · Esc belongs to the modal while one is open ───────────────
+
+    #[test]
+    fn escape_closes_the_json_modal_instead_of_the_app() {
+        let mut app = safe_app();
+        app.batch = sample_batch(&mut app.next_id, app.owner);
+        app.update(Message::OpenSave);
+        assert_eq!(app.modal, Modal::Save);
+
+        assert!(
+            app.update(Message::Escape).is_none(),
+            "Esc is consumed by the modal, not bubbled as Close"
+        );
+        assert_eq!(app.modal, Modal::None);
+        assert!(
+            app.json_text.is_empty(),
+            "and the overlay's contents go with it"
+        );
+
+        // With no modal open it steps back to the launcher as before.
+        assert!(matches!(app.update(Message::Escape), Some(Outcome::Close)));
+    }
+
+    /// `Close` never cleared `modal`, so the flag outlived the view that owned
+    /// it and re-entering the Builder landed straight back inside the overlay.
+    #[test]
+    fn closing_the_modal_actually_clears_it() {
+        let mut app = safe_app();
+        app.batch = sample_batch(&mut app.next_id, app.owner);
+        app.update(Message::OpenSave);
+        app.update(Message::CloseModal);
+        assert_eq!(app.modal, Modal::None);
+    }
+
+    // ── 2.7 · a persist that fails has something to roll back to ────────
+
+    #[test]
+    fn persisting_templates_carries_the_pre_change_list() {
+        let mut app = safe_app();
+        app.batch = sample_batch(&mut app.next_id, app.owner);
+        app.update(Message::SaveTemplate);
+        let Some(Outcome::PersistTemplates { list, rollback }) = app.update(Message::SaveTemplate)
+        else {
+            panic!("expected a PersistTemplates");
+        };
+        assert_eq!(list.len(), 2);
+        assert_eq!(
+            rollback.len(),
+            1,
+            "the coordinator needs the list as it was, to put back on a failed write"
+        );
+    }
+
+    // ── 2.1 · a broadcast is not an outcome ─────────────────────────────
+
+    #[test]
+    fn a_mined_batch_clears_the_queue_and_leaves_its_hash() {
+        let mut app = safe_app();
+        app.batch = sample_batch(&mut app.next_id, app.owner);
+        let hash = B256::repeat_byte(0x7A);
+        app.on_executed(hash);
+        assert!(app.batch.is_empty());
+        assert_eq!(app.settled, Some(Settled::Executed { hash }));
+        assert!(matches!(
+            app.update(Message::CopySettledHash),
+            Some(Outcome::CopyPlain(_))
+        ));
+    }
+
+    /// A successful propose used to be indistinguishable from an accidental
+    /// dismissal, so the natural response was to propose the batch again.
+    #[test]
+    fn a_proposed_batch_says_queued_rather_than_done() {
+        let mut app = safe_app();
+        app.batch = sample_batch(&mut app.next_id, app.owner);
+        app.on_proposed(7);
+        assert!(app.batch.is_empty());
+        assert_eq!(app.settled, Some(Settled::Proposed { nonce: 7 }));
+        assert!(
+            app.update(Message::CopySettledHash).is_none(),
+            "a proposal has no transaction hash to copy — nothing was sent"
+        );
     }
 
     /// Mainnet USDC — a known contract, so pasting its address resolves the ABI
@@ -1680,7 +2349,7 @@ mod tests {
     #[test]
     fn eoa_without_7702_caps_batch_at_one() {
         let mut app = TxBuilderApp::new(EOA);
-        app.set_context(EOA, Chain::Mainnet, false, None, false, Vec::new()); // EOA, cannot delegate
+        app.set_context(EOA, Chain::Mainnet, false, None, false, true, Vec::new()); // EOA, cannot delegate
         app.update(Message::AddrChanged(usdc().to_string()));
         let to = address!("0x000000000000000000000000000000000000dEaD");
         app.update(Message::ArgChanged(0, to.to_string()));
@@ -1698,7 +2367,7 @@ mod tests {
     #[test]
     fn eoa_with_7702_can_batch_multiple() {
         let mut app = TxBuilderApp::new(EOA);
-        app.set_context(EOA, Chain::Mainnet, false, None, true, Vec::new()); // EOA, Local/Ledger
+        app.set_context(EOA, Chain::Mainnet, false, None, true, true, Vec::new()); // EOA, Local/Ledger
         let to = address!("0x000000000000000000000000000000000000dEaD");
         app.update(Message::AddrChanged(usdc().to_string()));
         app.update(Message::ArgChanged(0, to.to_string()));
@@ -1713,7 +2382,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_revoke_appends_revoke_to_effective_calls() {
+    fn auto_revoke_wraps_effective_calls_at_both_ends() {
         use crate::txbuilder::abi;
         use crate::txbuilder::encode::build_contract_call;
         let usdc = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
@@ -1736,18 +2405,63 @@ mod tests {
 
         // Off: unchanged.
         assert_eq!(app.effective_calls().len(), 1);
-        // On: one revoke appended.
+        // On: opened at zero, then the approve, then closed at zero. The
+        // opening reset is what keeps a zero-first token from reverting the
+        // whole atomic batch on an allowance left standing by some earlier tx.
         app.auto_revoke = true;
         let eff = app.effective_calls();
-        assert_eq!(eff.len(), 2);
-        assert_eq!(eff[1].to, usdc);
-        assert_eq!(U256::from_be_slice(&eff[1].data[36..68]), U256::ZERO);
-        // A non-batching EOA never appends (nothing to batch into). Switching
+        assert_eq!(eff.len(), 3);
+        for i in [0, 2] {
+            assert_eq!(eff[i].to, usdc);
+            assert_eq!(U256::from_be_slice(&eff[i].data[36..68]), U256::ZERO);
+        }
+        assert_eq!(
+            U256::from_be_slice(&eff[1].data[36..68]),
+            U256::from(5000u64),
+            "the user's own approve keeps its amount, in the middle",
+        );
+        // The queue itself is untouched — the wrap is derived, never stored.
+        assert_eq!(app.batch.len(), 1);
+        // A non-batching EOA never wraps (nothing to batch into). Switching
         // identity drops the queue by design, so re-compose it as the EOA.
-        app.set_context(EOA, Chain::Mainnet, false, None, false, Vec::new());
+        app.set_context(EOA, Chain::Mainnet, false, None, false, true, Vec::new());
         assert!(app.batch.is_empty(), "the identity switch drops the batch");
-        app.batch = vec![eff[0].clone()];
-        assert_eq!(app.effective_calls().len(), 1, "no batching → no revoke");
+        app.batch = vec![eff[1].clone()];
+        assert_eq!(app.effective_calls().len(), 1, "no batching → no wrap");
+    }
+
+    /// The revert strip and the review note both index the *effective* calls,
+    /// while the queue cards are numbered over `batch`. With flash approval on
+    /// those are different spaces, and printing the raw index pointed at calls
+    /// the user cannot see, inspect or remove.
+    #[test]
+    fn a_failing_step_is_named_in_the_queues_own_numbering() {
+        let mut app = safe_app();
+        app.batch = sample_batch(&mut app.next_id, app.owner);
+        let queued = app.batch.len();
+        assert!(queued >= 2, "sample batch is worth indexing into");
+
+        // No wrap: effective index == queue index.
+        assert_eq!(app.describe_step(0), "call #1");
+        assert_eq!(app.describe_step(queued - 1), format!("call #{queued}"));
+
+        app.auto_revoke = true;
+        let opens = flash_approval::prepend_count(&app.batch);
+        assert!(opens > 0, "the sample batch approves something");
+        // Shifted by the prepends, and the synthesized calls are named for
+        // what they are rather than given a card number that doesn't exist.
+        assert!(app.describe_step(0).contains("before the batch"));
+        assert_eq!(app.describe_step(opens), "call #1");
+        assert_eq!(
+            app.describe_step(opens + queued - 1),
+            format!("call #{queued}")
+        );
+        assert!(
+            app.describe_step(opens + queued)
+                .contains("after the batch"),
+            "got {}",
+            app.describe_step(opens + queued)
+        );
     }
 
     #[test]
@@ -1799,6 +2513,7 @@ mod tests {
                 transfers: Vec::new(),
                 verified: true,
                 base_fee_per_gas: 1,
+                block: 21_000_000,
             }),
         );
         let Some(Outcome::Review { preflight, .. }) = app.update(Message::Review) else {
@@ -1807,7 +2522,7 @@ mod tests {
         assert_eq!(
             preflight,
             Preflight::Fails {
-                step: 1,
+                at: "call #2".to_string(),
                 reason: "ERC20: transfer amount exceeds balance".into(),
             },
         );
@@ -1830,12 +2545,13 @@ mod tests {
                 transfers: Vec::new(),
                 verified: true,
                 base_fee_per_gas: 1,
+                block: 21_000_000,
             }),
         );
         let Some(Outcome::Review { preflight, .. }) = app.update(Message::Review) else {
             panic!("expected Review");
         };
-        assert_eq!(preflight, Preflight::Passed);
+        assert_eq!(preflight, PASSED_CLEAN);
         assert!(!preflight.softens_confirm());
         assert!(preflight.warning().is_none(), "nothing to warn about");
     }
@@ -1854,6 +2570,7 @@ mod tests {
                 transfers: Vec::new(),
                 verified: true,
                 base_fee_per_gas: 1,
+                block: 21_000_000,
             }),
         );
         let removed = app.batch[0].id;
@@ -2043,6 +2760,7 @@ mod tests {
             false,
             None,
             true,
+            true,
             vec![(11155111, "Sepolia".into())],
         );
         app
@@ -2099,6 +2817,7 @@ mod tests {
             true,
             Some("1.4.1".into()),
             false,
+            true,
             Vec::new(),
         );
 
@@ -2125,6 +2844,7 @@ mod tests {
             true,
             Some("1.4.1".into()),
             false,
+            true,
             Vec::new(),
         );
 
@@ -2152,6 +2872,7 @@ mod tests {
             true,
             Some("1.4.1".into()),
             false,
+            true,
             Vec::new(),
         );
         assert_eq!(app.selected_net(), NetworkId::Builtin(Chain::Base));
@@ -2172,6 +2893,7 @@ mod tests {
             true,
             Some("1.4.1".into()),
             false,
+            true,
             Vec::new(),
         );
         assert!(app.batch.is_empty());
@@ -2194,6 +2916,7 @@ mod tests {
                 Chain::Mainnet,
                 false,
                 None,
+                true,
                 true,
                 vec![(11155111, "Sepolia".into())],
             );
@@ -2229,6 +2952,7 @@ mod tests {
                 base_fee_per_gas: 0,
                 transfers: Vec::new(),
                 verified: true,
+                block: 21_000_000,
             }),
         );
 
@@ -2255,9 +2979,10 @@ mod tests {
                 base_fee_per_gas: 0,
                 transfers: Vec::new(),
                 verified: true,
+                block: 21_000_000,
             }),
         );
-        assert_eq!(app.preflight(), Preflight::Passed);
+        assert_eq!(app.preflight(), PASSED_CLEAN);
         assert!(!app.sim_busy);
     }
 
@@ -2281,6 +3006,7 @@ mod tests {
             true,
             Some("1.4.1".into()),
             false,
+            true,
             Vec::new(),
         );
         assert_eq!(app.selected_net(), NetworkId::Builtin(Chain::Base));
@@ -2295,6 +3021,7 @@ mod tests {
             true,
             Some("1.4.1".into()),
             false,
+            true,
             Vec::new(),
         );
         assert_eq!(app.selected_net(), NetworkId::Builtin(Chain::Base));
@@ -2330,7 +3057,7 @@ mod tests {
         app.update(Message::SetNetwork(NetworkId::Custom(11155111)));
         assert!(app.is_custom());
         // Next context refresh no longer lists that custom network.
-        app.set_context(EOA, Chain::Mainnet, false, None, true, Vec::new());
+        app.set_context(EOA, Chain::Mainnet, false, None, true, true, Vec::new());
         assert_eq!(app.selected_net(), NetworkId::Builtin(Chain::Mainnet));
     }
 
@@ -2468,7 +3195,7 @@ mod tests {
         let n = app.batch.len();
         let out = app.update(Message::SaveTemplate);
         match out {
-            Some(Outcome::PersistTemplates(list)) => {
+            Some(Outcome::PersistTemplates { list, .. }) => {
                 assert_eq!(list.len(), 1);
                 assert_eq!(list[0].call_count, n);
             }
@@ -2489,7 +3216,7 @@ mod tests {
         app.update(Message::SaveTemplate);
         assert_eq!(app.templates.len(), 1);
         match app.update(Message::DeleteTemplate(0)) {
-            Some(Outcome::PersistTemplates(list)) => assert!(list.is_empty()),
+            Some(Outcome::PersistTemplates { list, .. }) => assert!(list.is_empty()),
             other => panic!("expected PersistTemplates, got {other:?}"),
         }
         assert!(app.templates.is_empty());
@@ -2506,7 +3233,7 @@ mod tests {
         assert_eq!(app.rename_idx, Some(0));
         app.update(Message::RenameChanged("  Payroll run  ".into()));
         match app.update(Message::CommitRename) {
-            Some(Outcome::PersistTemplates(list)) => assert_eq!(list[0].name, "Payroll run"),
+            Some(Outcome::PersistTemplates { list, .. }) => assert_eq!(list[0].name, "Payroll run"),
             other => panic!("expected PersistTemplates, got {other:?}"),
         }
         assert_eq!(app.templates[0].name, "Payroll run", "trimmed + applied");

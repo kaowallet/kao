@@ -421,6 +421,10 @@ fn contract_head(app: &TxBuilderApp, t: KaoTheme) -> Column<'_, Message> {
                 .push(Space::new().height(8))
                 .push(proxy_unverified_note(t));
         }
+    } else if let Some(e) = &app.resolve_error {
+        col = col
+            .push(Space::new().height(14))
+            .push(resolve_error_box(t, e));
     } else if app.not_found {
         col = col
             .push(Space::new().height(14))
@@ -1318,6 +1322,15 @@ fn batch_pane(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
 
     let mut inner = column![head].width(Length::Fill);
 
+    // What became of the last batch, above everything else. The composer used
+    // to report an outcome only by emptying itself, which is what a cancel
+    // looks like too.
+    if let Some(settled) = &app.settled {
+        inner = inner
+            .push(Space::new().height(12))
+            .push(settled_strip(t, settled));
+    }
+
     // The template menu expands inline beneath the header (same pattern as the
     // network switcher / method picker).
     if app.template_menu_open {
@@ -1409,6 +1422,55 @@ fn batch_pane(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
 /// Flash-approval toggle: append `approve(spender, 0)` revokes after the batch
 /// so no allowance survives the transaction. `n` is the number of allowances
 /// that would be reset.
+/// The persistent outcome strip. Stays until dismissed: a mined batch's hash is
+/// the only handle the user has on it afterwards, and a proposal's nonce is the
+/// only thing that distinguishes "filed for co-signers" from "the overlay
+/// closed and I don't know why".
+fn settled_strip<'a>(t: KaoTheme, settled: &super::Settled) -> Element<'a, Message> {
+    let (title, body, action): (String, String, Option<Element<'a, Message>>) = match settled {
+        super::Settled::Executed { hash } => (
+            "Batch executed".to_string(),
+            format!("{hash:#x}"),
+            Some(ghost_secondary(t, "⧉ Copy hash", Some(Message::CopySettledHash)).into()),
+        ),
+        super::Settled::Proposed { nonce } => (
+            "Batch queued for co-signers".to_string(),
+            format!(
+                "Filed at nonce {nonce}. It executes once enough owners confirm it — nothing                  has been sent yet."
+            ),
+            None,
+        ),
+    };
+    let mut col = column![
+        row![
+            text(title).size(12).color(t.up).font(bold()),
+            Space::new().width(Length::Fill),
+            ghost_button(t, text("✕").size(11).color(t.sub).font(mono()))
+                .on_press(Message::DismissSettled),
+        ]
+        .align_y(Alignment::Center)
+        .width(Length::Fill),
+        Space::new().height(3),
+        text(body).size(10).color(t.sub).font(mono()),
+    ]
+    .width(Length::Fill);
+    if let Some(a) = action {
+        col = col.push(Space::new().height(8)).push(a);
+    }
+    container(col.padding(Padding::from([12, 14])))
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(with_alpha(t.up, 0.08))),
+            border: Border {
+                color: with_alpha(t.up, 0.4),
+                width: 1.0,
+                radius: Radius::from(12),
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
 fn revoke_toggle(app: &TxBuilderApp, t: KaoTheme, n: usize) -> Element<'_, Message> {
     let cb = kao_checkbox(t, app.auto_revoke)
         .label("Revoke approvals after batch")
@@ -1417,8 +1479,12 @@ fn revoke_toggle(app: &TxBuilderApp, t: KaoTheme, n: usize) -> Element<'_, Messa
         .spacing(10)
         .text_size(13);
     let hint = if app.auto_revoke {
+        // Both ends, because the wrap has two: the opening reset is what makes
+        // the batch survive a zero-first token, and it is also the call the
+        // user will see in the review that they did not compose.
+        let opens = super::flash_approval::prepend_count(&app.batch);
         format!(
-            "+{n} revoke{} appended · allowance reset to 0",
+            "+{opens} reset before · +{n} revoke{} after · allowance ends at 0",
             if n == 1 { "" } else { "s" }
         )
     } else {
@@ -1634,7 +1700,7 @@ fn decoded_panel<'a>(t: KaoTheme, c: &'a super::QueuedCall) -> Element<'a, Messa
 }
 
 fn sim_strip<'a>(
-    _app: &TxBuilderApp,
+    app: &TxBuilderApp,
     t: KaoTheme,
     sim: &super::BatchSimResult,
 ) -> Element<'a, Message> {
@@ -1652,10 +1718,20 @@ fn sim_strip<'a>(
             };
             ("Simulation passed".to_string(), sub)
         }
-        BatchOutcome::Revert { step, reason } => {
-            (format!("Reverts at #{}", step + 1), reason.clone())
-        }
-        BatchOutcome::Halt { step, reason } => (format!("Halts at #{}", step + 1), reason.clone()),
+        // The simulator indexes the *effective* calls, which with flash
+        // approval on is not the numbering on the cards beside this strip —
+        // `#3` over a two-card queue pointed at a call the user can't see.
+        BatchOutcome::Revert { step, reason } => (
+            format!("Reverts at {}", app.describe_step(*step)),
+            reason.clone(),
+        ),
+        BatchOutcome::Halt { step, reason } => (
+            format!("Halts at {}", app.describe_step(*step)),
+            reason.clone(),
+        ),
+        // Why it couldn't run, rather than the bare shrug that used to send
+        // the user back to re-run something that can't succeed.
+        BatchOutcome::Error(reason) => ("Preflight couldn't run".to_string(), reason.clone()),
         BatchOutcome::Unavailable => (
             "Simulation unavailable".to_string(),
             "couldn't run preflight on this network".to_string(),
@@ -1666,10 +1742,25 @@ fn sim_strip<'a>(
         row![
             text(title).size(12).color(color).font(bold()),
             Space::new().width(Length::Fill),
-            text(if sim.verified {
-                "verified"
+            // The height the verdict is about. Without it, a pass taken
+            // twenty minutes ago is indistinguishable from one taken now.
+            text(if sim.block > 0 {
+                format!(
+                    "{} · block {}",
+                    if sim.verified {
+                        "verified"
+                    } else {
+                        "unverified"
+                    },
+                    sim.block
+                )
             } else {
-                "unverified"
+                (if sim.verified {
+                    "verified"
+                } else {
+                    "unverified"
+                })
+                .to_string()
             })
             .size(10)
             .color(t.sub)
@@ -2251,6 +2342,43 @@ fn proxy_unverified_note(t: KaoTheme) -> Element<'static, Message> {
          Paste the implementation's ABI to compose against it.",
         t.down,
     )
+}
+
+/// The composer couldn't *reach* the contract's code. Deliberately not the
+/// "No verified ABI" box: that one is a fact about the contract and its answer
+/// is to paste an ABI by hand, which is the wrong move — and a lot of work —
+/// when the real problem was a light-client hiccup on a well-known verified
+/// address.
+fn resolve_error_box<'a>(t: KaoTheme, err: &str) -> Element<'a, Message> {
+    let col = column![
+        text("Couldn't read this contract")
+            .size(13)
+            .color(t.down)
+            .font(bold()),
+        Space::new().height(3),
+        text(format!("{err}. The contract may still have a recoverable ABI — this says only that Kao couldn't fetch its code."))
+            .size(12)
+            .color(t.sub),
+        Space::new().height(10),
+        row![
+            ghost_secondary(t, "↻ Retry", Some(Message::RetryResolve)),
+            Space::new().width(8),
+            ghost_secondary(t, "Paste ABI JSON", Some(Message::ShowAbiPaste)),
+        ],
+    ]
+    .width(Length::Fill);
+    container(col.padding(Padding::from([13, 16])))
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(with_alpha(t.down, 0.08))),
+            border: Border {
+                color: with_alpha(t.down, 0.4),
+                width: 1.0,
+                radius: Radius::from(12),
+            },
+            ..Default::default()
+        })
+        .into()
 }
 
 fn not_found_box(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {

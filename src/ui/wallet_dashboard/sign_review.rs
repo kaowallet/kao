@@ -142,6 +142,19 @@ pub struct DelegationReview {
     /// `None` covers both an undelegated account and one already on
     /// `delegate` (see `already_active`).
     pub replacing: Option<Address>,
+    /// The `nonce` the authorization commits to, resolved at prepare.
+    ///
+    /// Self-sponsored, so it is the outer transaction's nonce **+ 1**. Pinning
+    /// it here is what gives this signature a digest at all: without a nonce
+    /// there is no `signature_hash`, and the one signature in this wallet whose
+    /// effect outlives its own transaction was also the only one the user could
+    /// not check against their device. The send path re-reads the account's
+    /// nonce and aborts if it moved, so the pin can't drift.
+    ///
+    /// `None` when `already_active` — nothing is signed, so nothing to commit.
+    pub auth_nonce: Option<u64>,
+    /// ERC-8213 digest of the authorization tuple, over `auth_nonce`.
+    pub auth_digest: Option<B256>,
 }
 
 /// The CoW GPv2 order the user signs as EIP-712 typed data. Every field here is a
@@ -254,6 +267,22 @@ pub struct SafeExecReview {
     /// and still revert after every owner has signed. Naming it is the honest
     /// minimum.
     pub guard: Option<Address>,
+    /// The Safe's live nonce when this was prepared. Equal to `nonce` on an
+    /// empty queue; lower when this transaction is being appended behind
+    /// proposals co-signers have already filed.
+    ///
+    /// `execTransaction` accepts the current nonce and nothing else, so the gap
+    /// is exactly the set of transactions that must execute before this one can
+    /// — which makes it both a disclosure and the reason the execute button
+    /// disappears while the queue is occupied.
+    pub onchain_nonce: u64,
+}
+
+impl SafeExecReview {
+    /// How many already-queued proposals this transaction sits behind.
+    pub fn queued_ahead(&self) -> u64 {
+        self.nonce.saturating_sub(self.onchain_nonce)
+    }
 }
 
 /// A CoW ERC-20 order authorized via EIP-1271 (a Safe `SafeMessage`). The order
@@ -462,6 +491,18 @@ pub enum SigningKind {
     /// A Safe proposal: sign once as `owner` and POST to the Transaction Service
     /// for co-signers to finish from their own wallets.
     SafePropose { owner: SigningOwner },
+    /// An atomic EOA batch via EIP-7702. Costs **two** device prompts when a
+    /// fresh authorization is needed (the authorization, then the transaction
+    /// carrying it) and one when the account is already delegated — a
+    /// difference the waiting card used to paper over by saying "waiting for a
+    /// signature" in both cases, so a second prompt appeared with nothing on
+    /// the host having predicted it.
+    Eip7702Batch { fresh_authorization: bool },
+    /// Signed and broadcast; waiting for the receipt that says whether it
+    /// actually worked. The overlay stays up through this because a broadcast
+    /// hash is not an outcome — a reverted transaction is broadcast exactly as
+    /// successfully as one that succeeds.
+    Broadcasting { hash: B256 },
 }
 
 /// Coordinator-held overlay state: what to show, and what to do on confirm.
@@ -793,6 +834,35 @@ fn waiting_card<'a>(
                     .font(mono()),
             );
         }
+        Some(SigningKind::Broadcasting { hash }) => {
+            col = col.push(Space::new().height(4));
+            col = col.push(
+                text("Broadcast — waiting for it to be mined.")
+                    .size(12)
+                    .color(t.sub)
+                    .font(mono()),
+            );
+            col = col.push(Space::new().height(8));
+            col = col.push(hash_row(t, "Transaction", *hash));
+        }
+        Some(SigningKind::Eip7702Batch {
+            fresh_authorization,
+        }) => {
+            col = col.push(Space::new().height(4));
+            col = col.push(
+                text(if *fresh_authorization {
+                    "Two signatures: first the account delegation, then the batch that uses \
+                     it. On a hardware wallet that is two separate prompts — the first names \
+                     the delegate, the second the transaction."
+                } else {
+                    "One signature: your account already runs the batch executor's code, so \
+                     no new delegation is authorized."
+                })
+                .size(12)
+                .color(t.sub)
+                .font(mono()),
+            );
+        }
         None => {
             col = col.push(Space::new().height(4));
             col = col.push(
@@ -894,13 +964,14 @@ pub(crate) fn erc8213_rows(step: &SignStep) -> Vec<(String, B256)> {
     let mut rows = Vec::new();
     match step {
         SignStep::RawTx(leg) => push_calldata(&mut rows, CALLDATA_DIGEST_LABEL, &leg.calldata),
-        // No rows: an EIP-7702 authorization's signature hash commits to a
-        // `nonce` that isn't known until broadcast (self-sponsored ⇒ the outer
-        // transaction's nonce + 1). Any digest shown here would be over a nonce
-        // we guessed, which is worse than showing none — the delegate and chain
-        // id are on the panel itself, where they can be checked against the
-        // device.
-        SignStep::Delegation(_) => {}
+        // The authorization's signature hash commits to a nonce, so it only
+        // exists once that nonce is pinned — which prepare now does. An
+        // already-active delegation signs nothing and so has no digest.
+        SignStep::Delegation(d) => {
+            if let Some(h) = d.auth_digest {
+                rows.push(("Authorization Digest (EIP-7702)".to_string(), h));
+            }
+        }
         SignStep::Typed(order) => push_eip712(&mut rows, &order.eip712),
         SignStep::SafeExec(x) => {
             push_eip712(&mut rows, &x.eip712);
@@ -1015,7 +1086,17 @@ fn safe_exec_panel<'a>(
     .spacing(0)
     .width(Length::Fill);
     col = col.push(addr_kv(t, "Safe", x.safe));
-    col = col.push(kv(t, "Nonce", x.nonce.to_string()));
+    col = col.push(kv(
+        t,
+        "Nonce",
+        match x.queued_ahead() {
+            0 => x.nonce.to_string(),
+            n => format!(
+                "{} (Safe is at {}, {n} queued ahead)",
+                x.nonce, x.onchain_nonce
+            ),
+        },
+    ));
     // The operation byte, always — a row that only appeared for delegatecall
     // would teach the user nothing about what its absence means.
     col = col.push(kv(
@@ -1045,6 +1126,26 @@ fn safe_exec_panel<'a>(
                  transaction when it executes, and the preflight simulation does not run it — \
                  a passing preflight is not a promise that the guard will allow this.",
             )
+            .size(11)
+            .color(t.sub),
+        );
+        col = col.push(Space::new().height(8));
+    }
+    if x.queued_ahead() > 0 {
+        col = col.push(
+            text(format!(
+                "This Safe already has {} transaction{} queued at nonce{} {}–{}. Signing at \
+                 nonce {} puts this one behind them: it can only be queued, not executed now, \
+                 and it becomes executable once those ahead of it have run. Filing it at the \
+                 Safe's current nonce instead would compete with them — whichever executed \
+                 first would void the other.",
+                x.queued_ahead(),
+                if x.queued_ahead() == 1 { "" } else { "s" },
+                if x.queued_ahead() == 1 { "" } else { "s" },
+                x.onchain_nonce,
+                x.nonce - 1,
+                x.nonce,
+            ))
             .size(11)
             .color(t.sub),
         );
@@ -1169,6 +1270,13 @@ fn delegation_panel<'a>(t: KaoTheme, d: &'a DelegationReview) -> Element<'a, Mes
         "Scoped to",
         format!("{} · chain id {}", d.net.display_name(), d.chain_id),
     ));
+    // The nonce is the third field of the signed tuple, alongside the chain id
+    // and the delegate already shown. Naming it is what makes the fingerprint
+    // below checkable: a digest over a nonce the user can't see is a digest
+    // they can compare but not reason about.
+    if let Some(n) = d.auth_nonce {
+        col = col.push(kv(t, "Authorization nonce", n.to_string()));
+    }
     col = col.push(Space::new().height(10));
     // The persistence is the part a user can't infer from the transaction
     // panel below, so it is stated rather than implied.
@@ -1768,8 +1876,29 @@ mod tests {
         // hash commits to a `nonce` that isn't known until broadcast
         // (self-sponsored ⇒ the outer transaction's nonce + 1). Any digest here
         // would be over a nonce we guessed — worse than none, because the user
-        // would check it against their device and find a mismatch. The delegate
-        // and chain id are on the panel itself instead.
+        // An already-active delegation signs no authorization at all, so there
+        // is no digest to show — and showing one would invite the user to check
+        // their device for a prompt that never comes.
+        let d = DelegationReview {
+            delegate: Address::repeat_byte(0x4C),
+            delegate_label: "EF · Simple7702Account".into(),
+            authority: Address::repeat_byte(0xE0),
+            chain_id: 1,
+            net: crate::chain::NetworkId::Builtin(Chain::Mainnet),
+            already_active: true,
+            replacing: None,
+            auth_nonce: None,
+            auth_digest: None,
+        };
+        assert!(erc8213_rows(&SignStep::Delegation(d)).is_empty());
+    }
+
+    /// The one signature whose effect outlives its transaction now has a
+    /// digest to hold against the device, because prepare pins the nonce it
+    /// commits to instead of leaving it to be discovered at broadcast.
+    #[test]
+    fn erc8213_rows_delegation_is_the_authorization_digest() {
+        let h = B256::repeat_byte(0x7E);
         let d = DelegationReview {
             delegate: Address::repeat_byte(0x4C),
             delegate_label: "EF · Simple7702Account".into(),
@@ -1778,8 +1907,13 @@ mod tests {
             net: crate::chain::NetworkId::Builtin(Chain::Mainnet),
             already_active: false,
             replacing: None,
+            auth_nonce: Some(42),
+            auth_digest: Some(h),
         };
-        assert!(erc8213_rows(&SignStep::Delegation(d)).is_empty());
+        assert_eq!(
+            erc8213_rows(&SignStep::Delegation(d)),
+            vec![("Authorization Digest (EIP-7702)".to_string(), h)],
+        );
     }
 
     #[test]
@@ -1811,6 +1945,7 @@ mod tests {
             inner: Box::new(leg_with(inner.clone())),
             operation: 1,
             guard: None,
+            onchain_nonce: 3,
         };
         let rows = erc8213_rows(&SignStep::SafeExec(x));
         assert_eq!(

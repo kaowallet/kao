@@ -14,6 +14,15 @@
 //! [`APPROVE_SELECTOR`]) with a non-zero amount word. The revoke is a plain
 //! `approve(spender, 0)` back to the same token, appended after every original
 //! call and deduped per `(token, spender)`.
+//!
+//! The wrap is symmetric — a zero-reset **before** the batch as well as after
+//! ([`wrap_with_flash_approval`]). The trailing revoke alone assumed every
+//! ERC-20 lets an allowance be overwritten in place, and the ones that don't
+//! (USDT and the other `require(amount == 0 || allowance == 0)` tokens) revert
+//! the *first* `approve` whenever an allowance is already standing — taking the
+//! whole atomic batch with them, for gas, having done nothing. Opening at zero
+//! costs one extra store per pair and makes the guarantee hold on every ERC-20
+//! rather than most of them.
 
 use alloy::primitives::{Address, Bytes, U256};
 
@@ -66,10 +75,15 @@ fn nonzero_approve_spender(data: &[u8]) -> Option<Address> {
     Some(Address::from_slice(&data[4 + 12..4 + 32]))
 }
 
-/// The deduped `(token, spender)` pairs the batch grants a non-zero allowance
-/// to, in first-seen order. These are the allowances a flash-approval revoke
-/// would reset. Pure — used for both the wrap and the UI hint/count.
-pub fn revoke_targets(calls: &[QueuedCall]) -> Vec<(Address, Address)> {
+/// The deduped `(token, spender)` pairs the batch sets a non-zero `approve` on
+/// at any point, in first-seen order.
+///
+/// This is the *prepend* set: the moment a zero-first token reverts is the
+/// non-zero `approve` itself, whether or not a later call in the same batch
+/// puts the allowance back to zero. Restricted to `approve` on purpose —
+/// `increaseAllowance` adds to whatever is already there, so opening at zero
+/// ahead of one would silently change what the user composed.
+fn granted_pairs(calls: &[QueuedCall]) -> Vec<(Address, Address)> {
     let mut out: Vec<(Address, Address)> = Vec::new();
     for c in calls {
         if let Some(spender) = nonzero_approve_spender(&c.data) {
@@ -80,6 +94,21 @@ pub fn revoke_targets(calls: &[QueuedCall]) -> Vec<(Address, Address)> {
         }
     }
     out
+}
+
+/// The `(token, spender)` pairs a flash-approval revoke has to close: the ones
+/// the batch would otherwise leave holding a non-zero allowance when it ends.
+/// Pure — used for both the wrap and the UI hint/count.
+///
+/// Deliberately the same set [`AllowanceVerdict::standing`] reports, rather
+/// than "every pair the batch approves". A batch that already ends a pair at
+/// zero — because the user composed the revoke by hand, or because a later
+/// call in the batch does — needs nothing appended for it; the earlier
+/// first-seen-grant reading queued a duplicate `approve(spender, 0)`, and the
+/// review counted it as a second reset. It also now sees `increaseAllowance`,
+/// which raises an allowance without ever matching an `approve` selector.
+pub fn revoke_targets(calls: &[QueuedCall]) -> Vec<(Address, Address)> {
+    allowance_verdict(calls).standing
 }
 
 /// What a batch does to ERC-20 allowances, as the review should describe it.
@@ -97,7 +126,7 @@ pub struct AllowanceVerdict {
     /// not hold and the survivors have to be named.
     pub standing: Vec<(Address, Address)>,
     /// `(token, spender)` pairs the batch ends at zero — whether the revoke
-    /// was appended by [`wrap_with_revoke`] or composed by hand.
+    /// was added by [`wrap_with_flash_approval`] or composed by hand.
     pub reset: Vec<(Address, Address)>,
     /// `(target, call name)` for approval grants this scan recognises but
     /// can't score (see [`UNMODELLED_GRANTS`]). Any entry here withholds the
@@ -277,36 +306,97 @@ fn token_label(calls: &[QueuedCall], token: Address) -> String {
         .unwrap_or_else(|| crate::wallet::short_address(token))
 }
 
-/// Return `calls` followed by one `approve(spender, 0)` revoke per
-/// `(token, spender)` the batch grants a non-zero allowance to. Ids for the
-/// appended calls start at `start_id`. A batch with no non-zero approvals is
-/// returned unchanged (cloned).
-pub fn wrap_with_revoke(calls: &[QueuedCall], start_id: u64) -> Vec<QueuedCall> {
-    let targets = revoke_targets(calls);
-    let mut out: Vec<QueuedCall> = calls.to_vec();
-    for (i, (token, spender)) in targets.into_iter().enumerate() {
-        let label = token_label(calls, token);
-        out.push(QueuedCall {
-            id: start_id + i as u64,
-            to: token,
-            value: U256::ZERO,
-            data: revoke_calldata(spender),
-            title: format!("Revoke {label}"),
-            detail: format!("{} → 0", crate::wallet::short_address(spender)),
-            signature: Some("approve(address,uint256)".to_string()),
-            decoded_args: vec![
-                DecodedArg {
-                    name: "spender".to_string(),
-                    ty: "address".to_string(),
-                    value: spender.to_string(),
-                },
-                DecodedArg {
-                    name: "amount".to_string(),
-                    ty: "uint256".to_string(),
-                    value: "0".to_string(),
-                },
-            ],
-        });
+/// One `approve(spender, 0)` call against `token`, as the wrap's own calls are
+/// built at both ends. `title`/`detail` say which end it is, so the review's
+/// leg cards and the revert-step label can tell them apart.
+fn zero_call(
+    id: u64,
+    token: Address,
+    spender: Address,
+    title: String,
+    detail: String,
+) -> QueuedCall {
+    QueuedCall {
+        id,
+        to: token,
+        value: U256::ZERO,
+        data: revoke_calldata(spender),
+        title,
+        detail,
+        signature: Some("approve(address,uint256)".to_string()),
+        decoded_args: vec![
+            DecodedArg {
+                name: "spender".to_string(),
+                ty: "address".to_string(),
+                value: spender.to_string(),
+            },
+            DecodedArg {
+                name: "amount".to_string(),
+                ty: "uint256".to_string(),
+                value: "0".to_string(),
+            },
+        ],
+    }
+}
+
+/// How many zero-resets [`wrap_with_flash_approval`] puts *before* `calls`.
+/// The UI needs this to map a simulator step index back to something the user
+/// can point at, since the prepends shift every queue position.
+pub fn prepend_count(calls: &[QueuedCall]) -> usize {
+    granted_pairs(calls).len()
+}
+
+/// Wrap `calls` so no ERC-20 allowance survives the transaction:
+///
+/// 1. one `approve(spender, 0)` per `(token, spender)` the batch approves,
+///    **ahead** of the batch, so a zero-first token can't revert the whole
+///    thing on an allowance that was already standing when it started;
+/// 2. the original calls;
+/// 3. one `approve(spender, 0)` per pair the batch would otherwise leave
+///    non-zero, **after** it.
+///
+/// Ids for the synthesized calls run from `start_id` upward — prepends first,
+/// then appends — so they can't collide with the queue's own. A batch that
+/// approves nothing is returned unchanged (cloned).
+///
+/// Step 1 is not free: a pair whose allowance is already zero pays for a store
+/// that changes nothing. That is the deliberate trade — the toggle is opt-in
+/// safety, and the alternative is either a per-token zero-first list to keep
+/// current or an `allowance()` probe whose answer is stale by the time the
+/// batch executes. Neither buys a guarantee this doesn't.
+pub fn wrap_with_flash_approval(calls: &[QueuedCall], start_id: u64) -> Vec<QueuedCall> {
+    let opens = granted_pairs(calls);
+    let closes = revoke_targets(calls);
+    if opens.is_empty() && closes.is_empty() {
+        return calls.to_vec();
+    }
+    let mut next = start_id;
+    let mut out: Vec<QueuedCall> = Vec::with_capacity(opens.len() + calls.len() + closes.len());
+    for (token, spender) in &opens {
+        let label = token_label(calls, *token);
+        out.push(zero_call(
+            next,
+            *token,
+            *spender,
+            format!("Reset {label} first"),
+            format!(
+                "{} → 0 before the batch",
+                crate::wallet::short_address(*spender)
+            ),
+        ));
+        next += 1;
+    }
+    out.extend(calls.iter().cloned());
+    for (token, spender) in &closes {
+        let label = token_label(calls, *token);
+        out.push(zero_call(
+            next,
+            *token,
+            *spender,
+            format!("Revoke {label}"),
+            format!("{} → 0", crate::wallet::short_address(*spender)),
+        ));
+        next += 1;
     }
     out
 }
@@ -388,7 +478,7 @@ mod tests {
         blanket.data = Bytes::from(data);
 
         // The ERC-20 side is spotless: granted and revoked in the same batch.
-        let batch = wrap_with_revoke(&[approve("5000000000")], 50);
+        let batch = wrap_with_flash_approval(&[approve("5000000000")], 50);
         let v = allowance_verdict(&[batch, vec![blanket]].concat());
 
         assert_eq!(v.standing, vec![], "the ERC-20 grant really is reset");
@@ -424,18 +514,100 @@ mod tests {
         let targets = revoke_targets(&batch);
         assert_eq!(targets, vec![(USDC, SPENDER)]);
 
-        let wrapped = wrap_with_revoke(&batch, 100);
-        assert_eq!(wrapped.len(), 2);
-        let revoke = &wrapped[1];
+        let wrapped = wrap_with_flash_approval(&batch, 100);
+        assert_eq!(wrapped.len(), 3, "one reset ahead, the approve, one revoke");
+        let revoke = &wrapped[2];
         assert_eq!(revoke.to, USDC);
         assert_eq!(revoke.value, U256::ZERO);
         assert_eq!(&revoke.data[..4], &APPROVE_SELECTOR);
         assert_eq!(Address::from_slice(&revoke.data[16..36]), SPENDER);
         assert_eq!(U256::from_be_slice(&revoke.data[36..68]), U256::ZERO);
         assert_eq!(revoke.title, "Revoke USDC");
-        assert_eq!(revoke.id, 100);
-        // The appended revoke is itself a zero approval → not a new target.
-        assert!(revoke_targets(&wrapped).len() == 1);
+        assert_eq!(
+            revoke.id, 101,
+            "ids run prepends-then-appends from start_id"
+        );
+        // Wrapped, the pair ends at zero — nothing left for a revoke to close.
+        assert!(
+            revoke_targets(&wrapped).is_empty(),
+            "the wrap is idempotent: re-wrapping adds nothing"
+        );
+    }
+
+    /// The zero-first case. USDT and its kin `require(amount == 0 || allowance
+    /// == 0)`, so an `approve(spender, X)` over a standing allowance reverts —
+    /// and in an atomic batch that takes every other call with it, for gas,
+    /// having done nothing. Opening the pair at zero makes the batch's entry
+    /// state its own business rather than a bet on what the account was left
+    /// holding by some earlier transaction.
+    #[test]
+    fn a_grant_is_opened_at_zero_before_the_batch_runs() {
+        let wrapped = wrap_with_flash_approval(&[approve("5000000000")], 7);
+        assert_eq!(wrapped.len(), 3);
+        let open = &wrapped[0];
+        assert_eq!(open.to, USDC);
+        assert_eq!(&open.data[..4], &APPROVE_SELECTOR);
+        assert_eq!(Address::from_slice(&open.data[16..36]), SPENDER);
+        assert_eq!(
+            U256::from_be_slice(&open.data[36..68]),
+            U256::ZERO,
+            "the opening call must set the allowance to zero, not to the grant"
+        );
+        assert_eq!(open.id, 7);
+        assert!(open.title.contains("Reset"), "got {}", open.title);
+        assert_eq!(
+            wrapped[1].to, USDC,
+            "the user's own approve is in the middle"
+        );
+        assert_eq!(
+            U256::from_be_slice(&wrapped[1].data[36..68]),
+            U256::from(5_000_000_000u64),
+        );
+    }
+
+    /// `increaseAllowance` adds to whatever is already standing, so opening
+    /// that pair at zero would change what the user composed. The prepend is
+    /// `approve`-only for exactly that reason.
+    #[test]
+    fn an_increase_allowance_is_not_opened_at_zero() {
+        let mut inc = approve("0");
+        let mut data = Vec::from(INCREASE_ALLOWANCE_SELECTOR);
+        data.extend_from_slice(&[0u8; 12]);
+        data.extend_from_slice(SPENDER.as_slice());
+        data.extend_from_slice(&U256::from(50u64).to_be_bytes::<32>());
+        inc.data = Bytes::from(data);
+
+        let wrapped = wrap_with_flash_approval(&[inc], 1);
+        assert_eq!(prepend_count(std::slice::from_ref(&wrapped[0])), 0);
+        assert_eq!(
+            wrapped.len(),
+            2,
+            "an increase gets a closing revoke but no opening reset"
+        );
+        assert!(
+            wrapped[1].title.contains("Revoke"),
+            "got {}",
+            wrapped[1].title
+        );
+    }
+
+    /// The over-count regression: a batch that already ends a pair at zero
+    /// needs nothing appended for it. The old first-seen-grant reading queued a
+    /// duplicate `approve(spender, 0)` and the review reported two resets.
+    #[test]
+    fn a_pair_the_batch_already_zeroes_gets_no_second_revoke() {
+        let batch = vec![approve("5000000000"), approve("0")];
+        assert!(
+            revoke_targets(&batch).is_empty(),
+            "nothing stands at the end, so nothing needs closing"
+        );
+        let wrapped = wrap_with_flash_approval(&batch, 1);
+        assert_eq!(
+            wrapped.len(),
+            3,
+            "one opening reset + the two composed calls, and no duplicate revoke"
+        );
+        assert_eq!(allowance_verdict(&wrapped).reset, vec![(USDC, SPENDER)]);
     }
 
     #[test]
@@ -447,7 +619,7 @@ mod tests {
         assert!(v.reset.is_empty());
 
         // Wrapped, the appended approve(_,0) is the last word on that pair.
-        let v = allowance_verdict(&wrap_with_revoke(&batch, 1));
+        let v = allowance_verdict(&wrap_with_flash_approval(&batch, 1));
         assert!(v.standing.is_empty());
         assert_eq!(v.reset, vec![(USDC, SPENDER)]);
         assert!(
@@ -511,8 +683,8 @@ mod tests {
     fn duplicate_approves_dedupe_to_one_revoke() {
         let batch = vec![approve("5000000000"), approve("1")];
         assert_eq!(revoke_targets(&batch), vec![(USDC, SPENDER)]);
-        let wrapped = wrap_with_revoke(&batch, 10);
-        assert_eq!(wrapped.len(), 3, "two approves → +1 revoke");
+        let wrapped = wrap_with_flash_approval(&batch, 10);
+        assert_eq!(wrapped.len(), 4, "two approves → +1 reset, +1 revoke");
     }
 
     #[test]
@@ -531,7 +703,8 @@ mod tests {
         .unwrap();
         let batch = vec![approve("0"), xfer];
         assert!(revoke_targets(&batch).is_empty());
-        assert_eq!(wrap_with_revoke(&batch, 1).len(), 2, "unchanged");
+        assert_eq!(prepend_count(&batch), 0);
+        assert_eq!(wrap_with_flash_approval(&batch, 1).len(), 2, "unchanged");
     }
 
     #[test]

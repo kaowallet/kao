@@ -1194,6 +1194,10 @@ pub struct SafeBatchRequest {
     pub input: SafeTxInput,
     pub call_count: usize,
     pub prepared: Option<(u64, B256)>,
+    /// Safe Transaction Service base URL for this Safe, so a batch that can't
+    /// meet the threshold from locally-held keys can still be proposed for the
+    /// remaining co-signers to confirm.
+    pub service_base: String,
 }
 
 /// A plain-EOA batch. One or more calls executed from `from`:

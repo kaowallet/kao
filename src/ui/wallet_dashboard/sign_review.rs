@@ -104,6 +104,46 @@ pub struct ReviewLeg {
     pub sub_legs: Vec<ReviewLeg>,
 }
 
+/// The EIP-7702 delegation an atomic EOA batch rides on.
+///
+/// A `SetCode` (type `0x04`) transaction carries a **second** signature the
+/// transaction panel below it can't show: an authorization tuple over
+/// `(chain_id, delegate, nonce)` that installs `delegate` as the account's
+/// code. Two things make it worth its own card rather than a line on the tx:
+/// it is signed separately (a Ledger prompts twice), and unlike the batch it
+/// rides on, it **persists** — the account keeps running that code after this
+/// transaction is mined.
+///
+/// The tuple's `nonce` is deliberately absent. It is bound at broadcast from
+/// the account's live nonce (self-sponsored ⇒ outer nonce + 1) and is pure
+/// replay protection; the fields a signer needs to check are the delegate and
+/// the chain it's scoped to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelegationReview {
+    /// The contract this account's code will point at.
+    pub delegate: Address,
+    /// Human label for the delegate, e.g. "EF Simple7702Account".
+    pub delegate_label: String,
+    /// The account being delegated.
+    pub authority: Address,
+    /// The chain the authorization is scoped to. Never 0 — a zero chain id in
+    /// a 7702 authorization makes the delegation valid on *every* chain.
+    pub chain_id: u64,
+    pub net: crate::chain::NetworkId,
+    /// True when the account already runs this delegate's code, so this
+    /// transaction reuses the existing delegation and signs no new
+    /// authorization at all.
+    pub already_active: bool,
+    /// The delegate the account runs *today*, when that is some other contract
+    /// — another wallet's smart-account implementation, say. Signing here
+    /// **replaces** it, which is a materially different act from delegating an
+    /// undelegated account and has to be said so.
+    ///
+    /// `None` covers both an undelegated account and one already on
+    /// `delegate` (see `already_active`).
+    pub replacing: Option<Address>,
+}
+
 /// The CoW GPv2 order the user signs as EIP-712 typed data. Every field here is a
 /// field of the signed message (or derived from it) so the review matches the
 /// signature byte-for-byte.
@@ -233,6 +273,10 @@ pub enum SignStep {
     /// A raw transaction the user signs (approval, EthFlow `createOrder`, a
     /// registrar call, a pool deposit), decoded for review.
     RawTx(ReviewLeg),
+    /// The EIP-7702 authorization an atomic EOA batch installs, reviewed ahead
+    /// of the transaction that carries it. Signed separately from the
+    /// transaction, and outlives it.
+    Delegation(DelegationReview),
     /// EIP-712 typed data the user signs (the CoW GPv2 order, EOA path).
     Typed(OrderReview),
     /// A Safe `execTransaction` (native `createOrder` / ERC-20 approve): the inner
@@ -786,6 +830,7 @@ fn step_card<'a>(
 ) -> Element<'a, Message> {
     let panel = match step {
         SignStep::RawTx(leg) => leg_card(t, leg, show_calldata),
+        SignStep::Delegation(d) => delegation_panel(t, d),
         SignStep::Typed(order) => order_panel(t, order),
         SignStep::SafeExec(x) => safe_exec_panel(t, x, show_calldata),
         SignStep::SafeMessage(m) => safe_message_panel(t, m),
@@ -831,6 +876,13 @@ pub(crate) fn erc8213_rows(step: &SignStep) -> Vec<(String, B256)> {
     let mut rows = Vec::new();
     match step {
         SignStep::RawTx(leg) => push_calldata(&mut rows, CALLDATA_DIGEST_LABEL, &leg.calldata),
+        // No rows: an EIP-7702 authorization's signature hash commits to a
+        // `nonce` that isn't known until broadcast (self-sponsored ⇒ the outer
+        // transaction's nonce + 1). Any digest shown here would be over a nonce
+        // we guessed, which is worse than showing none — the delegate and chain
+        // id are on the panel itself, where they can be checked against the
+        // device.
+        SignStep::Delegation(_) => {}
         SignStep::Typed(order) => push_eip712(&mut rows, &order.eip712),
         SignStep::SafeExec(x) => {
             push_eip712(&mut rows, &x.eip712);
@@ -956,6 +1008,72 @@ fn safe_exec_panel<'a>(
         "Each owner signs (SafeTx hash)",
         x.safe_tx_hash,
     ));
+    card(t, col.into())
+}
+
+/// The EIP-7702 authorization card. Deliberately leads with what changes about
+/// the *account* rather than with the transaction: this is the only signature
+/// in the wallet whose effect survives the transaction that carried it.
+fn delegation_panel<'a>(t: KaoTheme, d: &'a DelegationReview) -> Element<'a, Message> {
+    let mut col = column![
+        text("Account delegation — EIP-7702 authorization")
+            .size(11)
+            .color(t.sub)
+            .font(bold()),
+    ]
+    .spacing(0)
+    .width(Length::Fill);
+    col = col.push(Space::new().height(2));
+    col = col.push(
+        text(match (d.already_active, d.replacing.is_some()) {
+            (true, _) => "Your account already runs this code",
+            (false, true) => "Your account will be re-pointed to different code",
+            (false, false) => "Your account will start running contract code",
+        })
+        .size(13)
+        .color(t.text)
+        .font(bold()),
+    );
+    col = col.push(Space::new().height(8));
+    col = col.push(addr_kv(t, "Your account", d.authority));
+    // Naming the incumbent first makes the swap legible as a swap: without it,
+    // an account already delegated elsewhere reads identically to a fresh one.
+    if let Some(prev) = d.replacing {
+        col = col.push(addr_kv(t, "Currently delegated to", prev));
+    }
+    col = col.push(addr_kv(t, "Delegates to", d.delegate));
+    col = col.push(kv(t, "Delegate", d.delegate_label.clone()));
+    col = col.push(kv(
+        t,
+        "Scoped to",
+        format!("{} · chain id {}", d.net.display_name(), d.chain_id),
+    ));
+    col = col.push(Space::new().height(10));
+    // The persistence is the part a user can't infer from the transaction
+    // panel below, so it is stated rather than implied.
+    col = col.push(
+        text(match (d.already_active, d.replacing.is_some()) {
+            (true, _) => {
+                "This delegation is already in place, so no new authorization is signed — \
+                 the batch below is an ordinary call into the code your account already runs."
+            }
+            (false, true) => {
+                "Your account is ALREADY delegated to the contract above, and signing this \
+                 replaces it — anything reachable only through that contract stops being \
+                 reachable. You sign this separately from the transaction below (on a \
+                 hardware wallet, that's two prompts), and it does NOT expire with the \
+                 transaction."
+            }
+            (false, false) => {
+                "You sign this authorization separately from the transaction below (on a \
+                 hardware wallet, that's two prompts). It does NOT expire with the \
+                 transaction — your account keeps running this code until you replace it."
+            }
+        })
+        .size(11)
+        .color(if d.already_active { t.sub } else { t.down })
+        .font(bold()),
+    );
     card(t, col.into())
 }
 
@@ -1521,6 +1639,26 @@ mod tests {
         // A pure value transfer signs no calldata → the standard prescribes no
         // digest, and the section renders nothing (see `step_card`).
         assert!(erc8213_rows(&SignStep::RawTx(leg_with(Bytes::new()))).is_empty());
+    }
+
+    #[test]
+    fn erc8213_rows_delegation_has_no_fingerprints() {
+        // Deliberate, and worth pinning: an EIP-7702 authorization's signature
+        // hash commits to a `nonce` that isn't known until broadcast
+        // (self-sponsored ⇒ the outer transaction's nonce + 1). Any digest here
+        // would be over a nonce we guessed — worse than none, because the user
+        // would check it against their device and find a mismatch. The delegate
+        // and chain id are on the panel itself instead.
+        let d = DelegationReview {
+            delegate: Address::repeat_byte(0x4C),
+            delegate_label: "EF · Simple7702Account".into(),
+            authority: Address::repeat_byte(0xE0),
+            chain_id: 1,
+            net: crate::chain::NetworkId::Builtin(Chain::Mainnet),
+            already_active: false,
+            replacing: None,
+        };
+        assert!(erc8213_rows(&SignStep::Delegation(d)).is_empty());
     }
 
     #[test]

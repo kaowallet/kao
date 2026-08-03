@@ -773,15 +773,17 @@ impl TxBuilderApp {
                 self.json_error = None;
             }
             Message::CopyJson => return Some(Outcome::CopyText(self.json_text.clone())),
-            Message::ImportJson => match bundle::import(&self.json_text, self.next_id) {
-                Ok(calls) => {
-                    self.next_id += calls.len() as u64;
-                    self.batch = calls;
-                    self.invalidate_sim();
-                    self.modal = Modal::None;
+            Message::ImportJson => {
+                match bundle::import(&self.json_text, self.next_id, self.net.builtin()) {
+                    Ok(calls) => {
+                        self.next_id += calls.len() as u64;
+                        self.batch = calls;
+                        self.invalidate_sim();
+                        self.modal = Modal::None;
+                    }
+                    Err(e) => self.json_error = Some(e.to_string()),
                 }
-                Err(e) => self.json_error = Some(e.to_string()),
-            },
+            }
             Message::DismissError => self.error = None,
         }
         None
@@ -1425,32 +1427,9 @@ fn decode_read_rows(m: &AbiMethod, bytes: &[u8]) -> Vec<ReadRow> {
                 out.name.clone()
             },
             ty: out.ty_str.clone(),
-            value: format_sol_value(&val),
+            value: encode::format_sol_value(&val),
         })
         .collect()
-}
-
-/// Humanise a decoded [`DynSolValue`] for the read-result panel: checksummed
-/// address, decimal integer, `0x…` hex, or a bracketed list for compounds.
-fn format_sol_value(v: &DynSolValue) -> String {
-    match v {
-        DynSolValue::Address(a) => a.to_checksum(None),
-        DynSolValue::Bool(b) => b.to_string(),
-        DynSolValue::Int(i, _) => i.to_string(),
-        DynSolValue::Uint(u, _) => u.to_string(),
-        DynSolValue::FixedBytes(b, sz) => format!("0x{}", alloy::hex::encode(&b[..(*sz).min(32)])),
-        DynSolValue::Bytes(b) => format!("0x{}", alloy::hex::encode(b)),
-        DynSolValue::String(s) => s.clone(),
-        DynSolValue::Array(items) | DynSolValue::FixedArray(items) => {
-            let inner: Vec<String> = items.iter().map(format_sol_value).collect();
-            format!("[{}]", inner.join(", "))
-        }
-        DynSolValue::Tuple(items) => {
-            let inner: Vec<String> = items.iter().map(format_sol_value).collect();
-            format!("({})", inner.join(", "))
-        }
-        other => format!("{other:?}"),
-    }
 }
 
 // The view is large; split into its own module for readability.

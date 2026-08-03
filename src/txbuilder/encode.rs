@@ -196,6 +196,32 @@ fn summarize_detail(method: &AbiMethod, values: &[String], value: U256) -> Strin
     }
 }
 
+/// Humanise a decoded [`DynSolValue`]: checksummed address, decimal integer,
+/// `0x…` hex, or a bracketed list for compounds.
+///
+/// Used wherever a value recovered *from calldata* is shown — the read-result
+/// panel, and the decoded-argument view an imported bundle is rebuilt with.
+pub fn format_sol_value(v: &DynSolValue) -> String {
+    match v {
+        DynSolValue::Address(a) => a.to_checksum(None),
+        DynSolValue::Bool(b) => b.to_string(),
+        DynSolValue::Int(i, _) => i.to_string(),
+        DynSolValue::Uint(u, _) => u.to_string(),
+        DynSolValue::FixedBytes(b, sz) => format!("0x{}", alloy::hex::encode(&b[..(*sz).min(32)])),
+        DynSolValue::Bytes(b) => format!("0x{}", alloy::hex::encode(b)),
+        DynSolValue::String(s) => s.clone(),
+        DynSolValue::Array(items) | DynSolValue::FixedArray(items) => {
+            let inner: Vec<String> = items.iter().map(format_sol_value).collect();
+            format!("[{}]", inner.join(", "))
+        }
+        DynSolValue::Tuple(items) => {
+            let inner: Vec<String> = items.iter().map(format_sol_value).collect();
+            format!("({})", inner.join(", "))
+        }
+        other => format!("{other:?}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

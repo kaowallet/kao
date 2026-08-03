@@ -85,6 +85,18 @@ impl AbiMethod {
     /// The return type to ABI-decode an `eth_call` result against: a tuple of
     /// the declared outputs (a bare tuple decodes identically to head-tail ABI
     /// return data). `None` when the method declares no outputs.
+    /// The parameter tuple this method's calldata body encodes, for decoding
+    /// arguments back out of calldata. `None` for a no-argument method.
+    pub fn input_tuple(&self) -> Option<DynSolType> {
+        if self.inputs.is_empty() {
+            None
+        } else {
+            Some(DynSolType::Tuple(
+                self.inputs.iter().map(|i| i.ty.clone()).collect(),
+            ))
+        }
+    }
+
     pub fn output_tuple(&self) -> Option<DynSolType> {
         if self.outputs.is_empty() {
             None

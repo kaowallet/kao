@@ -64,7 +64,10 @@ impl Template {
 
     /// Reconstruct the template's calls, renumbering ids from `start_id`.
     pub fn calls(&self, start_id: u64) -> Result<Vec<QueuedCall>, TxBuilderError> {
-        bundle::import(&self.bundle_json, start_id)
+        // `None`: a stored template's chain id is the cosmetic `Chain::Mainnet`
+        // stamped by `from_batch`, not the chain it was composed on. Scoping
+        // templates per network is a separate, larger change.
+        bundle::import(&self.bundle_json, start_id, None)
     }
 }
 

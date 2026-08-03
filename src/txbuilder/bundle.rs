@@ -10,14 +10,14 @@
 //! another tool omits it (relying on the method + input values), we
 //! re-encode from those.
 
-use alloy::dyn_abi::DynSolType;
+use alloy::dyn_abi::{DynSolType, DynSolValue};
 use alloy::primitives::{Address, Bytes, U256};
 use serde::{Deserialize, Serialize};
 
 use crate::chain::Chain;
 
 use super::abi::{AbiMethod, AbiParam};
-use super::encode::encode_call;
+use super::encode::{encode_call, format_sol_value};
 use super::{DecodedArg, QueuedCall, TxBuilderError};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -193,13 +193,39 @@ fn tx_from_call(c: &QueuedCall) -> BundleTx {
 }
 
 /// Parse a bundle into queued calls, assigning ids `start_id, start_id+1,…`.
-pub fn import(json: &str, start_id: u64) -> Result<Vec<QueuedCall>, TxBuilderError> {
+///
+/// `expect_chain` rejects a bundle stamped for a different chain. A
+/// [`QueuedCall`] carries only `to`, and the same contract lives at a different
+/// address on every chain, so importing a Mainnet bundle while composing on
+/// Base would queue calls aimed at whatever occupies those addresses there.
+/// `None` skips the check — see [`super::templates`], whose stored bundles are
+/// stamped Mainnet unconditionally.
+pub fn import(
+    json: &str,
+    start_id: u64,
+    expect_chain: Option<Chain>,
+) -> Result<Vec<QueuedCall>, TxBuilderError> {
     let bundle: Bundle = serde_json::from_str(json.trim())
         .map_err(|e| TxBuilderError::Assembly(format!("not a batch bundle — {e}")))?;
     if bundle.transactions.is_empty() {
         return Err(TxBuilderError::Assembly(
             "bundle has no transactions".into(),
         ));
+    }
+    if let Some(want) = expect_chain {
+        // An unparseable or absent chain id is not treated as a match: the
+        // point of the check is that the addresses were composed for the chain
+        // we're about to aim them at.
+        let got = bundle.chain_id.trim().parse::<u64>().ok();
+        if got != Some(want.chain_id()) {
+            return Err(TxBuilderError::Assembly(format!(
+                "bundle is for chain {} but you're composing on {} (chain {}) — the same \
+                 contract has a different address on each chain",
+                bundle.chain_id.trim(),
+                want.display_name(),
+                want.chain_id(),
+            )));
+        }
     }
     bundle
         .transactions
@@ -227,52 +253,81 @@ fn call_from_tx(tx: &BundleTx, id: u64) -> Result<QueuedCall, TxBuilderError> {
         .transpose()?;
 
     match (&tx.contract_method, literal) {
-        // Contract call with metadata: rebuild the decoded view + encode
-        // (or trust the literal data if it was supplied).
+        // Contract call with metadata.
+        //
+        // The calldata is the only thing that executes, so it is the only
+        // thing trusted. `contractMethod` / `contractInputsValues` are
+        // untrusted labels on top of it: a bundle can name `approve` over
+        // `transfer` bytes, or claim `amount: 1` over a word holding MAX, and
+        // the queue card is exactly where a user vets a batch before signing
+        // it. So the metadata is *checked* against the bytes, never displayed
+        // over them.
         (Some(cm), literal) => {
             let method = method_from_meta(cm)?;
-            let values: Vec<String> = method
-                .inputs
-                .iter()
-                .enumerate()
-                .map(|(i, p)| {
-                    tx.contract_inputs_values
-                        .as_ref()
-                        .and_then(|m| m.get(&p.display_name(i)).or_else(|| m.get(&p.name)))
-                        .unwrap_or("")
-                        .to_string()
-                })
-                .collect();
             let data = match literal {
-                Some(d) => d,
-                None => encode_call(&method, &values)?,
+                Some(d) => {
+                    // The claimed method must be the encoded one. Comparing
+                    // selectors compares name *and* parameter types, since the
+                    // selector is derived from both.
+                    let got = d.get(..4).ok_or_else(|| {
+                        TxBuilderError::Assembly(format!(
+                            "transaction claims `{}` but carries {} bytes of calldata — \
+                             too short to hold a selector",
+                            method.signature,
+                            d.len()
+                        ))
+                    })?;
+                    if got != method.selector {
+                        return Err(TxBuilderError::Assembly(format!(
+                            "transaction claims `{}` (selector 0x{}) but its calldata starts \
+                             with 0x{} — refusing to import a batch whose description doesn't \
+                             match its bytes",
+                            method.signature,
+                            alloy::hex::encode(method.selector),
+                            alloy::hex::encode(got),
+                        )));
+                    }
+                    d
+                }
+                // No calldata supplied: encode it from the declared values, so
+                // the bytes are derived from the metadata and agree with it by
+                // construction.
+                None => {
+                    let values: Vec<String> = method
+                        .inputs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, p)| {
+                            tx.contract_inputs_values
+                                .as_ref()
+                                .and_then(|m| m.get(&p.display_name(i)).or_else(|| m.get(&p.name)))
+                                .unwrap_or("")
+                                .to_string()
+                        })
+                        .collect();
+                    encode_call(&method, &values)?
+                }
             };
-            let decoded_args = method
-                .inputs
-                .iter()
-                .enumerate()
-                .map(|(i, p)| DecodedArg {
-                    name: p.display_name(i),
-                    ty: p.ty_str.clone(),
-                    value: values[i].clone(),
-                })
-                .collect();
+            // Either way, the displayed arguments are decoded back out of the
+            // final bytes — never read off `contractInputsValues`. Calldata
+            // that won't decode against the signature it claims is a hard
+            // error: a batch can't be shown as something it isn't.
+            let decoded_args = decode_args(&method, &data).ok_or_else(|| {
+                TxBuilderError::Assembly(format!(
+                    "calldata doesn't decode as `{}` — refusing to import a batch it can't \
+                     account for",
+                    method.signature
+                ))
+            })?;
             Ok(QueuedCall {
                 id,
                 to,
                 value,
                 data,
                 title: format!("{}.{}", crate::wallet::short_address(to), cm.name),
-                detail: cm
-                    .inputs
+                detail: decoded_args
                     .first()
-                    .map(|inp| {
-                        format!(
-                            "{}: {}",
-                            inp.name,
-                            values.first().cloned().unwrap_or_default()
-                        )
-                    })
+                    .map(|a| format!("{}: {}", a.name, a.value))
                     .unwrap_or_else(|| "no arguments".into()),
                 signature: Some(method.signature),
                 decoded_args,
@@ -298,6 +353,40 @@ fn call_from_tx(tx: &BundleTx, id: u64) -> Result<QueuedCall, TxBuilderError> {
             })
         }
     }
+}
+
+/// Recover the decoded-argument view from calldata, against the method the
+/// calldata's selector identifies. The inverse of [`encode_call`], and the
+/// reason an imported batch's queue card can be trusted: what it shows is
+/// derived from the bytes it will execute.
+///
+/// `None` when the body doesn't decode against the signature — truncated,
+/// padded, or simply not that method's arguments.
+fn decode_args(m: &AbiMethod, data: &[u8]) -> Option<Vec<DecodedArg>> {
+    let Some(tuple) = m.input_tuple() else {
+        // A no-argument method: the calldata is the bare selector, and
+        // anything past it is unaccounted for.
+        return (data.len() == 4).then(Vec::new);
+    };
+    let body = data.get(4..)?;
+    let DynSolValue::Tuple(vals) = tuple.abi_decode_params(body).ok()? else {
+        return None;
+    };
+    if vals.len() != m.inputs.len() {
+        return None;
+    }
+    Some(
+        m.inputs
+            .iter()
+            .zip(vals)
+            .enumerate()
+            .map(|(i, (p, v))| DecodedArg {
+                name: p.display_name(i),
+                ty: p.ty_str.clone(),
+                value: format_sol_value(&v),
+            })
+            .collect(),
+    )
 }
 
 fn method_from_meta(cm: &ContractMethod) -> Result<AbiMethod, TxBuilderError> {
@@ -391,7 +480,7 @@ mod tests {
     fn export_then_import_round_trips_calldata() {
         let batch = sample_batch();
         let json = export(Chain::Mainnet, Some(Address::repeat_byte(0x5a)), &batch);
-        let back = import(&json, 1).unwrap();
+        let back = import(&json, 1, None).unwrap();
         assert_eq!(back.len(), 1);
         // The exact calldata survives the round-trip.
         assert_eq!(back[0].data, batch[0].data);
@@ -425,7 +514,7 @@ mod tests {
             "meta":{"name":"x","txBuilderVersion":"other"},
             "transactions":[{"to":"0x000000000000000000000000000000000000dEaD","value":"1000","data":"0xdeadbeef"}]
         }"#;
-        let calls = import(json, 5).unwrap();
+        let calls = import(json, 5, None).unwrap();
         assert_eq!(calls.len(), 1);
         assert!(calls[0].is_raw());
         assert_eq!(calls[0].data.as_ref(), &[0xde, 0xad, 0xbe, 0xef]);
@@ -447,7 +536,7 @@ mod tests {
                 "contractInputsValues":{"spender":"0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2","amount":"5000000000"}
             }]
         }"#;
-        let calls = import(json, 1).unwrap();
+        let calls = import(json, 1, None).unwrap();
         assert_eq!(
             calls[0].signature.as_deref(),
             Some("approve(address,uint256)")
@@ -460,9 +549,119 @@ mod tests {
         );
     }
 
+    /// `approve(address,uint256)` calldata, built by hand so a test can pair it
+    /// with metadata that describes something else.
+    fn approve_calldata(spender: Address, amount: U256) -> String {
+        let mut d = vec![0x09u8, 0x5e, 0xa7, 0xb3];
+        d.extend_from_slice(&spender.into_word().0);
+        d.extend_from_slice(&amount.to_be_bytes::<32>());
+        format!("0x{}", alloy::hex::encode(d))
+    }
+
+    fn bundle_with(tx_json: &str) -> String {
+        format!(
+            r#"{{"version":"1.0","chainId":"1",
+                "meta":{{"name":"x","txBuilderVersion":"other"}},
+                "transactions":[{tx_json}]}}"#
+        )
+    }
+
+    #[test]
+    fn import_rejects_metadata_that_names_a_different_method_than_the_calldata() {
+        // The attack: a bundle that reads as a harmless 1-unit approve in the
+        // queue card while the bytes are something else entirely. The card is
+        // where a batch is vetted, so this has to be refused outright.
+        let json = bundle_with(&format!(
+            r#"{{"to":"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48","value":"0",
+                 "data":"0xa9059cbb{}{}",
+                 "contractMethod":{{"name":"approve","payable":false,
+                   "inputs":[{{"name":"spender","type":"address"}},{{"name":"amount","type":"uint256"}}]}},
+                 "contractInputsValues":{{"spender":"0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2","amount":"1"}}}}"#,
+            alloy::hex::encode(Address::repeat_byte(0xDE).into_word().0),
+            alloy::hex::encode(U256::MAX.to_be_bytes::<32>()),
+        ));
+        let err = import(&json, 1, None).unwrap_err().to_string();
+        assert!(err.contains("approve(address,uint256)"), "{err}");
+        assert!(err.contains("0xa9059cbb"), "names the real selector: {err}");
+    }
+
+    #[test]
+    fn imported_arguments_come_from_the_calldata_not_the_metadata() {
+        // Same selector, lying values: the metadata says 1, the word holds MAX.
+        // The decoded view must report what will actually execute.
+        let spender = address!("0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2");
+        let json = bundle_with(&format!(
+            r#"{{"to":"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48","value":"0",
+                 "data":"{}",
+                 "contractMethod":{{"name":"approve","payable":false,
+                   "inputs":[{{"name":"spender","type":"address"}},{{"name":"amount","type":"uint256"}}]}},
+                 "contractInputsValues":{{"spender":"0x0000000000000000000000000000000000000001","amount":"1"}}}}"#,
+            approve_calldata(spender, U256::MAX),
+        ));
+        let calls = import(&json, 1, None).unwrap();
+        let args = &calls[0].decoded_args;
+        assert_eq!(
+            args[0].value,
+            spender.to_checksum(None),
+            "spender from bytes"
+        );
+        assert_eq!(args[1].value, U256::MAX.to_string(), "amount from bytes");
+        // The one-line summary is built from the same decoded view.
+        assert!(calls[0].detail.contains(&spender.to_checksum(None)));
+    }
+
+    #[test]
+    fn import_rejects_calldata_that_does_not_decode_as_the_claimed_method() {
+        // Right selector, truncated body — nothing to display honestly.
+        let json = bundle_with(
+            r#"{"to":"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48","value":"0",
+                "data":"0x095ea7b300",
+                "contractMethod":{"name":"approve","payable":false,
+                  "inputs":[{"name":"spender","type":"address"},{"name":"amount","type":"uint256"}]}}"#,
+        );
+        let err = import(&json, 1, None).unwrap_err().to_string();
+        assert!(err.contains("doesn't decode"), "{err}");
+    }
+
+    #[test]
+    fn import_rejects_calldata_too_short_to_carry_a_selector() {
+        let json = bundle_with(
+            r#"{"to":"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48","value":"0",
+                "data":"0x0102",
+                "contractMethod":{"name":"pause","payable":false,"inputs":[]}}"#,
+        );
+        let err = import(&json, 1, None).unwrap_err().to_string();
+        assert!(err.contains("too short"), "{err}");
+    }
+
+    #[test]
+    fn import_rejects_trailing_bytes_after_a_no_argument_selector() {
+        // `pause()` takes nothing, so anything past the selector is calldata
+        // the decoded view would silently omit.
+        let sig = alloy::primitives::keccak256(b"pause()");
+        let json = bundle_with(&format!(
+            r#"{{"to":"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48","value":"0",
+                 "data":"0x{}deadbeef",
+                 "contractMethod":{{"name":"pause","payable":false,"inputs":[]}}}}"#,
+            alloy::hex::encode(&sig[..4]),
+        ));
+        let err = import(&json, 1, None).unwrap_err().to_string();
+        assert!(err.contains("doesn't decode"), "{err}");
+    }
+
+    #[test]
+    fn import_rejects_a_bundle_stamped_for_another_chain() {
+        let batch = sample_batch();
+        let json = export(Chain::Mainnet, None, &batch);
+        let err = import(&json, 1, Some(Chain::Base)).unwrap_err().to_string();
+        assert!(err.contains("different address on each chain"), "{err}");
+        // …and accepts it on the chain it was composed for.
+        assert!(import(&json, 1, Some(Chain::Mainnet)).is_ok());
+    }
+
     #[test]
     fn import_rejects_garbage() {
-        assert!(import("not json", 1).is_err());
-        assert!(import(r#"{"version":"1.0","chainId":"1","meta":{"name":"x","txBuilderVersion":"y"},"transactions":[]}"#, 1).is_err());
+        assert!(import("not json", 1, None).is_err());
+        assert!(import(r#"{"version":"1.0","chainId":"1","meta":{"name":"x","txBuilderVersion":"y"},"transactions":[]}"#, 1, None).is_err());
     }
 }

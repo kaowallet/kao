@@ -15,7 +15,7 @@ use alloy::primitives::{Address, B256, Bytes, U256};
 use crate::chain::{Chain, NetworkId};
 use crate::portfolio::format_token_balance;
 use crate::safe::tx::SafeTxInput;
-use crate::txbuilder::abi::{self, AbiMethod, LoadedContract};
+use crate::txbuilder::abi::{self, AbiMethod, AbiSource, LoadedContract};
 use crate::txbuilder::sim::BatchSimResult;
 use crate::txbuilder::templates::Template;
 use crate::txbuilder::{QueuedCall, bundle, encode, flash_approval};
@@ -179,6 +179,23 @@ impl Message {
     }
 }
 
+/// The coordinator's answer to [`Outcome::ResolveContract`]: the runtime code
+/// the composer should introspect, plus what the proxy walk found on the way
+/// there.
+#[derive(Debug, Clone)]
+pub struct ResolvedCode {
+    /// Runtime bytecode of `implementation`. Empty ⇒ nothing deployed there.
+    pub code: Bytes,
+    /// The contract this code belongs to: the requested address itself, or the
+    /// implementation behind its proxy slots. Calls still go to the requested
+    /// address.
+    pub implementation: Address,
+    /// False when a proxy-slot read came back over unverified RPC. The walker
+    /// stops rather than following such a pointer, so the code above is the
+    /// proxy's own — usually near-empty of selectors.
+    pub all_verified: bool,
+}
+
 /// Requests bubbled to the coordinator.
 #[derive(Debug, Clone)]
 pub enum Outcome {
@@ -273,6 +290,11 @@ pub struct TxBuilderApp {
     resolving: bool,
     /// Set when a resolve found no ABI — prompts the paste-ABI fallback.
     not_found: bool,
+    /// Set when the last resolve hit a proxy slot it could only read over
+    /// unverified RPC. The pointer wasn't followed, so the ABI on screen is the
+    /// proxy stub's — worth saying out loud rather than leaving the user to
+    /// wonder why a well-known contract came back nearly empty.
+    proxy_unverified: bool,
     paste_open: bool,
     abi_paste: String,
     /// The address currently being resolved / loaded (dedup guard).
@@ -336,6 +358,7 @@ impl TxBuilderApp {
             loaded: None,
             resolving: false,
             not_found: false,
+            proxy_unverified: false,
             paste_open: false,
             abi_paste: String::new(),
             resolve_target: None,
@@ -402,24 +425,27 @@ impl TxBuilderApp {
         if is_safe {
             let pinned = NetworkId::Builtin(chain);
             if self.net != pinned {
+                let from = self.net;
                 self.net = pinned;
-                self.on_network_reset();
+                self.on_network_reset(from);
             }
         } else if let NetworkId::Custom(id) = self.net {
             // A plain EOA keeps its selection across context refreshes, except
             // when the selected custom network was removed underneath it.
             if !self.ctx.custom_networks.iter().any(|(cid, _)| *cid == id) {
+                let from = self.net;
                 self.net = NetworkId::Builtin(Chain::Mainnet);
-                self.on_network_reset();
+                self.on_network_reset(from);
             }
         }
     }
 
     // ── coordinator callbacks ─────────────────────────────────────────
 
-    /// The coordinator fetched the contract's runtime code (or failed).
-    /// `code` empty ⇒ no contract at that address.
-    pub fn on_contract_resolved(&mut self, seq: u64, code: Result<Bytes, String>) {
+    /// The coordinator fetched the contract's runtime code (or failed) — the
+    /// implementation's code when the address turned out to be a proxy. Empty
+    /// code ⇒ nothing deployed there.
+    pub fn on_contract_resolved(&mut self, seq: u64, result: Result<ResolvedCode, String>) {
         if seq != self.resolve_seq {
             return; // stale — a newer address was entered
         }
@@ -427,11 +453,14 @@ impl TxBuilderApp {
         let Some(addr) = self.resolve_target else {
             return;
         };
-        match code {
-            Ok(bytes) => match abi::from_bytecode(&bytes, addr) {
-                Some(loaded) => self.set_loaded(loaded),
-                None => self.not_found = true,
-            },
+        match result {
+            Ok(r) => {
+                self.proxy_unverified = !r.all_verified;
+                match abi::from_bytecode_behind_proxy(&r.code, addr, r.implementation) {
+                    Some(loaded) => self.set_loaded(loaded),
+                    None => self.not_found = true,
+                }
+            }
             Err(_) => self.not_found = true,
         }
     }
@@ -509,8 +538,9 @@ impl TxBuilderApp {
             Message::SetNetwork(net) => {
                 self.net_menu_open = false;
                 if self.net != net {
+                    let from = self.net;
                     self.net = net;
-                    self.on_network_reset();
+                    self.on_network_reset(from);
                 }
             }
             Message::AddrChanged(v) => return self.on_addr_changed(v),
@@ -554,19 +584,19 @@ impl TxBuilderApp {
                 self.read_idx = i;
                 self.read_menu_open = false;
                 self.reset_read_args();
-                self.read_result = None;
+                self.invalidate_read();
             }
             Message::ReadArgChanged(i, v) => {
                 if let Some(slot) = self.read_args.get_mut(i) {
                     *slot = v;
                 }
-                self.read_result = None;
+                self.invalidate_read();
             }
             Message::ReadBoolArg(i, b) => {
                 if let Some(slot) = self.read_args.get_mut(i) {
                     *slot = b.to_string();
                 }
-                self.read_result = None;
+                self.invalidate_read();
             }
             Message::Query => return self.on_query(),
             Message::CopyReadRaw => {
@@ -721,8 +751,10 @@ impl TxBuilderApp {
                             self.set_loaded(loaded);
                             None
                         } else {
+                            // `reset_composer_keep_addr` above already bumped
+                            // the sequence, retiring any earlier fetch; this
+                            // request rides the value it left behind.
                             self.resolving = true;
-                            self.resolve_seq += 1;
                             Some(Outcome::ResolveContract {
                                 seq: self.resolve_seq,
                                 chain,
@@ -746,15 +778,27 @@ impl TxBuilderApp {
     }
 
     fn set_loaded(&mut self, loaded: LoadedContract) {
+        // Installing a contract retires any resolve still in flight. Without
+        // this, a curated-registry hit or a pasted ABI (neither of which issues
+        // a request, so neither used to touch the sequence) leaves an older
+        // bytecode fetch matching `resolve_seq` — it would land, read the *new*
+        // `resolve_target`, and hand this address the other contract's methods.
+        self.invalidate_resolve();
         self.resolving = false;
         self.not_found = false;
+        // A curated or pasted ABI is authoritative for the address regardless
+        // of what the proxy walk could or couldn't read, so the caution retires
+        // with it; a bytecode load keeps it (that ABI *is* the stub's).
+        if loaded.source != AbiSource::Bytecode {
+            self.proxy_unverified = false;
+        }
         self.paste_open = false;
         self.resolve_target = Some(loaded.address);
         self.method_idx = 0;
         self.method_menu_open = false;
         self.read_idx = 0;
         self.read_menu_open = false;
-        self.read_result = None;
+        self.invalidate_read();
         self.loaded = Some(loaded);
         self.reset_args();
         self.reset_read_args();
@@ -785,9 +829,11 @@ impl TxBuilderApp {
     }
 
     fn reset_composer_keep_addr(&mut self) {
+        self.invalidate_resolve();
         self.loaded = None;
         self.resolving = false;
         self.not_found = false;
+        self.proxy_unverified = false;
         self.paste_open = false;
         self.resolve_target = None;
         self.method_idx = 0;
@@ -797,20 +843,58 @@ impl TxBuilderApp {
         self.read_idx = 0;
         self.read_menu_open = false;
         self.read_args.clear();
+        self.invalidate_read();
+    }
+
+    /// Retire any resolve still in flight. `on_contract_resolved` applies its
+    /// answer to whatever `resolve_target` holds when it lands, so every change
+    /// to that target — a new address, a curated hit, a pasted ABI, a network
+    /// switch — has to bump the sequence or the answer gets misapplied.
+    fn invalidate_resolve(&mut self) {
+        self.resolve_seq += 1;
+    }
+
+    /// Retire any read still in flight, plus its displayed result. Same shape
+    /// as [`Self::invalidate_resolve`]: `on_read` decodes the returned bytes
+    /// against whatever method is selected when they land, so anything that
+    /// changes the selection, the arguments, or the contract must bump the
+    /// sequence. Clearing `read_busy` also stops a superseded query from
+    /// leaving the spinner up forever — `on_read` returns on the stale-sequence
+    /// check before it gets to reset the flag.
+    fn invalidate_read(&mut self) {
+        self.read_seq += 1;
+        self.read_busy = false;
         self.read_result = None;
     }
 
     /// A network change invalidates every resolved-contract / query / sim piece
     /// of state — known contracts are per-chain and a call result is per-network.
-    fn on_network_reset(&mut self) {
+    ///
+    /// It invalidates the **queue** too, and that part is a safety property
+    /// rather than housekeeping: a [`QueuedCall`] carries only `to`, and the
+    /// same contract sits at a different address on every chain. A batch
+    /// composed on one network and left standing across a switch would be
+    /// packed into a MultiSend / `executeBatch` addressed at whatever happens
+    /// to occupy those addresses on the new one. `from` is the network the
+    /// dropped calls were composed for, named in the notice so the loss is
+    /// never silent.
+    fn on_network_reset(&mut self, from: NetworkId) {
         self.net_menu_open = false;
         self.reset_composer();
         self.invalidate_sim();
-        // Custom networks have no batch surface; drop any queued calls so the
-        // single-transaction composer starts clean.
-        if self.net.is_custom() {
-            self.batch.clear();
-            self.expanded = None;
+        let dropped = self.batch.len();
+        self.batch.clear();
+        self.expanded = None;
+        // The old banner described the old network's context — retire it
+        // before deciding whether this switch has something of its own to say.
+        self.error = None;
+        if dropped > 0 {
+            self.error = Some(format!(
+                "Batch cleared — {dropped} call{} composed for {} can't be replayed on {}.",
+                if dropped == 1 { "" } else { "s" },
+                from.display_name(),
+                self.net.display_name(),
+            ));
         }
     }
 
@@ -1032,9 +1116,8 @@ impl TxBuilderApp {
                 return None;
             }
         };
+        self.invalidate_read();
         self.read_busy = true;
-        self.read_result = None;
-        self.read_seq += 1;
         Some(Outcome::Read {
             seq: self.read_seq,
             net: self.net,
@@ -1418,6 +1501,16 @@ mod tests {
         }
     }
 
+    /// A resolve answer for a plain (non-proxy) address: the code is the
+    /// target's own and every read on the way was verified.
+    fn plain_code(target: Address, code: &[u8]) -> ResolvedCode {
+        ResolvedCode {
+            code: Bytes::copy_from_slice(code),
+            implementation: target,
+            all_verified: true,
+        }
+    }
+
     #[test]
     fn stale_resolve_is_dropped() {
         let mut app = safe_app();
@@ -1428,9 +1521,151 @@ mod tests {
         let b = address!("0x00000000000000000000000000000000BEEF0000");
         app.update(Message::AddrChanged(b.to_string()));
         // the stale answer must not clobber the new target
-        app.on_contract_resolved(stale_seq, Ok(Bytes::new()));
+        app.on_contract_resolved(stale_seq, Ok(plain_code(a, &[])));
         assert!(!app.not_found, "stale resolve result ignored");
         assert_eq!(app.resolve_target, Some(b));
+    }
+
+    #[test]
+    fn a_curated_hit_retires_an_in_flight_resolve() {
+        let mut app = eoa_app();
+        let unknown = address!("0x00000000000000000000000000000000C0FFEE00");
+        app.update(Message::AddrChanged(unknown.to_string()));
+        let stale_seq = app.resolve_seq;
+        assert!(app.resolving);
+
+        // The user pastes a curated address before the fetch returns. That
+        // resolves synchronously from the registry and issues no request of its
+        // own, so it has to retire the outstanding sequence explicitly.
+        app.update(Message::AddrChanged(usdc().to_string()));
+        let curated_methods = app.loaded.as_ref().expect("USDC loaded").methods.len();
+
+        // The stale answer carries recoverable selectors. Applied, it would
+        // hand USDC the other contract's method list while every composed call
+        // still went to USDC.
+        let code = crate::decode::bytecode::tiny_transfer_runtime();
+        app.on_contract_resolved(stale_seq, Ok(plain_code(unknown, &code)));
+
+        let c = app.loaded.as_ref().expect("still USDC");
+        assert_eq!(c.address, usdc(), "call target unchanged");
+        assert_eq!(c.source, AbiSource::Known, "curated ABI not displaced");
+        assert_eq!(c.methods.len(), curated_methods);
+    }
+
+    #[test]
+    fn a_pasted_abi_retires_an_in_flight_resolve() {
+        let mut app = eoa_app();
+        let addr = address!("0x00000000000000000000000000000000C0FFEE00");
+        app.update(Message::AddrChanged(addr.to_string()));
+        let stale_seq = app.resolve_seq;
+
+        app.update(Message::ShowAbiPaste);
+        app.update(Message::AbiPasteChanged(
+            r#"[{"type":"function","name":"stake","stateMutability":"nonpayable",
+                 "inputs":[],"outputs":[]}]"#
+                .into(),
+        ));
+        app.update(Message::LoadPastedAbi);
+        assert_eq!(app.loaded.as_ref().unwrap().source, AbiSource::Pasted);
+
+        // A pasted ABI is authoritative for the address; a bytecode answer that
+        // was already in flight must not silently replace it.
+        let code = crate::decode::bytecode::tiny_transfer_runtime();
+        app.on_contract_resolved(stale_seq, Ok(plain_code(addr, &code)));
+
+        let c = app.loaded.as_ref().expect("still the pasted ABI");
+        assert_eq!(c.source, AbiSource::Pasted, "bytecode must not displace it");
+        assert!(c.methods.iter().any(|m| m.name == "stake"));
+    }
+
+    #[test]
+    fn proxy_load_keeps_the_proxy_as_the_call_target() {
+        let mut app = safe_app();
+        let proxy = address!("0x00000000000000000000000000000000C0FFEE00");
+        let impl_addr = address!("0x00000000000000000000000000000000BEEF0000");
+        app.update(Message::AddrChanged(proxy.to_string()));
+        app.on_contract_resolved(
+            app.resolve_seq,
+            Ok(ResolvedCode {
+                code: Bytes::from(crate::decode::bytecode::tiny_transfer_runtime()),
+                implementation: impl_addr,
+                all_verified: true,
+            }),
+        );
+        let loaded = app.loaded.as_ref().expect("proxy ABI loaded");
+        // Methods came from the implementation; the call still goes to the proxy.
+        assert_eq!(loaded.address, proxy);
+        assert_eq!(loaded.proxy_impl, Some(impl_addr));
+        assert!(!app.proxy_unverified);
+    }
+
+    #[test]
+    fn unverified_proxy_slot_raises_the_caution() {
+        let mut app = safe_app();
+        let proxy = address!("0x00000000000000000000000000000000C0FFEE00");
+        app.update(Message::AddrChanged(proxy.to_string()));
+        // The walker refused to follow the pointer, so it hands back the
+        // proxy's own (selector-less) code with the flag cleared.
+        app.on_contract_resolved(
+            app.resolve_seq,
+            Ok(ResolvedCode {
+                code: Bytes::new(),
+                implementation: proxy,
+                all_verified: false,
+            }),
+        );
+        assert!(app.not_found);
+        assert!(
+            app.proxy_unverified,
+            "user must be told why the ABI came back empty"
+        );
+    }
+
+    #[test]
+    fn pasted_abi_retires_the_proxy_caution() {
+        let mut app = safe_app();
+        let proxy = address!("0x00000000000000000000000000000000C0FFEE00");
+        app.update(Message::AddrChanged(proxy.to_string()));
+        app.on_contract_resolved(
+            app.resolve_seq,
+            Ok(ResolvedCode {
+                code: Bytes::new(),
+                implementation: proxy,
+                all_verified: false,
+            }),
+        );
+        assert!(app.proxy_unverified);
+        // Pasting the implementation's ABI is authoritative — the caution goes.
+        app.update(Message::AbiPasteChanged(
+            r#"[{"type":"function","name":"transfer","stateMutability":"nonpayable",
+                "inputs":[{"name":"to","type":"address"},{"name":"amount","type":"uint256"}]}]"#
+                .into(),
+        ));
+        app.update(Message::LoadPastedAbi);
+        assert!(app.loaded.is_some(), "pasted ABI loaded");
+        assert!(!app.proxy_unverified);
+    }
+
+    #[test]
+    fn retyping_the_address_clears_the_proxy_caution() {
+        let mut app = safe_app();
+        let a = address!("0x00000000000000000000000000000000C0FFEE00");
+        app.update(Message::AddrChanged(a.to_string()));
+        app.on_contract_resolved(
+            app.resolve_seq,
+            Ok(ResolvedCode {
+                code: Bytes::new(),
+                implementation: a,
+                all_verified: false,
+            }),
+        );
+        assert!(app.proxy_unverified);
+        let b = address!("0x00000000000000000000000000000000BEEF0000");
+        app.update(Message::AddrChanged(b.to_string()));
+        assert!(
+            !app.proxy_unverified,
+            "caution must not follow the user to a different address"
+        );
     }
 
     // ── Network switcher ─────────────────────────────────────────────────
@@ -1455,6 +1690,62 @@ mod tests {
         app.update(Message::SetNetwork(NetworkId::Builtin(Chain::Base)));
         assert_eq!(app.selected_net(), NetworkId::Builtin(Chain::Base));
         assert!(app.batch_layout(), "built-in nets keep the batch layout");
+    }
+
+    #[test]
+    fn switching_builtin_networks_drops_the_batch() {
+        let mut app = eoa_app();
+        app.batch = sample_batch(&mut app.next_id, app.owner);
+        app.expanded = Some(app.batch[0].id);
+        assert_eq!(app.batch.len(), 2);
+
+        app.update(Message::SetNetwork(NetworkId::Builtin(Chain::Base)));
+
+        // A QueuedCall carries only `to`, and the same contract sits at a
+        // different address on Base — replaying these would target whatever
+        // happens to occupy those addresses there.
+        assert!(
+            app.batch.is_empty(),
+            "queue must not survive a chain change"
+        );
+        assert!(app.expanded.is_none());
+        let note = app.error.as_deref().unwrap_or_default();
+        assert!(
+            note.contains("Ethereum Mainnet"),
+            "notice names the origin chain: {note}"
+        );
+        assert!(
+            note.contains("Base"),
+            "notice names the destination chain: {note}"
+        );
+    }
+
+    #[test]
+    fn safe_pinning_a_different_chain_drops_the_batch() {
+        let mut app = eoa_app();
+        app.batch = sample_batch(&mut app.next_id, app.owner);
+
+        // Selecting a Safe re-pins the network on the next context refresh —
+        // the same re-homing as an explicit switch, and just as unsafe to let
+        // Mainnet-composed calls ride through.
+        app.set_context(Chain::Base, true, Some("1.4.1".into()), false, Vec::new());
+
+        assert_eq!(app.selected_net(), NetworkId::Builtin(Chain::Base));
+        assert!(
+            app.batch.is_empty(),
+            "an implicit re-pin drops the queue too"
+        );
+    }
+
+    #[test]
+    fn switching_networks_with_an_empty_queue_retires_the_old_banner() {
+        let mut app = eoa_app();
+        app.error = Some("atomic batching needs a software key or a Ledger".into());
+        app.update(Message::SetNetwork(NetworkId::Builtin(Chain::Base)));
+        assert!(
+            app.error.is_none(),
+            "a banner describing the old network doesn't outlive it"
+        );
     }
 
     #[test]
@@ -1569,6 +1860,58 @@ mod tests {
         app.on_read(stale, Ok((Bytes::new(), true)));
         // The stale answer must not populate the result.
         assert!(app.read_busy, "still awaiting the current query");
+    }
+
+    #[test]
+    fn switching_the_read_method_retires_an_in_flight_query() {
+        let mut app = eoa_app();
+        app.update(Message::AddrChanged(usdc().to_string()));
+        app.update(Message::SetMode(Mode::Read));
+        app.update(Message::ReadArgChanged(
+            0,
+            Address::repeat_byte(1).to_string(),
+        ));
+        app.update(Message::Query);
+        let stale = app.read_seq;
+        assert!(app.read_busy);
+
+        // `on_read` decodes the returned bytes against whatever method is
+        // selected when they land. Picking a different one mid-flight (here
+        // balanceOf → allowance) must retire the answer, not reinterpret a
+        // uint256 balance as the next method's return shape.
+        app.update(Message::PickReadMethod(1));
+        app.on_read(stale, Ok((Bytes::from(vec![0xAAu8; 32]), true)));
+
+        assert!(
+            app.read_result.is_none(),
+            "stale answer must not be decoded against the new method"
+        );
+        assert!(!app.read_busy, "a superseded query stops the spinner");
+    }
+
+    #[test]
+    fn a_new_contract_retires_an_in_flight_query() {
+        let mut app = eoa_app();
+        app.update(Message::AddrChanged(usdc().to_string()));
+        app.update(Message::SetMode(Mode::Read));
+        app.update(Message::ReadArgChanged(
+            0,
+            Address::repeat_byte(1).to_string(),
+        ));
+        app.update(Message::Query);
+        let stale = app.read_seq;
+
+        // Same hazard one level up: the answer belongs to the old contract.
+        app.update(Message::AddrChanged(
+            address!("0x00000000000000000000000000000000C0FFEE00").to_string(),
+        ));
+        app.on_read(stale, Ok((Bytes::from(vec![0xAAu8; 32]), true)));
+
+        assert!(
+            app.read_result.is_none(),
+            "answer belongs to the old target"
+        );
+        assert!(!app.read_busy);
     }
 
     // ── Templates ────────────────────────────────────────────────────────

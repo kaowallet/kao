@@ -58,30 +58,41 @@ pub fn lookup(code: &[u8], selector: [u8; 4]) -> Option<Vec<DynSolType>> {
         .map(|f| f.arg_types)
 }
 
+/// Minimal compiled `transfer(address,uint256)` dispatcher. Hand-
+/// crafted via solc against:
+///
+/// ```solidity
+/// contract T {
+///     function transfer(address to, uint256 amount) external {}
+/// }
+/// ```
+///
+/// We just need ANY valid runtime that exposes the standard ERC-20
+/// transfer selector for evmole to chew through. If this snippet
+/// breaks on an evmole upgrade, swap with `solc --bin-runtime`.
+/// Shared with the Transaction Builder's ABI tests, which need a contract
+/// whose selectors actually come back.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use alloy::hex;
+pub(crate) fn tiny_transfer_runtime() -> Vec<u8> {
+    let cleaned: String = TINY_TRANSFER_RUNTIME
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    alloy::hex::decode(&cleaned).expect("fixture bytecode hex is malformed")
+}
 
-    /// Minimal compiled `transfer(address,uint256)` dispatcher. Hand-
-    /// crafted via solc against:
-    ///
-    /// ```solidity
-    /// contract T {
-    ///     function transfer(address to, uint256 amount) external {}
-    /// }
-    /// ```
-    ///
-    /// We just need ANY valid runtime that exposes the standard ERC-20
-    /// transfer selector for evmole to chew through. If this snippet
-    /// breaks on an evmole upgrade, swap with `solc --bin-runtime`.
-    const TINY_TRANSFER_RUNTIME: &str = "608060405234801561001057600080fd5b50600436106100365760003560e01c\
+#[cfg(test)]
+const TINY_TRANSFER_RUNTIME: &str = "608060405234801561001057600080fd5b50600436106100365760003560e01c\
         8063a9059cbb1461003b575b600080fd5b610055600480360381019061005091906100a4565b610057565b005b505050565b6000\
         81359050610071816100f1565b92915050565b6000813590506100868161010856\
         5b92915050565b60008060408385031215610099576100986100ec565b5b60006100a785828601610062565b92505060206100b8\
         85828601610077565b9150509250929050565b6100ca816100d0565b82525050565b60006100db826100e2565b9050919050565b6000\
         819050919050565b600080fd5b6100f4816100d0565b81146100ff57600080fd5b50565b610111816100d6565b811461011c57\
         600080fd5b5056fea2646970667358221220";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
 
     #[test]
     fn empty_code_returns_empty() {
@@ -91,15 +102,7 @@ mod tests {
 
     #[test]
     fn extracts_transfer_selector() {
-        // Strip whitespace, decode hex; if odd length or invalid, the
-        // whole module's broken — surface the parse error.
-        let cleaned: String = TINY_TRANSFER_RUNTIME
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
-        let Ok(code) = hex::decode(&cleaned) else {
-            panic!("bench bytecode hex is malformed");
-        };
+        let code = tiny_transfer_runtime();
         let funcs = extract(&code);
         // Even if evmole's heuristic misses some, the transfer selector
         // is the only public entry point in this contract — it must
@@ -126,11 +129,7 @@ mod tests {
 
     #[test]
     fn lookup_finds_known_selector() {
-        let cleaned: String = TINY_TRANSFER_RUNTIME
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
-        let code = hex::decode(&cleaned).expect("bench bytecode hex");
+        let code = tiny_transfer_runtime();
         let types = lookup(&code, [0xa9, 0x05, 0x9c, 0xbb]);
         // evmole sometimes recovers the selector but not the arg types —
         // both "Some(empty)" and "Some([Address, Uint(256)])" mean the
@@ -140,11 +139,7 @@ mod tests {
 
     #[test]
     fn lookup_misses_unknown_selector() {
-        let cleaned: String = TINY_TRANSFER_RUNTIME
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
-        let code = hex::decode(&cleaned).expect("bench bytecode hex");
+        let code = tiny_transfer_runtime();
         // Selector that the contract doesn't expose. evmole should
         // simply not return it.
         assert!(lookup(&code, [0xde, 0xad, 0xbe, 0xef]).is_none());

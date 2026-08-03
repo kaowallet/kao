@@ -417,11 +417,13 @@ pub enum Message {
         steps: Result<Vec<sign_review::SignStep>, String>,
     },
     /// Transaction Builder: a contract's runtime bytecode was fetched (or the
-    /// fetch failed) so the composer can recover its ABI. `seq` round-trips to
-    /// drop a stale answer after the user typed a different address.
+    /// fetch failed) so the composer can recover its ABI — the code of the
+    /// implementation when the address turned out to be a proxy. `seq`
+    /// round-trips to drop a stale answer after the user typed a different
+    /// address.
     TxBuilderResolved {
         seq: u64,
-        code: Result<Bytes, String>,
+        result: Result<tx_builder::ResolvedCode, String>,
     },
     /// Transaction Builder: a Read-tab `eth_call` returned `(bytes, verified)`.
     TxBuilderRead {
@@ -4481,8 +4483,8 @@ impl WalletScreen {
                 };
                 return (Task::batch([resolve_task, task]), out);
             }
-            Message::TxBuilderResolved { seq, code } => {
-                self.apps.txbuilder_pane().on_contract_resolved(seq, code);
+            Message::TxBuilderResolved { seq, result } => {
+                self.apps.txbuilder_pane().on_contract_resolved(seq, result);
             }
             Message::TxBuilderRead { seq, result } => {
                 self.apps.txbuilder_pane().on_read(seq, result);
@@ -6315,7 +6317,8 @@ fn spawn_pool_resolve_task(
 
 // ── Transaction Builder task functions ──────────────────────────────────
 
-/// Fetch a contract's runtime bytecode so the composer can recover its ABI.
+/// Fetch a contract's runtime bytecode so the composer can recover its ABI,
+/// following any proxy indirection first.
 fn spawn_txbuilder_resolve(
     network: Arc<dyn BalanceFetcher>,
     seq: u64,
@@ -6323,9 +6326,32 @@ fn spawn_txbuilder_resolve(
     address: Address,
 ) -> Task<Message> {
     Task::perform(
-        async move { network.get_code(address, chain).await.map(|r| r.value) },
-        move |code| Message::TxBuilderResolved { seq, code },
+        async move { resolve_contract_code(network.as_ref(), chain, address).await },
+        move |result| Message::TxBuilderResolved { seq, result },
     )
+}
+
+/// Walk `address` through the known proxy slots, then fetch the runtime code of
+/// whatever will actually execute when a call lands there. A proxy stub's own
+/// code carries almost no selectors, so introspecting it directly is what makes
+/// most proxied contracts look like "no ABI found".
+///
+/// The walker refuses to follow a slot it could only read over unverified RPC;
+/// in that case `implementation` comes back equal to `address` and
+/// `all_verified` is false, so the composer can say why the ABI is thin instead
+/// of silently trusting an RPC-supplied pointer.
+async fn resolve_contract_code(
+    network: &dyn BalanceFetcher,
+    chain: Chain,
+    address: Address,
+) -> Result<tx_builder::ResolvedCode, String> {
+    let res = crate::decode::proxy::resolve_implementation(network, chain, address).await;
+    let code = network.get_code(res.implementation, chain).await?.value;
+    Ok(tx_builder::ResolvedCode {
+        code,
+        implementation: res.implementation,
+        all_verified: res.all_verified,
+    })
 }
 
 /// Run a Read-tab `eth_call`. Built-in chains go through the Helios-verified
@@ -12072,6 +12098,79 @@ mod tests {
             alloy::primitives::Bytes::from(U256::from(nonce).abi_encode()),
             true,
         );
+    }
+
+    /// The EIP-1967 implementation slot, recomputed here rather than reaching
+    /// into `decode::proxy`'s private const — if the two ever disagree these
+    /// tests stop planting the slot the walker reads.
+    fn eip1967_impl_slot() -> B256 {
+        let h = alloy::primitives::keccak256(b"eip1967.proxy.implementation");
+        let minus_one = U256::from_be_bytes(h.0) - U256::from(1u8);
+        B256::from(minus_one.to_be_bytes::<32>())
+    }
+
+    fn slot_holding(addr: Address) -> B256 {
+        let mut bytes = [0u8; 32];
+        bytes[12..].copy_from_slice(addr.as_slice());
+        B256::from(bytes)
+    }
+
+    #[tokio::test]
+    async fn resolve_contract_code_introspects_the_implementation() {
+        let mock = CallMock::new();
+        let proxy = Address::repeat_byte(0x11);
+        let impl_addr = Address::repeat_byte(0x22);
+        mock.set_storage(proxy, eip1967_impl_slot(), slot_holding(impl_addr), true);
+        // Only the implementation has code — the stub's own is empty, which is
+        // exactly the case that used to yield "no ABI for this address".
+        let code = Bytes::from(crate::decode::bytecode::tiny_transfer_runtime());
+        mock.set_code(impl_addr, code.clone(), true);
+
+        let out = resolve_contract_code(&mock, Chain::Mainnet, proxy)
+            .await
+            .unwrap();
+        assert_eq!(out.implementation, impl_addr);
+        assert_eq!(out.code, code);
+        assert!(out.all_verified);
+    }
+
+    #[tokio::test]
+    async fn resolve_contract_code_leaves_a_plain_contract_alone() {
+        let mock = CallMock::new();
+        let addr = Address::repeat_byte(0x11);
+        let code = Bytes::from(crate::decode::bytecode::tiny_transfer_runtime());
+        mock.set_code(addr, code.clone(), true);
+
+        let out = resolve_contract_code(&mock, Chain::Mainnet, addr)
+            .await
+            .unwrap();
+        assert_eq!(out.implementation, addr, "no proxy slot ⇒ no hop");
+        assert_eq!(out.code, code);
+    }
+
+    #[tokio::test]
+    async fn resolve_contract_code_will_not_follow_an_unverified_pointer() {
+        let mock = CallMock::new();
+        let proxy = Address::repeat_byte(0x11);
+        let impl_addr = Address::repeat_byte(0x22);
+        // The slot read only came back over raw RPC — an attacker-controlled
+        // pointer must not choose which contract we introspect.
+        mock.set_storage(proxy, eip1967_impl_slot(), slot_holding(impl_addr), false);
+        mock.set_code(
+            impl_addr,
+            Bytes::from(crate::decode::bytecode::tiny_transfer_runtime()),
+            true,
+        );
+
+        let out = resolve_contract_code(&mock, Chain::Mainnet, proxy)
+            .await
+            .unwrap();
+        assert_eq!(out.implementation, proxy);
+        assert!(
+            out.code.is_empty(),
+            "must read the proxy's code, not impl's"
+        );
+        assert!(!out.all_verified, "caution flag must reach the composer");
     }
 
     #[tokio::test]

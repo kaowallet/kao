@@ -14,7 +14,10 @@
 //!    the public selectors and argument *types* from the on-chain runtime
 //!    code, and the embedded 4byte database supplies human names where it
 //!    can. Never yields parameter names (positional `arg0…`), and can't
-//!    tell payable from non-payable — but always available.
+//!    tell payable from non-payable — but always available. When the address
+//!    is an EIP-1967 / ZeppelinOS proxy, the introspected code is the
+//!    implementation's (see [`from_bytecode_behind_proxy`]); a proxy stub's
+//!    own code exposes almost no selectors.
 //!
 //! All three converge on [`LoadedContract`] → `Vec<AbiMethod>`, which the
 //! composer renders identically.
@@ -123,6 +126,11 @@ pub struct LoadedContract {
     pub source: AbiSource,
     /// Brand kaomoji for known contracts; `None` otherwise.
     pub kaomoji: Option<&'static str>,
+    /// Set when `address` is a proxy and these methods were recovered from the
+    /// implementation behind it. Calls are still composed to `address` — the
+    /// proxy is what the user transacts with; this is only the contract whose
+    /// bytecode supplied the selectors.
+    pub proxy_impl: Option<Address>,
 }
 
 // ============================================================================
@@ -251,6 +259,10 @@ impl KnownContract {
             read_methods: self.read_methods.clone(),
             source: AbiSource::Known,
             kaomoji: Some(self.kaomoji),
+            // A curated entry carries a hand-verified ABI for the address the
+            // user calls, whether or not that address happens to be a proxy
+            // (USDC is) — no implementation walk was involved.
+            proxy_impl: None,
         }
     }
 }
@@ -575,6 +587,7 @@ pub fn parse_abi_json(json: &str, address: Address) -> Result<LoadedContract, Tx
         read_methods,
         source: AbiSource::Pasted,
         kaomoji: None,
+        proxy_impl: None,
     })
 }
 
@@ -653,7 +666,26 @@ pub fn from_bytecode(code: &[u8], address: Address) -> Option<LoadedContract> {
         read_methods: Vec::new(),
         source: AbiSource::Bytecode,
         kaomoji: None,
+        proxy_impl: None,
     })
+}
+
+/// Recover write methods for a proxy: the selectors come from
+/// `implementation`'s runtime code, but the loaded contract stays addressed at
+/// the proxy, because that's where the call has to land for the delegatecall to
+/// happen. `implementation == address` (no proxy detected, or a proxy whose
+/// pointer we refused to follow) degrades to plain [`from_bytecode`].
+pub fn from_bytecode_behind_proxy(
+    code: &[u8],
+    address: Address,
+    implementation: Address,
+) -> Option<LoadedContract> {
+    let mut loaded = from_bytecode(code, address)?;
+    if implementation != address {
+        loaded.label = "recovered from implementation bytecode".into();
+        loaded.proxy_impl = Some(implementation);
+    }
+    Some(loaded)
 }
 
 #[cfg(test)]
@@ -804,5 +836,45 @@ mod tests {
     #[test]
     fn from_bytecode_empty_code_is_none() {
         assert!(from_bytecode(&[], Address::ZERO).is_none());
+    }
+
+    #[test]
+    fn proxy_load_addresses_the_proxy_not_the_implementation() {
+        let proxy = Address::from([0x11; 20]);
+        let impl_addr = Address::from([0x22; 20]);
+        let code = crate::decode::bytecode::tiny_transfer_runtime();
+        let c = from_bytecode_behind_proxy(&code, proxy, impl_addr).expect("selectors recovered");
+        // The call must land on the proxy for the delegatecall to happen —
+        // composing to the implementation would bypass the proxy's storage.
+        assert_eq!(c.address, proxy);
+        assert_eq!(c.name, crate::wallet::short_address(proxy));
+        assert_eq!(c.proxy_impl, Some(impl_addr));
+        assert_eq!(c.label, "recovered from implementation bytecode");
+        assert!(c.methods.iter().any(|m| m.name == "transfer"));
+    }
+
+    #[test]
+    fn non_proxy_load_leaves_proxy_impl_unset() {
+        let addr = Address::from([0x11; 20]);
+        let code = crate::decode::bytecode::tiny_transfer_runtime();
+        // implementation == address ⇒ nothing was walked; must be
+        // indistinguishable from a plain `from_bytecode` load.
+        let via = from_bytecode_behind_proxy(&code, addr, addr).unwrap();
+        let plain = from_bytecode(&code, addr).unwrap();
+        assert!(via.proxy_impl.is_none());
+        assert_eq!(via.label, plain.label);
+        assert_eq!(via.methods.len(), plain.methods.len());
+    }
+
+    #[test]
+    fn curated_entry_never_claims_a_proxy_walk() {
+        // USDC *is* a proxy, but its curated ABI is hand-verified for the
+        // address the user calls — no implementation introspection involved.
+        let usdc = known_by_address(
+            Chain::Mainnet,
+            address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        )
+        .unwrap();
+        assert!(usdc.proxy_impl.is_none());
     }
 }

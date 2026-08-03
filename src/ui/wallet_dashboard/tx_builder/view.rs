@@ -416,6 +416,11 @@ fn contract_head(app: &TxBuilderApp, t: KaoTheme) -> Column<'_, Message> {
         col = col
             .push(Space::new().height(14))
             .push(contract_banner(t, c));
+        if app.proxy_unverified {
+            col = col
+                .push(Space::new().height(8))
+                .push(proxy_unverified_note(t));
+        }
     } else if app.not_found {
         col = col
             .push(Space::new().height(14))
@@ -2171,7 +2176,7 @@ fn contract_banner<'a>(t: KaoTheme, c: &'a super::LoadedContract) -> Element<'a,
     } else {
         format!("{} · {counts}", c.label)
     };
-    let info = column![
+    let mut info = column![
         row![
             text(c.name.clone()).size(13).color(t.text).font(bold()),
             Space::new().width(8),
@@ -2182,6 +2187,19 @@ fn contract_banner<'a>(t: KaoTheme, c: &'a super::LoadedContract) -> Element<'a,
     ]
     .spacing(2)
     .width(Length::Fill);
+
+    // Where the selectors came from, when that isn't the address being called.
+    if let Some(impl_addr) = c.proxy_impl {
+        info = info.push(
+            text(format!(
+                "proxy → {}",
+                crate::wallet::short_address(impl_addr)
+            ))
+            .size(10)
+            .color(t.a3)
+            .font(mono()),
+        );
+    }
 
     // Brand kaomoji for a known contract, if any.
     let head: Element<'a, Message> = if let Some(kao) = c.kaomoji {
@@ -2212,6 +2230,19 @@ fn contract_banner<'a>(t: KaoTheme, c: &'a super::LoadedContract) -> Element<'a,
         .into()
 }
 
+/// The proxy walk found an implementation pointer but could only read it over
+/// unverified RPC, so it wasn't followed. Says so rather than letting a
+/// near-empty ABI look like the contract's real surface.
+fn proxy_unverified_note(t: KaoTheme) -> Element<'static, Message> {
+    info_box(
+        t,
+        "This address looks like a proxy, but its implementation slot could \
+         only be read over unverified RPC — Kao won't follow that pointer. \
+         Paste the implementation's ABI to compose against it.",
+        t.down,
+    )
+}
+
 fn not_found_box(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
     let mut col = column![
         text("No verified ABI for this address")
@@ -2222,10 +2253,20 @@ fn not_found_box(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
         text("Paste the ABI as JSON, or switch to Raw hex to send custom calldata.")
             .size(12)
             .color(t.sub),
-        Space::new().height(10),
-        ghost_secondary(t, "Paste ABI JSON", Some(Message::ShowAbiPaste)),
     ]
     .width(Length::Fill);
+
+    if app.proxy_unverified {
+        col = col
+            .push(Space::new().height(8))
+            .push(proxy_unverified_note(t));
+    }
+
+    col = col.push(Space::new().height(10)).push(ghost_secondary(
+        t,
+        "Paste ABI JSON",
+        Some(Message::ShowAbiPaste),
+    ));
 
     if app.paste_open {
         col = col

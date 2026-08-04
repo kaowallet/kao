@@ -1284,7 +1284,8 @@ fn delegation_panel<'a>(t: KaoTheme, d: &'a DelegationReview) -> Element<'a, Mes
         text(match (d.already_active, d.replacing.is_some()) {
             (true, _) => {
                 "This delegation is already in place, so no new authorization is signed — \
-                 the batch below is an ordinary call into the code your account already runs."
+                 the transaction below is an ordinary call into the code your account \
+                 already runs."
             }
             (false, true) => {
                 "Your account is ALREADY delegated to the contract above, and signing this \

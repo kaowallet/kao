@@ -178,8 +178,13 @@ pub fn save(templates: &[Template]) -> Result<(), String> {
 fn save_to(path: &PathBuf, templates: &[Template]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("templates: mkdir: {e}"))?;
+        restrict_to_owner(parent, 0o700).map_err(|e| format!("templates: chmod dir: {e}"))?;
     }
     let db = Database::create(path).map_err(|e| format!("templates: open: {e}"))?;
+    // Every other store in the app is owner-only on disk; this one holds
+    // unauthenticated postcard rows whose `name`/`note` are rendered verbatim,
+    // so a locally-writable file is a rendering surface for another local user.
+    restrict_to_owner(path, 0o600).map_err(|e| format!("templates: chmod: {e}"))?;
     let txn = db
         .begin_write()
         .map_err(|e| format!("templates: begin: {e}"))?;
@@ -206,6 +211,21 @@ fn save_to(path: &PathBuf, templates: &[Template]) -> Result<(), String> {
     txn.commit()
         .map_err(|e| format!("templates: commit: {e}"))?;
     Ok(())
+}
+
+/// Restrict a path to owner-only access. Unix-only — Windows lacks POSIX
+/// modes and a proper ACL story is out of scope here, same as `wallet::store`.
+fn restrict_to_owner(path: &std::path::Path, mode: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -335,5 +355,24 @@ mod tests {
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].chain(), Some(Chain::Base));
         assert_eq!(back[0], t, "hydration restores the skipped field exactly");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_writes_the_template_store_with_owner_only_perms() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nested").join("templates.redb");
+        save_to(&path, &[sample_template("t")]).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "expected 0o600, got 0o{mode:o}");
+        let dir_mode = std::fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700, "expected 0o700, got 0o{dir_mode:o}");
     }
 }

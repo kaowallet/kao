@@ -4,7 +4,7 @@
 //! the `HeliosDb` revm plumbing; here we just map [`QueuedCall`]s to
 //! [`BatchStep`]s and re-export the result types the UI renders.
 
-pub use crate::wallet::sim::{BatchOutcome, BatchSimResult, BatchStep, simulate_batch};
+pub use crate::wallet::sim::{BatchOutcome, BatchSimResult, BatchStep, GasFit, simulate_batch};
 
 use super::QueuedCall;
 
@@ -45,9 +45,11 @@ use super::QueuedCall;
 ///   one the user is least familiar with.
 /// - **Gas is not the transaction's gas.** Each step pays its own intrinsic
 ///   cost and runs under its own limit, so the total over-counts by
-///   `(N − 1) × 21000` (the real transaction pays one intrinsic, not none),
-///   omits the wrapper's overhead entirely, and cannot detect that the batch as
-///   a whole exceeds the block gas limit.
+///   `(N − 1) × 21000` (the real transaction pays one intrinsic, not none) and
+///   omits the wrapper's overhead entirely. The one thing it no longer misses
+///   is the aggregate: [`BatchSimResult::gas_fit`] measures the sum against the
+///   gas limit of the block it ran against, so a batch that cannot be mined at
+///   all stops reading as a pass.
 pub fn to_steps(calls: &[QueuedCall]) -> Vec<BatchStep> {
     calls
         .iter()

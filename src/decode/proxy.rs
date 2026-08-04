@@ -21,10 +21,17 @@
 //!   beacon proxies store a beacon address in the slot, and you
 //!   resolve the implementation by calling `implementation()` on the
 //!   beacon. That requires an `eth_call`, which Phase 1 deliberately
-//!   skipped (alloy v1/v2 type wrangling on the Helios boundary). Beacon
-//!   proxies are uncommon in clear-signing-relevant contracts; track as
-//!   a follow-up if a real call lands at one.
+//!   skipped (alloy v1/v2 type wrangling on the Helios boundary). Not
+//!   followed, but [`is_beacon_proxy`] recognises the shape so the UI can
+//!   say which limitation it hit rather than showing an empty ABI.
 //! - **EIP-1967 admin** — used for upgrade governance, not call routing.
+//!
+//! ### Not a slot at all
+//!
+//! - **ERC-1167 minimal proxies** (OpenZeppelin `Clones`) carry the
+//!   implementation as 20 literal bytes inside a fixed 45-byte runtime, with no
+//!   storage pointer for this walker to find. [`erc1167_target`] reads it
+//!   straight out of the code — no RPC call, no trust decision.
 
 use alloy::primitives::{Address, B256, U256};
 
@@ -133,6 +140,58 @@ async fn probe_slots(
     None
 }
 
+/// ERC-1167 minimal-proxy runtime, split around the 20-byte target it embeds:
+/// `363d3d373d3d3d363d73 ‖ <impl> ‖ 5af43d82803e903d91602b57fd5bf3`.
+const ERC1167_PREFIX: [u8; 10] = [0x36, 0x3d, 0x3d, 0x37, 0x3d, 0x3d, 0x3d, 0x36, 0x3d, 0x73];
+const ERC1167_SUFFIX: [u8; 15] = [
+    0x5a, 0xf4, 0x3d, 0x82, 0x80, 0x3e, 0x90, 0x3d, 0x91, 0x60, 0x2b, 0x57, 0xfd, 0x5b, 0xf3,
+];
+
+/// The implementation an ERC-1167 minimal proxy delegates to, read straight out
+/// of its runtime bytecode.
+///
+/// A clone carries its target as 20 literal bytes in the middle of a fixed
+/// 45-byte body — there is no storage slot, so [`resolve_implementation`] can
+/// never find one, and the clone's own dispatcher exposes no selectors at all.
+/// That combination is what surfaced OpenZeppelin `Clones` deployments as an
+/// undifferentiated "no ABI found". Recovering the target costs no RPC call and
+/// no trust: the pointer is in code the caller already fetched.
+pub fn erc1167_target(code: &[u8]) -> Option<Address> {
+    if code.len() != ERC1167_PREFIX.len() + 20 + ERC1167_SUFFIX.len() {
+        return None;
+    }
+    if !code.starts_with(&ERC1167_PREFIX) || !code.ends_with(&ERC1167_SUFFIX) {
+        return None;
+    }
+    let addr = Address::from_slice(&code[ERC1167_PREFIX.len()..ERC1167_PREFIX.len() + 20]);
+    (addr != Address::ZERO).then_some(addr)
+}
+
+/// EIP-1967 beacon slot:
+/// `bytes32(uint256(keccak256("eip1967.proxy.beacon")) - 1)`.
+const EIP_1967_BEACON_SLOT: B256 = B256::new([
+    0xa3, 0xf0, 0xad, 0x74, 0xe5, 0x42, 0x3a, 0xeb, 0xfd, 0x80, 0xd3, 0xef, 0x43, 0x46, 0x57, 0x83,
+    0x35, 0xa9, 0xa7, 0x2a, 0xea, 0xee, 0x59, 0xff, 0x6c, 0xb3, 0x58, 0x2b, 0x35, 0x13, 0x3d, 0x50,
+]);
+
+/// Whether `addr` is a beacon proxy — a shape this walker recognises but does
+/// not follow.
+///
+/// Resolving a beacon means calling `implementation()` on the beacon contract,
+/// which is an `eth_call` rather than a storage read. Until that lands, saying
+/// "this is a beacon proxy and Kao doesn't follow those yet" is worth a read on
+/// its own: it is the difference between a limitation the user can act on and
+/// an empty method list with no explanation.
+pub async fn is_beacon_proxy(net: &dyn BalanceFetcher, chain: Chain, addr: Address) -> bool {
+    let slot = U256::from_be_bytes(EIP_1967_BEACON_SLOT.0);
+    match net.get_storage_at(addr, slot, chain).await {
+        // Only a verified read may make this claim: an unverified one would let
+        // a hostile RPC label any address a beacon and suppress its real ABI.
+        Ok(read) => read.verified && address_from_slot(read.value).is_some(),
+        Err(_) => false,
+    }
+}
+
 /// A storage word holds an address in its rightmost 20 bytes. Treat
 /// any non-zero upper bytes as "this slot doesn't hold an address" —
 /// that catches the case where a slot keccak'd by an unrelated mapping
@@ -155,6 +214,59 @@ fn address_from_slot(slot: B256) -> Option<Address> {
 mod tests {
     use super::*;
     use alloy::primitives::keccak256;
+
+    /// A canonical ERC-1167 runtime pointing at `target`.
+    fn clone_runtime(target: Address) -> Vec<u8> {
+        let mut code = ERC1167_PREFIX.to_vec();
+        code.extend_from_slice(target.as_slice());
+        code.extend_from_slice(&ERC1167_SUFFIX);
+        code
+    }
+
+    #[test]
+    fn erc1167_target_reads_the_implementation_out_of_the_clone() {
+        let target = Address::repeat_byte(0x42);
+        let code = clone_runtime(target);
+        assert_eq!(code.len(), 45, "the canonical clone runtime is 45 bytes");
+        assert_eq!(erc1167_target(&code), Some(target));
+    }
+
+    #[test]
+    fn erc1167_target_refuses_anything_that_is_not_exactly_a_clone() {
+        let target = Address::repeat_byte(0x42);
+        // Right shape, wrong length — a longer body is a different contract
+        // that merely opens the same way, and its 20 bytes at that offset are
+        // not a pointer.
+        let mut long = clone_runtime(target);
+        long.push(0x00);
+        assert!(erc1167_target(&long).is_none());
+
+        let mut short = clone_runtime(target);
+        short.pop();
+        assert!(erc1167_target(&short).is_none());
+
+        // Prefix matches, suffix doesn't.
+        let mut tampered = clone_runtime(target);
+        let n = tampered.len();
+        tampered[n - 1] = 0x00;
+        assert!(erc1167_target(&tampered).is_none());
+
+        // A clone to the zero address delegates nowhere.
+        assert!(erc1167_target(&clone_runtime(Address::ZERO)).is_none());
+
+        // Ordinary contract code.
+        assert!(erc1167_target(&crate::decode::bytecode::tiny_transfer_runtime()).is_none());
+        assert!(erc1167_target(&[]).is_none());
+    }
+
+    #[test]
+    fn eip1967_beacon_slot_is_the_standard_one() {
+        // keccak256("eip1967.proxy.beacon") - 1, same derivation as the
+        // implementation slot above.
+        let h = keccak256(b"eip1967.proxy.beacon");
+        let want = B256::from(U256::from_be_bytes(h.0) - U256::from(1u8));
+        assert_eq!(EIP_1967_BEACON_SLOT, want);
+    }
 
     #[test]
     fn keccak_smoketest() {

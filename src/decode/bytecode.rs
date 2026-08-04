@@ -19,11 +19,21 @@
 
 use alloy::dyn_abi::DynSolType;
 
+/// Solidity's four mutability classes, as evmole infers them from the
+/// dispatcher. Re-exported so callers don't take their own evmole dependency.
+pub use evmole::StateMutability;
+
 /// One public entry point recovered from the bytecode dispatcher.
 #[derive(Debug, Clone)]
 pub struct ExtractedFn {
     pub selector: [u8; 4],
     pub arg_types: Vec<DynSolType>,
+    /// Mutability, when evmole could infer it — `None` means it could not, and
+    /// callers must treat that as "unknown", not as `NonPayable`. Inference is
+    /// a heuristic over the dispatcher (does this path reach a `CALLVALUE`
+    /// guard, does it reach an `SSTORE`), so a wrong answer is possible; it
+    /// decides which menu a method appears in, never what gets signed.
+    pub mutability: Option<StateMutability>,
 }
 
 /// All public functions evmole could recover from `code`. Empty when
@@ -36,7 +46,8 @@ pub fn extract(code: &[u8]) -> Vec<ExtractedFn> {
     }
     let args = evmole::ContractInfoArgs::new(code)
         .with_selectors()
-        .with_arguments();
+        .with_arguments()
+        .with_state_mutability();
     let info = evmole::contract_info(args);
     info.functions
         .unwrap_or_default()
@@ -44,6 +55,7 @@ pub fn extract(code: &[u8]) -> Vec<ExtractedFn> {
         .map(|f| ExtractedFn {
             selector: f.selector,
             arg_types: f.arguments.unwrap_or_default(),
+            mutability: f.state_mutability,
         })
         .collect()
 }

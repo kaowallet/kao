@@ -14,12 +14,87 @@ use alloy::primitives::{Address, Bytes, U256};
 use super::abi::AbiMethod;
 use super::{DecodedArg, QueuedCall, TxBuilderError};
 
+/// Why a mixed-case address string was refused. Short: parameter errors are
+/// rendered prefixed with the parameter's name.
+const EIP55_REASON: &str = "fails its EIP-55 checksum — one character is off, re-copy it";
+
+/// True when `s` is a 20-byte hex address whose *mixed* case fails EIP-55.
+///
+/// All-lowercase and all-uppercase hex carry no checksum information — EIP-55
+/// defines them as unchecksummed, and both explorers and JSON-RPC still emit
+/// the lowercase form — so neither is ever a violation. Mixed case *is* a
+/// checksum claim, and a claim that doesn't hold is exactly the transposed or
+/// mistyped character the checksum exists to catch: one of the few corruptions
+/// that still parses as a perfectly valid address and sends the funds nowhere.
+fn fails_eip55(s: &str) -> bool {
+    // The prefix is optional on the way in — alloy's coercer takes a bare
+    // 40-hex address — so a check keyed on `0x` would wave that spelling past.
+    let body = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
+    if body.len() != 40 || !body.chars().all(|c| c.is_ascii_hexdigit()) {
+        return false;
+    }
+    let mut lower = false;
+    let mut upper = false;
+    for c in body.chars().filter(|c| c.is_ascii_alphabetic()) {
+        lower |= c.is_ascii_lowercase();
+        upper |= c.is_ascii_uppercase();
+    }
+    // Re-prefix rather than pass `s` through: alloy's checksummer only accepts
+    // a lowercase `0x`, so a `0X`-prefixed address would fail as a formatting
+    // quirk rather than as the checksum mismatch we are testing for.
+    lower && upper && Address::parse_checksummed(format!("0x{body}"), None).is_err()
+}
+
+/// Whether a token-level scan of a value string can be sure every 40-hex hit
+/// it finds is an address.
+///
+/// True iff the type tree has an `address` leaf and no leaf written as free
+/// hex. A `bytes20` is spelled exactly like an address and is *not* a checksum
+/// claim, so a type carrying both — `(address,bytes20)` — is left alone rather
+/// than risk refusing a legitimate value. That is a known hole in the gate, and
+/// the right direction to leave one in: the cost is a missed check on an
+/// unusual signature, against wrongly rejecting input the user typed correctly.
+fn addresses_are_unambiguous(ty: &DynSolType) -> bool {
+    fn walk(ty: &DynSolType, addr: &mut bool, hexish: &mut bool) {
+        match ty {
+            DynSolType::Address => *addr = true,
+            DynSolType::Bytes
+            | DynSolType::FixedBytes(_)
+            | DynSolType::Function
+            | DynSolType::String => *hexish = true,
+            DynSolType::Array(inner) => walk(inner, addr, hexish),
+            DynSolType::FixedArray(inner, _) => walk(inner, addr, hexish),
+            DynSolType::Tuple(items) => items.iter().for_each(|t| walk(t, addr, hexish)),
+            DynSolType::CustomStruct { tuple, .. } => {
+                tuple.iter().for_each(|t| walk(t, addr, hexish))
+            }
+            _ => {}
+        }
+    }
+    let (mut addr, mut hexish) = (false, false);
+    walk(ty, &mut addr, &mut hexish);
+    addr && !hexish
+}
+
 /// Validate a single parameter value against its type by coercing it. Ok
 /// carries the encodable value; Err is a short, user-facing reason.
 pub fn coerce_param(ty: &DynSolType, raw: &str) -> Result<DynSolValue, String> {
     let s = raw.trim();
     if s.is_empty() {
         return Err("required".into());
+    }
+    // Alloy's `address` coercer is pure hex, so the checksum has to be checked
+    // before it. Scanning the whole string rather than the scalar covers the
+    // addresses nested in a tuple or array argument, which coerce_str would
+    // otherwise wave through one level down.
+    if addresses_are_unambiguous(ty)
+        && s.split(|c: char| !c.is_ascii_alphanumeric())
+            .any(fails_eip55)
+    {
+        return Err(EIP55_REASON.into());
     }
     ty.coerce_str(s)
         .map_err(|_| format!("expected {}", ty.sol_type_name()))
@@ -31,14 +106,36 @@ pub fn is_valid(ty: &DynSolType, raw: &str) -> bool {
     coerce_param(ty, raw).is_ok()
 }
 
+/// The number a parameter string will actually encode to, when that differs
+/// from what was typed: `1 ether` → `1000000000000000000`, `1e6` → `1000000`,
+/// a lowercase address → its checksummed form. `None` when the input doesn't
+/// coerce, or when it already reads as what it encodes — the common case, where
+/// a second line would only be noise.
+///
+/// Rendered under the field, so the value being agreed to is on screen at the
+/// keystroke rather than only after the call is queued.
+pub fn encoded_preview(ty: &DynSolType, raw: &str) -> Option<String> {
+    let v = coerce_param(ty, raw).ok()?;
+    let shown = format_sol_value(&v);
+    (shown != raw.trim()).then_some(shown)
+}
+
 /// A short type hint shown as the field placeholder.
+///
+/// The integer hint names the grammar rather than a rule the parser doesn't
+/// enforce. Alloy's uint coercer takes `1 ether`, `2.5 gwei`, `1e18` and `0x10`
+/// as readily as a plain decimal, and `1 ether` into a 6-decimal token's
+/// `uint256` is 10¹² of it — so "base units, no decimals" was the worst of both,
+/// wrong about the units and wrong about the decimals (a bare `1.5` *is*
+/// refused; `2.5 gwei` is not). The field annotates the number that actually
+/// gets encoded — see [`encoded_preview`].
 pub fn type_hint(ty_str: &str) -> String {
     if ty_str == "address" {
         "0x… (20-byte address)".into()
     } else if ty_str == "bool" {
         "true / false".into()
     } else if ty_str.starts_with("uint") || ty_str.starts_with("int") {
-        "integer (base units, no decimals)".into()
+        "base units — 1e18 / 1 gwei / 1 ether / 0x10 also parse".into()
     } else if ty_str.starts_with("bytes") {
         "0x… hex".into()
     } else if ty_str == "string" {
@@ -61,11 +158,28 @@ pub fn parse_wei(raw: &str) -> Result<U256, String> {
     }
 }
 
-/// Parse and validate a target/recipient address.
+/// Parse and validate a target/recipient address, checksum included.
 pub fn parse_address(raw: &str) -> Result<Address, String> {
-    raw.trim()
-        .parse::<Address>()
+    let s = raw.trim();
+    if fails_eip55(s) {
+        return Err(format!("this address {EIP55_REASON}"));
+    }
+    s.parse::<Address>()
         .map_err(|_| "not a 20-byte 0x… address".into())
+}
+
+/// Parse the raw composer's calldata field. Empty or a bare `0x` is a plain
+/// value transfer, not an error. Odd-length or non-hex is refused — the same
+/// answer the composer's CTA is gated on, so the two can't disagree.
+pub fn parse_data(raw: &str) -> Result<Bytes, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "0x" {
+        return Ok(Bytes::new());
+    }
+    let hex = trimmed.strip_prefix("0x").unwrap_or(trimmed);
+    alloy::hex::decode(hex)
+        .map(Bytes::from)
+        .map_err(|_| "data is not valid hex".into())
 }
 
 /// ABI-encode a method call: `selector ‖ abi_encode_params(args)`.
@@ -92,6 +206,41 @@ pub fn encode_call(method: &AbiMethod, values: &[String]) -> Result<Bytes, TxBui
     Ok(Bytes::from(out))
 }
 
+/// Recover the decoded-argument view from calldata, against the method whose
+/// selector the calldata carries. The inverse of [`encode_call`], and the
+/// reason a queue card can be trusted: what it shows is derived from the bytes
+/// that will execute — never from the strings they were typed from, nor from
+/// the metadata a bundle claims for them.
+///
+/// `None` when the body doesn't decode against the signature — truncated,
+/// padded, or simply not that method's arguments.
+pub fn decode_args(m: &AbiMethod, data: &[u8]) -> Option<Vec<DecodedArg>> {
+    let Some(tuple) = m.input_tuple() else {
+        // A no-argument method: the calldata is the bare selector, and
+        // anything past it is unaccounted for.
+        return (data.len() == 4).then(Vec::new);
+    };
+    let body = data.get(4..)?;
+    let DynSolValue::Tuple(vals) = tuple.abi_decode_params(body).ok()? else {
+        return None;
+    };
+    if vals.len() != m.inputs.len() {
+        return None;
+    }
+    Some(
+        m.inputs
+            .iter()
+            .zip(vals)
+            .enumerate()
+            .map(|(i, (p, v))| DecodedArg {
+                name: p.display_name(i),
+                ty: p.ty_str.clone(),
+                value: format_sol_value(&v),
+            })
+            .collect(),
+    )
+}
+
 /// Build a fully-formed queued contract call from composer input.
 ///
 /// `contract_name` is the display prefix (`USDC`, `0x1234…`). `value_wei`
@@ -113,19 +262,22 @@ pub fn build_contract_call(
         U256::ZERO
     };
 
-    let decoded_args: Vec<DecodedArg> = method
-        .inputs
-        .iter()
-        .enumerate()
-        .map(|(i, p)| DecodedArg {
-            name: p.display_name(i),
-            ty: p.ty_str.clone(),
-            value: values[i].trim().to_string(),
-        })
-        .collect();
+    // The card is where a batch is vetted, one screen ahead of the review, so
+    // it answers to the same rule: every value on it is decoded back out of the
+    // calldata rather than echoed from the box it was typed in. Echoing hid a
+    // real difference — alloy's uint grammar takes `1 ether`, so that string
+    // read back as itself over a word holding 10^18 — and made the composer
+    // disagree with the import path, which has always decoded.
+    let decoded_args = decode_args(method, &data).ok_or_else(|| {
+        TxBuilderError::Assembly(format!(
+            "the encoded call doesn't decode as `{}` — refusing to queue a call the card \
+             can't account for",
+            method.signature,
+        ))
+    })?;
 
     let title = format!("{contract_name}.{}", method.name);
-    let detail = summarize_detail(method, values, value);
+    let detail = summarize_detail(method, &decoded_args, value);
 
     Ok(QueuedCall {
         id,
@@ -148,15 +300,7 @@ pub fn build_raw_call(
     data_hex: &str,
 ) -> Result<QueuedCall, TxBuilderError> {
     let value = parse_wei(value_wei).map_err(TxBuilderError::Input)?;
-    let trimmed = data_hex.trim();
-    let data = if trimmed.is_empty() || trimmed == "0x" {
-        Bytes::new()
-    } else {
-        let hex = trimmed.strip_prefix("0x").unwrap_or(trimmed);
-        let raw = alloy::hex::decode(hex)
-            .map_err(|_| TxBuilderError::Input("data is not valid hex".into()))?;
-        Bytes::from(raw)
-    };
+    let data = parse_data(data_hex).map_err(TxBuilderError::Input)?;
     let detail = if data.is_empty() {
         "plain ETH transfer".into()
     } else {
@@ -174,25 +318,23 @@ pub fn build_raw_call(
     })
 }
 
-/// A friendly one-line detail for the queue card. Falls back to the first
-/// argument for methods we don't special-case.
-fn summarize_detail(method: &AbiMethod, values: &[String], value: U256) -> String {
-    let arg = |i: usize| values.get(i).map(|s| s.trim()).unwrap_or("");
+/// A friendly one-line detail for the queue card, built from the *decoded*
+/// arguments so it can't quote a value the calldata doesn't hold. Falls back to
+/// the first argument for methods we don't special-case.
+fn summarize_detail(method: &AbiMethod, args: &[DecodedArg], value: U256) -> String {
+    let arg = |i: usize| args.get(i).map(|a| a.value.as_str()).unwrap_or("");
     let short = |s: &str| {
         s.parse::<Address>()
             .map(crate::wallet::short_address)
             .unwrap_or_else(|_| s.to_string())
     };
     match method.name.as_str() {
-        "transfer" | "approve" if method.inputs.len() >= 2 => {
+        "transfer" | "approve" if args.len() >= 2 => {
             format!("{} → {}", arg(1), short(arg(0)))
         }
         "deposit" if method.payable => format!("wrap {value} wei"),
-        _ if method.inputs.is_empty() => "no arguments".into(),
-        _ => {
-            let first = &method.inputs[0];
-            format!("{}: {}", first.display_name(0), short(arg(0)))
-        }
+        _ if args.is_empty() => "no arguments".into(),
+        _ => format!("{}: {}", args[0].name, short(arg(0))),
     }
 }
 
@@ -316,6 +458,168 @@ mod tests {
         let with_data = build_raw_call(2, to, "0", "0xdeadbeef").unwrap();
         assert_eq!(with_data.data.as_ref(), &[0xde, 0xad, 0xbe, 0xef]);
         assert!(build_raw_call(3, to, "0", "0xzz").is_err());
+    }
+
+    /// USDC, in its canonical EIP-55 form.
+    const CHECKSUMMED: &str = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
+    /// The same 20 bytes with the leading `A` lowercased: still mixed case, so
+    /// still a checksum claim, and now a false one.
+    const CORRUPTED: &str = "0xa0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
+
+    #[test]
+    fn parse_address_accepts_both_unchecksummed_forms() {
+        // EIP-55 defines all-one-case as carrying no checksum. Explorers and
+        // JSON-RPC both still emit the lowercase form, so refusing it would
+        // reject correct input.
+        for s in [
+            CHECKSUMMED,
+            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+            "0xA0B86991C6218B36C1D19D4A2E9EB0CE3606EB48",
+        ] {
+            assert!(parse_address(s).is_ok(), "{s} should parse");
+        }
+    }
+
+    #[test]
+    fn parse_address_rejects_a_mixed_case_address_failing_its_checksum() {
+        let err = parse_address(CORRUPTED).unwrap_err();
+        assert!(err.contains("EIP-55"), "unexpected reason: {err}");
+        // The corruption is invisible to the plain hex parser — which is the
+        // whole reason the checksum has to be checked separately.
+        assert!(CORRUPTED.parse::<Address>().is_ok());
+    }
+
+    #[test]
+    fn address_params_carry_the_checksum_gate_into_coercion() {
+        let c = usdc();
+        let transfer = c.methods.iter().find(|m| m.name == "transfer").unwrap();
+        let err = encode_call(transfer, &[CORRUPTED.into(), "1".into()]).unwrap_err();
+        let TxBuilderError::Input(msg) = &err else {
+            panic!("expected Input, got {err:?}");
+        };
+        assert!(msg.contains("EIP-55"), "unexpected reason: {msg}");
+        assert!(encode_call(transfer, &[CHECKSUMMED.into(), "1".into()]).is_ok());
+    }
+
+    #[test]
+    fn the_checksum_gate_reaches_an_address_nested_in_a_tuple() {
+        let ty: DynSolType = "(address,uint256)".parse().unwrap();
+        assert!(coerce_param(&ty, &format!("({CHECKSUMMED},5)")).is_ok());
+        assert!(coerce_param(&ty, &format!("({CORRUPTED},5)")).is_err());
+    }
+
+    #[test]
+    fn the_checksum_gate_leaves_a_type_it_cannot_read_alone() {
+        // A bytes20 may hold any mixed-case hex it likes; it is not a claim.
+        let ty: DynSolType = "bytes20".parse().unwrap();
+        assert!(coerce_param(&ty, CORRUPTED).is_ok());
+        let ty: DynSolType = "string".parse().unwrap();
+        assert!(coerce_param(&ty, CORRUPTED).is_ok());
+        // And a tuple mixing the two is left alone entirely: a token scan
+        // can't tell which 40-hex string was meant to be which, and refusing
+        // input the user typed correctly is the worse error.
+        let ty: DynSolType = "(address,bytes20)".parse().unwrap();
+        assert!(coerce_param(&ty, &format!("({CORRUPTED},{CORRUPTED})")).is_ok());
+    }
+
+    #[test]
+    fn parse_address_gates_a_bare_unprefixed_address_too() {
+        // alloy accepts 40 hex digits with no `0x`, so a predicate keyed on
+        // the prefix would wave that spelling straight past the checksum.
+        let bare = CORRUPTED.strip_prefix("0x").unwrap();
+        assert!(parse_address(bare).is_err());
+        assert!(parse_address(CHECKSUMMED.strip_prefix("0x").unwrap()).is_ok());
+    }
+
+    #[test]
+    fn queued_arguments_are_decoded_from_the_calldata_not_the_typed_text() {
+        // `1 ether` coerces cleanly into a uint256 and encodes 10^18. The card
+        // used to echo the keystrokes, so it read "1 ether" over a word that
+        // means a million million times a USDC unit.
+        let c = usdc();
+        let transfer = c.methods.iter().find(|m| m.name == "transfer").unwrap();
+        let call = build_contract_call(
+            1,
+            c.address,
+            "USDC",
+            transfer,
+            &[
+                "0x000000000000000000000000000000000000dead".into(),
+                "1 ether".into(),
+            ],
+            "0",
+        )
+        .unwrap();
+        assert_eq!(call.decoded_args[1].value, "1000000000000000000");
+        assert_eq!(
+            call.decoded_args[0].value, "0x000000000000000000000000000000000000dEaD",
+            "an address reads back checksummed, however it was typed"
+        );
+    }
+
+    #[test]
+    fn the_queue_detail_line_quotes_the_decoded_amount() {
+        let c = usdc();
+        let transfer = c.methods.iter().find(|m| m.name == "transfer").unwrap();
+        let call = build_contract_call(
+            1,
+            c.address,
+            "USDC",
+            transfer,
+            &[CHECKSUMMED.into(), "1 ether".into()],
+            "0",
+        )
+        .unwrap();
+        assert!(
+            call.detail.contains("1000000000000000000"),
+            "{}",
+            call.detail
+        );
+        assert!(!call.detail.contains("ether"), "{}", call.detail);
+    }
+
+    #[test]
+    fn the_integer_hint_names_the_units_the_parser_accepts() {
+        let hint = type_hint("uint256");
+        assert!(hint.contains("base units"), "{hint}");
+        assert!(hint.contains("ether"), "{hint}");
+        // `2.5 gwei` coerces, so the old "no decimals" was simply untrue.
+        assert!(!hint.contains("no decimals"), "{hint}");
+        let ty: DynSolType = "uint256".parse().unwrap();
+        assert!(is_valid(&ty, "2.5 gwei"));
+        assert!(!is_valid(&ty, "1.5"), "a bare fraction really is refused");
+    }
+
+    #[test]
+    fn encoded_preview_shows_only_what_the_typing_hides() {
+        let uint: DynSolType = "uint256".parse().unwrap();
+        assert_eq!(
+            encoded_preview(&uint, "1 ether").as_deref(),
+            Some("1000000000000000000")
+        );
+        assert_eq!(encoded_preview(&uint, "1e6").as_deref(), Some("1000000"));
+        assert!(
+            encoded_preview(&uint, "1000000").is_none(),
+            "a value that reads as what it encodes needs no second line"
+        );
+        let addr: DynSolType = "address".parse().unwrap();
+        assert_eq!(
+            encoded_preview(&addr, "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48").as_deref(),
+            Some(CHECKSUMMED)
+        );
+    }
+
+    #[test]
+    fn parse_data_accepts_the_empty_transfer_and_refuses_bad_hex() {
+        for empty in ["", "   ", "0x"] {
+            assert!(parse_data(empty).unwrap().is_empty(), "{empty:?}");
+        }
+        assert_eq!(
+            parse_data("0xdeadbeef").unwrap().as_ref(),
+            &[0xde, 0xad, 0xbe, 0xef]
+        );
+        assert!(parse_data("0xzz").is_err());
+        assert!(parse_data("0xabc").is_err(), "odd-length hex is not bytes");
     }
 
     #[test]

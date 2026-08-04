@@ -10,15 +10,15 @@
 //! another tool omits it (relying on the method + input values), we
 //! re-encode from those.
 
-use alloy::dyn_abi::{DynSolType, DynSolValue};
+use alloy::dyn_abi::DynSolType;
 use alloy::primitives::{Address, Bytes, U256};
 use serde::{Deserialize, Serialize};
 
 use crate::chain::Chain;
 
-use super::abi::{AbiMethod, AbiParam};
-use super::encode::{encode_call, format_sol_value};
-use super::{DecodedArg, QueuedCall, TxBuilderError};
+use super::abi::{AbiMethod, AbiParam, MethodProvenance};
+use super::encode::{decode_args, encode_call};
+use super::{QueuedCall, TxBuilderError};
 
 /// The bundle-format major version this wallet reads and writes.
 ///
@@ -29,6 +29,14 @@ use super::{DecodedArg, QueuedCall, TxBuilderError};
 /// something other than what it describes. A differing *minor* is fine (added
 /// fields deserialize away); an unknown major is refused.
 const FORMAT_MAJOR: u32 = 1;
+
+/// The largest bundle this wallet will parse, in bytes.
+///
+/// [`import`] is fed by a paste box, so its input is untrusted in size as well
+/// as in content, and everything downstream of it is linear in the batch. The
+/// only place to stop a pathological one cheaply is before serde walks it. A
+/// mebibyte is well above any batch whose calldata could fit in a block.
+pub const MAX_BUNDLE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Bundle {
@@ -270,13 +278,33 @@ pub fn import(
     start_id: u64,
     expect_chain: Option<Chain>,
 ) -> Result<Vec<QueuedCall>, TxBuilderError> {
-    let bundle: Bundle = serde_json::from_str(json.trim())
+    let json = json.trim();
+    // Ahead of serde: the cost of a hostile bundle is paid once in the parse
+    // and then again in every frame that lays out its cards.
+    if json.len() > MAX_BUNDLE_BYTES {
+        return Err(TxBuilderError::Assembly(format!(
+            "that bundle is {} bytes, and this wallet reads batches up to {MAX_BUNDLE_BYTES} — \
+             no batch whose calls fit in a block comes anywhere near it",
+            json.len(),
+        )));
+    }
+    let bundle: Bundle = serde_json::from_str(json)
         .map_err(|e| TxBuilderError::Assembly(format!("not a batch bundle — {e}")))?;
     check_version(&bundle.version)?;
     if bundle.transactions.is_empty() {
         return Err(TxBuilderError::Assembly(
             "bundle has no transactions".into(),
         ));
+    }
+    // Before a single QueuedCall is built, so a 50k-transaction bundle never
+    // becomes 50k cards.
+    if bundle.transactions.len() > super::MAX_BATCH_CALLS {
+        return Err(TxBuilderError::Assembly(format!(
+            "that bundle has {} transactions, and this wallet queues at most {} — a batch that \
+             long is more gas than a block will take and more cards than anyone reviews",
+            bundle.transactions.len(),
+            super::MAX_BATCH_CALLS,
+        )));
     }
     if let Some(want) = expect_chain {
         // An unparseable or absent chain id is not treated as a match: the
@@ -302,11 +330,12 @@ pub fn import(
 }
 
 fn call_from_tx(tx: &BundleTx, id: u64) -> Result<QueuedCall, TxBuilderError> {
-    let to = tx
-        .to
-        .trim()
-        .parse::<Address>()
-        .map_err(|_| TxBuilderError::Assembly(format!("bad `to` address: {}", tx.to)))?;
+    // Through the composer's own parser, so a bundle can't smuggle a corrupted
+    // target past the checksum wall that guards every hand-typed address.
+    // `export` writes the checksummed form, so anything this wallet emits
+    // round-trips; only genuine mixed-case corruption is refused.
+    let to = super::encode::parse_address(&tx.to)
+        .map_err(|e| TxBuilderError::Assembly(format!("bad `to` address: {} — {e}", tx.to)))?;
     let value = parse_value(&tx.value)?;
 
     // Prefer the literal calldata; fall back to re-encoding from the method.
@@ -428,40 +457,6 @@ fn call_from_tx(tx: &BundleTx, id: u64) -> Result<QueuedCall, TxBuilderError> {
     }
 }
 
-/// Recover the decoded-argument view from calldata, against the method the
-/// calldata's selector identifies. The inverse of [`encode_call`], and the
-/// reason an imported batch's queue card can be trusted: what it shows is
-/// derived from the bytes it will execute.
-///
-/// `None` when the body doesn't decode against the signature — truncated,
-/// padded, or simply not that method's arguments.
-fn decode_args(m: &AbiMethod, data: &[u8]) -> Option<Vec<DecodedArg>> {
-    let Some(tuple) = m.input_tuple() else {
-        // A no-argument method: the calldata is the bare selector, and
-        // anything past it is unaccounted for.
-        return (data.len() == 4).then(Vec::new);
-    };
-    let body = data.get(4..)?;
-    let DynSolValue::Tuple(vals) = tuple.abi_decode_params(body).ok()? else {
-        return None;
-    };
-    if vals.len() != m.inputs.len() {
-        return None;
-    }
-    Some(
-        m.inputs
-            .iter()
-            .zip(vals)
-            .enumerate()
-            .map(|(i, (p, v))| DecodedArg {
-                name: p.display_name(i),
-                ty: p.ty_str.clone(),
-                value: format_sol_value(&v),
-            })
-            .collect(),
-    )
-}
-
 /// Rebuild the [`AbiMethod`] a bundle's `contractMethod` block claims.
 ///
 /// The function *name* and the parameter *types* survive the trip because the
@@ -512,6 +507,11 @@ fn method_from_meta(cm: &ContractMethod) -> Result<AbiMethod, TxBuilderError> {
         payable: cm.payable,
         selector,
         signature: sig,
+        // The name came from the bundle's own metadata, and `import` only
+        // accepts it when the derived selector matches the calldata being
+        // imported — the same standard a declared ABI is held to.
+        provenance: MethodProvenance::Declared,
+        inferred_mutability: None,
     })
 }
 
@@ -576,6 +576,56 @@ mod tests {
         assert_eq!(back[0].value, batch[0].value);
         assert_eq!(back[0].signature, batch[0].signature);
         assert_eq!(back[0].id, 1);
+    }
+
+    #[test]
+    fn a_composed_call_reads_the_same_after_a_round_trip() {
+        // The audit's regression: the composer echoed keystrokes and the import
+        // path decoded bytes, so export-then-reimport changed what the card
+        // said about identical calldata. Both derive from the bytes now.
+        let usdc = abi::known_by_address(
+            Chain::Mainnet,
+            address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        )
+        .unwrap();
+        let approve = usdc.methods.iter().find(|m| m.name == "approve").unwrap();
+        let batch = vec![
+            build_contract_call(
+                1,
+                usdc.address,
+                "USDC",
+                approve,
+                &[
+                    "0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2".into(),
+                    // Typed with a unit suffix, which is where the two paths
+                    // used to disagree.
+                    "1 ether".into(),
+                ],
+                "0",
+            )
+            .unwrap(),
+        ];
+        let json = export(Chain::Mainnet, None, &batch);
+        let back = import(&json, 1, None).unwrap();
+        assert_eq!(back[0].data, batch[0].data);
+
+        // Values and types round-trip exactly, because both ends now read them
+        // out of the calldata.
+        let values = |c: &QueuedCall| -> Vec<(String, String)> {
+            c.decoded_args
+                .iter()
+                .map(|a| (a.ty.clone(), a.value.clone()))
+                .collect()
+        };
+        assert_eq!(values(&back[0]), values(&batch[0]));
+        assert_eq!(back[0].decoded_args[1].value, "1000000000000000000");
+
+        // Argument *names* deliberately do not survive: an imported name is
+        // unvalidated metadata bound to nothing in the bytes, so import
+        // replaces it with a positional label rather than render it over
+        // calldata it doesn't describe.
+        assert_eq!(batch[0].decoded_args[0].name, "spender");
+        assert_eq!(back[0].decoded_args[0].name, "arg0");
     }
 
     #[test]
@@ -697,6 +747,66 @@ mod tests {
                 "meta":{{"name":"x","txBuilderVersion":"other"}},
                 "transactions":[{tx_json}]}}"#
         )
+    }
+
+    #[test]
+    fn import_refuses_a_bundle_larger_than_the_read_limit() {
+        // Refused on length, before serde walks it — the point is that the
+        // parse never runs, so the shape of the payload is irrelevant.
+        let json = format!(
+            r#"{{"version":"1.0","pad":"{}"}}"#,
+            "a".repeat(MAX_BUNDLE_BYTES)
+        );
+        let err = import(&json, 1, None).unwrap_err().to_string();
+        assert!(err.contains(&MAX_BUNDLE_BYTES.to_string()), "{err}");
+    }
+
+    #[test]
+    fn import_refuses_more_transactions_than_the_queue_can_hold() {
+        let tx = r#"{"to":"0x000000000000000000000000000000000000dEaD","value":"0","data":"0x"}"#;
+        let bundle_of = |n: usize| {
+            format!(
+                r#"{{"version":"1.0","chainId":"1","transactions":[{}]}}"#,
+                vec![tx; n].join(",")
+            )
+        };
+        let err = import(&bundle_of(crate::txbuilder::MAX_BATCH_CALLS + 1), 1, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&(crate::txbuilder::MAX_BATCH_CALLS + 1).to_string()),
+            "{err}"
+        );
+        assert!(
+            err.contains(&crate::txbuilder::MAX_BATCH_CALLS.to_string()),
+            "{err}"
+        );
+        // Exactly at the ceiling still imports.
+        assert_eq!(
+            import(&bundle_of(crate::txbuilder::MAX_BATCH_CALLS), 1, None)
+                .unwrap()
+                .len(),
+            crate::txbuilder::MAX_BATCH_CALLS
+        );
+    }
+
+    #[test]
+    fn import_refuses_a_bundle_whose_target_fails_its_checksum() {
+        // A corrupted `to` still parses as a perfectly valid address, so the
+        // only thing standing between it and the queue is the checksum. What
+        // this wallet exports is checksummed, so nothing it wrote is refused.
+        let corrupted = "0xa0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
+        let json = bundle_with(&format!(
+            r#"{{"to":"{corrupted}","value":"0","data":"0xdeadbeef"}}"#
+        ));
+        let err = import(&json, 1, None).unwrap_err().to_string();
+        assert!(err.contains("EIP-55"), "{err}");
+
+        let good = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
+        let json = bundle_with(&format!(
+            r#"{{"to":"{good}","value":"0","data":"0xdeadbeef"}}"#
+        ));
+        assert!(import(&json, 1, None).is_ok());
     }
 
     #[test]

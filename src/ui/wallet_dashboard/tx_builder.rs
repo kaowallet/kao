@@ -18,7 +18,7 @@ use crate::safe::tx::SafeTxInput;
 use crate::txbuilder::abi::{self, AbiMethod, AbiSource, LoadedContract};
 use crate::txbuilder::sim::{BatchOutcome, BatchSimResult};
 use crate::txbuilder::templates::Template;
-use crate::txbuilder::{QueuedCall, bundle, encode, flash_approval};
+use crate::txbuilder::{MAX_BATCH_CALLS, QueuedCall, bundle, encode, flash_approval};
 use crate::ui::kao_theme::KaoTheme;
 use crate::wallet::SafeTrust;
 
@@ -219,6 +219,18 @@ pub struct ResolvedCode {
     /// stops rather than following such a pointer, so the code above is the
     /// proxy's own — usually near-empty of selectors.
     pub all_verified: bool,
+    /// False when the *code* read itself fell through to unverified RPC.
+    ///
+    /// A different fact from [`Self::all_verified`], with a different remedy: a
+    /// refused proxy pointer means the ABI on screen is the stub's (remedy: the
+    /// implementation's ABI), whereas unverified code means an untrusted
+    /// endpoint authored the entire method list (remedy: wait for the light
+    /// client, or don't trust the names). Conflating them would offer the wrong
+    /// advice for both.
+    pub code_verified: bool,
+    /// True when the address is a beacon proxy. Recognised, not followed —
+    /// see [`crate::decode::proxy::is_beacon_proxy`].
+    pub beacon: bool,
 }
 
 /// What the batch simulation said about the calls being sent for review.
@@ -241,6 +253,16 @@ pub enum Preflight {
     /// wrapped in flash-approval resets), which is not the numbering on the
     /// queue cards.
     Fails { at: String, reason: String },
+    /// Every sub-call succeeded, but the batch's metered gas is at or over the
+    /// gas limit of the block it was simulated against — a transaction no block
+    /// can include. Not a revert and not a fee problem: it has to be split.
+    ///
+    /// Its own variant rather than a flag on [`Self::Passed`] because it is not
+    /// a pass. The simulator runs each sub-call under its own limit with the
+    /// block limit disabled, which is what makes the preflight useful on a
+    /// gas-heavy call and is also why this used to render as a clean green
+    /// strip.
+    TooMuchGas { gas_used: u64, block_gas_limit: u64 },
     /// The simulator itself failed, and this is why. Distinct from
     /// [`Self::Missing`]: "go back and run the preflight" is useless advice for
     /// a batch whose preflight cannot succeed, and it was the advice given for
@@ -266,12 +288,18 @@ pub enum Preflight {
 /// direction a staleness bound should err in.
 pub const PREFLIGHT_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(180);
 
+/// `0x` + 40 hex digits — the length at which an address field stops being
+/// half-typed and starts being an answer worth contradicting.
+const ADDRESS_TEXT_LEN: usize = 42;
+
 impl Preflight {
     /// Whether the confirm button should read as a deliberate override rather
     /// than a routine confirmation.
     pub fn softens_confirm(&self) -> bool {
         match self {
-            Self::Fails { .. } | Self::Errored { .. } | Self::Missing => true,
+            Self::Fails { .. } | Self::Errored { .. } | Self::Missing | Self::TooMuchGas { .. } => {
+                true
+            }
             // A verdict taken a hundred blocks ago, or one resting on reads
             // that fell through to unverified RPC, is not the clean pass the
             // routine label promises.
@@ -303,6 +331,15 @@ impl Preflight {
                     why.join(" and "),
                 ))
             }
+            Self::TooMuchGas {
+                gas_used,
+                block_gas_limit,
+            } => Some(format!(
+                "⚠ This batch meters {gas_used} gas against a block gas limit of \
+                 {block_gas_limit}. No block can include a transaction this large, so it will \
+                 never be mined however much you pay — and the real figure is higher still, \
+                 since the preflight doesn't run the wrapper. Split it into smaller batches."
+            )),
             Self::Fails { at, reason } => Some(format!(
                 "⚠ Preflight FAILED at {at}: {reason}. The batch is atomic, so on-chain this \
                  reverts as a whole and costs gas for nothing."
@@ -464,11 +501,23 @@ pub struct TxBuilderApp {
     /// the same address did nothing at all — the dedup guard treated the failed
     /// state as settled.
     resolve_error: Option<String>,
+    /// Set when what is *in the box* can't be an address — a bad checksum, or
+    /// hex that isn't 20 bytes. Distinct from `resolve_error` again because
+    /// there is nothing to retry: the answer is to fix the text. Held back
+    /// until the input reaches full length, since every prefix of a valid
+    /// address is an invalid address and nobody wants to be corrected mid-word.
+    addr_error: Option<String>,
     /// Set when the last resolve hit a proxy slot it could only read over
     /// unverified RPC. The pointer wasn't followed, so the ABI on screen is the
     /// proxy stub's — worth saying out loud rather than leaving the user to
     /// wonder why a well-known contract came back nearly empty.
     proxy_unverified: bool,
+    /// Set when the address is a beacon proxy — a shape the walker recognises
+    /// but does not follow (resolving it needs an `eth_call` on the beacon, not
+    /// a storage read). Held apart from `proxy_unverified` because it is a
+    /// limitation of this wallet rather than of the connection, and saying
+    /// which one it is beats an empty method list with no explanation.
+    proxy_beacon: bool,
     paste_open: bool,
     abi_paste: String,
     /// The address currently being resolved / loaded (dedup guard).
@@ -547,7 +596,9 @@ impl TxBuilderApp {
             resolving: false,
             not_found: false,
             resolve_error: None,
+            addr_error: None,
             proxy_unverified: false,
+            proxy_beacon: false,
             paste_open: false,
             abi_paste: String::new(),
             resolve_target: None,
@@ -689,7 +740,13 @@ impl TxBuilderApp {
         match result {
             Ok(r) => {
                 self.proxy_unverified = !r.all_verified;
-                match abi::from_bytecode_behind_proxy(&r.code, addr, r.implementation) {
+                self.proxy_beacon = r.beacon;
+                match abi::from_bytecode_behind_proxy(
+                    &r.code,
+                    addr,
+                    r.implementation,
+                    r.code_verified,
+                ) {
                     Some(loaded) => self.set_loaded(loaded),
                     None => self.not_found = true,
                 }
@@ -1019,6 +1076,20 @@ impl TxBuilderApp {
                 }
             }
             Message::JsonChanged(v) => {
+                // The box is the paste target for an untrusted file, and a
+                // single-line `text_input` re-lays-out its whole content on
+                // every keystroke and every frame. `bundle::import` refuses an
+                // oversized bundle too, but only once "Load batch" is pressed —
+                // by which point the widget has already been handed it.
+                if v.len() > bundle::MAX_BUNDLE_BYTES {
+                    self.json_error = Some(format!(
+                        "that paste is {} bytes, and this wallet reads batches up to {} — it \
+                         hasn't been put in the box",
+                        v.len(),
+                        bundle::MAX_BUNDLE_BYTES,
+                    ));
+                    return None;
+                }
                 self.json_text = v;
                 self.json_error = None;
             }
@@ -1050,8 +1121,17 @@ impl TxBuilderApp {
         self.addr_input = v;
         self.error = None;
         let trimmed = self.addr_input.trim();
-        match trimmed.parse::<Address>() {
+        // A full-length string is a finished answer, so contradicting it is
+        // useful; anything shorter is still being typed. Read before the parse
+        // so the borrow on `addr_input` ends here.
+        let looks_complete = trimmed.len() >= ADDRESS_TEXT_LEN;
+        // Through `parse_address`, not `parse::<Address>()`, so a mixed-case
+        // address that fails its EIP-55 checksum is refused here rather than
+        // silently resolved against whatever those 20 bytes turn out to be.
+        let parsed = encode::parse_address(trimmed);
+        match parsed {
             Ok(addr) => {
+                self.addr_error = None;
                 // Already resolved / resolving this exact address — no-op.
                 // A *failed* resolve is deliberately not in this list: it is
                 // the one settled state worth leaving, so re-entering the same
@@ -1090,8 +1170,9 @@ impl TxBuilderApp {
                     }
                 }
             }
-            Err(_) => {
+            Err(reason) => {
                 self.reset_composer_keep_addr();
+                self.addr_error = looks_complete.then_some(reason);
                 None
             }
         }
@@ -1129,6 +1210,7 @@ impl TxBuilderApp {
         // with it; a bytecode load keeps it (that ABI *is* the stub's).
         if loaded.source != AbiSource::Bytecode {
             self.proxy_unverified = false;
+            self.proxy_beacon = false;
         }
         self.paste_open = false;
         self.resolve_target = Some(loaded.address);
@@ -1172,6 +1254,7 @@ impl TxBuilderApp {
         self.resolving = false;
         self.not_found = false;
         self.resolve_error = None;
+        self.addr_error = None;
         self.proxy_unverified = false;
         self.paste_open = false;
         self.resolve_target = None;
@@ -1304,9 +1387,22 @@ impl TxBuilderApp {
             // twenty-minute-old verdict resting on unverified RPC reads
             // produced exactly the same unsoftened confirm as one taken a
             // second ago against Helios-verified state.
-            BatchOutcome::Success => Preflight::Passed {
-                stale: self.sim_is_stale(),
-                verified: sim.verified,
+            // A pass is only as good as when it was taken, what it could
+            // verify, and whether the resulting transaction can be mined at
+            // all. The last is checked first: no amount of freshness makes a
+            // 125M-gas batch signable.
+            BatchOutcome::Success => match sim.gas_fit() {
+                crate::txbuilder::sim::GasFit::Exceeds {
+                    gas_used,
+                    block_gas_limit,
+                } => Preflight::TooMuchGas {
+                    gas_used,
+                    block_gas_limit,
+                },
+                _ => Preflight::Passed {
+                    stale: self.sim_is_stale(),
+                    verified: sim.verified,
+                },
             },
             BatchOutcome::Revert { step, reason } | BatchOutcome::Halt { step, reason } => {
                 Preflight::Fails {
@@ -1487,7 +1583,15 @@ impl TxBuilderApp {
                 let value_ok = !m.payable || encode::parse_wei(&self.value_input).is_ok();
                 args_ok && value_ok
             }
-            Mode::Raw => encode::parse_address(&self.raw_to).is_ok(),
+            // All three, not just the target. The CTA used to light up on a
+            // valid `to` beside an unparseable value or calldata, and the
+            // refusal then arrived as a banner at the foot of the page rather
+            // than beside the field that caused it.
+            Mode::Raw => {
+                encode::parse_address(&self.raw_to).is_ok()
+                    && encode::parse_wei(&self.raw_value).is_ok()
+                    && encode::parse_data(&self.raw_data).is_ok()
+            }
             Mode::Read => false,
         }
     }
@@ -1554,6 +1658,16 @@ impl TxBuilderApp {
                  or a Ledger (EIP-7702), or a Safe."
                     .into(),
             );
+            return;
+        }
+        // The same ceiling the import path applies, so a batch built by hand
+        // can always be exported and read back.
+        if self.batch.len() >= MAX_BATCH_CALLS {
+            self.error = Some(format!(
+                "This batch already has {MAX_BATCH_CALLS} calls — as many as one transaction \
+                 carries and still gets read before it is signed. Send this batch, then start \
+                 the next one."
+            ));
             return;
         }
         match self.compose_call() {
@@ -1686,6 +1800,14 @@ impl TxBuilderApp {
                 calls.len(),
             ));
         }
+        // After the one-at-a-time reason, so the more specific refusal wins for
+        // an account that could never have run this batch at any length.
+        if calls.len() > MAX_BATCH_CALLS {
+            return Err(format!(
+                "That batch has {} calls, and this wallet queues at most {MAX_BATCH_CALLS}.",
+                calls.len(),
+            ));
+        }
         let replaced = self.batch.len();
         self.next_id += calls.len() as u64;
         self.batch = calls;
@@ -1808,8 +1930,13 @@ pub struct EoaBatchRequest {
     /// and a multi-call dispatch with `None` here is refused — the same gate
     /// [`SafeBatchRequest::prepared`] already applies to the Safe arm.
     ///
-    /// Always `None` for a single call: nothing delegates, so there is no
-    /// decision to pin.
+    /// For a single call this is a *disclosure*, not a commitment: it is set
+    /// when the review found the account already carries a delegation, and it
+    /// is deliberately not re-checked at send. The signed bytes of a single
+    /// call don't commit to the account's code, so a delegation that moved
+    /// between review and confirm is not a reason to refuse that transaction —
+    /// and making it one would fail ordinary sends for something that isn't
+    /// about them. `None` when the account carries no delegation at all.
     pub prepared: Option<PreparedDelegation>,
 }
 
@@ -2025,6 +2152,42 @@ mod tests {
         assert!(!app.sim_busy, "the spinner has to come down either way");
     }
 
+    #[test]
+    fn a_batch_too_big_for_a_block_never_reads_as_a_pass() {
+        // Every sub-call succeeded, so the simulator says Success — but the
+        // sum is a transaction no builder can pack, at any price.
+        let mut app = safe_app();
+        app.batch = sample_batch(&mut app.next_id, app.owner);
+        let Some(Outcome::Simulate { seq, .. }) = app.update(Message::Simulate) else {
+            panic!("expected a Simulate");
+        };
+        app.on_sim(
+            seq,
+            Ok(BatchSimResult {
+                outcome: BatchOutcome::Success,
+                gas_used: 125_000_000,
+                transfers: Vec::new(),
+                verified: true,
+                base_fee_per_gas: 1,
+                block: 21_000_000,
+                block_gas_limit: 45_000_000,
+            }),
+        );
+        let p = app.preflight();
+        assert_eq!(
+            p,
+            Preflight::TooMuchGas {
+                gas_used: 125_000_000,
+                block_gas_limit: 45_000_000,
+            },
+            "a clean sweep of sub-calls is not a pass if the sum can't be mined"
+        );
+        assert!(p.softens_confirm(), "this must not confirm as routine");
+        let w = p.warning().expect("the user has to be told why");
+        assert!(w.contains("block gas limit"), "{w}");
+        assert!(w.contains("Split it"), "and what to do about it: {w}");
+    }
+
     // ── 2.3 · a pass is only as good as when it was taken ───────────────
 
     #[test]
@@ -2043,6 +2206,9 @@ mod tests {
                 verified: false, // fell through to raw RPC
                 base_fee_per_gas: 1,
                 block: 21_000_000,
+                // A realistic Mainnet ceiling: these fixtures are all
+                // small, so the aggregate check never fires on them.
+                block_gas_limit: 45_000_000,
             }),
         );
         let p = app.preflight();
@@ -2076,6 +2242,9 @@ mod tests {
                 verified: true,
                 base_fee_per_gas: 1,
                 block: 21_000_000,
+                // A realistic Mainnet ceiling: these fixtures are all
+                // small, so the aggregate check never fires on them.
+                block_gas_limit: 45_000_000,
             }),
         );
         assert_eq!(app.preflight(), PASSED_CLEAN, "fresh out of the simulator");
@@ -2514,6 +2683,9 @@ mod tests {
                 verified: true,
                 base_fee_per_gas: 1,
                 block: 21_000_000,
+                // A realistic Mainnet ceiling: these fixtures are all
+                // small, so the aggregate check never fires on them.
+                block_gas_limit: 45_000_000,
             }),
         );
         let Some(Outcome::Review { preflight, .. }) = app.update(Message::Review) else {
@@ -2546,6 +2718,9 @@ mod tests {
                 verified: true,
                 base_fee_per_gas: 1,
                 block: 21_000_000,
+                // A realistic Mainnet ceiling: these fixtures are all
+                // small, so the aggregate check never fires on them.
+                block_gas_limit: 45_000_000,
             }),
         );
         let Some(Outcome::Review { preflight, .. }) = app.update(Message::Review) else {
@@ -2571,6 +2746,9 @@ mod tests {
                 verified: true,
                 base_fee_per_gas: 1,
                 block: 21_000_000,
+                // A realistic Mainnet ceiling: these fixtures are all
+                // small, so the aggregate check never fires on them.
+                block_gas_limit: 45_000_000,
             }),
         );
         let removed = app.batch[0].id;
@@ -2589,6 +2767,8 @@ mod tests {
             code: Bytes::copy_from_slice(code),
             implementation: target,
             all_verified: true,
+            code_verified: true,
+            beacon: false,
         }
     }
 
@@ -2671,6 +2851,8 @@ mod tests {
                 code: Bytes::from(crate::decode::bytecode::tiny_transfer_runtime()),
                 implementation: impl_addr,
                 all_verified: true,
+                code_verified: true,
+                beacon: false,
             }),
         );
         let loaded = app.loaded.as_ref().expect("proxy ABI loaded");
@@ -2678,6 +2860,38 @@ mod tests {
         assert_eq!(loaded.address, proxy);
         assert_eq!(loaded.proxy_impl, Some(impl_addr));
         assert!(!app.proxy_unverified);
+    }
+
+    #[test]
+    fn a_mixed_case_address_failing_its_checksum_never_resolves() {
+        let mut app = safe_app();
+        // USDC with the leading `A` lowercased: parses as hex, fails EIP-55.
+        let out = app.update(Message::AddrChanged(
+            "0xa0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".into(),
+        ));
+        assert!(out.is_none(), "no fetch may be issued for a bad checksum");
+        assert!(app.loaded.is_none());
+        assert!(app.resolve_target.is_none());
+        let err = app.addr_error.as_deref().expect("refusal must be visible");
+        assert!(err.contains("EIP-55"), "unexpected reason: {err}");
+    }
+
+    #[test]
+    fn a_half_typed_address_is_not_corrected_mid_word() {
+        let mut app = safe_app();
+        app.update(Message::AddrChanged("0xA0b8699".into()));
+        assert!(
+            app.addr_error.is_none(),
+            "every prefix of a valid address is invalid; do not nag"
+        );
+        // Full length and still not hex — now it is a finished, wrong answer.
+        app.update(Message::AddrChanged(format!("0x{}", "z".repeat(40))));
+        assert!(app.addr_error.is_some());
+        // And a good address clears it again.
+        app.update(Message::AddrChanged(
+            "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".into(),
+        ));
+        assert!(app.addr_error.is_none());
     }
 
     #[test]
@@ -2693,6 +2907,8 @@ mod tests {
                 code: Bytes::new(),
                 implementation: proxy,
                 all_verified: false,
+                code_verified: true,
+                beacon: false,
             }),
         );
         assert!(app.not_found);
@@ -2713,6 +2929,8 @@ mod tests {
                 code: Bytes::new(),
                 implementation: proxy,
                 all_verified: false,
+                code_verified: true,
+                beacon: false,
             }),
         );
         assert!(app.proxy_unverified);
@@ -2738,6 +2956,8 @@ mod tests {
                 code: Bytes::new(),
                 implementation: a,
                 all_verified: false,
+                code_verified: true,
+                beacon: false,
             }),
         );
         assert!(app.proxy_unverified);
@@ -2953,6 +3173,9 @@ mod tests {
                 transfers: Vec::new(),
                 verified: true,
                 block: 21_000_000,
+                // A realistic Mainnet ceiling: these fixtures are all
+                // small, so the aggregate check never fires on them.
+                block_gas_limit: 45_000_000,
             }),
         );
 
@@ -2980,6 +3203,9 @@ mod tests {
                 transfers: Vec::new(),
                 verified: true,
                 block: 21_000_000,
+                // A realistic Mainnet ceiling: these fixtures are all
+                // small, so the aggregate check never fires on them.
+                block_gas_limit: 45_000_000,
             }),
         );
         assert_eq!(app.preflight(), PASSED_CLEAN);
@@ -3049,6 +3275,116 @@ mod tests {
             other => panic!("expected single-call Review, got {other:?}"),
         }
         assert!(app.batch.is_empty(), "single send never touches the batch");
+    }
+
+    #[test]
+    fn a_paste_over_the_read_limit_never_reaches_the_box() {
+        let mut app = safe_app();
+        app.update(Message::OpenLoad);
+        let huge = "a".repeat(bundle::MAX_BUNDLE_BYTES + 1);
+        app.update(Message::JsonChanged(huge));
+        assert!(app.json_text.is_empty(), "the widget was never handed it");
+        assert!(app.json_error.is_some());
+        assert_eq!(
+            app.modal,
+            Modal::Load,
+            "the user still needs somewhere to put the file"
+        );
+    }
+
+    #[test]
+    fn add_to_batch_stops_at_the_queue_ceiling() {
+        let mut app = safe_app();
+        app.batch = (0..MAX_BATCH_CALLS as u64)
+            .map(|i| QueuedCall {
+                id: i,
+                to: Address::repeat_byte(0xC1),
+                value: U256::ZERO,
+                data: Bytes::from(vec![0x01]),
+                title: "t".into(),
+                detail: "d".into(),
+                signature: None,
+                decoded_args: Vec::new(),
+            })
+            .collect();
+        app.next_id = MAX_BATCH_CALLS as u64;
+        app.update(Message::SetMode(Mode::Raw));
+        app.update(Message::RawToChanged(
+            "0x000000000000000000000000000000000000dEaD".into(),
+        ));
+        app.update(Message::AddToBatch);
+        assert_eq!(app.batch.len(), MAX_BATCH_CALLS, "the ceiling holds");
+        let err = app.error.as_deref().unwrap_or_default();
+        assert!(err.contains(&MAX_BATCH_CALLS.to_string()), "{err}");
+    }
+
+    #[test]
+    fn adopt_batch_refuses_an_over_long_batch_after_the_single_call_reason() {
+        let call = |i: u64| QueuedCall {
+            id: i,
+            to: Address::repeat_byte(0xC1),
+            value: U256::ZERO,
+            data: Bytes::from(vec![0x01]),
+            title: "t".into(),
+            detail: "d".into(),
+            signature: None,
+            decoded_args: Vec::new(),
+        };
+        let long: Vec<_> = (0..MAX_BATCH_CALLS as u64 + 10).map(call).collect();
+
+        // An account that can't batch at all gets the more specific reason —
+        // its problem isn't the length.
+        let mut eoa = eoa_app();
+        eoa.set_context(EOA, Chain::Mainnet, false, None, false, true, Vec::new());
+        let err = eoa.adopt_batch(long.clone()).unwrap_err();
+        assert!(err.contains("one at a time"), "{err}");
+
+        // A Safe can batch, so for it the length is the problem.
+        let mut safe = safe_app();
+        let err = safe.adopt_batch(long).unwrap_err();
+        assert!(err.contains(&MAX_BATCH_CALLS.to_string()), "{err}");
+        assert!(safe.batch.is_empty(), "nothing was adopted");
+    }
+
+    #[test]
+    fn raw_mode_cta_stays_off_until_the_value_and_the_data_parse() {
+        let mut app = eoa_app();
+        app.update(Message::SetMode(Mode::Raw));
+        app.update(Message::RawToChanged(
+            "0x000000000000000000000000000000000000dEaD".into(),
+        ));
+        assert!(app.compose_valid(), "a target alone is a valid raw call");
+
+        app.update(Message::RawValueChanged("12.5".into()));
+        assert!(!app.compose_valid(), "wei is an integer");
+
+        app.update(Message::RawValueChanged("0".into()));
+        app.update(Message::RawDataChanged("0xzz".into()));
+        assert!(!app.compose_valid(), "calldata must be hex");
+
+        app.update(Message::RawDataChanged("0xabc".into()));
+        assert!(!app.compose_valid(), "odd-length hex is not bytes");
+
+        app.update(Message::RawDataChanged("0xdeadbeef".into()));
+        assert!(app.compose_valid());
+    }
+
+    #[test]
+    fn a_raw_call_that_would_be_refused_is_never_queued() {
+        // The refusal is a dark CTA plus a reason under the field — not a
+        // banner at the foot of the page after the button was pressed.
+        let mut app = eoa_app();
+        app.update(Message::SetMode(Mode::Raw));
+        app.update(Message::RawToChanged(
+            "0x000000000000000000000000000000000000dEaD".into(),
+        ));
+        app.update(Message::RawDataChanged("0xabc".into()));
+        assert!(!app.compose_valid());
+        assert!(
+            app.error.is_none(),
+            "nothing was attempted, so nothing failed"
+        );
+        assert!(app.batch.is_empty());
     }
 
     #[test]

@@ -9,7 +9,9 @@ use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
 use super::abi::AbiSource;
 use super::{Message, Modal, Mode, ReadOutcome, TxBuilderApp, encode, wei_to_eth};
-use crate::txbuilder::sim::BatchOutcome;
+use crate::decode::bytecode::StateMutability;
+use crate::txbuilder::abi::MethodProvenance;
+use crate::txbuilder::sim::{BatchOutcome, GasFit};
 use crate::txbuilder::templates::Template;
 use crate::ui::kao_theme::{KaoTheme, with_alpha};
 use crate::ui::kao_widgets::{
@@ -421,6 +423,8 @@ fn contract_head(app: &TxBuilderApp, t: KaoTheme) -> Column<'_, Message> {
                 .push(Space::new().height(8))
                 .push(proxy_unverified_note(t));
         }
+    } else if let Some(e) = &app.addr_error {
+        col = col.push(Space::new().height(14)).push(addr_error_box(t, e));
     } else if let Some(e) = &app.resolve_error {
         col = col
             .push(Space::new().height(14))
@@ -559,58 +563,103 @@ fn read_composer(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
 }
 
 fn raw_composer(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
-    let to_invalid = !app.raw_to.trim().is_empty() && encode::parse_address(&app.raw_to).is_err();
-    column![
-        labelled(
-            t,
-            "To",
-            text_input("0x… target address", &app.raw_to)
-                .on_input(Message::RawToChanged)
-                .padding(Padding::from([11, 13]))
-                .size(13)
-                .font(mono())
-                .style(move |_, s| {
-                    let mut b = text_input_style(t, s);
-                    if to_invalid {
-                        b.border.color = t.down;
-                    }
-                    b
-                })
-                .into(),
-        ),
-        Space::new().height(14),
-        labelled(
-            t,
-            "ETH value (wei)",
-            text_input("0", &app.raw_value)
-                .on_input(Message::RawValueChanged)
-                .padding(Padding::from([11, 13]))
-                .size(13)
-                .font(mono())
-                .style(move |_, s| text_input_style(t, s))
-                .into(),
-        ),
-        Space::new().height(14),
-        labelled(
-            t,
-            "Data (hex calldata — leave empty for a plain transfer)",
-            text_input("0x…", &app.raw_data)
-                .on_input(Message::RawDataChanged)
-                .padding(Padding::from([11, 13]))
-                .size(12)
-                .font(mono())
-                .style(move |_, s| text_input_style(t, s))
-                .into(),
-        ),
-        Space::new().height(14),
-        info_box(
+    // Every field carries its own reason. All three gate the CTA now, so a
+    // refusal that used to arrive as a banner at the foot of the page lands
+    // beside the box that caused it — the treatment `to` already had, and the
+    // one the Write tab gives every parameter.
+    let to_err = (!app.raw_to.trim().is_empty())
+        .then(|| encode::parse_address(&app.raw_to).err())
+        .flatten();
+    let value_err = encode::parse_wei(&app.raw_value).err();
+    let data_err = encode::parse_data(&app.raw_data).err();
+    let (to_invalid, value_invalid, data_invalid) =
+        (to_err.is_some(), value_err.is_some(), data_err.is_some());
+
+    let mut col = column![labelled(
+        t,
+        "To",
+        text_input("0x… target address", &app.raw_to)
+            .on_input(Message::RawToChanged)
+            .padding(Padding::from([11, 13]))
+            .size(13)
+            .font(mono())
+            .style(move |_, s| {
+                let mut b = text_input_style(t, s);
+                if to_invalid {
+                    b.border.color = t.down;
+                }
+                b
+            })
+            .into(),
+    )]
+    .width(Length::Fill);
+    if let Some(e) = &to_err {
+        col = col.push(Space::new().height(6)).push(field_error(t, e));
+    }
+
+    col = col.push(Space::new().height(14)).push(labelled(
+        t,
+        "ETH value (wei)",
+        text_input("0", &app.raw_value)
+            .on_input(Message::RawValueChanged)
+            .padding(Padding::from([11, 13]))
+            .size(13)
+            .font(mono())
+            .style(move |_, s| {
+                let mut b = text_input_style(t, s);
+                if value_invalid {
+                    b.border.color = t.down;
+                }
+                b
+            })
+            .into(),
+    ));
+    if let Some(e) = &value_err {
+        col = col.push(Space::new().height(6)).push(field_error(t, e));
+    }
+
+    col = col.push(Space::new().height(14)).push(labelled(
+        t,
+        "Data (hex calldata — leave empty for a plain transfer)",
+        text_input("0x…", &app.raw_data)
+            .on_input(Message::RawDataChanged)
+            .padding(Padding::from([11, 13]))
+            .size(12)
+            .font(mono())
+            .style(move |_, s| {
+                let mut b = text_input_style(t, s);
+                if data_invalid {
+                    b.border.color = t.down;
+                }
+                b
+            })
+            .into(),
+    ));
+    if let Some(e) = &data_err {
+        col = col.push(Space::new().height(6)).push(field_error(t, e));
+    }
+
+    col.push(Space::new().height(14))
+        .push(info_box(
             t,
             "Expert mode — Kao won't decode this for you. Double-check the bytes.",
             t.sub,
-        ),
-    ]
-    .width(Length::Fill)
-    .into()
+        ))
+        .into()
+}
+
+/// A short reason under a field, in the same register as `param_row`'s
+/// `needs uint256` annotation. Full width and glyph-wrapped: some of these (the
+/// EIP-55 refusal) are a sentence, and a Shrink-width label beside the section
+/// header would push the row past the card.
+fn field_error<'a>(t: KaoTheme, msg: &str) -> Element<'a, Message> {
+    text(msg.to_string())
+        .size(10)
+        .color(t.down)
+        .font(mono_bold())
+        .wrapping(Wrapping::WordOrGlyph)
+        .width(Length::Fill)
+        .into()
 }
 
 fn method_picker(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
@@ -663,19 +712,59 @@ fn method_picker(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
     let mut col =
         column![section_label(t, "Method"), Space::new().height(8), head].width(Length::Fill);
 
+    // What the name on that button is worth. The review overlay says this at
+    // signing time; by then the method has been chosen, composed and simulated.
+    if let Some(m) = app.selected_method()
+        && let Some(caution) = m.provenance.caution()
+    {
+        let tone = if m.provenance.is_spoof_signal() {
+            t.down
+        } else {
+            t.sub
+        };
+        col = col
+            .push(Space::new().height(7))
+            .push(info_box(t, &caution, tone));
+    }
+
     if app.method_menu_open {
         let mut menu = column![].spacing(2).width(Length::Fill);
         for (i, m) in contract.methods.iter().enumerate() {
             let on = i == app.method_idx;
+            let mark = match &m.provenance {
+                p if p.is_spoof_signal() => Some(("⚠", t.down)),
+                MethodProvenance::Ambiguous { .. } => Some(("?", t.sub)),
+                // Composable, but the bytecode says it only reads. Marked
+                // rather than hidden — the inference fails towards "read-only",
+                // so hiding these would hide real write methods.
+                _ if matches!(
+                    m.inferred_mutability,
+                    Some(StateMutability::View | StateMutability::Pure)
+                ) =>
+                {
+                    Some(("view", t.sub))
+                }
+                _ => None,
+            };
             menu = menu.push(
                 button(
-                    // Spaces after commas give long signatures break points so
-                    // they wrap within the menu width instead of overflowing.
-                    text(m.signature.replace(',', ", "))
-                        .size(13)
-                        .color(if on { t.a1 } else { t.text })
-                        .font(mono())
-                        .width(Length::Fill),
+                    row![
+                        // Spaces after commas give long signatures break points
+                        // so they wrap within the menu width instead of
+                        // overflowing.
+                        text(m.signature.replace(',', ", "))
+                            .size(13)
+                            .color(if on { t.a1 } else { t.text })
+                            .font(mono())
+                            .width(Length::Fill),
+                        // Carried per row so a contested name is visible while
+                        // the menu is still open, not only once it is picked.
+                        text(mark.map(|(s, _)| s).unwrap_or("").to_string())
+                            .size(12)
+                            .color(mark.map(|(_, c)| c).unwrap_or(t.sub)),
+                    ]
+                    .align_y(Alignment::Center)
+                    .width(Length::Fill),
                 )
                 .padding(Padding::from([9, 10]))
                 .width(Length::Fill)
@@ -795,9 +884,22 @@ fn param_row<'a>(
             .into()
     };
 
-    column![head, Space::new().height(6), input]
-        .width(Length::Fill)
-        .into()
+    let mut col = column![head, Space::new().height(6), input].width(Length::Fill);
+    // What this string actually encodes to, when that isn't what it says.
+    // `1 ether` into a 6-decimal token's uint256 is 10¹² of it, and the field
+    // annotates it ✓ valid either way — so the number being agreed to belongs
+    // on screen at the keystroke, not only once the call is queued.
+    if let Some(p) = encode::encoded_preview(ty, value) {
+        col = col.push(Space::new().height(5)).push(
+            text(format!("= {p}"))
+                .size(10)
+                .color(t.sub)
+                .font(mono())
+                .wrapping(Wrapping::WordOrGlyph)
+                .width(Length::Fill),
+        );
+    }
+    col.into()
 }
 
 // ============================================================================
@@ -1704,7 +1806,10 @@ fn sim_strip<'a>(
     t: KaoTheme,
     sim: &super::BatchSimResult,
 ) -> Element<'a, Message> {
-    let ok = sim.is_success();
+    let fit = sim.gas_fit();
+    // A batch that cannot be mined is not a green strip, whatever the sub-calls
+    // did — the sum is the part the simulator was never asked about.
+    let ok = sim.is_success() && !matches!(fit, GasFit::Exceeds { .. });
     let (title, sub) = match &sim.outcome {
         BatchOutcome::Success => {
             // Approximate fee = metered gas × the block's base fee (excludes tip
@@ -1716,7 +1821,27 @@ fn sim_strip<'a>(
             } else {
                 format!("≈ {} gas", sim.gas_used)
             };
-            ("Simulation passed".to_string(), sub)
+            let sub = match fit {
+                GasFit::Exceeds {
+                    block_gas_limit, ..
+                } => format!(
+                    "{sub} · OVER the {block_gas_limit} block gas limit — this cannot be \
+                     mined; split the batch"
+                ),
+                GasFit::Crowded {
+                    block_gas_limit, ..
+                } => format!(
+                    "{sub} · over half the {block_gas_limit} block gas limit, and the wrapper \
+                     isn't counted here"
+                ),
+                GasFit::Fits | GasFit::Unknown => sub,
+            };
+            let title = if matches!(fit, GasFit::Exceeds { .. }) {
+                "Too large to mine".to_string()
+            } else {
+                "Simulation passed".to_string()
+            };
+            (title, sub)
         }
         // The simulator indexes the *effective* calls, which with flash
         // approval on is not the numbering on the cards beside this strip —
@@ -1814,6 +1939,42 @@ fn empty_state(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
 // JSON modal
 // ============================================================================
 
+/// A bounded, scrolling terminal box for a JSON body.
+///
+/// The scrollable is given a Fill width (and the text too) so it spans the whole
+/// panel — otherwise it shrinks to the widest JSON line and parks the scrollbar
+/// mid-panel instead of at the right edge. `WordOrGlyph` wraps any long,
+/// space-free value line (a big `data` hex) so nothing is clipped off the right.
+/// Owned `String` so both callers can pass a clone rather than borrow the app
+/// across the modal's lifetime.
+fn json_box<'a>(t: KaoTheme, body: String, height: f32) -> Element<'a, Message> {
+    container(
+        scrollable(
+            text(body)
+                .size(11)
+                .color(terminal_fg(t))
+                .font(mono())
+                .wrapping(Wrapping::WordOrGlyph)
+                .width(Length::Fill),
+        )
+        .width(Length::Fill)
+        .height(Length::Fixed(height))
+        .style(move |_, s| kao_scrollable_style(t, s)),
+    )
+    .padding(Padding::from([12, 14]))
+    .width(Length::Fill)
+    .style(move |_| container::Style {
+        background: Some(Background::Color(terminal_bg(t))),
+        border: Border {
+            color: t.border,
+            width: 1.0,
+            radius: Radius::from(12),
+        },
+        ..Default::default()
+    })
+    .into()
+}
+
 fn modal_view(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
     let is_save = app.modal == Modal::Save;
     let title = if is_save {
@@ -1840,38 +2001,9 @@ fn modal_view(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
     .width(Length::Fill);
 
     let editor: Element<'_, Message> = if is_save {
-        // Read-only display of the exported JSON. The scrollable is given a
-        // Fill width (and the text too) so it spans the whole panel — otherwise
-        // it shrinks to the widest JSON line and parks the scrollbar mid-panel
-        // instead of at the right edge. `WordOrGlyph` wraps any long, space-free
-        // value line (e.g. a big `data` hex) so nothing is clipped off the right.
-        container(
-            scrollable(
-                text(app.json_text.clone())
-                    .size(11)
-                    .color(terminal_fg(t))
-                    .font(mono())
-                    .wrapping(Wrapping::WordOrGlyph)
-                    .width(Length::Fill),
-            )
-            .width(Length::Fill)
-            .height(Length::Fixed(280.0))
-            .style(move |_, s| kao_scrollable_style(t, s)),
-        )
-        .padding(Padding::from([12, 14]))
-        .width(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(Background::Color(terminal_bg(t))),
-            border: Border {
-                color: t.border,
-                width: 1.0,
-                radius: Radius::from(12),
-            },
-            ..Default::default()
-        })
-        .into()
+        json_box(t, app.json_text.clone(), 280.0)
     } else {
-        text_input("paste the batch JSON here…", &app.json_text)
+        let field = text_input("paste the batch JSON here…", &app.json_text)
             .on_input(Message::JsonChanged)
             .padding(Padding::from([12, 14]))
             .size(12)
@@ -1882,8 +2014,18 @@ fn modal_view(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
                     b.border.color = t.down;
                 }
                 b
-            })
-            .into()
+            });
+        // The export side has always had a bounded, scrolling box; the import
+        // side showed the same JSON as one long horizontal ribbon in a
+        // single-line field. Reading what you are about to load matters at
+        // least as much as reading what you just wrote.
+        let mut c = column![field].width(Length::Fill);
+        if !app.json_text.trim().is_empty() {
+            c = c
+                .push(Space::new().height(10))
+                .push(json_box(t, app.json_text.clone(), 200.0));
+        }
+        c.into()
     };
 
     let mut col = column![head, Space::new().height(16), editor].width(Length::Fill);
@@ -2269,6 +2411,10 @@ fn contract_banner<'a>(t: KaoTheme, c: &'a super::LoadedContract) -> Element<'a,
     let badge = match c.source {
         AbiSource::Known => pill(t, "✓ verified", t.up),
         AbiSource::Pasted => pill(t, "pasted ABI", t.a2),
+        // Guard first: a menu authored during a light-client cooldown came off
+        // an untrusted endpoint, and used to be badged identically to one the
+        // light client proved.
+        AbiSource::Bytecode if !c.code_verified => pill(t, "⚠ unverified bytecode", t.down),
         AbiSource::Bytecode => pill(t, "from bytecode", t.a3),
     };
     let counts = format!("{} write · {} read", c.methods.len(), c.read_methods.len());
@@ -2349,6 +2495,40 @@ fn proxy_unverified_note(t: KaoTheme) -> Element<'static, Message> {
 /// is to paste an ABI by hand, which is the wrong move — and a lot of work —
 /// when the real problem was a light-client hiccup on a well-known verified
 /// address.
+/// What is in the box can't be an address. No Retry — there is nothing to
+/// retry, the text itself is the problem.
+fn addr_error_box<'a>(t: KaoTheme, err: &str) -> Element<'a, Message> {
+    let col = column![
+        text("That isn't an address")
+            .size(13)
+            .color(t.down)
+            .font(bold()),
+        Space::new().height(3),
+        text(capitalize_first(err)).size(12).color(t.sub),
+    ]
+    .width(Length::Fill);
+    container(col.padding(Padding::from([13, 16])))
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(with_alpha(t.down, 0.08))),
+            border: Border {
+                color: with_alpha(t.down, 0.4),
+                width: 1.0,
+                radius: Radius::from(12),
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+fn capitalize_first(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
+}
+
 fn resolve_error_box<'a>(t: KaoTheme, err: &str) -> Element<'a, Message> {
     let col = column![
         text("Couldn't read this contract")
@@ -2398,6 +2578,17 @@ fn not_found_box(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
         col = col
             .push(Space::new().height(8))
             .push(proxy_unverified_note(t));
+    }
+
+    if app.proxy_beacon {
+        col = col.push(Space::new().height(8)).push(info_box(
+            t,
+            "This is a beacon proxy. Kao can see that it is one, but reading which \
+             implementation it points at needs a call to the beacon contract, which the \
+             proxy walker doesn't make yet — so paste the implementation's ABI to compose \
+             against it.",
+            t.a3,
+        ));
     }
 
     col = col.push(Space::new().height(10)).push(ghost_secondary(

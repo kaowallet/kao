@@ -11,10 +11,11 @@
 //!    we keep the state-mutating functions and parse each param type.
 //!    Full param names, no network dependency.
 //! 3. **Bytecode heuristic** — for any other address, `evmole` recovers
-//!    the public selectors and argument *types* from the on-chain runtime
-//!    code, and the embedded 4byte database supplies human names where it
-//!    can. Never yields parameter names (positional `arg0…`), and can't
-//!    tell payable from non-payable — but always available. When the address
+//!    the public selectors, argument *types* and state mutability from the
+//!    on-chain runtime code, and the embedded 4byte database supplies human
+//!    names where it can. Never yields parameter names (positional `arg0…`),
+//!    and its mutability is inferred rather than declared — but always
+//!    available. When the address
 //!    is an EIP-1967 / ZeppelinOS proxy, the introspected code is the
 //!    implementation's (see [`from_bytecode_behind_proxy`]); a proxy stub's
 //!    own code exposes almost no selectors.
@@ -57,6 +58,57 @@ impl AbiParam {
     }
 }
 
+/// How a method's *name* was established.
+///
+/// [`AbiSource`] says where a contract's ABI came from; this says what a single
+/// method's label inside that ABI is worth. It only varies for a bytecode load,
+/// where the name (4byte) and the argument types (the contract's own
+/// dispatcher) come from two different places and can disagree — and where that
+/// disagreement is the phishing signal [`matcher::Resolved::BytecodeMismatch`]
+/// exists to raise. The review overlay already says so at signing time; this
+/// carries the same fact back to the menu the method is chosen from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum MethodProvenance {
+    /// The ABI declared this name: a curated entry, or a pasted JSON ABI.
+    #[default]
+    Declared,
+    /// One 4byte signature, consistent with the bytecode — name and code agree.
+    Matched,
+    /// Several 4byte names remain consistent with the bytecode. The one shown
+    /// is the first; the others are equally possible.
+    Ambiguous { alternatives: Vec<String> },
+    /// 4byte offered names and the contract's own argument types contradict
+    /// every one of them. Registering a friendly signature over code that does
+    /// something else is what a phishing contract looks like.
+    Mismatched { claimed: Vec<String> },
+    /// 4byte had nothing to offer; the name shown is the raw selector.
+    SelectorOnly,
+}
+
+impl MethodProvenance {
+    /// A one-line caution for the composer, or `None` when there is nothing to
+    /// say. Deliberately worded like `function_panel::warning_strip`, which
+    /// reports the same two conditions on the review — one fact, one phrasing.
+    pub fn caution(&self) -> Option<String> {
+        match self {
+            Self::Declared | Self::Matched | Self::SelectorOnly => None,
+            Self::Ambiguous { alternatives } => {
+                Some(format!("⚠ ambiguous: {}", alternatives.join(", ")))
+            }
+            Self::Mismatched { claimed } => Some(format!(
+                "⚠ possible spoof — on-chain code matches no known signature (claimed: {})",
+                claimed.join(", ")
+            )),
+        }
+    }
+
+    /// True for the spoof signal specifically, which the composer colours as a
+    /// warning rather than a note.
+    pub fn is_spoof_signal(&self) -> bool {
+        matches!(self, Self::Mismatched { .. })
+    }
+}
+
 /// A contract function the user can compose a call to. Covers both
 /// state-mutating (write) and `view`/`pure` (read) functions — the composer
 /// keeps the two in separate lists on [`LoadedContract`], but the shape is
@@ -71,14 +123,23 @@ pub struct AbiMethod {
     /// for bytecode-recovered methods (evmole doesn't recover outputs).
     pub outputs: Vec<AbiParam>,
     /// True iff the method accepts ETH (`payable`). The composer shows a
-    /// wei value field only for these. Always `false` for bytecode-derived
-    /// methods (evmole doesn't recover mutability) — use raw-hex mode for
-    /// a payable call on an unverified contract.
+    /// wei value field only for these. For a bytecode-derived method this is
+    /// evmole's inference from the dispatcher rather than a declaration, so it
+    /// can be wrong in either direction — raw-hex mode remains the escape
+    /// hatch when a payable call won't take a value.
     pub payable: bool,
     /// `keccak256(signature)[..4]`.
     pub selector: [u8; 4],
     /// Canonical signature, e.g. `approve(address,uint256)`.
     pub signature: String,
+    /// What `name` is worth. `Declared` for every source but bytecode.
+    pub provenance: MethodProvenance,
+    /// What the bytecode heuristic concluded about mutability, for a method
+    /// recovered from bytecode. `None` for a declared ABI — whose own
+    /// `stateMutability` already decided which list it is in — and for a
+    /// selector evmole declined to classify. Cosmetic: it decides how a method
+    /// is sorted and labelled, never whether it can be composed.
+    pub inferred_mutability: Option<bytecode::StateMutability>,
 }
 
 impl AbiMethod {
@@ -115,8 +176,9 @@ pub enum AbiSource {
     Known,
     /// User-pasted standard JSON ABI.
     Pasted,
-    /// Recovered from on-chain bytecode + the 4byte database. Argument
-    /// names are unknown; mutability is assumed non-payable.
+    /// Recovered from on-chain bytecode + the 4byte database. Argument names
+    /// are unknown and mutability is inferred; per-method name confidence is
+    /// carried separately, on [`MethodProvenance`].
     Bytecode,
 }
 
@@ -131,9 +193,10 @@ pub struct LoadedContract {
     /// Longer descriptor (`USD Coin · proxy`), may be empty.
     pub label: String,
     pub methods: Vec<AbiMethod>,
-    /// Read-only (`view`/`pure`) functions, with decodable `outputs`. Empty for
-    /// a bytecode load (evmole can't recover outputs); the Read tab then prompts
-    /// for a pasted ABI.
+    /// Read-only (`view`/`pure`) functions. `outputs` is populated for a known
+    /// or pasted ABI and empty for a bytecode load (evmole recovers mutability
+    /// but not return types), so a bytecode read renders as raw hex and the
+    /// Read tab still points at a pasted ABI for typed rows.
     pub read_methods: Vec<AbiMethod>,
     pub source: AbiSource,
     /// Brand kaomoji for known contracts; `None` otherwise.
@@ -143,6 +206,11 @@ pub struct LoadedContract {
     /// proxy is what the user transacts with; this is only the contract whose
     /// bytecode supplied the selectors.
     pub proxy_impl: Option<Address>,
+    /// False when this ABI rests on a code read that fell through to unverified
+    /// RPC — during a light-client cooldown, the whole method list can be
+    /// authored by an untrusted endpoint. Always true for a curated or pasted
+    /// ABI, neither of which reads code at all.
+    pub code_verified: bool,
 }
 
 // ============================================================================
@@ -196,6 +264,8 @@ fn method(name: &str, payable: bool, params: &[(&str, &str)]) -> AbiMethod {
         payable,
         selector,
         signature,
+        provenance: MethodProvenance::Declared,
+        inferred_mutability: None,
     }
 }
 
@@ -239,6 +309,8 @@ fn read_method(name: &str, params: &[(&str, &str)], outputs: &[(&str, &str)]) ->
         payable: false,
         selector,
         signature,
+        provenance: MethodProvenance::Declared,
+        inferred_mutability: None,
     }
 }
 
@@ -275,6 +347,7 @@ impl KnownContract {
             // user calls, whether or not that address happens to be a proxy
             // (USDC is) — no implementation walk was involved.
             proxy_impl: None,
+            code_verified: true,
         }
     }
 }
@@ -573,6 +646,8 @@ pub fn parse_abi_json(json: &str, address: Address) -> Result<LoadedContract, Tx
                 payable: false,
                 selector,
                 signature,
+                provenance: MethodProvenance::Declared,
+                inferred_mutability: None,
             });
         } else if let Some(payable) = is_writable(entry.state_mutability.as_deref(), entry.payable)
         {
@@ -583,6 +658,8 @@ pub fn parse_abi_json(json: &str, address: Address) -> Result<LoadedContract, Tx
                 payable,
                 selector,
                 signature,
+                provenance: MethodProvenance::Declared,
+                inferred_mutability: None,
             });
         }
     }
@@ -600,6 +677,8 @@ pub fn parse_abi_json(json: &str, address: Address) -> Result<LoadedContract, Tx
         source: AbiSource::Pasted,
         kaomoji: None,
         proxy_impl: None,
+        // A pasted ABI is the user's own claim, not a code read.
+        code_verified: true,
     })
 }
 
@@ -607,14 +686,26 @@ pub fn parse_abi_json(json: &str, address: Address) -> Result<LoadedContract, Tx
 // Bytecode heuristic
 // ============================================================================
 
-/// Recover a contract's write methods from its runtime `code` using
-/// `evmole` (arg types) reconciled with the embedded 4byte database
-/// (function names). Never yields parameter names or `payable` info, and
-/// includes read-only functions the 4byte DB can't distinguish — but works
-/// on any deployed contract without a pasted ABI. Returns `None` if the
-/// code exposes no recoverable functions (EOA, empty account, minimal
-/// proxy).
-pub fn from_bytecode(code: &[u8], address: Address) -> Option<LoadedContract> {
+/// Recover a contract's methods from its runtime `code` using `evmole` (arg
+/// types and state mutability) reconciled with the embedded 4byte database
+/// (function names). Never yields parameter names, and its `view`/`pure` split
+/// is inferred from the dispatcher rather than declared — but works on any
+/// deployed contract without a pasted ABI. Returns `None` if the code exposes
+/// no recoverable functions (EOA, empty account, minimal proxy).
+/// A selector evmole believes only reads state.
+///
+/// Kept composable — the inference bails silently on a big dispatcher and
+/// reports the remainder as `Pure`, so removing it from the menu would remove
+/// real write methods from the one screen that exists to compose arbitrary
+/// calls. It only sinks in the ordering and earns a `view` pill.
+fn reads_only(m: &AbiMethod) -> bool {
+    matches!(
+        m.inferred_mutability,
+        Some(bytecode::StateMutability::View | bytecode::StateMutability::Pure)
+    )
+}
+
+pub fn from_bytecode(code: &[u8], address: Address, code_verified: bool) -> Option<LoadedContract> {
     let extracted = bytecode::extract(code);
     if extracted.is_empty() {
         return None;
@@ -624,17 +715,45 @@ pub fn from_bytecode(code: &[u8], address: Address) -> Option<LoadedContract> {
         // Prefer a 4byte name whose arg shape matches the bytecode; fall
         // back to a synthetic name so the selector is still composable.
         let candidates = fourbyte::lookup(f.selector);
-        let (name, arg_types) = match matcher::resolve(&candidates, Some(&f.arg_types)) {
-            matcher::Resolved::Unique { name, arg_types } => (name, arg_types),
-            matcher::Resolved::Ambiguous(mut v) | matcher::Resolved::BytecodeMismatch(mut v)
-                if !v.is_empty() =>
-            {
+        // The matcher separates "one name, and the code agrees" from "several
+        // names" from "names the code contradicts". Taking the head of the list
+        // in all three cases was the same first choice made on three different
+        // strengths of evidence, with the difference discarded — so the strength
+        // rides along as `provenance` and reaches the menu.
+        let names = |v: &[(String, Vec<DynSolType>)]| -> Vec<String> {
+            v.iter().map(|(n, _)| n.clone()).collect()
+        };
+        let (name, arg_types, provenance) = match matcher::resolve(&candidates, Some(&f.arg_types))
+        {
+            matcher::Resolved::Unique { name, arg_types } => {
+                (name, arg_types, MethodProvenance::Matched)
+            }
+            matcher::Resolved::Ambiguous(mut v) if !v.is_empty() => {
+                let alternatives = names(&v);
                 let (name, arg_types) = v.remove(0);
-                (name, arg_types)
+                (
+                    name,
+                    arg_types,
+                    MethodProvenance::Ambiguous { alternatives },
+                )
+            }
+            matcher::Resolved::BytecodeMismatch(v) if !v.is_empty() => {
+                // Every name 4byte offered is contradicted by the contract's
+                // own argument types. Showing the friendliest of them as *the*
+                // method name is precisely what a phishing registration buys,
+                // so the menu names the selector and the claims stay inside the
+                // caution — which is the choice `decode::render` already makes
+                // for the review. The two used to disagree about the same bytes.
+                (
+                    format!("0x{}", alloy::hex::encode(f.selector)),
+                    f.arg_types.clone(),
+                    MethodProvenance::Mismatched { claimed: names(&v) },
+                )
             }
             _ => (
                 format!("0x{}", alloy::hex::encode(f.selector)),
                 f.arg_types.clone(),
+                MethodProvenance::SelectorOnly,
             ),
         };
         let inputs: Vec<AbiParam> = arg_types
@@ -650,35 +769,60 @@ pub fn from_bytecode(code: &[u8], address: Address) -> Option<LoadedContract> {
         // whose canonical form doesn't hash back to this selector would be
         // a mislabel, so we fall back to the raw selector name instead.
         let (signature, selector) = signature_and_selector(&name, &inputs);
-        let (signature, selector, name) = if selector == f.selector {
-            (signature, selector, name)
+        let (signature, selector, name, provenance) = if selector == f.selector {
+            (signature, selector, name, provenance)
         } else {
             let synth = format!("0x{}", alloy::hex::encode(f.selector));
             let (sig, _) = signature_and_selector(&synth, &inputs);
-            (sig, f.selector, synth)
+            // A discarded 4byte name takes its confidence with it — unless it
+            // was discarded on purpose above, in which case the *reason* is the
+            // thing worth keeping and must not be downgraded to a shrug.
+            let p = match provenance {
+                MethodProvenance::Mismatched { .. } => provenance,
+                _ => MethodProvenance::SelectorOnly,
+            };
+            (sig, f.selector, synth, p)
         };
-        methods.push(AbiMethod {
+        let method = AbiMethod {
             name,
             inputs,
             outputs: Vec::new(),
-            payable: false,
+            payable: matches!(f.mutability, Some(bytecode::StateMutability::Payable)),
             selector,
             signature,
-        });
+            provenance,
+            inferred_mutability: f.mutability,
+        };
+        methods.push(method);
     }
-    methods.sort_by(|a, b| a.name.cmp(&b.name));
+    // Writes first, then the read-only ones, each block alphabetical: the Write
+    // menu opens on what can actually change state instead of interleaving a
+    // contract's whole read surface through it.
+    //
+    // Sorted rather than *removed*, deliberately. evmole's view/pure analysis
+    // starts optimistic (`view: true, pure: true`) and breaks out of its walk on
+    // a VM error or an exhausted gas budget without ever clearing them — so a
+    // large contract whose dispatcher it couldn't finish reports `Pure` for
+    // methods that write. Dropping those from the menu would quietly make them
+    // uncomposable, which is the one thing this pane exists to do.
+    methods.sort_by(|a, b| reads_only(a).cmp(&reads_only(b)).then(a.name.cmp(&b.name)));
+    // The same view/pure selectors, mirrored into the Read tab — which was dead
+    // for a bytecode load. evmole recovers no return types, so these query and
+    // render as raw hex; `read_result_panel` already says so.
+    let read_methods: Vec<AbiMethod> = methods.iter().filter(|m| reads_only(m)).cloned().collect();
     Some(LoadedContract {
         address,
         name: crate::wallet::short_address(address),
         label: "recovered from bytecode".into(),
         methods,
-        // evmole recovers selectors + arg types but not return types, so a
-        // bytecode load exposes no decodable reads — the Read tab prompts for
-        // a pasted ABI instead.
-        read_methods: Vec::new(),
+        // evmole recovers selectors, arg types and mutability, but not return
+        // types — so these reads query fine and render as raw hex rather than
+        // typed rows. The Read tab still points at a pasted ABI for those.
+        read_methods,
         source: AbiSource::Bytecode,
         kaomoji: None,
         proxy_impl: None,
+        code_verified,
     })
 }
 
@@ -691,8 +835,9 @@ pub fn from_bytecode_behind_proxy(
     code: &[u8],
     address: Address,
     implementation: Address,
+    code_verified: bool,
 ) -> Option<LoadedContract> {
-    let mut loaded = from_bytecode(code, address)?;
+    let mut loaded = from_bytecode(code, address, code_verified)?;
     if implementation != address {
         loaded.label = "recovered from implementation bytecode".into();
         loaded.proxy_impl = Some(implementation);
@@ -847,7 +992,7 @@ mod tests {
 
     #[test]
     fn from_bytecode_empty_code_is_none() {
-        assert!(from_bytecode(&[], Address::ZERO).is_none());
+        assert!(from_bytecode(&[], Address::ZERO, true).is_none());
     }
 
     #[test]
@@ -855,7 +1000,8 @@ mod tests {
         let proxy = Address::from([0x11; 20]);
         let impl_addr = Address::from([0x22; 20]);
         let code = crate::decode::bytecode::tiny_transfer_runtime();
-        let c = from_bytecode_behind_proxy(&code, proxy, impl_addr).expect("selectors recovered");
+        let c =
+            from_bytecode_behind_proxy(&code, proxy, impl_addr, true).expect("selectors recovered");
         // The call must land on the proxy for the delegatecall to happen —
         // composing to the implementation would bypass the proxy's storage.
         assert_eq!(c.address, proxy);
@@ -866,16 +1012,141 @@ mod tests {
     }
 
     #[test]
+    fn a_declared_abi_carries_declared_provenance() {
+        let usdc = known_by_address(
+            Chain::Mainnet,
+            address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        )
+        .unwrap();
+        for m in usdc.methods.iter().chain(&usdc.read_methods) {
+            assert_eq!(m.provenance, MethodProvenance::Declared);
+            assert!(m.provenance.caution().is_none());
+        }
+        let pasted = parse_abi_json(
+            r#"[{"type":"function","name":"transfer","stateMutability":"nonpayable",
+                 "inputs":[{"name":"to","type":"address"}]}]"#,
+            Address::ZERO,
+        )
+        .unwrap();
+        assert_eq!(pasted.methods[0].provenance, MethodProvenance::Declared);
+    }
+
+    #[test]
+    fn a_bytecode_selector_the_4byte_db_cannot_name_is_marked_selector_only() {
+        let code = crate::decode::bytecode::tiny_transfer_runtime();
+        let c = from_bytecode(&code, Address::ZERO, true).unwrap();
+        let m = c
+            .methods
+            .iter()
+            .chain(&c.read_methods)
+            .find(|m| m.name == "transfer")
+            .unwrap();
+        // 4byte knows `transfer(address,uint256)` and the bytecode agrees.
+        assert_eq!(m.provenance, MethodProvenance::Matched);
+        assert!(m.provenance.caution().is_none());
+        assert!(!m.provenance.is_spoof_signal());
+    }
+
+    #[test]
+    fn the_spoof_signal_reaches_the_composer_instead_of_being_dropped() {
+        // The matcher raises `BytecodeMismatch` when 4byte's names are all
+        // contradicted by the contract's own argument types. That verdict used
+        // to be collapsed to `v.remove(0)`, so the menu showed the friendly
+        // name with nothing to say about it.
+        let spoof = MethodProvenance::Mismatched {
+            claimed: vec!["transfer".into(), "approve".into()],
+        };
+        assert!(spoof.is_spoof_signal());
+        let caution = spoof.caution().expect("a spoof must be voiced");
+        assert!(caution.contains("possible spoof"), "{caution}");
+        assert!(caution.contains("transfer, approve"), "{caution}");
+
+        let ambiguous = MethodProvenance::Ambiguous {
+            alternatives: vec!["transfer".into(), "doppel".into()],
+        };
+        assert!(
+            !ambiguous.is_spoof_signal(),
+            "ambiguity is not an accusation"
+        );
+        let caution = ambiguous.caution().unwrap();
+        assert!(caution.contains("ambiguous"), "{caution}");
+    }
+
+    #[test]
+    fn a_read_only_selector_is_mirrored_into_the_read_tab_but_stays_composable() {
+        // The fixture is `function transfer(address,uint256) external {}` — an
+        // empty body, so evmole infers `pure`.
+        //
+        // It must still appear in the Write menu. evmole's view/pure walk
+        // starts at `view: true, pure: true` and breaks out on a VM error or an
+        // exhausted gas budget WITHOUT clearing them, so "Pure" is also what a
+        // dispatcher it couldn't finish reports — and dropping those would make
+        // real write methods on large contracts uncomposable.
+        let code = crate::decode::bytecode::tiny_transfer_runtime();
+        let c = from_bytecode(&code, Address::ZERO, true).expect("selectors recovered");
+
+        let write = c
+            .methods
+            .iter()
+            .find(|m| m.name == "transfer")
+            .expect("an inferred-pure selector stays composable");
+        assert_eq!(write.selector, [0xa9, 0x05, 0x9c, 0xbb]);
+        assert!(!write.payable);
+        assert!(reads_only(write), "but it is known to be read-only");
+
+        // And the Read tab, which used to be empty for every bytecode load,
+        // now offers it. evmole recovers no return types, so it renders raw.
+        let read = c
+            .read_methods
+            .iter()
+            .find(|m| m.name == "transfer")
+            .expect("mirrored into the read menu");
+        assert!(read.output_tuple().is_none());
+    }
+
+    #[test]
+    fn the_write_menu_sinks_read_only_selectors_below_the_writes() {
+        // Sorting, not filtering: the composable set is unchanged, but the menu
+        // opens on what can actually change state.
+        let mut methods = [
+            AbiMethod {
+                name: "zzWrite".into(),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                payable: false,
+                selector: [1, 2, 3, 4],
+                signature: "zzWrite()".into(),
+                provenance: MethodProvenance::Matched,
+                inferred_mutability: Some(bytecode::StateMutability::NonPayable),
+            },
+            AbiMethod {
+                name: "aaRead".into(),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                payable: false,
+                selector: [5, 6, 7, 8],
+                signature: "aaRead()".into(),
+                provenance: MethodProvenance::Matched,
+                inferred_mutability: Some(bytecode::StateMutability::View),
+            },
+        ];
+        methods.sort_by(|a, b| reads_only(a).cmp(&reads_only(b)).then(a.name.cmp(&b.name)));
+        assert_eq!(methods[0].name, "zzWrite", "writes first, alphabet second");
+        assert_eq!(methods[1].name, "aaRead");
+    }
+
+    #[test]
     fn non_proxy_load_leaves_proxy_impl_unset() {
         let addr = Address::from([0x11; 20]);
         let code = crate::decode::bytecode::tiny_transfer_runtime();
         // implementation == address ⇒ nothing was walked; must be
         // indistinguishable from a plain `from_bytecode` load.
-        let via = from_bytecode_behind_proxy(&code, addr, addr).unwrap();
-        let plain = from_bytecode(&code, addr).unwrap();
+        let via = from_bytecode_behind_proxy(&code, addr, addr, true).unwrap();
+        let plain = from_bytecode(&code, addr, true).unwrap();
         assert!(via.proxy_impl.is_none());
         assert_eq!(via.label, plain.label);
         assert_eq!(via.methods.len(), plain.methods.len());
+        assert_eq!(via.read_methods.len(), plain.read_methods.len());
     }
 
     #[test]

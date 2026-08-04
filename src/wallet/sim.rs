@@ -498,6 +498,36 @@ pub enum BatchOutcome {
     Unavailable,
 }
 
+/// Where a batch's metered gas lands against the block it would have to be
+/// mined in.
+///
+/// [`simulate_batch`] runs each sub-call as its own revm transaction under
+/// [`SIM_GAS_LIMIT`], with `disable_block_gas_limit = true` on the `CfgEnv` —
+/// which is what keeps a legitimate gas-heavy call from bouncing during
+/// preflight, and is also why five 25M-gas steps metered 125M and reported a
+/// clean pass for a transaction no block on any chain Kao supports could ever
+/// include. The per-step limit stays; this is what stops the aggregate lying.
+///
+/// The ceiling is the live `LatestBlock::gas_limit` the simulation already ran
+/// against, not a per-chain constant: free, correct on Mainnet, Base and
+/// Optimism alike, and it doesn't rot at the next limit bump.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GasFit {
+    /// No block gas limit was read (the simulation never ran) — nothing to say.
+    Unknown,
+    /// Comfortably inside the block: under half the limit.
+    Fits,
+    /// Inside the limit but occupying more than half a block. Includable only
+    /// when the rest of the block is nearly empty — and the metered figure
+    /// under-counts the real transaction (it omits the MultiSend loop, the
+    /// `execTransaction` wrapper, calldata cost and per-owner signature
+    /// verification), so past half a block there is no honest margin left.
+    Crowded { gas_used: u64, block_gas_limit: u64 },
+    /// At or over the block gas limit. This transaction cannot be mined at all:
+    /// no builder can pack it, and it is not a fee problem. It has to be split.
+    Exceeds { gas_used: u64, block_gas_limit: u64 },
+}
+
 #[derive(Debug, Clone)]
 pub struct BatchSimResult {
     pub outcome: BatchOutcome,
@@ -517,6 +547,12 @@ pub struct BatchSimResult {
     /// twenty minutes and a hundred blocks ago is indistinguishable from one
     /// taken a second before the review opened.
     pub block: u64,
+    /// The gas limit of the block this ran against — the ceiling the assembled
+    /// transaction has to fit under. Live and per-chain (the same value fed to
+    /// revm's `BlockEnv`), so there is no hardcoded limit to keep in sync. Zero
+    /// means no block was read, which reads as "unknown" and suppresses the
+    /// check rather than failing it.
+    pub block_gas_limit: u64,
 }
 
 impl BatchSimResult {
@@ -528,6 +564,29 @@ impl BatchSimResult {
             verified: false,
             base_fee_per_gas: 0,
             block: 0,
+            block_gas_limit: 0,
+        }
+    }
+
+    /// How this batch's metered gas sits against the block it would be mined
+    /// in. See [`GasFit`] for why the bands are where they are.
+    pub fn gas_fit(&self) -> GasFit {
+        let limit = self.block_gas_limit;
+        if limit == 0 {
+            return GasFit::Unknown;
+        }
+        if self.gas_used >= limit {
+            GasFit::Exceeds {
+                gas_used: self.gas_used,
+                block_gas_limit: limit,
+            }
+        } else if self.gas_used.saturating_mul(2) >= limit {
+            GasFit::Crowded {
+                gas_used: self.gas_used,
+                block_gas_limit: limit,
+            }
+        } else {
+            GasFit::Fits
         }
     }
 
@@ -584,6 +643,10 @@ pub async fn simulate_batch(
     let chain_id = chain.chain_id();
     let base_fee_per_gas = block.base_fee_per_gas;
     let block_number = block.number;
+    // Captured before `block` moves into the blocking closure: the ceiling the
+    // assembled transaction has to fit under, so the caller can tell a batch
+    // that passed from one that passed and cannot be mined.
+    let block_gas_limit = block.gas_limit;
     let handle = Handle::current();
 
     let result = tokio::task::spawn_blocking(move || -> Result<BatchSimResult, SimError> {
@@ -659,6 +722,7 @@ pub async fn simulate_batch(
             verified,
             base_fee_per_gas,
             block: block_number,
+            block_gas_limit,
         })
     })
     .await
@@ -929,6 +993,57 @@ fn address_from_topic(topic: &B256) -> Address {
 mod tests {
     use super::*;
     use alloy::primitives::{LogData, address, b256, bytes};
+
+    /// A `Success` result metering `gas_used` against `block_gas_limit`.
+    fn metered(gas_used: u64, block_gas_limit: u64) -> BatchSimResult {
+        BatchSimResult {
+            outcome: BatchOutcome::Success,
+            gas_used,
+            transfers: Vec::new(),
+            verified: true,
+            base_fee_per_gas: 1,
+            block: 21_000_000,
+            block_gas_limit,
+        }
+    }
+
+    #[test]
+    fn batch_gas_fit_flags_a_batch_that_cannot_fit_in_a_block() {
+        // Five 25M-gas steps: each is fine on its own under the per-step limit,
+        // and revm is run with `disable_block_gas_limit`, so the sum used to
+        // come back as a clean pass for a transaction no block can include.
+        let over = metered(125_000_000, 45_000_000);
+        assert_eq!(
+            over.gas_fit(),
+            GasFit::Exceeds {
+                gas_used: 125_000_000,
+                block_gas_limit: 45_000_000,
+            }
+        );
+        // The boundary is unminable, not borderline: a transaction has to fit
+        // *under* the limit, alongside nothing else.
+        assert!(matches!(
+            metered(45_000_000, 45_000_000).gas_fit(),
+            GasFit::Exceeds { .. }
+        ));
+    }
+
+    #[test]
+    fn batch_gas_fit_warns_past_half_a_block_and_stays_quiet_below() {
+        assert!(matches!(
+            metered(30_000_000, 45_000_000).gas_fit(),
+            GasFit::Crowded { .. }
+        ));
+        assert_eq!(metered(1_000_000, 45_000_000).gas_fit(), GasFit::Fits);
+    }
+
+    #[test]
+    fn batch_gas_fit_says_nothing_when_no_block_was_read() {
+        // `unavailable()` never ran, so it has no ceiling to measure against —
+        // and a stale-state false negative must never hard-block a batch.
+        assert_eq!(BatchSimResult::unavailable().gas_fit(), GasFit::Unknown);
+        assert_eq!(metered(125_000_000, 0).gas_fit(), GasFit::Unknown);
+    }
 
     #[test]
     fn decode_error_string_revert() {

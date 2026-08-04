@@ -6701,11 +6701,48 @@ async fn resolve_contract_code(
     address: Address,
 ) -> Result<tx_builder::ResolvedCode, String> {
     let res = crate::decode::proxy::resolve_implementation(network, chain, address).await;
-    let code = network.get_code(res.implementation, chain).await?.value;
+    // Keep the read's own verification flag. During a Helios cooldown
+    // `get_code` falls through to raw RPC for every call in the window, and the
+    // whole method list — names, argument types, the write/read split — is then
+    // authored by an untrusted endpoint. `decode::render` already treats that
+    // as `Warning::UnverifiedBytecode`; the composer used to drop it on the
+    // floor and badge such a menu identically to a light-client-proved one.
+    let read = network.get_code(res.implementation, chain).await?;
+
+    // An ERC-1167 clone has no implementation *slot* — its target is 20 literal
+    // bytes inside a fixed 45-byte runtime, so the walk above could never find
+    // one, and the clone's own dispatcher exposes no selectors. Every
+    // OpenZeppelin `Clones` deployment therefore came back as "no ABI found".
+    // Read the target out of the code already in hand and hop once more.
+    //
+    // Deliberately here rather than inside `resolve_implementation`: the walker
+    // is shared with the Send flow's descriptor decode, which does not fetch
+    // code, and folding a `get_code` into it would put an extra round trip on
+    // every clear-sign. This costs one read, only when the code really is a
+    // clone — the exact case that is broken today.
+    if let Some(target) = crate::decode::proxy::erc1167_target(&read.value) {
+        let inner = network.get_code(target, chain).await?;
+        return Ok(tx_builder::ResolvedCode {
+            code: inner.value,
+            implementation: target,
+            all_verified: res.all_verified,
+            code_verified: read.verified && inner.verified,
+            beacon: false,
+        });
+    }
+
+    // Only worth asking when there is nothing to show anyway: a beacon proxy's
+    // own code carries no selectors, and naming the limitation beats an empty
+    // method list the user can't account for.
+    let beacon = read.value.is_empty()
+        && crate::decode::proxy::is_beacon_proxy(network, chain, res.implementation).await;
+
     Ok(tx_builder::ResolvedCode {
-        code,
+        code: read.value,
         implementation: res.implementation,
         all_verified: res.all_verified,
+        code_verified: read.verified,
+        beacon,
     })
 }
 
@@ -6814,6 +6851,26 @@ fn spawn_txbuilder_prepare(
         },
         |(seq, steps)| Message::SignReviewPrepared { seq, steps },
     )
+}
+
+/// Human label for an EIP-7702 delegate address.
+///
+/// [`EF_SIMPLE_7702_ACCOUNT`](crate::txbuilder::eip7702::EF_SIMPLE_7702_ACCOUNT)
+/// is the only delegate this wallet installs and the only one a Ledger
+/// clear-signs by name. Anything else found on an account got there from
+/// somewhere else, and is labelled as exactly that — a delegate the review
+/// can't vouch for reads like a wallet feature unless it is named as one it
+/// isn't.
+fn delegate_label(delegate: Address, chain: Chain) -> String {
+    use crate::txbuilder::eip7702;
+    if delegate == eip7702::EF_SIMPLE_7702_ACCOUNT {
+        "Ethereum Foundation · Simple7702Account".to_string()
+    } else {
+        match crate::txbuilder::abi::known_by_address(chain, delegate) {
+            Some(c) => format!("{} · not a delegate this wallet installs", c.name),
+            None => "UNRECOGNISED — not a delegate this wallet installs".to_string(),
+        }
+    }
 }
 
 /// Clear-sign one call for a review leg, or [`DecodeResult::Empty`] when the
@@ -7088,7 +7145,7 @@ async fn build_txbuilder_steps(
                 };
                 let delegation = sign_review::DelegationReview {
                     delegate: eip7702::EF_SIMPLE_7702_ACCOUNT,
-                    delegate_label: "Ethereum Foundation · Simple7702Account".to_string(),
+                    delegate_label: delegate_label(eip7702::EF_SIMPLE_7702_ACCOUNT, chain),
                     authority: e.from,
                     chain_id: chain.chain_id(),
                     net: e.net,
@@ -7129,7 +7186,42 @@ async fn build_txbuilder_steps(
                     decoded: Box::new(decoded),
                     sub_legs: Vec::new(),
                 };
-                Ok(vec![sign_review::SignStep::RawTx(leg)])
+                // An account carrying a 7702 delegation designator is not a
+                // plain EOA: the `from` of this transaction runs whatever
+                // contract the designator points at, and the callbacks and
+                // reentrancy paths that exist only because of it are live for
+                // the duration of this call. Nothing here changes that and
+                // nothing extra is signed — but the single-call path used to
+                // say nothing at all, so an account another wallet delegated
+                // read exactly like an undelegated one. Read live, like the
+                // batch arm does, so what is disclosed is a fact about the
+                // chain rather than about the composer.
+                let mut steps = Vec::with_capacity(2);
+                if let Some(chain) = e.net.builtin() {
+                    let code = network.get_code(e.from, chain).await?.value;
+                    if let Some(current) = eip7702::delegated_to(&code) {
+                        steps.push(sign_review::SignStep::Delegation(
+                            sign_review::DelegationReview {
+                                delegate: current,
+                                delegate_label: delegate_label(current, chain),
+                                authority: e.from,
+                                chain_id: chain.chain_id(),
+                                net: e.net,
+                                // A disclosure, not a decision: the delegation
+                                // is already in place and this transaction
+                                // neither installs nor replaces it, so there is
+                                // no authorization and no digest to compare
+                                // against a device.
+                                already_active: true,
+                                replacing: None,
+                                auth_nonce: None,
+                                auth_digest: None,
+                            },
+                        ));
+                    }
+                }
+                steps.push(sign_review::SignStep::RawTx(leg));
+                Ok(steps)
             }
         }
     }
@@ -13098,6 +13190,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_contract_code_follows_an_erc1167_clone_to_its_implementation() {
+        // A clone has no implementation slot at all, and its own 45-byte
+        // runtime exposes no selectors — so every OpenZeppelin `Clones`
+        // deployment used to surface as an undifferentiated "no ABI found".
+        let mock = CallMock::new();
+        let clone = Address::repeat_byte(0x11);
+        let target = Address::repeat_byte(0x22);
+
+        let mut runtime = vec![0x36, 0x3d, 0x3d, 0x37, 0x3d, 0x3d, 0x3d, 0x36, 0x3d, 0x73];
+        runtime.extend_from_slice(target.as_slice());
+        runtime.extend_from_slice(&[
+            0x5a, 0xf4, 0x3d, 0x82, 0x80, 0x3e, 0x90, 0x3d, 0x91, 0x60, 0x2b, 0x57, 0xfd, 0x5b,
+            0xf3,
+        ]);
+        mock.set_code(clone, Bytes::from(runtime), true);
+
+        let impl_code = Bytes::from(crate::decode::bytecode::tiny_transfer_runtime());
+        mock.set_code(target, impl_code.clone(), true);
+
+        let out = resolve_contract_code(&mock, Chain::Mainnet, clone)
+            .await
+            .unwrap();
+        assert_eq!(out.implementation, target);
+        assert_eq!(out.code, impl_code, "the selectors come from the target");
+        assert!(out.code_verified);
+
+        // And the call still has to land on the clone, not the target — the
+        // clone is what holds the storage.
+        let loaded = crate::txbuilder::abi::from_bytecode_behind_proxy(
+            &out.code,
+            clone,
+            out.implementation,
+            out.code_verified,
+        )
+        .expect("selectors recovered");
+        assert_eq!(loaded.address, clone);
+        assert_eq!(loaded.proxy_impl, Some(target));
+    }
+
+    #[tokio::test]
+    async fn resolve_contract_code_names_a_beacon_proxy_it_cannot_follow() {
+        // Resolving a beacon needs an `eth_call` on the beacon contract, which
+        // the walker doesn't make. Saying so beats an empty method list.
+        let mock = CallMock::new();
+        let proxy = Address::repeat_byte(0x11);
+        let beacon = Address::repeat_byte(0x33);
+        let slot = alloy::primitives::B256::new([
+            0xa3, 0xf0, 0xad, 0x74, 0xe5, 0x42, 0x3a, 0xeb, 0xfd, 0x80, 0xd3, 0xef, 0x43, 0x46,
+            0x57, 0x83, 0x35, 0xa9, 0xa7, 0x2a, 0xea, 0xee, 0x59, 0xff, 0x6c, 0xb3, 0x58, 0x2b,
+            0x35, 0x13, 0x3d, 0x50,
+        ]);
+        mock.set_storage(proxy, slot, slot_holding(beacon), true);
+
+        let out = resolve_contract_code(&mock, Chain::Mainnet, proxy)
+            .await
+            .unwrap();
+        assert!(out.code.is_empty(), "a beacon stub carries no selectors");
+        assert!(out.beacon, "the shape has to be named");
+    }
+
+    #[tokio::test]
+    async fn resolve_contract_code_reports_an_unverified_code_read() {
+        // During a Helios cooldown `get_code` falls through to raw RPC for
+        // every call in the window, so an untrusted endpoint authors the whole
+        // method list — names, argument types, the write/read split. That flag
+        // used to be dropped on the floor and the menu badged as if the light
+        // client had proved it.
+        let mock = CallMock::new();
+        let addr = Address::repeat_byte(0x11);
+        let code = Bytes::from(crate::decode::bytecode::tiny_transfer_runtime());
+        mock.set_code(addr, code.clone(), false);
+
+        let out = resolve_contract_code(&mock, Chain::Mainnet, addr)
+            .await
+            .unwrap();
+        assert_eq!(out.code, code);
+        assert!(!out.code_verified, "the caution has to reach the composer");
+        // A different fact from the proxy-pointer flag, with a different
+        // remedy — no proxy slot was involved here at all.
+        assert!(out.all_verified);
+
+        let loaded =
+            crate::txbuilder::abi::from_bytecode(&out.code, addr, out.code_verified).unwrap();
+        assert!(!loaded.code_verified, "and reach the badge");
+    }
+
+    #[tokio::test]
     async fn resolve_contract_code_leaves_a_plain_contract_alone() {
         let mock = CallMock::new();
         let addr = Address::repeat_byte(0x11);
@@ -13660,6 +13839,105 @@ mod tests {
         assert_eq!(leg.to, call.to);
         assert_eq!(leg.value, call.value);
         assert_eq!(leg.calldata, call.data, "reviewed bytes == queued bytes");
+    }
+
+    /// `0xef0100 ‖ delegate` — the EIP-7702 designator an account's code
+    /// carries while it is delegated.
+    fn designator(delegate: Address) -> Bytes {
+        let mut code = vec![0xef, 0x01, 0x00];
+        code.extend_from_slice(delegate.as_slice());
+        Bytes::from(code)
+    }
+
+    #[tokio::test]
+    async fn txbuilder_single_call_discloses_an_existing_delegation() {
+        // The `from` of this transaction runs a contract's code. Nothing here
+        // changes that and nothing extra is signed, but the review used to say
+        // nothing at all — an account another wallet delegated read exactly
+        // like a plain EOA.
+        let call = queued(1, addr(0xC1), 42, vec![0xab, 0xcd, 0xef, 0x01]);
+        let req = eoa_batch_req(
+            crate::chain::NetworkId::Builtin(Chain::Mainnet),
+            vec![call.clone()],
+        );
+        let incumbent = addr(0x77);
+        let mock = CallMock::new();
+        mock.set_code(req.from, designator(incumbent), true);
+        let steps = prepared_steps(&mock, tx_builder::BatchSignRequest::Eoa(req))
+            .await
+            .unwrap();
+        let [
+            sign_review::SignStep::Delegation(d),
+            sign_review::SignStep::RawTx(leg),
+        ] = steps.as_slice()
+        else {
+            panic!("expected a disclosure card then the call, got {steps:?}");
+        };
+        assert_eq!(d.delegate, incumbent);
+        assert!(d.already_active, "a disclosure, not a decision");
+        assert!(d.replacing.is_none(), "nothing is being replaced");
+        assert_eq!(leg.calldata, call.data, "reviewed bytes == queued bytes");
+    }
+
+    #[tokio::test]
+    async fn txbuilder_single_call_disclosure_signs_nothing() {
+        // A digest on this card would send the user looking for a device
+        // prompt that never comes.
+        let call = queued(1, addr(0xC1), 0, vec![0x01]);
+        let req = eoa_batch_req(crate::chain::NetworkId::Builtin(Chain::Mainnet), vec![call]);
+        let mock = CallMock::new();
+        mock.set_code(req.from, designator(addr(0x77)), true);
+        let steps = prepared_steps(&mock, tx_builder::BatchSignRequest::Eoa(req))
+            .await
+            .unwrap();
+        let [sign_review::SignStep::Delegation(d), _] = steps.as_slice() else {
+            panic!("expected a disclosure card, got {steps:?}");
+        };
+        assert!(d.auth_nonce.is_none());
+        assert!(d.auth_digest.is_none());
+        assert!(
+            sign_review::erc8213_rows(&steps[0]).is_empty(),
+            "nothing is signed here, so there is no fingerprint to compare"
+        );
+    }
+
+    #[tokio::test]
+    async fn txbuilder_single_call_names_an_unrecognised_delegate_as_unrecognised() {
+        // A delegate this wallet never installs must not read like a feature.
+        let label = delegate_label(addr(0x77), Chain::Mainnet);
+        assert!(label.contains("UNRECOGNISED"), "{label}");
+        let ef = delegate_label(eip7702::EF_SIMPLE_7702_ACCOUNT, Chain::Mainnet);
+        assert_eq!(ef, "Ethereum Foundation · Simple7702Account");
+    }
+
+    #[tokio::test]
+    async fn txbuilder_single_call_on_an_undelegated_account_shows_only_the_call() {
+        let call = queued(1, addr(0xC1), 0, vec![0x01]);
+        let req = eoa_batch_req(crate::chain::NetworkId::Builtin(Chain::Mainnet), vec![call]);
+        let steps = prepared_steps(&CallMock::new(), tx_builder::BatchSignRequest::Eoa(req))
+            .await
+            .unwrap();
+        assert!(
+            matches!(steps.as_slice(), [sign_review::SignStep::RawTx(_)]),
+            "an undelegated account gains no card, got {steps:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn txbuilder_single_call_on_a_custom_network_makes_no_delegation_claim() {
+        // The designator can't be verified on a custom network, and an
+        // unbadged unverified read is not something the review may assert.
+        let call = queued(1, addr(0xC1), 0, vec![0x01]);
+        let req = eoa_batch_req(crate::chain::NetworkId::Custom(1337), vec![call]);
+        let mock = CallMock::new();
+        mock.set_code(req.from, designator(addr(0x77)), true);
+        let steps = prepared_steps(&mock, tx_builder::BatchSignRequest::Eoa(req))
+            .await
+            .unwrap();
+        assert!(
+            matches!(steps.as_slice(), [sign_review::SignStep::RawTx(_)]),
+            "no verified chain, no claim, got {steps:?}"
+        );
     }
 
     /// The function name a leg's decode resolved to, if any.

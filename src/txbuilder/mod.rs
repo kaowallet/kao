@@ -47,6 +47,17 @@ pub struct DecodedArg {
     pub value: String,
 }
 
+/// The most calls one batch may carry, however the queue is filled.
+///
+/// Gas binds long before this does — a 64-call MultiSend is already millions —
+/// but the *rendering* cost is paid before the gas is: the batch pane lays out
+/// one card per call every frame with no virtualization, the review resolves one
+/// leg per call over the network, and the preflight simulates one step per call.
+/// So the queue is capped where a person could still read it, and the same
+/// number applies to hand-adding, to a loaded template, and to an imported
+/// bundle — otherwise a batch built one way would fail to reload the other.
+pub const MAX_BATCH_CALLS: usize = 64;
+
 /// A single call queued in the batch. Self-contained: it carries the
 /// already-ABI-encoded `data`, so simulation, MultiSend packing, and
 /// broadcast never re-encode from user input (the reviewed bytes are the

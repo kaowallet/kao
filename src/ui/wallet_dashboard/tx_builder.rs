@@ -80,6 +80,29 @@ pub enum Settled {
     Unconfirmed { hash: B256 },
 }
 
+/// A settled outcome together with the account and network it happened on.
+///
+/// The strip used to be a bare [`Settled`], and the identity/network resets
+/// clear the queue but not the outcome — so switching to a different Safe left
+/// a hash or a Safe nonce sitting over an account it had nothing to do with.
+/// That was a mislabel while the only outcomes were `Executed` and `Proposed`;
+/// with `Unconfirmed` it became advice ("this may still be pending, don't
+/// rebuild it") displayed to someone with nothing pending.
+///
+/// Bound rather than cleared, deliberately. Clearing on switch would fix the
+/// attribution by destroying the hash — and for `Unconfirmed` that hash is the
+/// only way to find out whether rebuilding the batch would run it twice, which
+/// is the entire reason the variant exists. Binding hides the strip off-context
+/// and brings it back intact on the way back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettledFor {
+    pub outcome: Settled,
+    /// The account that was composing when this settled.
+    pub identity: Address,
+    /// The network it settled on.
+    pub net: NetworkId,
+}
+
 impl Settled {
     /// The transaction hash, for the outcomes that have one. `Proposed` does
     /// not: nothing has been broadcast.
@@ -770,7 +793,7 @@ pub struct TxBuilderApp {
     /// The last batch this pane got a definitive answer about. Persists until
     /// dismissed — a receipt is the only thing that distinguishes a batch that
     /// worked from one that reverted, and neither used to leave a trace.
-    settled: Option<Settled>,
+    settled: Option<SettledFor>,
 
     error: Option<String>,
 }
@@ -1025,17 +1048,38 @@ impl TxBuilderApp {
             s.invalidate_sim();
             s.expanded = None;
             s.error = None;
-            s.settled = Some(Settled::Executed { hash });
+            let stamped = s.stamp(Settled::Executed { hash });
+            s.settled = Some(stamped);
         })
     }
 
     /// The batch was filed on the Transaction Service for co-signers. Not an
     /// execution: it clears the composer the same way, but says so differently,
     /// because "queued" and "done" are not the same claim.
-    /// The pane's settled-outcome strip, for the coordinator's tests.
+    /// Bind an outcome to the account and network it happened on.
+    fn stamp(&self, outcome: Settled) -> SettledFor {
+        SettledFor {
+            outcome,
+            identity: self.owner,
+            net: self.net,
+        }
+    }
+
+    /// The settled outcome, when it belongs to the context currently on screen.
+    ///
+    /// `None` while composing as someone else or on another network — the
+    /// record survives, so switching back restores it, but a hash from one
+    /// account is never captioned with another's.
+    pub fn visible_settled(&self) -> Option<&Settled> {
+        let s = self.settled.as_ref()?;
+        (s.identity == self.owner && s.net == self.net).then_some(&s.outcome)
+    }
+
+    /// The pane's settled-outcome strip as the user would see it, for the
+    /// coordinator's tests.
     #[cfg(test)]
     pub fn settled_state(&self) -> Option<Settled> {
-        self.settled.clone()
+        self.visible_settled().cloned()
     }
 
     /// The batch was broadcast and did **not** succeed. Records the hash so it
@@ -1050,7 +1094,8 @@ impl TxBuilderApp {
             _ => Settled::Unconfirmed { hash },
         };
         self.traced("on_broadcast_unsuccessful", move |s| {
-            s.settled = Some(settled);
+            let stamped = s.stamp(settled);
+            s.settled = Some(stamped);
         })
     }
 
@@ -1060,7 +1105,8 @@ impl TxBuilderApp {
             s.invalidate_sim();
             s.expanded = None;
             s.error = None;
-            s.settled = Some(Settled::Proposed { nonce });
+            let stamped = s.stamp(Settled::Proposed { nonce });
+            s.settled = Some(stamped);
         })
     }
 
@@ -1423,7 +1469,7 @@ impl TxBuilderApp {
                 // Every outcome that has a hash offers it. The unconfirmed one
                 // needs it most: looking that hash up is the only way to find
                 // out whether rebuilding the batch would run it twice.
-                if let Some(hash) = self.settled.as_ref().and_then(Settled::hash) {
+                if let Some(hash) = self.visible_settled().and_then(Settled::hash) {
                     return Some(Outcome::CopyPlain(format!("{hash:#x}")));
                 }
             }
@@ -3233,7 +3279,7 @@ mod tests {
         let hash = B256::repeat_byte(0x7A);
         app.on_executed(hash);
         assert!(app.batch.is_empty());
-        assert_eq!(app.settled, Some(Settled::Executed { hash }));
+        assert_eq!(app.visible_settled(), Some(&Settled::Executed { hash }));
         assert!(matches!(
             app.update(Message::CopySettledHash),
             Some(Outcome::CopyPlain(_))
@@ -3248,7 +3294,7 @@ mod tests {
         app.batch = sample_batch(&mut app.next_id, app.owner);
         app.on_proposed(7);
         assert!(app.batch.is_empty());
-        assert_eq!(app.settled, Some(Settled::Proposed { nonce: 7 }));
+        assert_eq!(app.visible_settled(), Some(&Settled::Proposed { nonce: 7 }));
         assert!(
             app.update(Message::CopySettledHash).is_none(),
             "a proposal has no transaction hash to copy — nothing was sent"
@@ -4103,6 +4149,77 @@ mod tests {
         );
         d.extend_from_slice(&U256::from(amount).to_be_bytes::<32>());
         d
+    }
+
+    #[test]
+    fn a_settled_outcome_is_hidden_off_the_account_it_happened_on() {
+        // The resets clear the queue and not the strip, so an unconfirmed
+        // broadcast used to follow the user to a different Safe — where
+        // "may still be pending, don't rebuild this batch" is advice for
+        // someone else's account.
+        let mut app = safe_app();
+        let hash = alloy::primitives::B256::repeat_byte(0x7A);
+        app.on_broadcast_unsuccessful(hash, &BatchFate::Unknown { reason: "t".into() });
+        assert_eq!(
+            app.visible_settled(),
+            Some(&Settled::Unconfirmed { hash }),
+            "visible on the account that broadcast it",
+        );
+
+        let was = app.owner;
+        app.owner = EOA;
+        app.on_identity_reset(was, EOA);
+        assert_eq!(app.visible_settled(), None, "and not on another account");
+
+        // Bound, not destroyed: that hash is the only way to find out whether
+        // rebuilding the batch would run it twice, so switching back has to
+        // bring it back rather than having thrown it away.
+        app.owner = was;
+        assert_eq!(
+            app.visible_settled(),
+            Some(&Settled::Unconfirmed { hash }),
+            "switching back restores it intact",
+        );
+    }
+
+    #[test]
+    fn a_settled_outcome_is_hidden_off_the_network_it_happened_on() {
+        let mut app = safe_app();
+        let hash = alloy::primitives::B256::repeat_byte(0x7A);
+        app.on_executed(hash);
+        assert!(app.visible_settled().is_some());
+
+        let was = app.net;
+        app.net = NetworkId::Builtin(Chain::Base);
+        app.on_network_reset(was);
+        assert_eq!(
+            app.visible_settled(),
+            None,
+            "a Mainnet hash is not a Base hash",
+        );
+        app.net = was;
+        assert!(app.visible_settled().is_some(), "and comes back");
+    }
+
+    #[test]
+    fn copying_the_settled_hash_respects_the_active_context() {
+        // The copy button reads the same record the strip does — otherwise a
+        // hidden outcome could still be copied out under the wrong caption.
+        let mut app = safe_app();
+        let hash = alloy::primitives::B256::repeat_byte(0x7A);
+        app.on_executed(hash);
+        assert!(matches!(
+            app.update(Message::CopySettledHash),
+            Some(Outcome::CopyPlain(_)),
+        ));
+
+        let was = app.owner;
+        app.owner = EOA;
+        app.on_identity_reset(was, EOA);
+        assert!(
+            app.update(Message::CopySettledHash).is_none(),
+            "nothing to copy while the outcome belongs to another account",
+        );
     }
 
     #[test]

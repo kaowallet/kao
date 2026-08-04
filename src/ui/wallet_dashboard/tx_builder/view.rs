@@ -1437,7 +1437,7 @@ fn batch_pane(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
     // What became of the last batch, above everything else. The composer used
     // to report an outcome only by emptying itself, which is what a cancel
     // looks like too.
-    if let Some(settled) = &app.settled {
+    if let Some(settled) = app.visible_settled() {
         inner = inner
             .push(Space::new().height(12))
             .push(settled_strip(t, settled));

@@ -201,6 +201,22 @@ fn trim_eth_sig_digits(s: &str) -> String {
     }
 }
 
+/// A wei-per-gas price formatted in gwei — `12_400_000_000` → `Some("12.4")`.
+/// `None` at zero, so callers omit the clause rather than printing "0 gwei".
+///
+/// Same significant-digit treatment as [`format_gas_fee_eth`]: sub-gwei base
+/// fees (routine on Base and Optimism) keep three digits past their leading
+/// zeros instead of rounding to a flat `0`.
+pub fn format_gwei(wei_per_gas: u64) -> Option<String> {
+    if wei_per_gas == 0 {
+        return None;
+    }
+    let gwei =
+        alloy::primitives::utils::format_units(alloy::primitives::U256::from(wei_per_gas), 9)
+            .ok()?;
+    Some(trim_eth_sig_digits(&gwei))
+}
+
 /// Thousands-grouped gas figure: `21000` renders as `"21,000"`,
 /// `30000000` as `"30,000,000"`.
 pub fn format_gas(gas: u64) -> String {
@@ -217,7 +233,22 @@ pub fn format_gas(gas: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_gas, format_gas_fee_eth};
+    use super::{format_gas, format_gas_fee_eth, format_gwei};
+
+    #[test]
+    fn format_gwei_denominates_and_trims() {
+        assert_eq!(format_gwei(12_400_000_000).as_deref(), Some("12.4"));
+        assert_eq!(format_gwei(1_000_000_000).as_deref(), Some("1"));
+        // Sub-gwei base fees are the norm on the L2s: three significant digits
+        // past the leading zeros rather than a rounded-to-nothing "0".
+        assert_eq!(format_gwei(6_780_000).as_deref(), Some("0.00678"));
+    }
+
+    #[test]
+    fn format_gwei_skips_zero() {
+        // No block was read — the clause is omitted, not printed as "0 gwei".
+        assert!(format_gwei(0).is_none());
+    }
 
     #[test]
     fn format_gas_groups_thousands() {

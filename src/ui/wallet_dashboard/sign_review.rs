@@ -505,6 +505,107 @@ pub enum SigningKind {
     Broadcasting { hash: B256 },
 }
 
+/// Which way a netted balance change runs, relative to the signing account.
+///
+/// There is deliberately no third "moved between two other parties" variant.
+/// Every row here is a change to *this* account's balance; a hop between third
+/// parties nets out of the total, and is already visible on the leg that made
+/// it. A card titled "this transaction moves" whose rows are a mix of the two
+/// is one a user has to reconcile by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoveDirection {
+    /// Leaves the account that is signing.
+    Out,
+    /// Arrives at the account that is signing.
+    In,
+}
+
+impl MoveDirection {
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Out => "−",
+            Self::In => "+",
+        }
+    }
+}
+
+/// One line of "what this transaction moves", already denominated for display.
+///
+/// Formatted at prepare time rather than at render time: resolving a token
+/// contract to a symbol and decimals needs the live portfolio, which the
+/// overlay's `view` does not have, and doing it once at prepare keeps the two
+/// halves of `reviewed == signed` from drifting apart on a re-render.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MovedAmount {
+    /// Amount and symbol, e.g. `1,250.5 USDC`, `#4211 BAYC`, `0.4 ETH`.
+    pub amount: String,
+    pub direction: MoveDirection,
+}
+
+/// What a Transaction Builder batch is expected to move, and what it will cost.
+///
+/// The Builder was the one signing surface that showed neither: the batch
+/// simulator has always computed the token transfers a batch performs and the
+/// gas it meters, and both were dropped on the way to the overlay — so a user
+/// signed a six-call DeFi batch on the strength of a green "Simulation passed"
+/// strip and a call list, with no statement anywhere of what left their account
+/// or what the transaction cost.
+///
+/// Every figure here is advisory and says so. The fee is a *base-fee* estimate
+/// over *simulated* gas; [`Self::fee_excludes`] carries what it leaves out, and
+/// the card renders it under a leading `≈`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchEconomics {
+    /// Balance movements, signer-relative. Native value is derived from the
+    /// calls themselves and is present even without a simulation; token rows
+    /// come from the simulation's `Transfer` logs and are not.
+    pub moves: Vec<MovedAmount>,
+    /// Whether a successful simulation stands behind the token rows.
+    ///
+    /// Load-bearing, not decorative: when this is false an empty `moves` means
+    /// "nothing is known about token movement", which must not be allowed to
+    /// read as "this batch moves no tokens".
+    pub simulated: bool,
+    /// True when every read behind the simulation went through Helios's
+    /// verified path.
+    pub verified: bool,
+    /// The simulation is old enough that it is no longer a statement about the
+    /// state this batch will meet.
+    ///
+    /// Tracked here and not left to the note alone: verification and freshness
+    /// are different properties, and a "✓ Verified by Helios" badge sitting
+    /// over balance figures from twenty minutes ago vouches for the wrong one.
+    pub stale: bool,
+    /// Gas metered by the simulated sub-calls, and the base fee of the block
+    /// they ran against. Zero for either means there is no fee to state.
+    pub gas_used: u64,
+    pub base_fee_per_gas: u64,
+    /// How the fee figure is wrong, in the user's terms — in *both* directions,
+    /// which is why these are caveats rather than a list of exclusions: the
+    /// simulated gas under-counts the wrapper and the calldata, and over-counts
+    /// the intrinsic 21 000 on every call past the first.
+    ///
+    /// Derived from the batch's shape and chain, so the list names only what
+    /// actually applies — a list padded with inapplicable caveats is one users
+    /// learn to skip.
+    pub fee_caveats: Vec<String>,
+}
+
+impl BatchEconomics {
+    /// The estimated fee in ETH, or `None` when no simulation produced a gas
+    /// figure or the block carried no base fee — in which case the card omits
+    /// the fee line rather than claiming a free transaction.
+    pub fn fee_eth(&self) -> Option<String> {
+        super::sim_view::format_gas_fee_eth(self.gas_used, self.base_fee_per_gas)
+    }
+
+    /// Nothing to say at all — no movements and no fee. The card is skipped
+    /// entirely rather than rendering an empty box.
+    pub fn is_empty(&self) -> bool {
+        self.moves.is_empty() && self.fee_eth().is_none()
+    }
+}
+
 /// Coordinator-held overlay state: what to show, and what to do on confirm.
 #[derive(Debug, Clone)]
 pub struct SignReview {
@@ -551,6 +652,11 @@ pub struct SignReview {
     /// for a signature" card lays out the per-owner device prompts; `None` for a
     /// single-signature flow (the plain card). Cleared when a dispatch resolves.
     pub signing_progress: Option<SigningKind>,
+    /// What this transaction moves and what it costs. Set by the Transaction
+    /// Builder, which is the flow that had neither; `None` everywhere else,
+    /// where the step's own renderer already carries it (the Send review's
+    /// `TxQuote` + simulation block).
+    pub economics: Option<BatchEconomics>,
 }
 
 impl SignReview {
@@ -591,6 +697,7 @@ impl SignReview {
             confirm_label: None,
             confirm_disabled: false,
             secondary_label: None,
+            economics: None,
             show_calldata: false,
             show_fingerprints: false,
             signing_progress: None,
@@ -660,6 +767,14 @@ pub fn view<'a>(t: KaoTheme, review: &'a SignReview, progress: f32) -> Element<'
             ]
             .into(),
         ));
+    }
+
+    // What the transaction moves and costs. Above the note (which carries the
+    // batch-level caveats) and below the legs, so the reading order is: what it
+    // does → what it costs you → what to watch out for.
+    if let Some(e) = review.economics.as_ref().filter(|e| !e.is_empty()) {
+        body = body.push(Space::new().height(12));
+        body = body.push(economics_card(t, e));
     }
 
     if let Some(note) = &review.note {
@@ -1595,6 +1710,133 @@ fn addr_kv<'a>(t: KaoTheme, label: impl Into<String>, addr: Address) -> Element<
     .padding(Padding::from([2, 0]))
     .width(Length::Fill)
     .into()
+}
+
+/// "What this moves, and what it costs" — the Transaction Builder's economics
+/// block.
+///
+/// Deliberately two claims in one card, because they answer the same question
+/// and were both missing: the balance movements the reviewed simulation
+/// observed, and a base-fee estimate over the gas it metered. Everything here
+/// is hedged in the copy rather than in a footnote — the fee leads with `≈`,
+/// and `fee_caveats` names how the number is wrong, because a fee figure with
+/// no stated error bars is one users treat as a quote.
+fn economics_card<'a>(t: KaoTheme, e: &'a BatchEconomics) -> Element<'a, Message> {
+    let mut col = column![].spacing(4).width(Length::Fill);
+
+    let header = row![
+        text(if e.moves.is_empty() {
+            "Cost"
+        } else {
+            "This transaction moves"
+        })
+        .size(12)
+        .color(t.sub)
+        .font(mono_bold()),
+        Space::new().width(Length::Fill),
+        // Freshness is checked before verification: a Helios-verified read of
+        // a balance that has since moved is precisely verified and no longer
+        // true, so the badge must not lead with the tick.
+        text(if !e.simulated {
+            "not simulated"
+        } else if e.stale {
+            "⚠ Simulated a while ago"
+        } else if e.verified {
+            "✓ Verified by Helios"
+        } else {
+            "⚠ Unverified simulation"
+        })
+        .size(11)
+        .color(if e.simulated && e.verified && !e.stale {
+            t.up
+        } else {
+            t.sub
+        })
+        .font(bold()),
+    ]
+    .align_y(Alignment::Center)
+    .width(Length::Fill);
+    col = col.push(header);
+
+    for m in &e.moves {
+        col = col.push(
+            text(format!("{} {}", m.direction.prefix(), m.amount))
+                .size(13)
+                .color(match m.direction {
+                    MoveDirection::Out => t.down,
+                    MoveDirection::In => t.up,
+                })
+                .font(mono()),
+        );
+    }
+
+    // Absence of token rows is only evidence of "moves no tokens" when a
+    // simulation actually ran. Without one, say so where the rows would be —
+    // an empty list under a "this transaction moves" header otherwise reads as
+    // a positive finding.
+    if !e.simulated {
+        col = col.push(
+            text(
+                "Token movement wasn't simulated for this batch, so this list covers only the \
+                 native value the calls carry — run the preflight to see ERC-20 and NFT \
+                 movement.",
+            )
+            .size(11)
+            .color(t.sub)
+            .font(mono()),
+        );
+    } else {
+        // The one hole a successful simulation still leaves. Balance changes
+        // are recovered from `Transfer` logs, and native ETH *arriving* emits
+        // none — an unwrap or a refund lands in the account with nothing here
+        // to show for it. The outgoing side is exact (it is the calls' own
+        // `value`), so the gap is one-directional and worth naming as such.
+        col = col.push(
+            text(
+                "ETH arriving back in the account isn't tracked here — native transfers emit no \
+                 event. The ETH these calls send is exact.",
+            )
+            .size(11)
+            .color(t.sub)
+            .font(mono()),
+        );
+    }
+
+    if let Some(fee) = e.fee_eth() {
+        let basis = match crate::ui::wallet_dashboard::sim_view::format_gwei(e.base_fee_per_gas) {
+            Some(g) => format!(
+                "{} gas at {g} gwei base fee",
+                crate::ui::wallet_dashboard::sim_view::format_gas(e.gas_used)
+            ),
+            None => format!(
+                "{} gas",
+                crate::ui::wallet_dashboard::sim_view::format_gas(e.gas_used)
+            ),
+        };
+        col = col.push(Space::new().height(4));
+        col = col.push(
+            row![
+                text(format!("≈ {fee} ETH fee"))
+                    .size(13)
+                    .color(t.text)
+                    .font(bold()),
+                Space::new().width(8),
+                text(basis).size(11).color(t.sub).font(mono()),
+            ]
+            .align_y(Alignment::Center)
+            .width(Length::Fill),
+        );
+        for caveat in &e.fee_caveats {
+            col = col.push(
+                text(format!("· {caveat}"))
+                    .size(11)
+                    .color(t.sub)
+                    .font(mono()),
+            );
+        }
+    }
+
+    card(t, col.into())
 }
 
 fn card<'a>(t: KaoTheme, content: Element<'a, Message>) -> Element<'a, Message> {

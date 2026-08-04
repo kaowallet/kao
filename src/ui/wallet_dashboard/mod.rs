@@ -2161,7 +2161,12 @@ impl WalletScreen {
                     .map_or(self.address, |d| Address::from(d.address));
                 spawn_txbuilder_simulate(self.network.clone(), seq, chain, from, calls)
             }
-            O::Review { calls, preflight } => self.open_txbuilder_review(calls, preflight),
+            O::Review {
+                calls,
+                preflight,
+                sim,
+                fee_caveats,
+            } => self.open_txbuilder_review(calls, preflight, sim.map(|s| *s), fee_caveats),
             O::PersistTemplates { list, rollback } => {
                 if let Err(e) = crate::txbuilder::templates::save(&list) {
                     // The pane already applied the change optimistically. Put
@@ -2187,6 +2192,8 @@ impl WalletScreen {
         &mut self,
         calls: Vec<crate::txbuilder::QueuedCall>,
         preflight: tx_builder::Preflight,
+        sim: Option<crate::txbuilder::sim::BatchSimResult>,
+        fee_caveats: Vec<String>,
     ) -> Task<Message> {
         if self.sign_review.is_some() || calls.is_empty() {
             return Task::none();
@@ -2223,8 +2230,27 @@ impl WalletScreen {
             can_execute,
             preflight: preflight.clone(),
         };
+        // Signer-relative economics: the calls execute as the Safe on the
+        // MultiSend path and as the account itself on the EOA path, and that is
+        // the balance the user is reasoning about.
+        let (sender, net) = match &req {
+            tx_builder::BatchSignRequest::Safe(s) => (s.safe, s.chain.into()),
+            tx_builder::BatchSignRequest::Eoa(e) => (e.from, e.net),
+        };
+        let economics = build_batch_economics(
+            &calls,
+            sim.as_ref(),
+            // The one verdict that carries staleness. Every other shape either
+            // has no numbers to go stale or is already refused.
+            matches!(preflight, tx_builder::Preflight::Passed { stale: true, .. }),
+            sender,
+            net,
+            &self.portfolio,
+            fee_caveats,
+        );
         let mut review =
             sign_review::SignReview::pending(title, subtitle, Vec::new(), note, seq, action);
+        review.economics = Some(economics);
         // The Safe arm re-derives its label once the prepare pins the hash (it
         // needs the execute/propose fork); the EOA arm has no such pass, so its
         // override is set here and never revisited.
@@ -2234,6 +2260,182 @@ impl WalletScreen {
         self.sign_review = Some(review);
         let local_names = build_local_names(&self.accounts, &self.safes, &self.contacts);
         spawn_txbuilder_prepare(self.network.clone(), seq, req, local_names)
+    }
+}
+
+/// Build the review's "what this moves and what it costs" block.
+///
+/// Pure, so the whole economics surface can be pinned by tests without a live
+/// dashboard — same reason [`txbuilder_review_copy`] is.
+///
+/// Two independent sources, deliberately kept distinguishable:
+/// - **native value** comes from the calls themselves and is always known, so
+///   an unsimulated batch (a custom network, or a preflight never run) still
+///   states the ETH it moves;
+/// - **token movement** comes from the simulation's `Transfer` logs, and is
+///   only claimed when a simulation actually succeeded. `simulated: false`
+///   makes the card say the list is partial rather than let an empty list read
+///   as "moves no tokens".
+///
+/// Everything is signer-relative: `sender` is the address the calls execute as
+/// — the Safe for a MultiSend delegatecall, the account itself for an EOA —
+/// which is the account whose balance the user is reasoning about.
+///
+/// **Fungible transfers are netted per token, not listed per log.**
+/// `BatchSimResult::transfers` is the concatenation of every `Transfer` event
+/// across every step, so a single swap arrives here as the hop into the pool,
+/// the hop out of it, and whatever the router did in between. Rendered raw that
+/// is eight rows the user has to reconcile by hand, several of them between two
+/// third parties; netted it is the two lines they actually asked for. Transfers
+/// touching neither side of the signer cancel out of the sum by construction,
+/// which is the correct treatment: they are not a change to this account's
+/// balance, and every one of them is already on a leg above.
+///
+/// NFTs are exempt from the netting — token ids don't sum — so they are listed
+/// individually, and only when the signer is a party.
+fn build_batch_economics(
+    calls: &[crate::txbuilder::QueuedCall],
+    sim: Option<&crate::txbuilder::sim::BatchSimResult>,
+    stale: bool,
+    sender: Address,
+    net: crate::chain::NetworkId,
+    portfolio: &[crate::portfolio::LiveToken],
+    fee_caveats: Vec<String>,
+) -> sign_review::BatchEconomics {
+    use sign_review::{MoveDirection, MovedAmount};
+
+    let mut moves = Vec::new();
+
+    // Native value the calls carry. Summed across the batch: one line for "this
+    // transaction moves 0.4 ETH" beats N lines the user has to add up, and the
+    // per-call figure is already on each leg.
+    let native: U256 = calls
+        .iter()
+        .fold(U256::ZERO, |acc, c| acc.saturating_add(c.value));
+    if !native.is_zero() {
+        let symbol = net.builtin().map_or("native coin", |c| c.native_symbol());
+        moves.push(MovedAmount {
+            amount: format!(
+                "{} {symbol}",
+                crate::portfolio::format_token_balance(native, 18).0
+            ),
+            direction: MoveDirection::Out,
+        });
+    }
+
+    // Token movement, only from a simulation that actually succeeded. A revert
+    // performs no net transfer, and `simulate_batch` clears the list on one —
+    // so treating any non-success as "no token rows, and say the list is
+    // partial" is both correct and the safe direction to be wrong in.
+    let simulated = sim.is_some_and(|s| s.is_success());
+    if let Some(s) = sim.filter(|s| s.is_success()) {
+        // Net per token, in first-seen order so the rows keep the batch's own
+        // narrative (what you spent, then what you got) rather than an address
+        // sort. `(in, out)` accumulators rather than a signed integer: U256 has
+        // no negative, and the pair is what the sign is derived from anyway.
+        let mut order: Vec<Address> = Vec::new();
+        let mut totals: std::collections::HashMap<Address, (U256, U256)> =
+            std::collections::HashMap::new();
+        for tr in s.transfers.iter().filter(|tr| !tr.is_nft) {
+            let incoming = tr.to == sender;
+            let outgoing = tr.from == sender;
+            // A self-transfer nets to nothing and a third-party hop is not this
+            // account's balance; both fall out here rather than at render time.
+            if incoming == outgoing {
+                continue;
+            }
+            let e = totals.entry(tr.token).or_insert_with(|| {
+                order.push(tr.token);
+                (U256::ZERO, U256::ZERO)
+            });
+            if incoming {
+                e.0 = e.0.saturating_add(tr.value);
+            } else {
+                e.1 = e.1.saturating_add(tr.value);
+            }
+        }
+        for token in order {
+            let (inc, out) = totals[&token];
+            // Exactly equal in and out is a round trip that left the balance
+            // where it started — a row reading "0 USDC" states a change that
+            // did not happen.
+            let (value, direction) = match inc.cmp(&out) {
+                std::cmp::Ordering::Equal => continue,
+                std::cmp::Ordering::Greater => (inc - out, MoveDirection::In),
+                std::cmp::Ordering::Less => (out - inc, MoveDirection::Out),
+            };
+            moves.push(MovedAmount {
+                amount: format_token_amount(token, value, false, net, portfolio),
+                direction,
+            });
+        }
+        // NFTs: token ids don't sum, so each one the signer is a party to gets
+        // its own row.
+        for tr in s.transfers.iter().filter(|tr| tr.is_nft) {
+            let direction = if tr.to == sender {
+                MoveDirection::In
+            } else if tr.from == sender {
+                MoveDirection::Out
+            } else {
+                continue;
+            };
+            moves.push(MovedAmount {
+                amount: format_token_amount(tr.token, tr.value, true, net, portfolio),
+                direction,
+            });
+        }
+    }
+
+    sign_review::BatchEconomics {
+        moves,
+        simulated,
+        verified: sim.is_some_and(|s| s.verified),
+        stale,
+        // Gas and the base fee are only meaningful off a run that executed.
+        gas_used: sim.filter(|s| s.is_success()).map_or(0, |s| s.gas_used),
+        base_fee_per_gas: sim
+            .filter(|s| s.is_success())
+            .map_or(0, |s| s.base_fee_per_gas),
+        fee_caveats,
+    }
+}
+
+/// Denominate a token amount for display, resolving the contract against the
+/// live portfolio for a symbol and decimals.
+///
+/// Mirrors `sim_view::transfer_row`'s fallback exactly: an unknown contract
+/// renders raw base units against a shortened address rather than guessing 18
+/// decimals, because a guessed denomination is a wrong number stated with
+/// confidence.
+fn format_token_amount(
+    token: Address,
+    value: U256,
+    is_nft: bool,
+    net: crate::chain::NetworkId,
+    portfolio: &[crate::portfolio::LiveToken],
+) -> String {
+    // Match on (chain, contract): the portfolio is multi-chain, and the same
+    // contract address on L1 and an L2 is not the same token.
+    let known = portfolio
+        .iter()
+        .find(|p| p.chain == net && p.contract == Some(token));
+    match known {
+        Some(tk) if is_nft => format!("#{value} {}", tk.symbol),
+        Some(tk) => format!(
+            "{} {}",
+            crate::portfolio::format_token_balance(value, tk.decimals).0,
+            tk.symbol
+        ),
+        None => {
+            let bytes = token.as_slice();
+            let head = alloy::hex::encode(&bytes[..4]);
+            let tail = alloy::hex::encode(&bytes[bytes.len() - 4..]);
+            if is_nft {
+                format!("#{value} of 0x{head}…{tail}")
+            } else {
+                format!("{value} units of 0x{head}…{tail}")
+            }
+        }
     }
 }
 
@@ -13502,6 +13704,302 @@ mod tests {
         }
     }
 
+    /// A successful batch simulation carrying `transfers`, metered at
+    /// `gas_used` against a 12 gwei block.
+    fn sim_ok(
+        transfers: Vec<crate::wallet::sim::TokenTransfer>,
+        gas_used: u64,
+    ) -> crate::txbuilder::sim::BatchSimResult {
+        crate::txbuilder::sim::BatchSimResult {
+            outcome: crate::txbuilder::sim::BatchOutcome::Success,
+            gas_used,
+            transfers,
+            verified: true,
+            base_fee_per_gas: 12_000_000_000,
+            block: 1_000,
+            block_gas_limit: 30_000_000,
+        }
+    }
+
+    fn transfer(
+        token: Address,
+        from: Address,
+        to: Address,
+        value: u64,
+    ) -> crate::wallet::sim::TokenTransfer {
+        crate::wallet::sim::TokenTransfer {
+            token,
+            from,
+            to,
+            value: U256::from(value),
+            is_nft: false,
+        }
+    }
+
+    /// A portfolio row so a token contract resolves to a symbol + decimals.
+    fn live_token(symbol: &str, contract: Address, decimals: u8) -> crate::portfolio::LiveToken {
+        crate::portfolio::LiveToken {
+            symbol: symbol.into(),
+            name: symbol.into(),
+            balance: "0".into(),
+            balance_f64: 0.0,
+            balance_raw: U256::ZERO,
+            decimals,
+            contract: Some(contract),
+            usd_price: 0.0,
+            usd_value: 0.0,
+            chain: Chain::Mainnet.into(),
+        }
+    }
+
+    #[test]
+    fn economics_total_the_native_value_the_calls_carry() {
+        // Knowable without a simulator, so it must survive one being absent —
+        // this is the whole economics surface on a custom network.
+        let calls = vec![
+            queued(1, addr(0xC1), 400_000_000_000_000_000, vec![0x01]),
+            queued(2, addr(0xC2), 100_000_000_000_000_000, vec![0x02]),
+        ];
+        let e = build_batch_economics(
+            &calls,
+            None,
+            false,
+            addr(0xAA),
+            Chain::Mainnet.into(),
+            &[],
+            Vec::new(),
+        );
+        assert_eq!(e.moves.len(), 1, "one summed native row, not one per call");
+        assert_eq!(e.moves[0].direction, sign_review::MoveDirection::Out);
+        assert!(
+            e.moves[0].amount.contains("0.5") && e.moves[0].amount.ends_with("ETH"),
+            "{}",
+            e.moves[0].amount,
+        );
+        assert!(!e.simulated, "no simulation stands behind this");
+        assert!(e.fee_eth().is_none(), "no gas figure ⇒ no fee claimed");
+    }
+
+    #[test]
+    fn economics_net_a_swap_down_to_what_the_account_actually_moved() {
+        // The shape a real swap arrives in: the router pulls the sell token,
+        // the pool pays out, and there is a hop between two third parties in
+        // the middle. Rendered per-log that is four rows to reconcile by hand;
+        // netted it is the two lines the user asked for.
+        let me = addr(0xAA);
+        let usdc = addr(0xDC);
+        let weth = addr(0xEE);
+        let router = addr(0xBB);
+        let pool = addr(0xCC);
+        let sim = sim_ok(
+            vec![
+                transfer(usdc, me, router, 3_000_000_000),
+                transfer(usdc, me, router, 2_000_000_000),
+                // Neither side is the signer — not this account's balance.
+                transfer(usdc, router, pool, 5_000_000_000),
+                transfer(weth, pool, me, 1_940_000_000_000_000_000),
+            ],
+            1_200_000,
+        );
+        let portfolio = vec![live_token("USDC", usdc, 6), live_token("WETH", weth, 18)];
+        let e = build_batch_economics(
+            &[queued(1, usdc, 0, vec![0x01])],
+            Some(&sim),
+            false,
+            me,
+            Chain::Mainnet.into(),
+            &portfolio,
+            Vec::new(),
+        );
+        use sign_review::MoveDirection::*;
+        assert_eq!(
+            e.moves.iter().map(|m| m.direction).collect::<Vec<_>>(),
+            vec![Out, In],
+            "one row per token, in the order the batch touched them",
+        );
+        assert!(
+            e.moves[0].amount.starts_with("5000") && e.moves[0].amount.ends_with("USDC"),
+            "the two pulls sum, the third-party hop does not count: {}",
+            e.moves[0].amount,
+        );
+        assert!(
+            e.moves[1].amount.starts_with("1.94") && e.moves[1].amount.ends_with("WETH"),
+            "{}",
+            e.moves[1].amount,
+        );
+        assert!(e.simulated && e.verified && !e.stale);
+    }
+
+    #[test]
+    fn a_token_that_comes_back_where_it_started_gets_no_row() {
+        // A flash-loan-shaped batch: out and back in the same amount. The
+        // balance did not change, and a row reading "0 USDC" would state a
+        // change that did not happen.
+        let me = addr(0xAA);
+        let usdc = addr(0xDC);
+        let sim = sim_ok(
+            vec![
+                transfer(usdc, me, addr(0xBB), 1_000_000),
+                transfer(usdc, addr(0xBB), me, 1_000_000),
+            ],
+            300_000,
+        );
+        let e = build_batch_economics(
+            &[queued(1, usdc, 0, vec![0x01])],
+            Some(&sim),
+            false,
+            me,
+            Chain::Mainnet.into(),
+            &[live_token("USDC", usdc, 6)],
+            Vec::new(),
+        );
+        assert!(e.moves.is_empty(), "{:?}", e.moves);
+    }
+
+    #[test]
+    fn an_nft_is_listed_per_token_id_rather_than_netted() {
+        // Token ids don't sum: #7 out and #9 in is two facts, not a delta.
+        let me = addr(0xAA);
+        let bayc = addr(0xB1);
+        let mut out = transfer(bayc, me, addr(0xBB), 7);
+        out.is_nft = true;
+        let mut inc = transfer(bayc, addr(0xBB), me, 9);
+        inc.is_nft = true;
+        let sim = sim_ok(vec![out, inc], 300_000);
+        let e = build_batch_economics(
+            &[queued(1, bayc, 0, vec![0x01])],
+            Some(&sim),
+            false,
+            me,
+            Chain::Mainnet.into(),
+            &[live_token("BAYC", bayc, 0)],
+            Vec::new(),
+        );
+        use sign_review::MoveDirection::*;
+        assert_eq!(
+            e.moves.iter().map(|m| m.direction).collect::<Vec<_>>(),
+            vec![Out, In],
+        );
+        assert_eq!(e.moves[0].amount, "#7 BAYC");
+        assert_eq!(e.moves[1].amount, "#9 BAYC");
+    }
+
+    #[test]
+    fn economics_do_not_guess_decimals_for_an_unknown_token() {
+        // A guessed denomination is a wrong number stated with confidence —
+        // the fallback shows raw units against the contract instead.
+        let me = addr(0xAA);
+        let unknown = addr(0xD1);
+        let sim = sim_ok(vec![transfer(unknown, me, addr(0xBB), 1_234)], 100_000);
+        let e = build_batch_economics(
+            &[queued(1, unknown, 0, vec![0x01])],
+            Some(&sim),
+            false,
+            me,
+            Chain::Mainnet.into(),
+            &[],
+            Vec::new(),
+        );
+        assert_eq!(e.moves.len(), 1);
+        assert!(
+            e.moves[0].amount.starts_with("1234 units of 0x"),
+            "{}",
+            e.moves[0].amount,
+        );
+    }
+
+    #[test]
+    fn a_reverting_simulation_quotes_no_fee_and_claims_no_token_movement() {
+        // The batch never executes, so its metered gas is not a cost the user
+        // would pay — and `simulated` must stay false so an empty token list
+        // reads as "unknown", not as "moves nothing".
+        let me = addr(0xAA);
+        let mut sim = sim_ok(Vec::new(), 900_000);
+        sim.outcome = crate::txbuilder::sim::BatchOutcome::Revert {
+            step: 0,
+            reason: "ERC20: insufficient allowance".into(),
+        };
+        let e = build_batch_economics(
+            &[queued(1, addr(0xC1), 0, vec![0x01])],
+            Some(&sim),
+            false,
+            me,
+            Chain::Mainnet.into(),
+            &[],
+            Vec::new(),
+        );
+        assert!(!e.simulated, "a revert is not a statement about movement");
+        assert_eq!(e.gas_used, 0, "no fee quoted for a batch that reverts");
+        assert!(e.fee_eth().is_none());
+        assert!(
+            e.is_empty(),
+            "nothing to say ⇒ the card is skipped entirely"
+        );
+    }
+
+    #[test]
+    fn economics_quote_a_base_fee_estimate_over_the_simulated_gas() {
+        let e = build_batch_economics(
+            &[queued(1, addr(0xC1), 0, vec![0x01])],
+            Some(&sim_ok(Vec::new(), 21_000)),
+            false,
+            addr(0xAA),
+            Chain::Mainnet.into(),
+            &[],
+            vec!["excludes the priority tip".to_string()],
+        );
+        // 21 000 gas × 12 gwei = 0.000252 ETH.
+        assert_eq!(e.fee_eth().as_deref(), Some("0.000252"));
+        assert!(!e.is_empty(), "a fee alone is worth the card");
+        assert_eq!(e.fee_caveats.len(), 1);
+    }
+
+    #[test]
+    fn a_stale_verdict_does_not_get_the_verified_badge() {
+        // Verification and freshness are different properties. A Helios-verified
+        // read of a balance that has since moved is precisely verified and no
+        // longer true, so `stale` has to reach the card rather than being left
+        // to the note.
+        let mut s = screen_with_key();
+        let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
+        let _ = s.open_txbuilder_review(
+            calls,
+            tx_builder::Preflight::Passed {
+                stale: true,
+                verified: true,
+            },
+            Some(sim_ok(Vec::new(), 21_000)),
+            Vec::new(),
+        );
+        let e = s
+            .sign_review
+            .as_ref()
+            .expect("overlay")
+            .economics
+            .as_ref()
+            .expect("economics");
+        assert!(e.stale && e.verified, "both are true and both are carried");
+    }
+
+    #[test]
+    fn the_review_carries_what_the_batch_moves_and_costs() {
+        // End-to-end through the coordinator: the overlay the user reads must
+        // actually hold the block, not just the builder be capable of one.
+        let mut s = screen_with_key();
+        let calls = vec![queued(1, addr(0xC1), 250_000_000_000_000_000, vec![0x01])];
+        let _ = s.open_txbuilder_review(
+            calls,
+            PASSED_CLEAN,
+            Some(sim_ok(Vec::new(), 21_000)),
+            vec!["excludes the priority tip".to_string()],
+        );
+        let review = s.sign_review.as_ref().expect("overlay opened");
+        let e = review.economics.as_ref().expect("economics attached");
+        assert_eq!(e.fee_eth().as_deref(), Some("0.000252"));
+        assert_eq!(e.moves.len(), 1, "the ETH the call carries");
+        assert!(e.moves[0].amount.contains("0.25"), "{}", e.moves[0].amount);
+    }
+
     /// `approve(spender, amount)` calldata. `amount == 0` is the
     /// allowance-reset the flash-approval disclosure counts.
     fn approve_data(spender: Address, amount: u64) -> Vec<u8> {
@@ -14386,7 +14884,7 @@ mod tests {
             queued(1, addr(0xC1), 0, vec![0x01]),
             queued(2, addr(0xC2), 0, vec![0x02]),
         ];
-        let _ = s.open_txbuilder_review(calls, PASSED_CLEAN);
+        let _ = s.open_txbuilder_review(calls, PASSED_CLEAN, None, Vec::new());
         assert!(s.sign_review.is_none(), "no overlay opened");
         let err = s
             .apps
@@ -14407,6 +14905,8 @@ mod tests {
                 at: "call #1".to_string(),
                 reason: "reverted".into(),
             },
+            None,
+            Vec::new(),
         );
         let review = s.sign_review.as_ref().expect("overlay opened");
         let note = review.note.as_deref().expect("a note");

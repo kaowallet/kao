@@ -66,6 +66,44 @@ pub enum Settled {
     Executed { hash: B256 },
     /// Filed on the Transaction Service at `nonce`, awaiting co-signers.
     Proposed { nonce: u64 },
+    /// Mined with `status == 0` — every call rolled back and the gas was spent.
+    /// The batch stays in the composer, because the user will want to fix it.
+    Reverted { hash: B256 },
+    /// Broadcast, and no receipt was read before the poll window closed (or
+    /// there was no RPC to read one with).
+    ///
+    /// **Not a failure.** The transaction is in the mempool and may mine at any
+    /// time, so this is the one outcome where rebuilding the batch is actively
+    /// dangerous: the composer still holds it, and running it again would
+    /// execute it twice if the first one lands. The strip says so and keeps the
+    /// hash, which used to be dropped the moment the overlay was dismissed.
+    Unconfirmed { hash: B256 },
+}
+
+/// What became of a broadcast batch, as read from its receipt.
+///
+/// Replaces a `Result<(), String>` whose error arm conflated two opposite
+/// facts. "Reverted" is a *verdict*: the transaction mined, the nonce is spent,
+/// and it can never execute. "No receipt yet" is the *absence* of a verdict:
+/// the transaction is live and may still mine. Both used to re-arm the overlay's
+/// Confirm button with the reason in an error banner, so the second one invited
+/// the user to sign and broadcast the same batch a second time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchFate {
+    /// Mined with `status == 1`.
+    Mined,
+    /// Mined with `status == 0`.
+    Reverted,
+    /// No receipt within the poll window, or no RPC to read one.
+    Unknown { reason: String },
+}
+
+impl BatchFate {
+    /// Whether the transaction's outcome is settled. `false` means it may still
+    /// be pending — the case where re-broadcasting risks a double execution.
+    pub fn is_decided(&self) -> bool {
+        !matches!(self, Self::Unknown { .. })
+    }
 }
 
 /// The JSON import/export overlay, if any.
@@ -519,6 +557,21 @@ pub enum Outcome {
         /// button can't read as a routine "sign this" over a batch the user
         /// just watched revert.
         preflight: Preflight,
+        /// The simulation `preflight` was derived from, carried so the review
+        /// can state what the batch moves and what it costs.
+        ///
+        /// Deliberately the *same* value the verdict came from, read in the
+        /// same expression: derived twice, a re-read could describe a different
+        /// batch than the verdict beside it, which is exactly the class of
+        /// desync the rest of this flow is built to prevent. `None` when no
+        /// simulation stands behind the review (never run, or an unsimulable
+        /// custom network) — the economics then cover only what the calls
+        /// themselves declare.
+        sim: Option<Box<BatchSimResult>>,
+        /// How the fee estimate is wrong, in the user's terms — derived here
+        /// because the batch's shape (Safe wrapper, 7702 batch, single call) is
+        /// the pane's knowledge, not the overlay's.
+        fee_caveats: Vec<String>,
     },
     /// Persist the user's template list to redb.
     ///
@@ -1181,6 +1234,9 @@ impl TxBuilderApp {
                 return Some(Outcome::Review {
                     calls: self.effective_calls(),
                     preflight: self.preflight(),
+                    // Same `self.sim` the verdict above was derived from.
+                    sim: self.sim.clone().map(Box::new),
+                    fee_caveats: self.fee_caveats(),
                 });
             }
             Message::ToggleTemplateMenu => {
@@ -1717,6 +1773,53 @@ impl TxBuilderApp {
         out
     }
 
+    /// How wrong the review's fee estimate is, phrased for the user.
+    ///
+    /// The estimate is `simulated gas × the simulated block's base fee`, which
+    /// is the only fee figure this flow can honestly produce before signing: a
+    /// real `eth_estimateGas` needs the assembled owner signatures on the Safe
+    /// path, and on the 7702 path it needs the authorization the review exists
+    /// to get agreed to. So the number is stated with its error bars rather
+    /// than withheld — and the bars run in both directions.
+    ///
+    /// Derived from the batch's shape, like [`Self::sim_blind_spots`], so a
+    /// single call on Mainnet doesn't carry the wrapper and L1-data caveats
+    /// that belong to a Safe batch on Base.
+    fn fee_caveats(&self) -> Vec<String> {
+        let mut out =
+            vec!["excludes the priority tip, which every transaction also pays".to_string()];
+        // On the OP stack the L1 data fee is frequently the larger half of the
+        // total, so omitting it silently would understate the cost by more than
+        // the figure itself.
+        if matches!(self.net.builtin(), Some(Chain::Base | Chain::Optimism)) {
+            out.push(
+                "excludes the L1 data fee, which on this chain is often the larger half of the \
+                 total"
+                    .to_string(),
+            );
+        }
+        if self.ctx.is_safe {
+            out.push(
+                "excludes the execTransaction wrapper and its per-owner signature checks"
+                    .to_string(),
+            );
+            out.push("excludes the MultiSend dispatch loop".to_string());
+        } else if self.effective_calls().len() > 1 {
+            out.push("excludes the executeBatch dispatch loop".to_string());
+        }
+        // The one caveat that runs the other way. Named because a user
+        // reconciling this against the figure their device shows deserves to
+        // know which direction the gap points.
+        if self.effective_calls().len() > 1 {
+            out.push(
+                "counts the 21,000 intrinsic gas once per call, where the real transaction pays \
+                 it once in total"
+                    .to_string(),
+            );
+        }
+        out
+    }
+
     /// Whether the active identity can execute more than one call atomically —
     /// a Safe (MultiSend) or a 7702-capable EOA. Gates the flash-approval
     /// toggle: appending a revoke only makes sense if the batch can batch.
@@ -1931,6 +2034,11 @@ impl TxBuilderApp {
                     // This path only exists on custom networks, where there is
                     // no simulator to have run.
                     preflight: Preflight::Unsupported,
+                    sim: None,
+                    // No simulation means no gas figure, so the review shows no
+                    // fee at all here and there is nothing to qualify. The
+                    // native value the call carries still reaches the card.
+                    fee_caveats: Vec::new(),
                 })
             }
             Err(e) => {
@@ -3156,7 +3264,9 @@ mod tests {
         }
         assert!(app.sim_busy);
         match app.update(Message::Review) {
-            Some(Outcome::Review { calls, preflight }) => {
+            Some(Outcome::Review {
+                calls, preflight, ..
+            }) => {
                 assert_eq!(calls.len(), 2);
                 // Simulate was fired but hasn't landed — the review must not
                 // present an unsimulated batch as if it had passed.
@@ -3763,7 +3873,9 @@ mod tests {
         let to = address!("0x000000000000000000000000000000000000dEaD");
         app.update(Message::RawToChanged(to.to_string()));
         match app.update(Message::SendSingle) {
-            Some(Outcome::Review { calls, preflight }) => {
+            Some(Outcome::Review {
+                calls, preflight, ..
+            }) => {
                 assert_eq!(calls.len(), 1);
                 assert_eq!(
                     preflight,
@@ -3789,6 +3901,96 @@ mod tests {
             Modal::Load,
             "the user still needs somewhere to put the file"
         );
+    }
+
+    /// N identical queued calls, for the shape-derived caveat tests.
+    fn n_calls(n: u64) -> Vec<QueuedCall> {
+        (0..n)
+            .map(|i| QueuedCall {
+                id: i,
+                to: Address::repeat_byte(0xC1),
+                value: U256::ZERO,
+                data: Bytes::from(vec![0x01]),
+                title: "t".into(),
+                detail: "d".into(),
+                signature: None,
+                decoded_args: Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fee_caveats_name_only_what_applies_to_this_batch() {
+        // A single Mainnet EOA call: no wrapper, no L2 data fee, and the
+        // intrinsic gas is counted exactly once, so the tip is the only gap.
+        let mut app = eoa_app();
+        app.batch = n_calls(1);
+        let c = app.fee_caveats();
+        assert_eq!(c.len(), 1, "{c:?}");
+        assert!(c[0].contains("priority tip"), "{c:?}");
+    }
+
+    #[test]
+    fn fee_caveats_flag_the_l1_data_fee_only_on_the_op_stack() {
+        let mut app = eoa_app();
+        app.batch = n_calls(1);
+        assert!(
+            !app.fee_caveats().iter().any(|c| c.contains("L1 data fee")),
+            "Mainnet has no L1 data fee to exclude",
+        );
+        app.update(Message::SetNetwork(NetworkId::Builtin(Chain::Base)));
+        app.batch = n_calls(1);
+        assert!(
+            app.fee_caveats().iter().any(|c| c.contains("L1 data fee")),
+            "on Base it is often the larger half of the cost",
+        );
+    }
+
+    #[test]
+    fn fee_caveats_disclose_the_intrinsic_over_count_only_on_a_batch() {
+        // The one caveat that runs the *other* way: the estimate is too high,
+        // not too low. Naming it is what lets a user reconcile this figure
+        // against the one their device shows.
+        let mut app = eoa_app();
+        app.batch = n_calls(1);
+        assert!(!app.fee_caveats().iter().any(|c| c.contains("21,000")));
+        app.batch = n_calls(3);
+        assert!(
+            app.fee_caveats().iter().any(|c| c.contains("21,000")),
+            "three calls pay three intrinsics here and one on chain",
+        );
+    }
+
+    #[test]
+    fn a_safe_batch_discloses_the_wrapper_the_estimate_cannot_see() {
+        let mut app = safe_app();
+        app.batch = n_calls(2);
+        let c = app.fee_caveats();
+        assert!(c.iter().any(|x| x.contains("execTransaction")), "{c:?}");
+        assert!(c.iter().any(|x| x.contains("MultiSend")), "{c:?}");
+    }
+
+    #[test]
+    fn the_review_carries_the_simulation_its_verdict_came_from() {
+        // The economics and the preflight verdict must describe the same run —
+        // derived twice, they could describe different batches.
+        let mut app = safe_app();
+        app.batch = n_calls(2);
+        app.sim = Some(BatchSimResult {
+            outcome: BatchOutcome::Success,
+            gas_used: 210_000,
+            transfers: Vec::new(),
+            verified: true,
+            base_fee_per_gas: 12_000_000_000,
+            block: 1,
+            block_gas_limit: 30_000_000,
+        });
+        let Some(Outcome::Review { sim, preflight, .. }) = app.update(Message::Review) else {
+            panic!("review outcome");
+        };
+        assert!(matches!(preflight, Preflight::Passed { .. }));
+        let sim = sim.expect("the verdict's own simulation rides along");
+        assert_eq!(sim.gas_used, 210_000);
     }
 
     #[test]

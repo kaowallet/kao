@@ -549,9 +549,16 @@ pub struct BatchSimResult {
     /// that check deliberately treats "over half a block" as already too
     /// close to call rather than trusting the number near the boundary.
     pub gas_used: u64,
-    /// Net token transfers observed across all sub-calls. Only meaningful on
-    /// `Success` — a reverting batch performs no net transfer, so it's
-    /// cleared.
+    /// Every ERC-20/721 `Transfer` event emitted across all sub-calls, in
+    /// execution order. **Not netted** — this is the concatenation of each
+    /// step's logs, so one swap contributes the hop into the pool and the hop
+    /// out of it, and a router contributes its own legs in between. A consumer
+    /// presenting these as balance changes has to net them itself (see
+    /// `wallet_dashboard::build_batch_economics`, which sums per token against
+    /// the sending account).
+    ///
+    /// Only meaningful on `Success` — a reverting batch performs no transfer,
+    /// so it's cleared.
     pub transfers: Vec<TokenTransfer>,
     pub verified: bool,
     pub base_fee_per_gas: u64,

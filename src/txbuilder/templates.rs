@@ -30,6 +30,8 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use alloy::primitives::Address;
+
 use crate::chain::Chain;
 
 use super::{QueuedCall, TxBuilderError, bundle};
@@ -64,6 +66,15 @@ pub struct Template {
     /// JSON, where it always was; this is a cache, repopulated on load.
     #[serde(skip)]
     pub chain_id: Option<u64>,
+    /// The account the batch was composed as, cached out of `bundle_json` the
+    /// same way — and `#[serde(skip)]` for the same reason.
+    ///
+    /// A template is the shape this matters most in: saving a batch and running
+    /// it later, under whatever identity happens to be active, is the whole
+    /// point of the feature. `None` for a row saved before this was recorded,
+    /// which reads as "unknown" and makes no claim either way.
+    #[serde(skip)]
+    pub from: Option<Address>,
 }
 
 impl Template {
@@ -74,6 +85,7 @@ impl Template {
         name: impl Into<String>,
         kaomoji: impl Into<String>,
         chain: Chain,
+        from: Address,
         calls: &[QueuedCall],
     ) -> Self {
         Self {
@@ -81,8 +93,9 @@ impl Template {
             kaomoji: kaomoji.into(),
             note: "saved".into(),
             call_count: calls.len(),
-            bundle_json: bundle::export(chain, None, calls),
+            bundle_json: bundle::export(chain, None, from, calls),
             chain_id: Some(chain.chain_id()),
+            from: Some(from),
         }
     }
 
@@ -122,9 +135,11 @@ impl Template {
     /// Re-read the cached `chain_id` out of the stored bundle JSON. Called on
     /// load, where the field always arrives `None` (it is never serialized).
     fn hydrate_chain(&mut self) {
-        self.chain_id = serde_json::from_str::<bundle::Bundle>(&self.bundle_json)
+        let meta = serde_json::from_str::<bundle::Bundle>(&self.bundle_json)
             .ok()
-            .and_then(|b| b.meta.kao_chain_id);
+            .map(|b| b.meta);
+        self.chain_id = meta.as_ref().and_then(|m| m.kao_chain_id);
+        self.from = meta.as_ref().and_then(bundle::Meta::composed_as);
     }
 }
 

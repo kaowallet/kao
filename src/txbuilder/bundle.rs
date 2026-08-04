@@ -110,6 +110,28 @@ pub struct Meta {
         skip_serializing_if = "Option::is_none"
     )]
     pub kao_chain_id: Option<u64>,
+    /// The account the batch was composed *as* — the Safe in Safe mode, the
+    /// EOA otherwise.
+    ///
+    /// A batch's calls are written against one account: its allowances, its
+    /// balances, its position. Reloading it under a different identity re-aims
+    /// every one of them, and the natural workflow is exactly the dangerous one
+    /// (compose and test as your EOA, save, switch to the Safe to run it).
+    /// `meta.safe` recorded half of this and only for a Safe; nothing read it.
+    ///
+    /// **A disclosure, not a gate.** An imported bundle's `meta` is authored by
+    /// whoever wrote the file, so a mismatch here can't be trusted as a
+    /// *refusal* — it is worth saying out loud, and worth nothing as a wall.
+    /// The value is real for a batch this wallet exported and reloads itself.
+    #[serde(default, rename = "kaoFrom", skip_serializing_if = "Option::is_none")]
+    pub kao_from: Option<String>,
+}
+
+impl Meta {
+    /// The composing identity, when one was recorded and parses.
+    pub fn composed_as(&self) -> Option<Address> {
+        self.kao_from.as_ref()?.parse().ok()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -207,7 +229,11 @@ pub mod indexmap_lite {
 }
 
 /// Serialize a batch to a pretty Safe-compatible JSON string.
-pub fn export(chain: Chain, safe: Option<Address>, calls: &[QueuedCall]) -> String {
+///
+/// `from` is the account the batch was composed as, recorded so reloading it
+/// under a different identity can say so — see [`Meta::kao_from`]. `safe` stays
+/// the Safe-app-compatible field and is `None` for an EOA batch.
+pub fn export(chain: Chain, safe: Option<Address>, from: Address, calls: &[QueuedCall]) -> String {
     let transactions = calls.iter().map(tx_from_call).collect();
     let bundle = Bundle {
         version: format!("{FORMAT_MAJOR}.0"),
@@ -218,6 +244,7 @@ pub fn export(chain: Chain, safe: Option<Address>, calls: &[QueuedCall]) -> Stri
             tx_builder_version: concat!("kao-", env!("CARGO_PKG_VERSION")).into(),
             safe: safe.map(|s| s.to_string()),
             kao_chain_id: Some(chain.chain_id()),
+            kao_from: Some(from.to_string()),
         },
         transactions,
     };

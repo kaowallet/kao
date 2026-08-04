@@ -102,6 +102,21 @@ pub struct ReviewLeg {
     ///
     /// Empty for an ordinary single-call leg.
     pub sub_legs: Vec<ReviewLeg>,
+    /// Set when this leg calls the very account it executes as.
+    ///
+    /// For a Safe batch that is the multisig reconfiguring itself:
+    /// `MultiSendCallOnly` is reached by `DELEGATECALL`, so every packed
+    /// sub-call runs with the Safe as `msg.sender` — which is the one and only
+    /// way to satisfy the `authorized` modifier on `addOwnerWithThreshold`,
+    /// `changeThreshold`, `setGuard` and `enableModule`. A bundle pasted from
+    /// a dapp can therefore carry a call that hands the Safe to someone else,
+    /// and it renders as an ordinary leg addressed to a plain hex address.
+    ///
+    /// The string is what the call *changes*, in the user's terms. A self-call
+    /// whose selector isn't one this wallet recognises still gets a value here
+    /// — an unrecognised call to the account's own address is more alarming
+    /// than a recognised one, not less.
+    pub self_admin: Option<String>,
 }
 
 /// The EIP-7702 delegation an atomic EOA batch rides on.
@@ -657,6 +672,16 @@ pub struct SignReview {
     /// where the step's own renderer already carries it (the Send review's
     /// `TxQuote` + simulation block).
     pub economics: Option<BatchEconomics>,
+    /// The hash of a transaction this review has already put on the wire.
+    ///
+    /// A **broadcast-once latch**: while it is set, Confirm is dead no matter
+    /// what else happens to the overlay. A receipt that never arrived used to
+    /// clear `signing_since`, drop the hash and hand the user back a live
+    /// Confirm button under the words "not confirmed in time" — an invitation
+    /// to sign and broadcast the same batch again while the first one sat in
+    /// the mempool. Signing again is not a retry; it needs a fresh review
+    /// against a fresh nonce, which is what closing this overlay gets you.
+    pub broadcast: Option<B256>,
 }
 
 impl SignReview {
@@ -698,6 +723,7 @@ impl SignReview {
             confirm_disabled: false,
             secondary_label: None,
             economics: None,
+            broadcast: None,
             show_calldata: false,
             show_fingerprints: false,
             signing_progress: None,
@@ -810,16 +836,29 @@ pub fn view<'a>(t: KaoTheme, review: &'a SignReview, progress: f32) -> Element<'
         // approve bytes they haven't been shown yet, and while a step-level guard
         // blocks it (a Send with too little ETH for gas). The label can be
         // overridden per-flow (Send's "Sign & Send" / "Sign anyway ⚠").
-        let label = review.confirm_label.as_deref().unwrap_or("Confirm & sign");
-        let enabled = !review.legs_loading && !review.confirm_disabled;
+        //
+        // `broadcast` is the hard one: this review has already put a transaction
+        // on the wire, so there is nothing left here to confirm. Signing again
+        // is a new transaction at a new nonce and has to go through a new
+        // review — not a second press of a button whose numbers are now stale.
+        let broadcast = review.broadcast.is_some();
+        let label = if broadcast {
+            "Already broadcast"
+        } else {
+            review.confirm_label.as_deref().unwrap_or("Confirm & sign")
+        };
+        let enabled = !review.legs_loading && !review.confirm_disabled && !broadcast;
         let confirm = primary_button(t, label, enabled);
         let confirm = if enabled {
             confirm.on_press(Message::Confirm)
         } else {
             confirm
         };
+        // "Cancel" would be a lie once the transaction is out — there is
+        // nothing left to cancel, only a window to shut.
+        let dismiss = if broadcast { "Close" } else { "Cancel" };
         let actions = row![
-            container(secondary_button(t, "Cancel").on_press(Message::Cancel))
+            container(secondary_button(t, dismiss).on_press(Message::Cancel))
                 .width(Length::FillPortion(1)),
             Space::new().width(10),
             container(confirm).width(Length::FillPortion(1)),
@@ -1348,6 +1387,40 @@ fn operation_banner<'a>(t: KaoTheme, operation: u8, to: Address) -> Element<'a, 
         .into()
 }
 
+/// The banner for a sub-call addressed to the account executing the batch.
+///
+/// Styled like [`operation_banner`] on purpose. That banner is the one place
+/// this surface already raises its voice, and this is the case it was leaving
+/// out: it reassures the reader that `MultiSendCallOnly` "can only make plain
+/// calls", which is true and, for a call addressed to the Safe itself, beside
+/// the point — a plain call from the Safe to the Safe is precisely what the
+/// `authorized` modifier accepts.
+fn self_admin_banner<'a>(t: KaoTheme, warning: &'a str) -> Element<'a, Message> {
+    let col = column![
+        text("⚠ THIS CALL TARGETS THE SIGNING ACCOUNT")
+            .size(12)
+            .color(t.down)
+            .font(bold()),
+        Space::new().height(3),
+        text(warning).size(11).color(t.text),
+    ]
+    .spacing(0)
+    .width(Length::Fill);
+    container(col)
+        .padding(10)
+        .width(Length::Fill)
+        .style(move |_: &iced::Theme| container::Style {
+            background: Some(t.card_alt.into()),
+            border: iced::Border {
+                color: t.down,
+                width: 1.0,
+                radius: 8.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
 /// The EIP-7702 authorization card. Deliberately leads with what changes about
 /// the *account* rather than with the transaction: this is the only signature
 /// in the wallet whose effect survives the transaction that carried it.
@@ -1535,6 +1608,13 @@ fn leg_card<'a>(t: KaoTheme, leg: &'a ReviewLeg, show_detail: bool) -> Element<'
     .spacing(0)
     .width(Length::Fill);
 
+    // Ahead of everything, including the headline: a call to the signing
+    // account is a fact about the call the decode cannot express.
+    if let Some(warning) = &leg.self_admin {
+        col = col.push(self_admin_banner(t, warning));
+        col = col.push(Space::new().height(8));
+    }
+
     // What it does, before who it touches: the headline leads the card, the
     // destination rows follow, the mechanical decode comes last.
     let headline = leg.decoded.headline();
@@ -1632,6 +1712,14 @@ fn sub_leg_card<'a>(t: KaoTheme, leg: &'a ReviewLeg, show_detail: bool) -> Eleme
     ]
     .spacing(0)
     .width(Length::Fill);
+
+    // Above the decode, not below it: a call that reconfigures the multisig is
+    // not a footnote on an otherwise ordinary leg, and the decode underneath it
+    // renders `addOwnerWithThreshold` as calmly as it renders `approve`.
+    if let Some(warning) = &leg.self_admin {
+        col = col.push(self_admin_banner(t, warning));
+        col = col.push(Space::new().height(6));
+    }
 
     let headline = leg.decoded.headline();
     if let Some(h) = &headline {
@@ -2072,6 +2160,7 @@ mod tests {
             calldata,
             decoded: Box::new(DecodeResult::Empty),
             sub_legs: Vec::new(),
+            self_admin: None,
         }
     }
 

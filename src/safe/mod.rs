@@ -50,6 +50,7 @@ use crate::chain::Chain;
 use crate::net::BalanceFetcher;
 use crate::wallet::{SafeDescriptor, SafeTrust, short_address};
 
+pub mod admin;
 pub mod service;
 pub mod sim;
 pub mod tx;

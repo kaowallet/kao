@@ -80,6 +80,19 @@ pub enum Settled {
     Unconfirmed { hash: B256 },
 }
 
+impl Settled {
+    /// The transaction hash, for the outcomes that have one. `Proposed` does
+    /// not: nothing has been broadcast.
+    pub fn hash(&self) -> Option<B256> {
+        match self {
+            Self::Executed { hash } | Self::Reverted { hash } | Self::Unconfirmed { hash } => {
+                Some(*hash)
+            }
+            Self::Proposed { .. } => None,
+        }
+    }
+}
+
 /// What became of a broadcast batch, as read from its receipt.
 ///
 /// Replaces a `Result<(), String>` whose error arm conflated two opposite
@@ -1019,6 +1032,28 @@ impl TxBuilderApp {
     /// The batch was filed on the Transaction Service for co-signers. Not an
     /// execution: it clears the composer the same way, but says so differently,
     /// because "queued" and "done" are not the same claim.
+    /// The pane's settled-outcome strip, for the coordinator's tests.
+    #[cfg(test)]
+    pub fn settled_state(&self) -> Option<Settled> {
+        self.settled.clone()
+    }
+
+    /// The batch was broadcast and did **not** succeed. Records the hash so it
+    /// survives the overlay being dismissed, and — unlike [`Self::on_executed`]
+    /// — leaves the queue alone: a reverted batch is one the user wants to fix,
+    /// and an unconfirmed one is one they must not rebuild blind.
+    pub fn on_broadcast_unsuccessful(&mut self, hash: B256, fate: &BatchFate) {
+        let settled = match fate {
+            BatchFate::Reverted => Settled::Reverted { hash },
+            // `Mined` never reaches here — `on_executed` handles it — but a
+            // wrong guess in this direction is the safe one: it claims less.
+            _ => Settled::Unconfirmed { hash },
+        };
+        self.traced("on_broadcast_unsuccessful", move |s| {
+            s.settled = Some(settled);
+        })
+    }
+
     pub fn on_proposed(&mut self, nonce: u64) {
         self.traced("on_proposed", move |s| {
             s.batch.clear();
@@ -1212,6 +1247,13 @@ impl TxBuilderApp {
             Message::Simulate => {
                 // Simulation is a verified-path preflight — built-in chains only.
                 if let (false, Some(chain)) = (self.batch.is_empty(), self.net.builtin()) {
+                    let calls = match self.effective_calls_checked() {
+                        Ok(c) => c,
+                        Err(e) => {
+                            self.error = Some(e);
+                            return None;
+                        }
+                    };
                     // Retire any earlier run before claiming the new sequence,
                     // so a slower predecessor can't answer for this batch.
                     self.invalidate_sim();
@@ -1219,7 +1261,7 @@ impl TxBuilderApp {
                     return Some(Outcome::Simulate {
                         seq: self.sim_seq,
                         chain,
-                        calls: self.effective_calls(),
+                        calls,
                     });
                 }
             }
@@ -1231,8 +1273,15 @@ impl TxBuilderApp {
                     self.error = Some(why);
                     return None;
                 }
+                let calls = match self.effective_calls_checked() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        self.error = Some(e);
+                        return None;
+                    }
+                };
                 return Some(Outcome::Review {
-                    calls: self.effective_calls(),
+                    calls,
                     preflight: self.preflight(),
                     // Same `self.sim` the verdict above was derived from.
                     sim: self.sim.clone().map(Box::new),
@@ -1349,7 +1398,10 @@ impl TxBuilderApp {
                 }
             }
             Message::CopySettledHash => {
-                if let Some(Settled::Executed { hash, .. }) = &self.settled {
+                // Every outcome that has a hash offers it. The unconfirmed one
+                // needs it most: looking that hash up is the only way to find
+                // out whether rebuilding the batch would run it twice.
+                if let Some(hash) = self.settled.as_ref().and_then(Settled::hash) {
                     return Some(Outcome::CopyPlain(format!("{hash:#x}")));
                 }
             }
@@ -1707,6 +1759,34 @@ impl TxBuilderApp {
         self.auto_revoke && self.can_batch()
     }
 
+    /// [`Self::effective_calls`], refused when the wrap pushes the transaction
+    /// past the queue ceiling.
+    ///
+    /// [`MAX_BATCH_CALLS`] was enforced on `batch` — what the user queues — and
+    /// nowhere on what actually gets simulated, packed and signed. Flash
+    /// approval adds a zero-reset *before* and *after* each distinct
+    /// `(token, spender)` pair, so a 64-call batch of approvals leaves here as
+    /// up to 192, and every reason for the cap (one card per call laid out
+    /// unvirtualized, one decode round trip per leg at review, one simulated
+    /// step per call) applies to the expanded list rather than the queued one.
+    ///
+    /// Refusing at the point of use rather than blocking the toggle: the queue
+    /// can grow after the toggle is set, so a check on the toggle alone would
+    /// be a gate the user walks straight past.
+    fn effective_calls_checked(&self) -> Result<Vec<QueuedCall>, String> {
+        let calls = self.effective_calls();
+        if calls.len() <= MAX_BATCH_CALLS {
+            return Ok(calls);
+        }
+        Err(format!(
+            "With \"revoke approvals after batch\" on, these {} calls become {} — one reset \
+             before and one after each approval — and this wallet runs at most \
+             {MAX_BATCH_CALLS} in a transaction. Turn the toggle off, or split the batch.",
+            self.batch.len(),
+            calls.len(),
+        ))
+    }
+
     /// Name the effective-call at `step` in terms the user can point at.
     ///
     /// The simulator indexes [`Self::effective_calls`], while the queue cards
@@ -1771,6 +1851,33 @@ impl TxBuilderApp {
             );
         }
         out
+    }
+
+    /// A queued call that targets the account this batch would execute as.
+    ///
+    /// The same fact the review overlay raises, surfaced one step earlier: the
+    /// queue is where an imported bundle first becomes visible, and it is the
+    /// last point at which dropping the call is one click rather than a
+    /// re-composition. `None` for every ordinary call.
+    ///
+    /// Only meaningful once a batch can be batched at all — a custom-network
+    /// composer sends a single call and has no Safe to reconfigure.
+    pub(crate) fn self_admin_note(&self, c: &QueuedCall) -> Option<String> {
+        if c.to != self.owner {
+            return None;
+        }
+        if !self.ctx.is_safe {
+            return Some("This call is addressed to the account that would send it.".to_string());
+        }
+        Some(match crate::safe::admin::authorized_effect(&c.data) {
+            Some(effect) => format!(
+                "Runs as the Safe and {effect}. Remove it unless you meant to change the \
+                 multisig itself."
+            ),
+            None => "Addressed to the Safe that would execute it, and this wallet doesn't \
+                     recognise the call. Run this way it acts as the Safe on itself."
+                .to_string(),
+        })
     }
 
     /// How wrong the review's fee estimate is, phrased for the user.
@@ -3917,6 +4024,67 @@ mod tests {
                 decoded_args: Vec::new(),
             })
             .collect()
+    }
+
+    #[test]
+    fn the_queue_flags_a_call_addressed_to_the_active_safe() {
+        // The queue is where an imported bundle first becomes visible, and the
+        // last point at which dropping the call is one click.
+        let app = safe_app();
+        let mut add_owner =
+            alloy::primitives::keccak256(b"addOwnerWithThreshold(address,uint256)")[..4].to_vec();
+        add_owner.extend_from_slice(
+            alloy::primitives::B256::left_padding_from(EOA.as_slice()).as_slice(),
+        );
+        add_owner.extend_from_slice(&U256::from(1u64).to_be_bytes::<32>());
+
+        let governance = QueuedCall {
+            id: 1,
+            to: SAFE,
+            value: U256::ZERO,
+            data: Bytes::from(add_owner),
+            title: "t".into(),
+            detail: "d".into(),
+            signature: None,
+            decoded_args: Vec::new(),
+        };
+        let ordinary = QueuedCall {
+            to: Address::repeat_byte(0xC1),
+            ..governance.clone()
+        };
+
+        let note = app
+            .self_admin_note(&governance)
+            .expect("a call to the Safe is flagged in the queue");
+        assert!(note.contains("adds an owner"), "{note}");
+        assert!(
+            app.self_admin_note(&ordinary).is_none(),
+            "and an ordinary call is not",
+        );
+    }
+
+    #[test]
+    fn the_queue_flag_keys_on_the_active_identity_not_a_constant() {
+        // Same calldata, EOA identity: there is no Safe to reconfigure, so the
+        // Safe-specific wording must not appear.
+        let app = eoa_app();
+        let c = QueuedCall {
+            id: 1,
+            to: SAFE,
+            value: U256::ZERO,
+            data: Bytes::from(vec![0x01, 0x02, 0x03, 0x04]),
+            title: "t".into(),
+            detail: "d".into(),
+            signature: None,
+            decoded_args: Vec::new(),
+        };
+        assert!(
+            app.self_admin_note(&c).is_none(),
+            "a Safe address is just an address when no Safe is active",
+        );
+        let self_call = QueuedCall { to: EOA, ..c };
+        let note = app.self_admin_note(&self_call).expect("self-call flagged");
+        assert!(!note.contains("multisig"), "{note}");
     }
 
     #[test]

@@ -1539,12 +1539,21 @@ fn batch_pane(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
 /// only thing that distinguishes "filed for co-signers" from "the overlay
 /// closed and I don't know why".
 fn settled_strip<'a>(t: KaoTheme, settled: &super::Settled) -> Element<'a, Message> {
+    // Green for the two outcomes that went to plan, the warning colour for the
+    // two that did not — a reverted batch rendered in the success palette is
+    // the same class of lie as reporting a broadcast hash as a win.
+    let good = matches!(
+        settled,
+        super::Settled::Executed { .. } | super::Settled::Proposed { .. }
+    );
+    let accent = if good { t.up } else { t.down };
+    let copy = || -> Option<Element<'a, Message>> {
+        Some(ghost_secondary(t, "⧉ Copy hash", Some(Message::CopySettledHash)).into())
+    };
     let (title, body, action): (String, String, Option<Element<'a, Message>>) = match settled {
-        super::Settled::Executed { hash } => (
-            "Batch executed".to_string(),
-            format!("{hash:#x}"),
-            Some(ghost_secondary(t, "⧉ Copy hash", Some(Message::CopySettledHash)).into()),
-        ),
+        super::Settled::Executed { hash } => {
+            ("Batch executed".to_string(), format!("{hash:#x}"), copy())
+        }
         super::Settled::Proposed { nonce } => (
             "Batch queued for co-signers".to_string(),
             format!(
@@ -1552,10 +1561,27 @@ fn settled_strip<'a>(t: KaoTheme, settled: &super::Settled) -> Element<'a, Messa
             ),
             None,
         ),
+        super::Settled::Reverted { hash } => (
+            "Batch reverted".to_string(),
+            format!(
+                "{hash:#x}\nEvery call was rolled back and the gas was spent. The batch is still \
+                 in the composer — fix it and review again."
+            ),
+            copy(),
+        ),
+        super::Settled::Unconfirmed { hash } => (
+            "Broadcast — outcome unknown".to_string(),
+            format!(
+                "{hash:#x}\nNo receipt came back in time. This transaction may still be pending \
+                 and may mine at any moment. Look the hash up before you run this batch again — \
+                 rebuilding it now could execute it twice."
+            ),
+            copy(),
+        ),
     };
     let mut col = column![
         row![
-            text(title).size(12).color(t.up).font(bold()),
+            text(title).size(12).color(accent).font(bold()),
             Space::new().width(Length::Fill),
             ghost_button(t, text("✕").size(11).color(t.sub).font(mono()))
                 .on_press(Message::DismissSettled),
@@ -1572,9 +1598,9 @@ fn settled_strip<'a>(t: KaoTheme, settled: &super::Settled) -> Element<'a, Messa
     container(col.padding(Padding::from([12, 14])))
         .width(Length::Fill)
         .style(move |_| container::Style {
-            background: Some(Background::Color(with_alpha(t.up, 0.08))),
+            background: Some(Background::Color(with_alpha(accent, 0.08))),
             border: Border {
-                color: with_alpha(t.up, 0.4),
+                color: with_alpha(accent, 0.4),
                 width: 1.0,
                 radius: Radius::from(12),
             },
@@ -1685,18 +1711,54 @@ fn tx_card<'a>(
         .push(icon_btn(t, "✕", true, false, Message::RemoveCall(c.id)));
 
     let mut inner = column![top].width(Length::Fill);
+    // A call addressed to the signing account gets its warning here, in the
+    // queue, and not only on the review overlay. The queue is where an imported
+    // bundle first becomes visible, and it is the last point at which removing
+    // one call is a single click rather than a re-composition.
+    let self_admin = app.self_admin_note(c);
+    if let Some(note) = &self_admin {
+        inner = inner.push(Space::new().height(8)).push(
+            container(
+                column![
+                    text("⚠ Targets the signing account")
+                        .size(11)
+                        .color(t.down)
+                        .font(mono_bold()),
+                    Space::new().height(2),
+                    text(note.clone()).size(10).color(t.text).font(mono()),
+                ]
+                .width(Length::Fill),
+            )
+            .padding(Padding::from([8, 10]))
+            .width(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(Background::Color(with_alpha(t.down, 0.10))),
+                border: Border {
+                    color: t.down,
+                    width: 1.0,
+                    radius: Radius::from(10),
+                },
+                ..Default::default()
+            }),
+        );
+    }
     if open {
         inner = inner
             .push(Space::new().height(10))
             .push(decoded_panel(t, c));
     }
 
+    let outline = if self_admin.is_some() {
+        t.down
+    } else {
+        t.border
+    };
     container(inner.padding(Padding::from([11, 12])))
         .width(Length::Fill)
         .style(move |_| container::Style {
             background: Some(Background::Color(t.card_alt)),
             border: Border {
-                color: t.border,
+                color: outline,
                 width: 1.0,
                 radius: Radius::from(14),
             },

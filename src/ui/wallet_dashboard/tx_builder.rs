@@ -1306,7 +1306,13 @@ impl TxBuilderApp {
                 if let (false, Some(chain)) = (self.batch.is_empty(), self.net.builtin()) {
                     self.cancel_rename();
                     let rollback = self.templates.clone();
-                    let t = Template::from_batch("Untitled batch", "(｡•̀ᴗ-)✧", chain, &self.batch);
+                    let t = Template::from_batch(
+                        "Untitled batch",
+                        "(｡•̀ᴗ-)✧",
+                        chain,
+                        self.owner,
+                        &self.batch,
+                    );
                     self.templates.push(t);
                     self.template_menu_open = true;
                     return Some(self.persist(rollback));
@@ -1344,8 +1350,12 @@ impl TxBuilderApp {
                     ));
                     return None;
                 };
-                self.json_text =
-                    bundle::export(chain, self.ctx.is_safe.then_some(self.owner), &self.batch);
+                self.json_text = bundle::export(
+                    chain,
+                    self.ctx.is_safe.then_some(self.owner),
+                    self.owner,
+                    &self.batch,
+                );
                 self.modal = Modal::Save;
             }
             Message::OpenLoad => {
@@ -1387,13 +1397,25 @@ impl TxBuilderApp {
             Message::CopyJson => return Some(Outcome::CopyText(self.json_text.clone())),
             Message::ImportJson => {
                 match bundle::import(&self.json_text, self.next_id, self.net.builtin()) {
-                    Ok(calls) => match self.adopt_batch(calls) {
-                        Ok(()) => self.modal = Modal::None,
-                        // Stays in the modal with the reason: the JSON is still
-                        // in the box, so the user can take it somewhere that
-                        // can run it rather than losing it to a closed overlay.
-                        Err(e) => self.json_error = Some(e),
-                    },
+                    Ok(calls) => {
+                        // Read before adopting: `json_text` is cleared with the
+                        // modal, and the meta is the only record of who the
+                        // batch was written for.
+                        let composed_as = serde_json::from_str::<bundle::Bundle>(&self.json_text)
+                            .ok()
+                            .and_then(|b| b.meta.composed_as());
+                        match self.adopt_batch(calls) {
+                            Ok(()) => {
+                                self.modal = Modal::None;
+                                self.note_identity_drift(composed_as, "This bundle");
+                            }
+                            // Stays in the modal with the reason: the JSON is
+                            // still in the box, so the user can take it
+                            // somewhere that can run it rather than losing it
+                            // to a closed overlay.
+                            Err(e) => self.json_error = Some(e),
+                        }
+                    }
                     Err(e) => self.json_error = Some(e.to_string()),
                 }
             }
@@ -2269,9 +2291,45 @@ impl TxBuilderApp {
             Ok(()) => {
                 self.template_menu_open = false;
                 self.cancel_rename();
+                self.note_identity_drift(t.from, &format!("\"{}\"", t.name));
             }
             Err(e) => self.error = Some(e),
         }
+    }
+
+    /// Say so when a loaded batch was composed as a different account.
+    ///
+    /// The calls in a batch are written against one identity — its allowances,
+    /// its balances, its positions — and the natural workflow is exactly the
+    /// one that re-aims them: compose and test as your EOA, save it, switch to
+    /// the Safe to actually run it. The chain wall has always refused a
+    /// cross-chain load; this one is a *notice*, not a refusal, for two
+    /// reasons. A batch of generic calls is legitimately reusable across
+    /// accounts, so refusing would break a real workflow. And for an imported
+    /// bundle the recorded identity is authored by whoever wrote the file, so
+    /// as a wall it would stop nobody — an attacker just omits the key.
+    ///
+    /// Silence stays the answer when nothing was recorded (`None`): a batch
+    /// saved before this existed makes no claim, and inventing one would be
+    /// the same mistake `meta.chainId` made.
+    fn note_identity_drift(&mut self, composed_as: Option<Address>, what: &str) {
+        let Some(from) = composed_as else { return };
+        if from == self.owner {
+            return;
+        }
+        let notice = format!(
+            "{what} was composed as {}, and you're composing as {}. The calls still point where \
+             they did — check any allowance, balance or position they assume belongs to the \
+             other account.",
+            crate::wallet::short_address(from),
+            crate::wallet::short_address(self.owner),
+        );
+        // `adopt_batch` may already have said it replaced a queue. Both facts
+        // matter, and the identity one is the one that changes what executes.
+        self.error = Some(match self.error.take() {
+            Some(prev) => format!("{notice} {prev}"),
+            None => notice,
+        });
     }
 
     /// Replace the queue with `calls`, applying the same rules
@@ -2394,7 +2452,18 @@ pub struct SafeBatchRequest {
     /// so proposing over an already-queued slot filed a silent competitor:
     /// whichever of the two executes voids the other, and neither the review
     /// nor the queue said a word. The prepare step pins past these instead.
-    pub queued_nonces: Vec<u64>,
+    /// `None` means this wallet does **not know** what is queued — the fetch is
+    /// in flight, it failed, or it never ran. Distinct from `Some(vec![])`,
+    /// which is the positive finding that the queue is empty.
+    ///
+    /// They used to be the same value, so a Transaction Service that was slow
+    /// or down produced exactly the pin an empty queue does, and the propose
+    /// path filed the silent competitor this field exists to prevent. Unknown
+    /// now blocks proposing rather than guessing: an execute reads the live
+    /// nonce and fails honestly if something is ahead of it, but a proposal is
+    /// filed and forgotten, and the collision only surfaces when a co-signer's
+    /// confirmation voids someone else's.
+    pub queued_nonces: Option<Vec<u64>>,
     /// Safe Transaction Service base URL for this Safe, so a batch that can't
     /// meet the threshold from locally-held keys can still be proposed for the
     /// remaining co-signers to confirm.
@@ -4024,6 +4093,117 @@ mod tests {
                 decoded_args: Vec::new(),
             })
             .collect()
+    }
+
+    /// `approve(spender, amount)` calldata.
+    fn approve_calldata(spender: Address, amount: u64) -> Vec<u8> {
+        let mut d = vec![0x09, 0x5e, 0xa7, 0xb3];
+        d.extend_from_slice(
+            alloy::primitives::B256::left_padding_from(spender.as_slice()).as_slice(),
+        );
+        d.extend_from_slice(&U256::from(amount).to_be_bytes::<32>());
+        d
+    }
+
+    #[test]
+    fn flash_approval_cannot_push_the_transaction_past_the_queue_ceiling() {
+        // The cap was enforced on what the user queues and nowhere on what
+        // actually gets simulated, packed and signed. A zero-reset before and
+        // after each approval nearly triples the list.
+        let mut app = safe_app();
+        app.batch = (0..MAX_BATCH_CALLS as u64)
+            .map(|i| QueuedCall {
+                id: i,
+                to: Address::repeat_byte(0xC1),
+                value: U256::ZERO,
+                // A distinct spender per call, so each is its own
+                // (token, spender) pair and earns its own pair of resets.
+                data: Bytes::from(approve_calldata(Address::repeat_byte(i as u8 + 1), 100)),
+                title: "t".into(),
+                detail: "d".into(),
+                signature: None,
+                decoded_args: Vec::new(),
+            })
+            .collect();
+        app.auto_revoke = true;
+        assert!(
+            app.effective_calls().len() > MAX_BATCH_CALLS,
+            "precondition: the wrap really does exceed the cap",
+        );
+
+        assert!(app.update(Message::Review).is_none(), "review is refused");
+        let e = app.error.as_deref().expect("with a reason");
+        assert!(e.contains("revoke approvals"), "{e}");
+        assert!(e.contains(&MAX_BATCH_CALLS.to_string()), "{e}");
+
+        app.error = None;
+        assert!(app.update(Message::Simulate).is_none(), "so is simulate");
+        assert!(app.error.is_some(), "and it says why");
+
+        // Turning the toggle off puts it back inside the cap.
+        app.auto_revoke = false;
+        app.error = None;
+        assert!(
+            app.update(Message::Review).is_some(),
+            "un-wrapped, the same queue reviews fine",
+        );
+    }
+
+    #[test]
+    fn loading_a_template_composed_as_another_account_says_so() {
+        // The natural workflow is the dangerous one: compose and test as your
+        // EOA, save, switch to the Safe to run it. The calls still point where
+        // they did.
+        let mut app = safe_app();
+        let t = Template::from_batch(
+            "Weekly claim",
+            "(°ᴗ°)",
+            Chain::Mainnet,
+            EOA,
+            &[QueuedCall {
+                id: 1,
+                to: Address::repeat_byte(0xC1),
+                value: U256::ZERO,
+                data: Bytes::from(vec![0x01, 0x02, 0x03, 0x04]),
+                title: "t".into(),
+                detail: "d".into(),
+                signature: None,
+                decoded_args: Vec::new(),
+            }],
+        );
+        app.load_template(&t);
+        assert_eq!(app.batch.len(), 1, "it still loads — a notice, not a wall");
+        let e = app
+            .error
+            .as_deref()
+            .expect("and says who it was written for");
+        assert!(e.contains("Weekly claim"), "{e}");
+        assert!(e.contains("composed as"), "{e}");
+    }
+
+    #[test]
+    fn loading_a_template_composed_as_this_account_stays_quiet() {
+        // The warning has to be rare to be read.
+        let mut app = safe_app();
+        let t = Template::from_batch(
+            "Mine",
+            "(°ᴗ°)",
+            Chain::Mainnet,
+            SAFE,
+            &[QueuedCall {
+                id: 1,
+                to: Address::repeat_byte(0xC1),
+                value: U256::ZERO,
+                data: Bytes::from(vec![0x01, 0x02, 0x03, 0x04]),
+                title: "t".into(),
+                detail: "d".into(),
+                signature: None,
+                decoded_args: Vec::new(),
+            }],
+        );
+        app.load_template(&t);
+        assert_eq!(app.batch.len(), 1);
+        assert!(app.error.is_none(), "{:?}", app.error);
     }
 
     #[test]

@@ -594,7 +594,12 @@ mod tests {
     #[test]
     fn export_then_import_round_trips_calldata() {
         let batch = sample_batch();
-        let json = export(Chain::Mainnet, Some(Address::repeat_byte(0x5a)), &batch);
+        let json = export(
+            Chain::Mainnet,
+            Some(Address::repeat_byte(0x5a)),
+            Address::repeat_byte(0x5a),
+            &batch,
+        );
         let back = import(&json, 1, None).unwrap();
         assert_eq!(back.len(), 1);
         // The exact calldata survives the round-trip.
@@ -632,7 +637,7 @@ mod tests {
             )
             .unwrap(),
         ];
-        let json = export(Chain::Mainnet, None, &batch);
+        let json = export(Chain::Mainnet, None, Address::repeat_byte(0xAA), &batch);
         let back = import(&json, 1, None).unwrap();
         assert_eq!(back[0].data, batch[0].data);
 
@@ -658,7 +663,7 @@ mod tests {
     #[test]
     fn export_shape_is_safe_compatible() {
         let batch = sample_batch();
-        let json = export(Chain::Mainnet, None, &batch);
+        let json = export(Chain::Mainnet, None, Address::repeat_byte(0xAA), &batch);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["version"], "1.0");
         assert_eq!(v["chainId"], "1");
@@ -922,7 +927,7 @@ mod tests {
     #[test]
     fn import_rejects_a_bundle_stamped_for_another_chain() {
         let batch = sample_batch();
-        let json = export(Chain::Mainnet, None, &batch);
+        let json = export(Chain::Mainnet, None, Address::repeat_byte(0xAA), &batch);
         let err = import(&json, 1, Some(Chain::Base)).unwrap_err().to_string();
         assert!(err.contains("different address on each chain"), "{err}");
         // …and accepts it on the chain it was composed for.
@@ -997,7 +1002,7 @@ mod tests {
 
     #[test]
     fn export_stamps_a_creation_time_and_the_format_version() {
-        let json = export(Chain::Mainnet, None, &[]);
+        let json = export(Chain::Mainnet, None, Address::repeat_byte(0xAA), &[]);
         let b: Bundle = serde_json::from_str(&json).unwrap();
         assert_eq!(b.version, "1.0");
         assert!(b.created_at > 1_700_000_000, "got {}", b.created_at);

@@ -2583,7 +2583,15 @@ impl WalletScreen {
                         input,
                         call_count: calls.len(),
                         prepared: None,
-                        queued_nonces: self.safe_pending.iter().map(|p| p.nonce).collect(),
+                        // `None` when this wallet has not actually established
+                        // what is in the Safe's queue — the fetch is still in
+                        // flight, it errored, or it was never launched. An
+                        // empty `Vec` used to stand for all four, so "nothing
+                        // is queued" and "I don't know" chose the same nonce,
+                        // and only one of those is a fact.
+                        queued_nonces: (!self.safe_pending_loading
+                            && self.safe_pending_error.is_none())
+                        .then(|| self.safe_pending.iter().map(|p| p.nonce).collect()),
                         service_base: d.tx_service_base().to_string(),
                     },
                 ))
@@ -2662,6 +2670,29 @@ impl WalletScreen {
                 // the user chose the secondary action): sign with one owner and
                 // queue the batch on the Transaction Service for the rest.
                 if !execute {
+                    // Proposing pins a nonce and walks away. If this wallet
+                    // never established what is already queued, that pin is a
+                    // guess, and a wrong guess files a transaction that is
+                    // mutually exclusive with a co-signer's — discovered only
+                    // when one of them executes and voids the other, after
+                    // every owner has signed both.
+                    //
+                    // Deliberately not applied to execute: `execTransaction`
+                    // takes the live nonce and nothing else, so a stale pin
+                    // there fails loudly at the broadcast rather than quietly
+                    // months later.
+                    if sreq.queued_nonces.is_none() {
+                        if let Some(r) = self.sign_review.as_mut() {
+                            r.error = Some(
+                                "Kao couldn't read this Safe's pending queue, so it can't tell \
+                                 which nonce is free. Proposing now risks filing a transaction \
+                                 that competes with one a co-signer already queued. Reopen the \
+                                 Safe's queue to refresh it, then try again."
+                                    .to_string(),
+                            );
+                        }
+                        return Task::none();
+                    }
                     let Some((idx, owner_desc)) = sreq.signable_indices.first().and_then(|&idx| {
                         self.accounts
                             .get(idx as usize)
@@ -7088,13 +7119,56 @@ fn spawn_txbuilder_prepare(
 ) -> Task<Message> {
     Task::perform(
         async move {
+            // The nonce the *broadcast* will use, read from the same source the
+            // broadcast reads it from.
+            //
+            // `BalanceFetcher::get_transaction_count` is a verified read at the
+            // latest head and says so in its own doc: it is explicitly not the
+            // pending nonce. Prepare pinned the authorization at `latest + 1`
+            // while `send_eoa_batch` computes `pending + 1`, so an account with
+            // one transaction still in the mempool got a reviewed digest over a
+            // nonce the send would never use — and the send's reviewed==signed
+            // check, correctly, refused it. Fail-closed, and unusable: the first
+            // delegation could not be sent at all until the mempool drained.
+            //
+            // `None` when there is no provider or the read fails; the EOA arm
+            // then falls back to the verified head exactly as before, and the
+            // send-side check still stands behind it.
+            let pending_nonce = match &req {
+                tx_builder::BatchSignRequest::Eoa(e) if e.is_batch() => {
+                    resolve_pending_nonce(&network, e.net, e.from).await
+                }
+                _ => None,
+            };
             (
                 seq,
-                build_txbuilder_steps(network.as_ref(), req, local_names).await,
+                build_txbuilder_steps(network.as_ref(), req, local_names, pending_nonce).await,
             )
         },
         |(seq, steps)| Message::SignReviewPrepared { seq, steps },
     )
+}
+
+/// The account's pending nonce — mempool included — or `None` if it can't be
+/// read. Mirrors `send_eoa_batch`'s own `.pending()` read so the two halves of
+/// the 7702 ceremony agree about which nonce the authorization commits to.
+async fn resolve_pending_nonce(
+    network: &Arc<dyn BalanceFetcher>,
+    net: crate::chain::NetworkId,
+    from: Address,
+) -> Option<u64> {
+    use alloy::providers::Provider;
+    let provider = provider_for(network, net).await?;
+    match provider.get_transaction_count(from).pending().await {
+        Ok(n) => Some(n),
+        Err(e) => {
+            warn!(
+                error = %crate::net::redact_urls(&e.to_string()),
+                "tx-builder: pending nonce unavailable at prepare, falling back to the verified head",
+            );
+            None
+        }
+    }
 }
 
 /// Human label for an EIP-7702 delegate address.
@@ -7268,6 +7342,7 @@ async fn build_txbuilder_steps(
     network: &dyn BalanceFetcher,
     req: tx_builder::BatchSignRequest,
     local_names: std::collections::HashMap<Address, String>,
+    pending_nonce: Option<u64>,
 ) -> Result<Vec<sign_review::SignStep>, String> {
     use crate::safe::tx::{
         build_safe_tx_with_nonce, current_safe_nonce, ensure_signable_version, safe_domain,
@@ -7299,8 +7374,13 @@ async fn build_txbuilder_steps(
                 // execute reverts, having cost every owner a signature. Only
                 // proposals at or beyond the live nonce count: the service keeps
                 // showing ones the Safe has already executed past.
+                // An unknown queue pins at the live nonce — the same place it
+                // always did — but records that it was a guess, so the propose
+                // path can refuse rather than file a competitor blind.
                 let nonce = s
                     .queued_nonces
+                    .as_deref()
+                    .unwrap_or_default()
                     .iter()
                     .copied()
                     .filter(|n| *n >= onchain)
@@ -7444,7 +7524,15 @@ async fn build_txbuilder_steps(
                 let (auth_nonce, auth_digest) = if already_ef {
                     (None, None)
                 } else {
-                    let tx_nonce = network.get_transaction_count(e.from, chain).await?.value;
+                    // Prefer the pending nonce: it is what the broadcast will
+                    // consume, and pinning anything else guarantees the
+                    // reviewed digest is not the one signed whenever this
+                    // account has a transaction in flight. The verified head is
+                    // the fallback for when it can't be read.
+                    let tx_nonce = match pending_nonce {
+                        Some(n) => n,
+                        None => network.get_transaction_count(e.from, chain).await?.value,
+                    };
                     let n = tx_nonce + 1;
                     let auth = eip7702::build_authorization(chain.chain_id(), n);
                     (Some(n), Some(auth.signature_hash()))
@@ -7628,6 +7716,28 @@ async fn execute_txbuilder_safe_batch(
                 Some(p) => p,
                 None => return Err("no execution RPCs configured".into()),
             };
+            // Whoever pays for `execTransaction` has to be able to pay for it,
+            // and that was never checked on this path — so a 3-of-5 Safe could
+            // walk three hardware devices through three prompts and only then
+            // have the node refuse the broadcast for insufficient funds, with
+            // the signatures living in a local `Vec` that goes out of scope.
+            //
+            // The executor is resolved for its *address* here and rebuilt as a
+            // signer after the loop; deriving the address costs nothing and
+            // touches no device. Note the default: with no dedicated gas payer
+            // the executor is the first signing owner, and Safe owner keys
+            // routinely hold zero ETH — which makes this the common case, not
+            // the exotic one.
+            let executor_addr = match local_executor_key {
+                Some(key) => crate::wallet::signer_from_bytes(&key)
+                    .map(|s| s.address())
+                    .map_err(|e| format!("derive executor: {e}"))?,
+                None => signer_owners
+                    .first()
+                    .and_then(crate::wallet::account_address)
+                    .ok_or_else(|| "no owner signer available to execute".to_string())?,
+            };
+            check_executor_funding(&provider, executor_addr).await?;
             let needed = sreq.threshold as usize;
             let mut sigs = Vec::with_capacity(needed);
             let mut live_owners = Vec::with_capacity(needed);
@@ -7817,6 +7927,45 @@ fn spawn_txbuilder_eoa_send(
             result: result.map(SignOutcome::Tx),
         },
     )
+}
+
+/// Refuse a Safe execution whose gas payer provably cannot pay for it, before
+/// the first owner is prompted.
+///
+/// The Safe-side counterpart to [`check_gas_funding`], and bounded from below
+/// for the same reason: `execTransaction`'s real cost can't be estimated until
+/// the owner signatures exist, and collecting those is precisely what this runs
+/// ahead of. The floor is the intrinsic 21 000 gas, which no transaction comes
+/// in under — so it cannot false-positive, and it catches the case that
+/// actually turns up, which is an executor holding nothing at all.
+///
+/// The value the batch moves is *not* part of the floor here: that leaves the
+/// Safe, not the executor. This account pays gas only.
+async fn check_executor_funding(
+    provider: &alloy::providers::RootProvider<alloy::network::Ethereum>,
+    executor: Address,
+) -> Result<(), String> {
+    use alloy::providers::Provider;
+    const INTRINSIC_GAS: u64 = 21_000;
+    let Ok(fees) = provider.estimate_eip1559_fees().await else {
+        // A fee oracle that won't answer is not evidence the account is broke.
+        return Ok(());
+    };
+    let Ok(balance) = provider.get_balance(executor).await else {
+        return Ok(());
+    };
+    let floor = U256::from(INTRINSIC_GAS).saturating_mul(U256::from(fees.max_fee_per_gas));
+    if balance < floor {
+        return Err(format!(
+            "{} is the account that would pay the gas for this execution, and it holds {} ETH — \
+             not even the minimum {} ETH this transaction needs. Fund it, or set a different gas \
+             payer. Nothing has been signed.",
+            short_address(executor),
+            crate::portfolio::format_token_balance(balance, 18).0,
+            crate::portfolio::format_token_balance(floor, 18).0,
+        ));
+    }
+    Ok(())
 }
 
 /// Refuse an EOA batch the account provably cannot pay for, before the first
@@ -14139,7 +14288,7 @@ mod tests {
             input: multisend::build_multisend_input(calls, "1.4.1").expect("multisend wrapper"),
             call_count: calls.len(),
             prepared: None,
-            queued_nonces: Vec::new(),
+            queued_nonces: Some(Vec::new()),
             service_base: crate::safe::service::DEFAULT_TX_SERVICE_BASE.to_string(),
         }
     }
@@ -14204,12 +14353,22 @@ mod tests {
     }
 
     /// [`build_txbuilder_steps`] with an empty local address book — no test
-    /// here turns on contact naming.
+    /// here turns on contact naming — and no pending nonce, so the verified
+    /// head stands in (the fallback path a mock chain models).
     async fn prepared_steps(
         mock: &CallMock,
         req: tx_builder::BatchSignRequest,
     ) -> Result<Vec<sign_review::SignStep>, String> {
-        build_txbuilder_steps(mock, req, std::collections::HashMap::new()).await
+        build_txbuilder_steps(mock, req, std::collections::HashMap::new(), None).await
+    }
+
+    /// [`prepared_steps`] with the pending nonce the broadcast would read.
+    async fn prepared_steps_pending(
+        mock: &CallMock,
+        req: tx_builder::BatchSignRequest,
+        pending: u64,
+    ) -> Result<Vec<sign_review::SignStep>, String> {
+        build_txbuilder_steps(mock, req, std::collections::HashMap::new(), Some(pending)).await
     }
 
     // ── prepare: what the overlay shows ──────────────────────────────
@@ -15244,7 +15403,7 @@ mod tests {
     async fn safe_prepare_pins_past_the_pending_queue() {
         let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
         let mut req = safe_batch_req(&calls, 1, vec![0]);
-        req.queued_nonces = vec![5, 6];
+        req.queued_nonces = Some(vec![5, 6]);
         let (tx, hash) = expected_batch_tx(&req, 7);
         let mock = CallMock::new();
         mock.set_code(req.input.to, Bytes::from(vec![0x60u8]), true);
@@ -15268,7 +15427,7 @@ mod tests {
     async fn safe_prepare_ignores_queued_nonces_already_executed_past() {
         let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
         let mut req = safe_batch_req(&calls, 1, vec![0]);
-        req.queued_nonces = vec![1, 2, 3];
+        req.queued_nonces = Some(vec![1, 2, 3]);
         let (tx, hash) = expected_batch_tx(&req, 9);
         let mock = CallMock::new();
         mock.set_code(req.input.to, Bytes::from(vec![0x60u8]), true);
@@ -15648,6 +15807,115 @@ mod tests {
         .await
         .expect("decodes");
         assert!(legs.iter().all(|l| l.self_admin.is_none()));
+    }
+
+    #[test]
+    fn an_unread_safe_queue_blocks_proposing_but_not_executing() {
+        // `Some(vec![])` is "the queue is empty"; `None` is "I never found
+        // out". They used to be the same value, so a Transaction Service that
+        // was slow or down produced exactly the pin an empty queue does — and
+        // proposing filed a silent competitor for a co-signer's nonce.
+        let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
+        let mut req = safe_batch_req(&calls, 1, vec![0]);
+        req.prepared = Some((0, B256::ZERO));
+        req.queued_nonces = None;
+        let mut s = screen_with_txbuilder_preflight(req, true, PASSED_CLEAN);
+        s.apps.txbuilder_pane().set_templates(Vec::new());
+
+        // Propose (the secondary action) is refused with a reason.
+        let _ = s.dispatch_txbuilder(false);
+        let r = s.sign_review.as_ref().expect("overlay stays up");
+        assert!(r.signing_since.is_none(), "nothing was dispatched");
+        let e = r.error.as_deref().expect("and it says why");
+        assert!(e.contains("pending queue"), "{e}");
+
+        // Execute is untouched: it takes the live nonce and fails loudly at
+        // the broadcast rather than quietly months later.
+        s.sign_review.as_mut().unwrap().error = None;
+        let _ = s.dispatch_txbuilder(true);
+        assert!(
+            s.sign_review
+                .as_ref()
+                .is_some_and(|r| r.signing_since.is_some()),
+            "an unread queue must not block executing",
+        );
+    }
+
+    #[test]
+    fn a_known_empty_safe_queue_still_proposes() {
+        // The other half of the distinction: an actually-empty queue is a
+        // positive finding and must not be caught by the new gate.
+        let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
+        let mut req = safe_batch_req(&calls, 1, vec![0]);
+        req.prepared = Some((0, B256::ZERO));
+        req.queued_nonces = Some(Vec::new());
+        let mut s = screen_with_txbuilder_preflight(req, true, PASSED_CLEAN);
+        s.apps.txbuilder_pane().set_templates(Vec::new());
+        let _ = s.dispatch_txbuilder(false);
+        assert!(
+            s.sign_review
+                .as_ref()
+                .is_some_and(|r| r.signing_since.is_some()),
+            "a known-empty queue proposes as it always did",
+        );
+    }
+
+    #[tokio::test]
+    async fn the_7702_authorization_pins_the_nonce_the_broadcast_will_use() {
+        // Prepare read the *verified head* while `send_eoa_batch` reads the
+        // *pending* nonce, so an account with one transaction in the mempool
+        // got a reviewed digest over a nonce the send would never use — and
+        // the send's reviewed==signed check, correctly, refused to proceed.
+        // Fail-closed, and unusable: the first delegation couldn't be sent at
+        // all until the mempool drained.
+        let calls = vec![
+            queued(1, addr(0xC1), 0, vec![0x01]),
+            queued(2, addr(0xC2), 0, vec![0x02]),
+        ];
+        let req = || {
+            tx_builder::BatchSignRequest::Eoa(eoa_batch_req(
+                crate::chain::NetworkId::Builtin(Chain::Mainnet),
+                calls.clone(),
+            ))
+        };
+        let mock = CallMock::new();
+        mock.set_code(
+            eip7702::EF_SIMPLE_7702_ACCOUNT,
+            Bytes::from(vec![0x60u8]),
+            true,
+        );
+
+        let auth_nonce_of = |steps: &[sign_review::SignStep]| {
+            steps.iter().find_map(|s| match s {
+                sign_review::SignStep::Delegation(d) => Some(d.auth_nonce),
+                _ => None,
+            })
+        };
+
+        // The mock's verified head is 0, so the fallback pins 1 — unchanged.
+        let latest_only = prepared_steps(&mock, req()).await.unwrap();
+        assert_eq!(
+            auth_nonce_of(&latest_only),
+            Some(Some(1)),
+            "fallback: verified head + 1, as before",
+        );
+
+        // With one transaction in the mempool the broadcast consumes 6, so the
+        // authorization has to commit to 7 — and the digest must follow it.
+        let with_pending = prepared_steps_pending(&mock, req(), 6).await.unwrap();
+        assert_eq!(
+            auth_nonce_of(&with_pending),
+            Some(Some(7)),
+            "the pending nonce wins — it is what the broadcast consumes",
+        );
+        let [sign_review::SignStep::Delegation(d), _] = with_pending.as_slice() else {
+            panic!("expected a delegation card then the batch leg");
+        };
+        assert_eq!(
+            d.auth_digest,
+            Some(eip7702::build_authorization(Chain::Mainnet.chain_id(), 7).signature_hash()),
+            "the reviewed digest is over the nonce that will be signed",
+        );
     }
 
     /// A status-0 receipt, a guard rejection and a GS013 all broadcast exactly

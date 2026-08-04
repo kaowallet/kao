@@ -272,7 +272,13 @@ mod tests {
     }
 
     fn sample_template(name: &str) -> Template {
-        Template::from_batch(name, "(°ᴗ°)", Chain::Mainnet, &sample_calls())
+        Template::from_batch(
+            name,
+            "(°ᴗ°)",
+            Chain::Mainnet,
+            Address::repeat_byte(0xAA),
+            &sample_calls(),
+        )
     }
 
     #[test]
@@ -300,7 +306,13 @@ mod tests {
     #[test]
     fn from_batch_captures_calls() {
         let calls = sample_calls();
-        let t = Template::from_batch("My batch", "(°ᴗ°)", Chain::Mainnet, &calls);
+        let t = Template::from_batch(
+            "My batch",
+            "(°ᴗ°)",
+            Chain::Mainnet,
+            Address::repeat_byte(0xAA),
+            &calls,
+        );
         assert_eq!(t.name, "My batch");
         assert_eq!(t.note, "saved");
         assert_eq!(t.call_count, calls.len());
@@ -312,7 +324,13 @@ mod tests {
     /// loading a template on another network retargeted its addresses.
     #[test]
     fn a_template_refuses_to_load_on_another_chain() {
-        let t = Template::from_batch("opt batch", "(°ᴗ°)", Chain::Optimism, &sample_calls());
+        let t = Template::from_batch(
+            "opt batch",
+            "(°ᴗ°)",
+            Chain::Optimism,
+            Address::repeat_byte(0xAA),
+            &sample_calls(),
+        );
         assert_eq!(t.chain(), Some(Chain::Optimism));
         let err = t
             .calls(1, Chain::Mainnet)
@@ -364,7 +382,13 @@ mod tests {
     fn chain_survives_a_save_load_round_trip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("templates.redb");
-        let t = Template::from_batch("base batch", "(°ᴗ°)", Chain::Base, &sample_calls());
+        let t = Template::from_batch(
+            "base batch",
+            "(°ᴗ°)",
+            Chain::Base,
+            Address::repeat_byte(0xAA),
+            &sample_calls(),
+        );
         save_to(&path, std::slice::from_ref(&t)).unwrap();
         let back = load_from(&path);
         assert_eq!(back.len(), 1);

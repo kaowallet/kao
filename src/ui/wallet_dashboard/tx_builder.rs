@@ -417,6 +417,13 @@ pub struct ResolvedCode {
     /// stops rather than following such a pointer, so the code above is the
     /// proxy's own — usually near-empty of selectors.
     pub all_verified: bool,
+    /// True when the address the user typed has no contract code at all.
+    ///
+    /// Distinct from "no recoverable ABI": that one says the code is there and
+    /// wouldn't yield selectors, this one says there is no code. Only set when
+    /// the requested address *is* the implementation — behind a proxy the
+    /// address necessarily has code (the proxy's own).
+    pub nothing_deployed: bool,
     /// False when the *code* read itself fell through to unverified RPC.
     ///
     /// A different fact from [`Self::all_verified`], with a different remedy: a
@@ -727,6 +734,9 @@ pub struct TxBuilderApp {
     /// proxy stub's — worth saying out loud rather than leaving the user to
     /// wonder why a well-known contract came back nearly empty.
     proxy_unverified: bool,
+    /// No contract code at the composed address. Survives a pasted ABI: pasting
+    /// an ABI answers "what does it expose", not "is anything there".
+    pub(crate) nothing_deployed: bool,
     /// Set when the address is a beacon proxy — a shape the walker recognises
     /// but does not follow (resolving it needs an `eth_call` on the beacon, not
     /// a storage read). Held apart from `proxy_unverified` because it is a
@@ -813,6 +823,7 @@ impl TxBuilderApp {
             resolve_error: None,
             addr_error: None,
             proxy_unverified: false,
+            nothing_deployed: false,
             proxy_beacon: false,
             paste_open: false,
             abi_paste: String::new(),
@@ -962,15 +973,36 @@ impl TxBuilderApp {
                 Ok(r) => {
                     s.proxy_unverified = !r.all_verified;
                     s.proxy_beacon = r.beacon;
+                    // Set before `set_loaded`, which clears it — a curated hit
+                    // being augmented must keep whatever the chain just said
+                    // about whether anything is deployed there.
+                    let nothing_deployed = r.nothing_deployed;
                     match abi::from_bytecode_behind_proxy(
                         &r.code,
                         addr,
                         r.implementation,
                         r.code_verified,
                     ) {
-                        Some(loaded) => s.set_loaded(loaded),
-                        None => s.not_found = true,
+                        // A curated entry is already on screen: fold the
+                        // recovered selectors into it rather than replacing it,
+                        // so the hand-written names win where they overlap and
+                        // everything the contract actually exposes is reachable.
+                        Some(recovered) => match s.loaded.take() {
+                            Some(curated) if curated.source != AbiSource::Bytecode => {
+                                s.set_loaded(abi::merge_recovered(curated, recovered));
+                            }
+                            _ => s.set_loaded(recovered),
+                        },
+                        // Nothing recoverable. A curated entry already loaded
+                        // stands on its own — the augmenting fetch failing to
+                        // add anything is not a reason to drop it.
+                        None => {
+                            if s.loaded.is_none() {
+                                s.not_found = true;
+                            }
+                        }
                     }
+                    s.nothing_deployed = nothing_deployed;
                 }
                 // A failed *fetch* says nothing about whether this contract has
                 // a recoverable ABI, so it must not be reported as "no verified
@@ -1509,20 +1541,23 @@ impl TxBuilderApp {
                     // Built-in chain: curated registry first, else fetch the
                     // verified bytecode and recover the ABI.
                     Some(chain) => {
+                        // A curated hit shows immediately — its names are
+                        // authoritative and it needs no round trip — and then
+                        // the fetch runs anyway to fill in everything the
+                        // hand-written subset leaves out. `set_loaded` bumps
+                        // the sequence, so the request must read it afterwards.
                         if let Some(loaded) = abi::known_by_address(chain, addr) {
                             self.set_loaded(loaded);
-                            None
-                        } else {
-                            // `reset_composer_keep_addr` above already bumped
-                            // the sequence, retiring any earlier fetch; this
-                            // request rides the value it left behind.
-                            self.resolving = true;
-                            Some(Outcome::ResolveContract {
-                                seq: self.resolve_seq,
-                                chain,
-                                address: addr,
-                            })
                         }
+                        // `reset_composer_keep_addr` above already bumped the
+                        // sequence, retiring any earlier fetch; this request
+                        // rides whatever value it left behind.
+                        self.resolving = self.loaded.is_none();
+                        Some(Outcome::ResolveContract {
+                            seq: self.resolve_seq,
+                            chain,
+                            address: addr,
+                        })
                     }
                     // Custom (unverified) network: no verified-bytecode fetch and
                     // no curated registry — prompt straight for a pasted ABI.
@@ -1618,6 +1653,11 @@ impl TxBuilderApp {
         self.resolve_error = None;
         self.addr_error = None;
         self.proxy_unverified = false;
+        // Belongs to the address being left behind. Cleared here rather than in
+        // `set_loaded` (which a pasted ABI also goes through) precisely because
+        // pasting an ABI must NOT retire it: it answers what the address
+        // exposes, not whether anything is deployed there.
+        self.nothing_deployed = false;
         self.paste_open = false;
         self.resolve_target = None;
         self.method_idx = 0;
@@ -3308,13 +3348,79 @@ mod tests {
     }
 
     #[test]
-    fn known_address_loads_contract_synchronously() {
+    fn known_address_loads_contract_synchronously_and_still_fetches() {
         let mut app = safe_app();
         let out = app.update(Message::AddrChanged(usdc().to_string()));
-        assert!(out.is_none(), "known contracts resolve without I/O");
+        // The curated entry is on screen with no round trip — its names are
+        // authoritative and shouldn't wait on the network…
         assert!(app.loaded.is_some());
-        assert!(!app.resolving);
         assert_eq!(app.loaded.as_ref().unwrap().name, "USDC");
+        assert!(!app.resolving, "nothing to wait for — the menu is usable");
+        // …and the fetch goes out anyway, because the curated list is a
+        // hand-written subset and everything it omits is otherwise unreachable.
+        assert!(
+            matches!(out, Some(Outcome::ResolveContract { .. })),
+            "a curated hit must still fetch bytecode to fill in the rest",
+        );
+    }
+
+    #[test]
+    fn recovered_methods_fill_in_a_curated_contract_without_displacing_it() {
+        let mut app = safe_app();
+        app.update(Message::AddrChanged(usdc().to_string()));
+        let curated = app.loaded.clone().expect("curated USDC");
+        let before = curated.methods.len();
+        let kept = curated.methods[0].clone();
+
+        // The augmenting fetch lands: one selector the registry already lists
+        // (under its declared name) and one it doesn't.
+        let extra = AbiMethod {
+            // `increaseAllowance` — a real USDC method the curated subset
+            // (transfer / approve / transferFrom) leaves out.
+            name: "increaseAllowance".into(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            payable: false,
+            selector: [0x39, 0x50, 0x93, 0x51],
+            signature: "increaseAllowance(address,uint256)".into(),
+            provenance: abi::MethodProvenance::SelectorOnly,
+            inferred_mutability: None,
+        };
+        let collision = AbiMethod {
+            name: "not_the_declared_name".into(),
+            ..extra.clone()
+        };
+        let recovered = LoadedContract {
+            methods: vec![
+                AbiMethod {
+                    selector: kept.selector,
+                    ..collision
+                },
+                extra,
+            ],
+            source: AbiSource::Bytecode,
+            ..curated.clone()
+        };
+
+        let merged = abi::merge_recovered(curated, recovered);
+        assert_eq!(
+            merged.methods.len(),
+            before + 1,
+            "only the genuinely new selector is added",
+        );
+        assert_eq!(
+            merged.methods[0].name, kept.name,
+            "the declared name survives a selector collision",
+        );
+        assert!(
+            merged.methods.iter().any(|m| m.name == "increaseAllowance"),
+            "and the method the curated subset omitted is now reachable",
+        );
+        assert_eq!(
+            merged.source,
+            AbiSource::Known,
+            "still the curated contract"
+        );
     }
 
     #[test]
@@ -3595,6 +3701,7 @@ mod tests {
     /// target's own and every read on the way was verified.
     fn plain_code(target: Address, code: &[u8]) -> ResolvedCode {
         ResolvedCode {
+            nothing_deployed: false,
             code: Bytes::copy_from_slice(code),
             implementation: target,
             all_verified: true,
@@ -3679,6 +3786,7 @@ mod tests {
         app.on_contract_resolved(
             app.resolve_seq,
             Ok(ResolvedCode {
+                nothing_deployed: false,
                 code: Bytes::from(crate::decode::bytecode::tiny_transfer_runtime()),
                 implementation: impl_addr,
                 all_verified: true,
@@ -3735,6 +3843,7 @@ mod tests {
         app.on_contract_resolved(
             app.resolve_seq,
             Ok(ResolvedCode {
+                nothing_deployed: false,
                 code: Bytes::new(),
                 implementation: proxy,
                 all_verified: false,
@@ -3757,6 +3866,7 @@ mod tests {
         app.on_contract_resolved(
             app.resolve_seq,
             Ok(ResolvedCode {
+                nothing_deployed: false,
                 code: Bytes::new(),
                 implementation: proxy,
                 all_verified: false,
@@ -3784,6 +3894,7 @@ mod tests {
         app.on_contract_resolved(
             app.resolve_seq,
             Ok(ResolvedCode {
+                nothing_deployed: false,
                 code: Bytes::new(),
                 implementation: a,
                 all_verified: false,
@@ -4149,6 +4260,77 @@ mod tests {
         );
         d.extend_from_slice(&U256::from(amount).to_be_bytes::<32>());
         d
+    }
+
+    #[test]
+    fn an_address_with_no_code_says_so_and_keeps_saying_it() {
+        // The wrong-chain paste. Every downstream signal reads as success: the
+        // ABI pastes fine, a call to a code-less account does not revert, and
+        // the receipt comes back status 1 with the ETH gone.
+        let mut app = safe_app();
+        let addr = address!("0x00000000000000000000000000000000C0FFEE00");
+        app.update(Message::AddrChanged(addr.to_string()));
+        app.on_contract_resolved(
+            app.resolve_seq,
+            Ok(ResolvedCode {
+                code: Bytes::new(),
+                implementation: addr,
+                all_verified: true,
+                code_verified: true,
+                beacon: false,
+                nothing_deployed: true,
+            }),
+        );
+        assert!(
+            app.nothing_deployed,
+            "the emptiness is recorded, not dropped"
+        );
+
+        // Pasting an ABI answers "what does it expose", not "is anything
+        // there" — so the warning has to survive it.
+        app.update(Message::ShowAbiPaste);
+        app.update(Message::AbiPasteChanged(
+            r#"[{"type":"function","name":"deposit","inputs":[],"stateMutability":"payable"}]"#
+                .into(),
+        ));
+        app.update(Message::LoadPastedAbi);
+        assert!(app.loaded.is_some(), "the pasted ABI loads");
+        assert!(
+            app.nothing_deployed,
+            "and the address still has no contract behind it",
+        );
+
+        // A different address clears it.
+        app.update(Message::AddrChanged(usdc().to_string()));
+        assert!(!app.nothing_deployed);
+    }
+
+    #[test]
+    fn an_unrecovered_parameter_list_is_not_reported_as_no_parameters() {
+        use abi::MethodProvenance as P;
+        // A declaration can say "takes nothing"; evmole returning an empty
+        // vec cannot — it returns one both for a zero-argument method and for
+        // a function whose body it could not reach.
+        assert!(P::Declared.declares_argument_list());
+        assert!(P::Matched.declares_argument_list());
+        assert!(
+            P::Ambiguous {
+                alternatives: vec!["a()".into()]
+            }
+            .declares_argument_list(),
+            "4byte supplied the types even though the name is ambiguous",
+        );
+        assert!(!P::SelectorOnly.declares_argument_list());
+        assert!(
+            !P::Mismatched {
+                claimed: vec!["a()".into()]
+            }
+            .declares_argument_list(),
+        );
+        // And the bytecode-only case now says the list may be short, where it
+        // used to say nothing at all.
+        let c = P::SelectorOnly.caution().expect("a caution");
+        assert!(c.contains("incomplete"), "{c}");
     }
 
     #[test]

@@ -86,12 +86,38 @@ pub enum MethodProvenance {
 }
 
 impl MethodProvenance {
+    /// Whether an empty parameter list means "this method takes no arguments"
+    /// or "nobody recovered what it takes".
+    ///
+    /// Only a declaration settles it. `Declared` is an ABI saying so, and
+    /// `Matched`/`Ambiguous` carry 4byte's argument types for a signature that
+    /// agrees with the code. The other two get their types from evmole, which
+    /// returns `vec![]` both for a genuine zero-argument method and for a
+    /// function whose body it could not reach — see `decode::matcher`, which
+    /// documents the same conflation and refuses to treat the empty list as a
+    /// spoof signal for exactly this reason.
+    pub fn declares_argument_list(&self) -> bool {
+        matches!(
+            self,
+            Self::Declared | Self::Matched | Self::Ambiguous { .. }
+        )
+    }
+
     /// A one-line caution for the composer, or `None` when there is nothing to
     /// say. Deliberately worded like `function_panel::warning_strip`, which
-    /// reports the same two conditions on the review — one fact, one phrasing.
+    /// reports the same conditions on the review — one fact, one phrasing.
     pub fn caution(&self) -> Option<String> {
         match self {
-            Self::Declared | Self::Matched | Self::SelectorOnly => None,
+            // Recovered from the dispatcher with no 4byte name to corroborate
+            // it: the parameter list is evmole's inference, and evmole gives up
+            // by returning a short list rather than an error — so a plausible,
+            // fillable, wrong set of fields is a reachable outcome.
+            Self::SelectorOnly => Some(
+                "⚠ name and parameters recovered from bytecode — the argument list may be \
+                 incomplete"
+                    .to_string(),
+            ),
+            Self::Declared | Self::Matched => None,
             Self::Ambiguous { alternatives } => {
                 Some(format!("⚠ ambiguous: {}", alternatives.join(", ")))
             }
@@ -526,6 +552,35 @@ pub fn known_for_chain(chain: Chain) -> Vec<&'static KnownContract> {
         .iter()
         .filter(|k| k.chain == chain)
         .collect()
+}
+
+/// Fold bytecode-recovered methods into a curated (or pasted) ABI.
+///
+/// The curated registry is a hand-written subset — two to four methods per
+/// entry — and a curated hit used to short-circuit the bytecode fetch entirely,
+/// so the four addresses most likely to be typed into a transaction builder
+/// were the four with the shortest menus. `DAI.transferFrom` exists, is
+/// composable from bytecode, and was unreachable because DAI is *curated*.
+///
+/// `base` wins every collision: its names and parameter names are declarations,
+/// while the recovered entries are inference (see
+/// [`MethodProvenance::declares_argument_list`]). Recovered methods are matched
+/// by **selector**, not by name — an overload the registry lists under one
+/// signature must not suppress the other.
+///
+/// Reads merge the same way. `source` stays the base's: the contract is still
+/// the curated one, now with more of its surface reachable.
+pub fn merge_recovered(base: LoadedContract, recovered: LoadedContract) -> LoadedContract {
+    fn fold(mut kept: Vec<AbiMethod>, extra: Vec<AbiMethod>) -> Vec<AbiMethod> {
+        let known: std::collections::HashSet<[u8; 4]> = kept.iter().map(|m| m.selector).collect();
+        kept.extend(extra.into_iter().filter(|m| !known.contains(&m.selector)));
+        kept
+    }
+    LoadedContract {
+        methods: fold(base.methods, recovered.methods),
+        read_methods: fold(base.read_methods, recovered.read_methods),
+        ..base
+    }
 }
 
 /// Look up a curated contract by address (case-insensitive) on `chain`.

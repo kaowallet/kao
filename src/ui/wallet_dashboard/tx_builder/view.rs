@@ -428,17 +428,30 @@ fn contract_head(app: &TxBuilderApp, t: KaoTheme) -> Column<'_, Message> {
         col = col
             .push(Space::new().height(14))
             .push(contract_banner(t, c));
+        // Ahead of the proxy note: "there is no contract here" outranks any
+        // observation about which ABI is on screen.
+        if app.nothing_deployed {
+            col = col
+                .push(Space::new().height(8))
+                .push(nothing_deployed_note(app, t));
+        }
         if app.proxy_unverified {
             col = col
                 .push(Space::new().height(8))
                 .push(proxy_unverified_note(t));
         }
+        // A loaded ABI used to be final: a wrong bytecode recovery, or a
+        // curated entry missing the method you want, had no way back except
+        // retyping the address or dropping to Raw hex.
+        col = col
+            .push(Space::new().height(10))
+            .push(abi_paste_block(app, t, "Replace ABI…"));
     } else if let Some(e) = &app.addr_error {
         col = col.push(Space::new().height(14)).push(addr_error_box(t, e));
     } else if let Some(e) = &app.resolve_error {
         col = col
             .push(Space::new().height(14))
-            .push(resolve_error_box(t, e));
+            .push(resolve_error_box(app, t, e));
     } else if app.not_found {
         col = col
             .push(Space::new().height(14))
@@ -481,11 +494,24 @@ fn call_composer(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
             }
             if m.inputs.is_empty() {
                 if !m.payable {
-                    col = col.push(Space::new().height(12)).push(
-                        text("No parameters — this method takes no arguments.")
-                            .size(12)
-                            .color(t.sub),
-                    );
+                    // "Takes no arguments" is a claim, and only a declared ABI
+                    // is in a position to make it. Recovered from bytecode, an
+                    // empty list is equally "evmole couldn't reach the function
+                    // body" — and asserting the first reading queues a 4-byte
+                    // call for a method that wanted arguments.
+                    let (msg, tone) = if m.provenance.declares_argument_list() {
+                        ("No parameters — this method takes no arguments.", t.sub)
+                    } else {
+                        (
+                            "No parameters were recovered — that may mean this method takes \
+                             none, or that its argument list couldn't be read out of the \
+                             bytecode. Paste the contract's ABI to be sure, or use Raw hex.",
+                            t.down,
+                        )
+                    };
+                    col = col
+                        .push(Space::new().height(12))
+                        .push(text(msg).size(12).color(tone));
                 }
             } else {
                 col = col
@@ -2631,7 +2657,7 @@ fn capitalize_first(s: &str) -> String {
     }
 }
 
-fn resolve_error_box<'a>(t: KaoTheme, err: &str) -> Element<'a, Message> {
+fn resolve_error_box<'a>(app: &'a TxBuilderApp, t: KaoTheme, err: &'a str) -> Element<'a, Message> {
     let col = column![
         text("Couldn't read this contract")
             .size(13)
@@ -2642,11 +2668,9 @@ fn resolve_error_box<'a>(t: KaoTheme, err: &str) -> Element<'a, Message> {
             .size(12)
             .color(t.sub),
         Space::new().height(10),
-        row![
-            ghost_secondary(t, "↻ Retry", Some(Message::RetryResolve)),
-            Space::new().width(8),
-            ghost_secondary(t, "Paste ABI JSON", Some(Message::ShowAbiPaste)),
-        ],
+        ghost_secondary(t, "↻ Retry", Some(Message::RetryResolve)),
+        Space::new().height(8),
+        abi_paste_block(app, t, "Paste ABI JSON"),
     ]
     .width(Length::Fill);
     container(col.padding(Padding::from([13, 16])))
@@ -2661,6 +2685,80 @@ fn resolve_error_box<'a>(t: KaoTheme, err: &str) -> Element<'a, Message> {
             ..Default::default()
         })
         .into()
+}
+
+/// There is no contract at the address the user typed.
+///
+/// The wrong-chain paste is the most common way to lose money in a transaction
+/// builder — a contract that exists on Mainnet and not on Base — and every
+/// signal downstream reads as success: the ABI can be pasted by hand, the
+/// preflight passes (a call to an account with no code *does* succeed, doing
+/// nothing), and the receipt comes back status 1 with the ETH gone. Nothing
+/// else in the flow will say this, so it is said here and kept on screen for as
+/// long as it is true — a pasted ABI answers a different question and does not
+/// retire it.
+fn nothing_deployed_note<'a>(app: &'a TxBuilderApp, t: KaoTheme) -> Element<'a, Message> {
+    let col = column![
+        text("⚠ Nothing is deployed at this address")
+            .size(12)
+            .color(t.down)
+            .font(bold()),
+        Space::new().height(3),
+        text(format!(
+            "{} has no contract code on {}. Calls to it will not revert — they succeed having \
+             done nothing, and any ETH you attach is spent. Check the network, and check the \
+             address.",
+            app.addr_input.trim(),
+            app.net.display_name(),
+        ))
+        .size(11)
+        .color(t.text),
+    ]
+    .width(Length::Fill);
+    container(col.padding(Padding::from([10, 12])))
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(with_alpha(t.down, 0.10))),
+            border: Border {
+                color: t.down,
+                width: 1.0,
+                radius: Radius::from(10),
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+/// The "Paste ABI JSON" button and, once armed, the box it opens.
+///
+/// One block rather than three copies, because the button used to be offered in
+/// places the box was not: `resolve_error_box` rendered the button and nothing
+/// listened — the paste input only existed inside `not_found_box`, so the
+/// escape hatch offered on a failed fetch did visibly nothing. And a
+/// successfully-loaded contract offered no way in at all, which made a wrong
+/// bytecode recovery a dead end short of the Raw tab.
+fn abi_paste_block<'a>(app: &'a TxBuilderApp, t: KaoTheme, label: &'a str) -> Element<'a, Message> {
+    let mut col =
+        column![ghost_secondary(t, label, Some(Message::ShowAbiPaste))].width(Length::Fill);
+    if app.paste_open {
+        col = col
+            .push(Space::new().height(10))
+            .push(
+                text_input("[{\"type\":\"function\", …}]", &app.abi_paste)
+                    .on_input(Message::AbiPasteChanged)
+                    .padding(Padding::from([11, 13]))
+                    .size(12)
+                    .font(mono())
+                    .style(move |_, s| text_input_style(t, s)),
+            )
+            .push(Space::new().height(8))
+            .push(ghost_secondary(
+                t,
+                "Load ABI",
+                (!app.abi_paste.trim().is_empty()).then_some(Message::LoadPastedAbi),
+            ));
+    }
+    col.into()
 }
 
 fn not_found_box(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
@@ -2693,30 +2791,9 @@ fn not_found_box(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
         ));
     }
 
-    col = col.push(Space::new().height(10)).push(ghost_secondary(
-        t,
-        "Paste ABI JSON",
-        Some(Message::ShowAbiPaste),
-    ));
-
-    if app.paste_open {
-        col = col
-            .push(Space::new().height(10))
-            .push(
-                text_input("[{\"type\":\"function\", …}]", &app.abi_paste)
-                    .on_input(Message::AbiPasteChanged)
-                    .padding(Padding::from([11, 13]))
-                    .size(12)
-                    .font(mono())
-                    .style(move |_, s| text_input_style(t, s)),
-            )
-            .push(Space::new().height(8))
-            .push(ghost_secondary(
-                t,
-                "Load ABI",
-                (!app.abi_paste.trim().is_empty()).then_some(Message::LoadPastedAbi),
-            ));
-    }
+    col = col
+        .push(Space::new().height(10))
+        .push(abi_paste_block(app, t, "Paste ABI JSON"));
 
     container(col.padding(Padding::from([13, 16])))
         .width(Length::Fill)

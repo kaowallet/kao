@@ -6999,6 +6999,9 @@ async fn resolve_contract_code(
             all_verified: res.all_verified,
             code_verified: read.verified && inner.verified,
             beacon: false,
+            // A clone was read *out of* the requested address's own code, so
+            // there is certainly something deployed there.
+            nothing_deployed: false,
         });
     }
 
@@ -7009,6 +7012,11 @@ async fn resolve_contract_code(
         && crate::decode::proxy::is_beacon_proxy(network, chain, res.implementation).await;
 
     Ok(tx_builder::ResolvedCode {
+        // Only when the address the user typed is the thing we read: behind a
+        // proxy the address has the proxy's code by definition, and a beacon
+        // has been recognised as a contract even though its own runtime carries
+        // no selectors.
+        nothing_deployed: res.implementation == address && read.value.is_empty() && !beacon,
         code: read.value,
         implementation: res.implementation,
         all_verified: res.all_verified,

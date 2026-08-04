@@ -108,16 +108,10 @@ impl MethodProvenance {
     /// reports the same conditions on the review — one fact, one phrasing.
     pub fn caution(&self) -> Option<String> {
         match self {
-            // Recovered from the dispatcher with no 4byte name to corroborate
-            // it: the parameter list is evmole's inference, and evmole gives up
-            // by returning a short list rather than an error — so a plausible,
-            // fillable, wrong set of fields is a reachable outcome.
-            Self::SelectorOnly => Some(
-                "⚠ name and parameters recovered from bytecode — the argument list may be \
-                 incomplete"
-                    .to_string(),
-            ),
-            Self::Declared | Self::Matched => None,
+            // Nothing to say on its own — what a bytecode-only recovery is
+            // worth depends on what it recovered, which is
+            // [`AbiMethod::caution`]'s question, not this one's.
+            Self::SelectorOnly | Self::Declared | Self::Matched => None,
             Self::Ambiguous { alternatives } => {
                 Some(format!("⚠ ambiguous: {}", alternatives.join(", ")))
             }
@@ -169,6 +163,40 @@ pub struct AbiMethod {
 }
 
 impl AbiMethod {
+    /// The one-line caution for this method in the composer, if any.
+    ///
+    /// Provenance alone can't answer it for a bytecode-only recovery: what
+    /// matters is what was recovered. evmole reports failure by returning a
+    /// *short list* rather than an error — it gives up on an unreachable
+    /// function body or an exhausted gas budget and hands back whatever it had
+    /// — so the same `SelectorOnly` label covers two very different positions.
+    ///
+    /// An **empty** list is the sharp one, and it is checkable: a real
+    /// zero-argument method and a total recovery failure are indistinguishable,
+    /// so calldata composed here is four bytes, and the argument the function
+    /// wanted is simply absent. A **non-empty** list is milder — the types are
+    /// inference and could still be truncated, but nothing about it is
+    /// provably wrong, and saying so on every such method is how a caution
+    /// stops being read.
+    ///
+    /// General detection is not available and this does not pretend otherwise:
+    /// `SelectorOnly` means 4byte had no signature for the selector, so there
+    /// is no name to hash and nothing to check a recovered list against. What
+    /// catches a truncated list downstream is the preflight — a call with the
+    /// wrong calldata shape reverts — and this is what points the user at it.
+    pub fn caution(&self) -> Option<String> {
+        if matches!(self.provenance, MethodProvenance::SelectorOnly) {
+            return Some(if self.inputs.is_empty() {
+                "⚠ no name and no parameters recovered — this composes a bare 4-byte call. If \
+                 the method takes arguments, they will be missing. Paste the ABI, or use Raw hex."
+                    .to_string()
+            } else {
+                "⚠ name unknown; parameter types inferred from bytecode".to_string()
+            });
+        }
+        self.provenance.caution()
+    }
+
     /// The return type to ABI-decode an `eth_call` result against: a tuple of
     /// the declared outputs (a bare tuple decodes identically to head-tail ABI
     /// return data). `None` when the method declares no outputs.

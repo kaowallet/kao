@@ -584,6 +584,19 @@ pub enum Outcome {
         to: Address,
         data: Bytes,
     },
+    /// Ask whether anything is deployed at `address`. Answered via
+    /// [`TxBuilderApp::on_code_probed`].
+    ///
+    /// Bubbled by the two composers that can't otherwise find out: the Raw-hex
+    /// tab, which never resolves anything, and the contract composer on a
+    /// custom network, where there is no registry and no bytecode tier. Both
+    /// could aim a call at an address holding no contract — the call then
+    /// succeeds having done nothing, and any ETH attached to it is spent.
+    ProbeCode {
+        seq: u64,
+        net: NetworkId,
+        address: Address,
+    },
     /// Simulate the batch on `chain` (built-in only). Answered via
     /// [`TxBuilderApp::on_sim`].
     Simulate {
@@ -643,6 +656,7 @@ impl Outcome {
             Outcome::Close => "Close",
             Outcome::ResolveContract { .. } => "ResolveContract",
             Outcome::Read { .. } => "Read",
+            Outcome::ProbeCode { .. } => "ProbeCode",
             Outcome::Simulate { .. } => "Simulate",
             Outcome::Review { .. } => "Review",
             Outcome::PersistTemplates { .. } => "PersistTemplates",
@@ -737,6 +751,12 @@ pub struct TxBuilderApp {
     /// No contract code at the composed address. Survives a pasted ABI: pasting
     /// an ABI answers "what does it expose", not "is anything there".
     pub(crate) nothing_deployed: bool,
+    /// Same fact for the Raw-hex tab's `to` field, which resolves nothing and
+    /// so had no way to learn it.
+    pub(crate) raw_nothing_deployed: bool,
+    /// Generation guard for [`Outcome::ProbeCode`]: a reply for an address the
+    /// user has since retyped must not land on the new one.
+    probe_seq: u64,
     /// Set when the address is a beacon proxy — a shape the walker recognises
     /// but does not follow (resolving it needs an `eth_call` on the beacon, not
     /// a storage read). Held apart from `proxy_unverified` because it is a
@@ -824,6 +844,8 @@ impl TxBuilderApp {
             addr_error: None,
             proxy_unverified: false,
             nothing_deployed: false,
+            raw_nothing_deployed: false,
+            probe_seq: 0,
             proxy_beacon: false,
             paste_open: false,
             abi_paste: String::new(),
@@ -1009,6 +1031,37 @@ impl TxBuilderApp {
                 // ABI".
                 Err(e) => s.resolve_error = Some(e),
             }
+        })
+    }
+
+    /// Whether anything is deployed at the address a composer is pointed at.
+    ///
+    /// Applied to whichever field still holds `address`, so a reply that
+    /// arrives after the user has moved on lands nowhere. A failed probe is
+    /// silent: not being able to ask is not evidence of an empty account, and
+    /// this warning must never fire on an RPC hiccup.
+    pub fn on_code_probed(&mut self, seq: u64, address: Address, result: Result<bool, String>) {
+        self.traced("on_code_probed", move |s| {
+            if seq != s.probe_seq {
+                return;
+            }
+            let Ok(has_code) = result else { return };
+            if s.raw_to.trim().parse::<Address>() == Ok(address) {
+                s.raw_nothing_deployed = !has_code;
+            }
+            if s.resolve_target == Some(address) {
+                s.nothing_deployed = !has_code;
+            }
+        })
+    }
+
+    /// Bubble a code probe for `address` if it is worth asking about.
+    fn probe_code(&mut self, address: Address) -> Option<Outcome> {
+        self.probe_seq += 1;
+        Some(Outcome::ProbeCode {
+            seq: self.probe_seq,
+            net: self.net,
+            address,
         })
     }
 
@@ -1290,7 +1343,19 @@ impl TxBuilderApp {
                     return Some(Outcome::CopyPlain(r.value.clone()));
                 }
             }
-            Message::RawToChanged(v) => self.raw_to = v,
+            Message::RawToChanged(v) => {
+                self.raw_to = v;
+                // The Raw tab resolves nothing, so this is its only chance to
+                // learn that the address holds no contract — the wrong-chain
+                // paste, where the call succeeds having done nothing and takes
+                // the attached ETH with it. Cleared first: the old answer
+                // belongs to the old address.
+                self.raw_nothing_deployed = false;
+                self.probe_seq += 1;
+                if let Ok(addr) = encode::parse_address(self.raw_to.trim()) {
+                    return self.probe_code(addr);
+                }
+            }
             Message::RawValueChanged(v) => self.raw_value = v,
             Message::RawDataChanged(v) => self.raw_data = v,
             Message::AddToBatch => self.add_to_batch(),
@@ -1559,11 +1624,15 @@ impl TxBuilderApp {
                             address: addr,
                         })
                     }
-                    // Custom (unverified) network: no verified-bytecode fetch and
-                    // no curated registry — prompt straight for a pasted ABI.
+                    // Custom (unverified) network: no verified-bytecode fetch
+                    // and no curated registry — prompt straight for a pasted
+                    // ABI. Whether anything is *deployed* there is still worth
+                    // asking, and the configured RPC can answer it: pasting an
+                    // ABI proves nothing about the account it is aimed at, and
+                    // this is the composer with the least else to go on.
                     None => {
                         self.not_found = true;
-                        None
+                        self.probe_code(addr)
                     }
                 }
             }
@@ -4306,6 +4375,70 @@ mod tests {
     }
 
     #[test]
+    fn the_raw_tab_asks_whether_anything_is_deployed() {
+        // The Raw tab resolves nothing, so this probe is its only chance to
+        // learn that the address holds no contract.
+        let mut app = safe_app();
+        let addr = address!("0x00000000000000000000000000000000C0FFEE00");
+        let out = app.update(Message::RawToChanged(addr.to_string()));
+        let Some(Outcome::ProbeCode { seq, address, .. }) = out else {
+            panic!("a complete address must be probed, got {out:?}");
+        };
+        assert_eq!(address, addr);
+
+        app.on_code_probed(seq, addr, Ok(false));
+        assert!(app.raw_nothing_deployed, "empty account is reported");
+
+        // A contract there says nothing.
+        app.on_code_probed(seq, addr, Ok(true));
+        assert!(!app.raw_nothing_deployed);
+    }
+
+    #[test]
+    fn a_failed_or_stale_code_probe_never_raises_the_warning() {
+        let mut app = safe_app();
+        let addr = address!("0x00000000000000000000000000000000C0FFEE00");
+        let Some(Outcome::ProbeCode { seq, .. }) =
+            app.update(Message::RawToChanged(addr.to_string()))
+        else {
+            panic!("expected a probe");
+        };
+
+        // Not being able to ask is not evidence of an empty account — this
+        // warning must never fire on an RPC hiccup.
+        app.on_code_probed(seq, addr, Err("connection reset".into()));
+        assert!(!app.raw_nothing_deployed);
+
+        // And a reply for an address the user has since retyped lands nowhere.
+        let other = address!("0x00000000000000000000000000000000C0FFEE11");
+        app.update(Message::RawToChanged(other.to_string()));
+        app.on_code_probed(seq, addr, Ok(false));
+        assert!(
+            !app.raw_nothing_deployed,
+            "a superseded probe must not caption the new address",
+        );
+    }
+
+    #[test]
+    fn a_custom_network_composer_still_asks_about_code() {
+        // No registry and no bytecode tier there, so this box is the whole
+        // answer — and "is anything deployed" is still answerable over the
+        // configured RPC.
+        let mut app = safe_app();
+        app.net = NetworkId::Custom(31337);
+        let addr = address!("0x00000000000000000000000000000000C0FFEE00");
+        let out = app.update(Message::AddrChanged(addr.to_string()));
+        assert!(app.not_found, "still prompts for a pasted ABI");
+        let Some(Outcome::ProbeCode { seq, address, net }) = out else {
+            panic!("expected a code probe, got {out:?}");
+        };
+        assert_eq!(address, addr);
+        assert_eq!(net, NetworkId::Custom(31337));
+        app.on_code_probed(seq, addr, Ok(false));
+        assert!(app.nothing_deployed);
+    }
+
+    #[test]
     fn an_unrecovered_parameter_list_is_not_reported_as_no_parameters() {
         use abi::MethodProvenance as P;
         // A declaration can say "takes nothing"; evmole returning an empty
@@ -4327,10 +4460,44 @@ mod tests {
             }
             .declares_argument_list(),
         );
-        // And the bytecode-only case now says the list may be short, where it
-        // used to say nothing at all.
-        let c = P::SelectorOnly.caution().expect("a caution");
-        assert!(c.contains("incomplete"), "{c}");
+        // And the caution now keys on what was actually recovered, not on the
+        // label. Empty is the sharp case — a bare 4-byte call — and gets said
+        // so; a recovered list is milder and must not carry the same alarm, or
+        // the alarm stops being read.
+        let bare = AbiMethod {
+            name: "0x1e83409a".into(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            payable: false,
+            selector: [0x1e, 0x83, 0x40, 0x9a],
+            signature: "0x1e83409a()".into(),
+            provenance: P::SelectorOnly,
+            inferred_mutability: None,
+        };
+        let c = bare.caution().expect("the bare-selector case warns");
+        assert!(c.contains("4-byte"), "{c}");
+        assert!(c.contains("Paste the ABI"), "it names the remedy: {c}");
+
+        let typed = AbiMethod {
+            inputs: vec![abi::AbiParam {
+                name: String::new(),
+                ty: alloy::dyn_abi::DynSolType::Address,
+                ty_str: "address".into(),
+            }],
+            ..bare.clone()
+        };
+        let c = typed.caution().expect("still worth a note");
+        assert!(!c.contains("4-byte"), "but not the same alarm: {c}");
+
+        // A declared ABI stays silent.
+        assert!(
+            AbiMethod {
+                provenance: P::Declared,
+                ..bare
+            }
+            .caution()
+            .is_none(),
+        );
     }
 
     #[test]

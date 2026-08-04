@@ -431,9 +431,11 @@ fn contract_head(app: &TxBuilderApp, t: KaoTheme) -> Column<'_, Message> {
         // Ahead of the proxy note: "there is no contract here" outranks any
         // observation about which ABI is on screen.
         if app.nothing_deployed {
-            col = col
-                .push(Space::new().height(8))
-                .push(nothing_deployed_note(app, t));
+            col = col.push(Space::new().height(8)).push(nothing_deployed_note(
+                app,
+                t,
+                app.addr_input.trim(),
+            ));
         }
         if app.proxy_unverified {
             col = col
@@ -632,6 +634,14 @@ fn raw_composer(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
     if let Some(e) = &to_err {
         col = col.push(Space::new().height(6)).push(field_error(t, e));
     }
+    // A well-formed address with nothing behind it. Not a field error — the
+    // input is valid — but the call would succeed having done nothing, so it
+    // sits with the field rather than in a banner at the bottom of the page.
+    if app.raw_nothing_deployed {
+        col =
+            col.push(Space::new().height(8))
+                .push(nothing_deployed_note(app, t, app.raw_to.trim()));
+    }
 
     col = col.push(Space::new().height(14)).push(labelled(
         t,
@@ -751,7 +761,7 @@ fn method_picker(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
     // What the name on that button is worth. The review overlay says this at
     // signing time; by then the method has been chosen, composed and simulated.
     if let Some(m) = app.selected_method()
-        && let Some(caution) = m.provenance.caution()
+        && let Some(caution) = m.caution()
     {
         let tone = if m.provenance.is_spoof_signal() {
             t.down
@@ -2697,7 +2707,11 @@ fn resolve_error_box<'a>(app: &'a TxBuilderApp, t: KaoTheme, err: &'a str) -> El
 /// else in the flow will say this, so it is said here and kept on screen for as
 /// long as it is true — a pasted ABI answers a different question and does not
 /// retire it.
-fn nothing_deployed_note<'a>(app: &'a TxBuilderApp, t: KaoTheme) -> Element<'a, Message> {
+fn nothing_deployed_note<'a>(
+    app: &'a TxBuilderApp,
+    t: KaoTheme,
+    address: &'a str,
+) -> Element<'a, Message> {
     let col = column![
         text("⚠ Nothing is deployed at this address")
             .size(12)
@@ -2708,7 +2722,7 @@ fn nothing_deployed_note<'a>(app: &'a TxBuilderApp, t: KaoTheme) -> Element<'a, 
             "{} has no contract code on {}. Calls to it will not revert — they succeed having \
              done nothing, and any ETH you attach is spent. Check the network, and check the \
              address.",
-            app.addr_input.trim(),
+            address,
             app.net.display_name(),
         ))
         .size(11)
@@ -2773,6 +2787,15 @@ fn not_found_box(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
             .color(t.sub),
     ]
     .width(Length::Fill);
+
+    // On a custom network this box is the whole answer — there is no registry
+    // and no bytecode tier — so it is also where "there is no contract here"
+    // has to be said.
+    if app.nothing_deployed {
+        col = col
+            .push(Space::new().height(10))
+            .push(nothing_deployed_note(app, t, app.addr_input.trim()));
+    }
 
     if app.proxy_unverified {
         col = col

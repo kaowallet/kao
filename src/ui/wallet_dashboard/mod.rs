@@ -447,6 +447,13 @@ pub enum Message {
         hash: TxHash,
         fate: tx_builder::BatchFate,
     },
+    /// Whether anything is deployed at `address`. `address` rides along so the
+    /// pane can drop a reply for a field the user has since retyped.
+    TxBuilderCodeProbed {
+        seq: u64,
+        address: Address,
+        result: Result<bool, String>,
+    },
     /// Names app: reverse-lookup discovery finished. `owner` is the account the
     /// scan was spawned for — the handler drops it if the active account changed.
     NameReverseScanned {
@@ -2154,6 +2161,9 @@ impl WalletScreen {
             } => spawn_txbuilder_resolve(self.network.clone(), seq, chain, address),
             O::Read { seq, net, to, data } => {
                 spawn_txbuilder_read(self.network.clone(), seq, net, to, data)
+            }
+            O::ProbeCode { seq, net, address } => {
+                spawn_txbuilder_code_probe(self.network.clone(), seq, net, address)
             }
             O::Simulate { seq, chain, calls } => {
                 let from = self
@@ -4971,6 +4981,16 @@ impl WalletScreen {
             Message::TxBuilderResolved { seq, result } => {
                 self.apps.txbuilder_pane().on_contract_resolved(seq, result);
             }
+            Message::TxBuilderCodeProbed {
+                seq,
+                address,
+                result,
+            } => {
+                self.apps
+                    .txbuilder_pane()
+                    .on_code_probed(seq, address, result);
+                return (Task::none(), None);
+            }
             Message::TxBuilderRead { seq, result } => {
                 self.apps.txbuilder_pane().on_read(seq, result);
             }
@@ -7028,6 +7048,54 @@ async fn resolve_contract_code(
 /// Run a Read-tab `eth_call`. Built-in chains go through the Helios-verified
 /// `call` (the returned `verified` flag drives the badge); a custom network
 /// issues a raw `eth_call` against its configured RPC (never verified).
+/// Ask whether anything is deployed at `address` — nothing more.
+///
+/// Separate from [`spawn_txbuilder_resolve`], which walks proxies and recovers
+/// an ABI, because the two callers here don't want an ABI. The Raw-hex tab
+/// composes calldata by hand and the custom-network composer can't introspect
+/// anything, and both were free to aim a call at an address with no contract on
+/// it — the wrong-chain paste, where the call succeeds, does nothing, and takes
+/// any attached ETH with it.
+///
+/// Verification is deliberately not required. On a built-in chain the read goes
+/// through the light client; on a custom network it is a raw `eth_getCode` over
+/// a configured RPC. An untrusted endpoint could lie in both directions, but
+/// "an RPC might be lying about there being no contract here" is still a better
+/// position than never asking.
+fn spawn_txbuilder_code_probe(
+    network: Arc<dyn BalanceFetcher>,
+    seq: u64,
+    net: crate::chain::NetworkId,
+    address: Address,
+) -> Task<Message> {
+    use alloy::providers::Provider;
+    Task::perform(
+        async move {
+            match net.builtin() {
+                Some(chain) => network
+                    .get_code(address, chain)
+                    .await
+                    .map(|r| !r.value.is_empty()),
+                None => {
+                    let provider = provider_for(&network, net)
+                        .await
+                        .ok_or_else(|| "no RPC configured for this network".to_string())?;
+                    provider
+                        .get_code_at(address)
+                        .await
+                        .map(|c| !c.is_empty())
+                        .map_err(|e| crate::net::redact_urls(&e.to_string()))
+                }
+            }
+        },
+        move |result| Message::TxBuilderCodeProbed {
+            seq,
+            address,
+            result,
+        },
+    )
+}
+
 fn spawn_txbuilder_read(
     network: Arc<dyn BalanceFetcher>,
     seq: u64,

@@ -52,13 +52,15 @@ ignore = [
     { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 unmaintained. Build-time proc-macro used by alloy-primitives via alloy-chains. No known vuln, no runtime surface." },
     { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 2.0.1 unmaintained (fork of proc-macro-error, see RUSTSEC-2024-0370 above). Build-time proc-macro diagnostics used by alloy-sol-macro. No known vuln, no runtime surface. Revisit when alloy-sol-macro migrates off it upstream." },
 
-    # ── iced GUI font/glyph subtree (cosmic-text + usvg → fontdb → ttf-parser) ─
-    # The only non-helios, non-alloy entry: it enters through the GUI, not the
-    # chain/signing path. ttf-parser parses font files and SVG glyph outlines for
-    # on-screen text rendering only — it never sees keys, encrypted storage,
-    # signed payloads, or verified chain state, and the fonts/SVG assets it reads
-    # ship with the app.
+    # ── iced GUI font/glyph subtree (cosmic-text + usvg → fontdb → ttf-parser,
+    #    resvg → usvg → rustybuzz) ──────────────────────────────────────────
+    # The only non-helios, non-alloy entries: they enter through the GUI, not the
+    # chain/signing path. These crates parse font files and shape/lay out glyph
+    # outlines for on-screen text rendering only — they never see keys, encrypted
+    # storage, signed payloads, or verified chain state, and the fonts/SVG assets
+    # they read ship with the app.
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser 0.25.1 unmaintained (author won't ship further fixes; no known vuln). Reaches the tree via iced's text/SVG rendering (cosmic-text + usvg → fontdb). Glyph/font parsing for rendering only — disjoint from signing, storage, and chain verification. Revisit when iced/cosmic-text/usvg migrate to skrifa." },
+    { id = "RUSTSEC-2026-0206", reason = "rustybuzz 0.20.1 unmaintained (maintainer points at harfrust; no known vuln). Enters via iced's SVG rendering (iced_tiny_skia/iced_wgpu → resvg 0.45 → usvg). Text shaping for the bundled app icons only — same rendering-path isolation as ttf-parser above. No consumer-side upgrade: iced pins resvg ^0.45 and even usvg 0.47 still requires rustybuzz ^0.20.1. Revisit when usvg migrates to harfrust and iced bumps resvg." },
 
     # ── iced Wayland subtree (winit → smithay-client-toolkit →
     #    wayland-scanner → quick-xml 0.39) ───────────────────────────────────

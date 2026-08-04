@@ -418,6 +418,10 @@ criteria = "safe-to-deploy"
 version = "0.5.0"
 criteria = "safe-to-deploy"
 
+[[exemptions.ark-ff]]
+version = "0.6.0"
+criteria = "safe-to-deploy"
+
 [[exemptions.ark-ff-asm]]
 version = "0.3.0"
 criteria = "safe-to-deploy"
@@ -430,6 +434,10 @@ criteria = "safe-to-deploy"
 version = "0.5.0"
 criteria = "safe-to-deploy"
 
+[[exemptions.ark-ff-asm]]
+version = "0.6.0"
+criteria = "safe-to-deploy"
+
 [[exemptions.ark-ff-macros]]
 version = "0.3.0"
 criteria = "safe-to-deploy"
@@ -440,6 +448,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.ark-ff-macros]]
 version = "0.5.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.ark-ff-macros]]
+version = "0.6.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.ark-groth16]]
@@ -470,8 +482,16 @@ criteria = "safe-to-deploy"
 version = "0.5.0"
 criteria = "safe-to-deploy"
 
+[[exemptions.ark-serialize]]
+version = "0.6.0"
+criteria = "safe-to-deploy"
+
 [[exemptions.ark-serialize-derive]]
 version = "0.5.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.ark-serialize-derive]]
+version = "0.6.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.ark-snark]]
@@ -488,6 +508,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.ark-std]]
 version = "0.5.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.ark-std]]
+version = "0.6.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.as-raw-xcb-connection]]
@@ -2923,7 +2947,7 @@ version = "1.29.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.ruint]]
-version = "1.18.0"
+version = "1.20.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.ruint-macro]]

@@ -91,6 +91,16 @@ pub(super) fn root(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
         composer_pane(app, t)
     };
 
+    // A standing refusal — no key for this account, or a Safe version this
+    // wallet won't sign for — belongs above the composer, not in the error
+    // banner at the foot of the page. Both used to be discovered on the click
+    // that opens the review, with the batch already composed and simulated.
+    if let Some(why) = app.no_signer_reason() {
+        header = header
+            .push(Space::new().height(10))
+            .push(signing_block_banner(t, &why));
+    }
+
     let mut col = column![header, Space::new().height(16), panes]
         .width(Length::Fill)
         .height(Length::Fill);
@@ -1863,6 +1873,18 @@ fn sim_strip<'a>(
         ),
     };
     let color = if ok { t.up } else { t.down };
+    // A verdict is a claim about execution, and this box was making it flat.
+    // Only attached where execution actually happened: `Unavailable` and
+    // `Error` ran nothing, so there is no claim to qualify.
+    let ran = matches!(
+        sim.outcome,
+        BatchOutcome::Success | BatchOutcome::Revert { .. } | BatchOutcome::Halt { .. }
+    );
+    let blind_spots = if ran {
+        app.sim_blind_spots()
+    } else {
+        Vec::new()
+    };
     let body = column![
         row![
             text(title).size(12).color(color).font(bold()),
@@ -1896,6 +1918,24 @@ fn sim_strip<'a>(
     ]
     .spacing(4)
     .width(Length::Fill);
+
+    let body = if blind_spots.is_empty() {
+        body
+    } else {
+        let mut list = column![
+            Space::new().height(3),
+            text("Not modelled by this preflight")
+                .size(10)
+                .color(t.sub)
+                .font(bold()),
+        ]
+        .spacing(3)
+        .width(Length::Fill);
+        for item in blind_spots {
+            list = list.push(text(format!("· {item}")).size(10).color(t.sub));
+        }
+        body.push(list)
+    };
 
     container(body.padding(Padding::from([11, 13])))
         .width(Length::Fill)
@@ -2628,6 +2668,33 @@ fn not_found_box(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
             ..Default::default()
         })
         .into()
+}
+
+/// A standing statement about the active identity, not a dismissible error:
+/// nothing the user does in this pane clears it, so it has no ✕ and doesn't
+/// share the `error` slot that a network switch or a bad argument writes to.
+fn signing_block_banner<'a>(t: KaoTheme, msg: &str) -> Element<'a, Message> {
+    container(
+        row![
+            text("Read-only here").size(12).color(t.a2).font(bold()),
+            Space::new().width(10),
+            text(msg.to_string()).size(11).color(t.sub),
+        ]
+        .align_y(Alignment::Center)
+        .width(Length::Fill),
+    )
+    .padding(Padding::from([10, 14]))
+    .width(Length::Fill)
+    .style(move |_| container::Style {
+        background: Some(Background::Color(with_alpha(t.a2, 0.08))),
+        border: Border {
+            color: with_alpha(t.a2, 0.35),
+            width: 1.0,
+            radius: Radius::from(12),
+        },
+        ..Default::default()
+    })
+    .into()
 }
 
 fn error_banner<'a>(t: KaoTheme, msg: &str) -> Element<'a, Message> {

@@ -76,6 +76,130 @@ enum Modal {
     Load,
 }
 
+/// A sample of the pane's coarse state, taken either side of an `update`.
+///
+/// See [`TxBuilderApp::trace_snapshot`] for why the state is sampled rather
+/// than logged at each assignment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TraceState {
+    mode: Mode,
+    net: NetworkId,
+    batch: usize,
+    modal: Modal,
+    loaded: bool,
+    resolving: bool,
+    read_busy: bool,
+    sim_busy: bool,
+    sim: bool,
+    errored: bool,
+    settled: bool,
+}
+
+impl TraceState {
+    /// Emit one DEBUG line per field that moved, naming the message that moved
+    /// it. Nothing is logged when the dispatch changed no coarse state — which
+    /// is most of them, since typing into a field is a message per keystroke.
+    fn diff(&self, cause: &str, to: &Self) {
+        for (what, from, to) in self.changes(to) {
+            crate::trace::state_caused("tx_builder", cause, what, from, to);
+        }
+    }
+
+    /// The fields that moved, as `(what, from, to)`.
+    ///
+    /// Split out from [`Self::diff`] so it can be asserted on without standing
+    /// up a tracing subscriber: the failure mode this guards against is a new
+    /// field being added to the pane and never reaching the snapshot, which
+    /// silently shrinks what the log can show and looks exactly like a working
+    /// trace.
+    fn changes(&self, to: &Self) -> Vec<(&'static str, String, String)> {
+        let mut out = Vec::new();
+        if self == to {
+            return out;
+        }
+        let mut log = |what, from: String, to: String| out.push((what, from, to));
+        if self.mode != to.mode {
+            log(
+                "mode",
+                mode_name(self.mode).into(),
+                mode_name(to.mode).into(),
+            );
+        }
+        if self.net != to.net {
+            log("net", self.net.display_name(), to.net.display_name());
+        }
+        if self.batch != to.batch {
+            log("batch", self.batch.to_string(), to.batch.to_string());
+        }
+        if self.modal != to.modal {
+            log(
+                "modal",
+                modal_name(&self.modal).into(),
+                modal_name(&to.modal).into(),
+            );
+        }
+        if self.loaded != to.loaded {
+            log("contract", self.loaded.to_string(), to.loaded.to_string());
+        }
+        if self.resolving != to.resolving {
+            log(
+                "resolving",
+                self.resolving.to_string(),
+                to.resolving.to_string(),
+            );
+        }
+        if self.read_busy != to.read_busy {
+            log(
+                "read_busy",
+                self.read_busy.to_string(),
+                to.read_busy.to_string(),
+            );
+        }
+        if self.sim_busy != to.sim_busy {
+            log(
+                "sim_busy",
+                self.sim_busy.to_string(),
+                to.sim_busy.to_string(),
+            );
+        }
+        if self.sim != to.sim {
+            log("sim_verdict", self.sim.to_string(), to.sim.to_string());
+        }
+        if self.errored != to.errored {
+            log("error", self.errored.to_string(), to.errored.to_string());
+        }
+        if self.settled != to.settled {
+            log("settled", self.settled.to_string(), to.settled.to_string());
+        }
+        out
+    }
+
+    /// Just the names of the fields that moved.
+    #[cfg(test)]
+    fn changed_fields(&self, to: &Self) -> Vec<&'static str> {
+        self.changes(to)
+            .into_iter()
+            .map(|(what, ..)| what)
+            .collect()
+    }
+}
+
+fn mode_name(m: Mode) -> &'static str {
+    match m {
+        Mode::Write => "Write",
+        Mode::Read => "Read",
+        Mode::Raw => "Raw",
+    }
+}
+
+fn modal_name(m: &Modal) -> &'static str {
+    match m {
+        Modal::None => "None",
+        Modal::Save => "Save",
+        Modal::Load => "Load",
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     Close,
@@ -447,8 +571,10 @@ struct Ctx {
     identity: Option<Address>,
     /// Whether the active identity is a Safe (atomic batching via MultiSend).
     is_safe: bool,
-    /// The active Safe's contract version, for the MultiSend routing hint.
-    #[allow(dead_code)]
+    /// The active Safe's contract version. Decides the EIP-712 domain shape
+    /// and which `MultiSendCallOnly` deployment the batch routes through, so
+    /// a version outside the signable range is a standing refusal the composer
+    /// states up front — see [`TxBuilderApp::safe_version_block`].
     safe_version: Option<String>,
     /// For a plain EOA: whether the active signer can authorize an EIP-7702
     /// delegation (Local / Ledger) and therefore batch N calls atomically.
@@ -667,48 +793,53 @@ impl TxBuilderApp {
         can_sign: bool,
         custom_networks: Vec<(u64, String)>,
     ) {
-        let prev_identity = self.ctx.identity;
-        self.ctx = Ctx {
-            identity: Some(identity),
-            is_safe,
-            safe_version,
-            eoa_can_batch,
-            can_sign,
-            custom_networks,
-        };
-        self.owner = identity;
-        // Identity first: a Safe->EOA flip usually moves the network too, and
-        // the identity notice is the one that explains the drop.
-        let mut explained = false;
-        if let Some(prev) = prev_identity
-            && prev != identity
-        {
-            explained = self.on_identity_reset(prev, identity);
-        }
-        // A Safe can only transact on its own chain — pin the selector there.
-        //
-        // Selecting a Safe usually moves both axes at once. The identity reset
-        // above has already dropped the queue and explained why, so re-running
-        // the network reset here would find nothing to drop and clear that
-        // explanation on its way past — the drop would go unexplained in the
-        // one case where the most has changed. When the identity moved, the
-        // network re-pin does its housekeeping silently instead.
-        if is_safe {
-            let pinned = NetworkId::Builtin(chain);
-            if self.net != pinned {
-                let from = self.net;
-                self.net = pinned;
-                self.repin_network(from, explained);
+        self.traced("set_context", move |s| {
+            let prev_identity = s.ctx.identity;
+            s.ctx = Ctx {
+                identity: Some(identity),
+                is_safe,
+                safe_version,
+                eoa_can_batch,
+                can_sign,
+                custom_networks,
+            };
+            s.owner = identity;
+            // Identity first: a Safe->EOA flip usually moves the network too,
+            // and the identity notice is the one that explains the drop.
+            let mut explained = false;
+            if let Some(prev) = prev_identity
+                && prev != identity
+            {
+                explained = s.on_identity_reset(prev, identity);
             }
-        } else if let NetworkId::Custom(id) = self.net {
-            // A plain EOA keeps its selection across context refreshes, except
-            // when the selected custom network was removed underneath it.
-            if !self.ctx.custom_networks.iter().any(|(cid, _)| *cid == id) {
-                let from = self.net;
-                self.net = NetworkId::Builtin(Chain::Mainnet);
-                self.repin_network(from, explained);
+            // A Safe can only transact on its own chain — pin the selector
+            // there.
+            //
+            // Selecting a Safe usually moves both axes at once. The identity
+            // reset above has already dropped the queue and explained why, so
+            // re-running the network reset here would find nothing to drop and
+            // clear that explanation on its way past — the drop would go
+            // unexplained in the one case where the most has changed. When the
+            // identity moved, the network re-pin does its housekeeping
+            // silently instead.
+            if is_safe {
+                let pinned = NetworkId::Builtin(chain);
+                if s.net != pinned {
+                    let from = s.net;
+                    s.net = pinned;
+                    s.repin_network(from, explained);
+                }
+            } else if let NetworkId::Custom(id) = s.net {
+                // A plain EOA keeps its selection across context refreshes,
+                // except when the selected custom network was removed
+                // underneath it.
+                if !s.ctx.custom_networks.iter().any(|(cid, _)| *cid == id) {
+                    let from = s.net;
+                    s.net = NetworkId::Builtin(Chain::Mainnet);
+                    s.repin_network(from, explained);
+                }
             }
-        }
+        })
     }
 
     /// The network moved underneath the composer. `already_explained` is set
@@ -730,31 +861,34 @@ impl TxBuilderApp {
     /// implementation's code when the address turned out to be a proxy. Empty
     /// code ⇒ nothing deployed there.
     pub fn on_contract_resolved(&mut self, seq: u64, result: Result<ResolvedCode, String>) {
-        if seq != self.resolve_seq {
-            return; // stale — a newer address was entered
-        }
-        self.resolving = false;
-        let Some(addr) = self.resolve_target else {
-            return;
-        };
-        match result {
-            Ok(r) => {
-                self.proxy_unverified = !r.all_verified;
-                self.proxy_beacon = r.beacon;
-                match abi::from_bytecode_behind_proxy(
-                    &r.code,
-                    addr,
-                    r.implementation,
-                    r.code_verified,
-                ) {
-                    Some(loaded) => self.set_loaded(loaded),
-                    None => self.not_found = true,
-                }
+        self.traced("on_contract_resolved", move |s| {
+            if seq != s.resolve_seq {
+                return; // stale — a newer address was entered
             }
-            // A failed *fetch* says nothing about whether this contract has a
-            // recoverable ABI, so it must not be reported as "no verified ABI".
-            Err(e) => self.resolve_error = Some(e),
-        }
+            s.resolving = false;
+            let Some(addr) = s.resolve_target else {
+                return;
+            };
+            match result {
+                Ok(r) => {
+                    s.proxy_unverified = !r.all_verified;
+                    s.proxy_beacon = r.beacon;
+                    match abi::from_bytecode_behind_proxy(
+                        &r.code,
+                        addr,
+                        r.implementation,
+                        r.code_verified,
+                    ) {
+                        Some(loaded) => s.set_loaded(loaded),
+                        None => s.not_found = true,
+                    }
+                }
+                // A failed *fetch* says nothing about whether this contract has
+                // a recoverable ABI, so it must not be reported as "no verified
+                // ABI".
+                Err(e) => s.resolve_error = Some(e),
+            }
+        })
     }
 
     /// Batch simulation result (or failure → treated as unavailable). `seq`
@@ -762,49 +896,53 @@ impl TxBuilderApp {
     /// account may all have changed since it was dispatched, and this verdict
     /// is what the review's confirm button is derived from.
     pub fn on_sim(&mut self, seq: u64, result: Result<BatchSimResult, String>) {
-        if seq != self.sim_seq {
-            return; // stale — a newer batch superseded this run
-        }
-        self.sim_busy = false;
-        // The failure reason used to be discarded here (`unwrap_or_else(|_|
-        // …unavailable())`), which is how a Helios outage, an unservicable
-        // `BLOCKHASH` read and a batch that can never simulate all came out as
-        // the same "Simulation unavailable" — followed by advice to go and run
-        // the preflight again.
-        self.sim = Some(match result {
-            Ok(r) => r,
-            Err(e) => BatchSimResult::errored(e),
-        });
-        self.sim_at = Some(std::time::Instant::now());
+        self.traced("on_sim", move |s| {
+            if seq != s.sim_seq {
+                return; // stale — a newer batch superseded this run
+            }
+            s.sim_busy = false;
+            // The failure reason used to be discarded here (`unwrap_or_else(|_|
+            // …unavailable())`), which is how a Helios outage, an unservicable
+            // `BLOCKHASH` read and a batch that can never simulate all came out
+            // as the same "Simulation unavailable" — followed by advice to go
+            // and run the preflight again.
+            s.sim = Some(match result {
+                Ok(r) => r,
+                Err(e) => BatchSimResult::errored(e),
+            });
+            s.sim_at = Some(std::time::Instant::now());
+        })
     }
 
     /// A Read-tab `eth_call` returned. `seq` guards against a stale query
     /// (the user changed the method / params before this landed). The raw
     /// return bytes are decoded here against the queried method's outputs.
     pub fn on_read(&mut self, seq: u64, result: Result<(Bytes, bool), String>) {
-        if seq != self.read_seq {
-            return; // stale — a newer query superseded this one
-        }
-        self.read_busy = false;
-        self.read_result = Some(match result {
-            Ok((bytes, verified)) => {
-                let raw = if bytes.is_empty() {
-                    "0x".to_string()
-                } else {
-                    format!("0x{}", alloy::hex::encode(&bytes))
-                };
-                let rows = self
-                    .selected_read_method()
-                    .map(|m| decode_read_rows(m, &bytes))
-                    .unwrap_or_default();
-                ReadOutcome::Ok {
-                    rows,
-                    raw,
-                    verified,
-                }
+        self.traced("on_read", move |s| {
+            if seq != s.read_seq {
+                return; // stale — a newer query superseded this one
             }
-            Err(e) => ReadOutcome::Err(e),
-        });
+            s.read_busy = false;
+            s.read_result = Some(match result {
+                Ok((bytes, verified)) => {
+                    let raw = if bytes.is_empty() {
+                        "0x".to_string()
+                    } else {
+                        format!("0x{}", alloy::hex::encode(&bytes))
+                    };
+                    let rows = s
+                        .selected_read_method()
+                        .map(|m| decode_read_rows(m, &bytes))
+                        .unwrap_or_default();
+                    ReadOutcome::Ok {
+                        rows,
+                        raw,
+                        verified,
+                    }
+                }
+                Err(e) => ReadOutcome::Err(e),
+            });
+        })
     }
 
     /// The batch was **mined successfully** — `hash` had `status == 1`. Clears
@@ -816,33 +954,81 @@ impl TxBuilderApp {
     /// and this used to clear the queue for all of them with no record and
     /// nothing to retry from.
     pub fn on_executed(&mut self, hash: B256) {
-        self.batch.clear();
-        self.invalidate_sim();
-        self.expanded = None;
-        self.error = None;
-        self.settled = Some(Settled::Executed { hash });
+        self.traced("on_executed", move |s| {
+            s.batch.clear();
+            s.invalidate_sim();
+            s.expanded = None;
+            s.error = None;
+            s.settled = Some(Settled::Executed { hash });
+        })
     }
 
     /// The batch was filed on the Transaction Service for co-signers. Not an
     /// execution: it clears the composer the same way, but says so differently,
     /// because "queued" and "done" are not the same claim.
     pub fn on_proposed(&mut self, nonce: u64) {
-        self.batch.clear();
-        self.invalidate_sim();
-        self.expanded = None;
-        self.error = None;
-        self.settled = Some(Settled::Proposed { nonce });
+        self.traced("on_proposed", move |s| {
+            s.batch.clear();
+            s.invalidate_sim();
+            s.expanded = None;
+            s.error = None;
+            s.settled = Some(Settled::Proposed { nonce });
+        })
     }
 
     pub fn update(&mut self, msg: Message) -> Option<Outcome> {
         crate::trace_msg!("tx_builder", &msg);
-        let name = msg.name();
+        // `Message::name` used to be computed here and thrown away — a 51-arm
+        // match with no reader — and no coarse transition was logged at all, so
+        // `RUST_LOG=kao::gui=debug` showed this pane as a black box while every
+        // other screen reported its own state machine. The name is the *cause*
+        // field: several distinct paths clear the queue, and `batch: 3 -> 0` on
+        // its own doesn't say which one did.
+        let cause = msg.name();
+        let before = self.trace_snapshot();
         let outcome = self.update_inner(msg);
+        before.diff(cause, &self.trace_snapshot());
         if let Some(o) = &outcome {
             crate::trace::outcome("tx_builder", o.name());
         }
-        let _ = name;
         outcome
+    }
+
+    /// Run `f` and log whatever coarse state it moved, attributed to `cause`.
+    ///
+    /// The wrapper on [`Self::update`] only sees messages. Everything the
+    /// coordinator delivers — a resolved contract, a read result, a preflight
+    /// verdict, a receipt, a context refresh — arrives through a direct method
+    /// call instead, and those are precisely the transitions worth watching in
+    /// a log: they're the ones the user didn't cause and can't replay.
+    fn traced<R>(&mut self, cause: &str, f: impl FnOnce(&mut Self) -> R) -> R {
+        let before = self.trace_snapshot();
+        let out = f(self);
+        before.diff(cause, &self.trace_snapshot());
+        out
+    }
+
+    /// The coarse state worth a DEBUG line, sampled either side of a dispatch.
+    ///
+    /// Sampled rather than instrumented at each assignment site for the reason
+    /// [`crate::trace`] gives: the assignments are spread over fifty-odd match
+    /// arms plus a dozen coordinator callbacks, and any of them can be missed.
+    /// Deliberately excludes per-keystroke fields (`addr_input`, `args`,
+    /// `json_text`) — those are message-level detail, already visible at TRACE.
+    fn trace_snapshot(&self) -> TraceState {
+        TraceState {
+            mode: self.mode,
+            net: self.net,
+            batch: self.batch.len(),
+            modal: self.modal.clone(),
+            loaded: self.loaded.is_some(),
+            resolving: self.resolving,
+            read_busy: self.read_busy,
+            sim_busy: self.sim_busy,
+            sim: self.sim.is_some(),
+            errored: self.error.is_some(),
+            settled: self.settled.is_some(),
+        }
     }
 
     fn update_inner(&mut self, msg: Message) -> Option<Outcome> {
@@ -1439,7 +1625,7 @@ impl TxBuilderApp {
     /// that couldn't be built was logged and dropped, so the primary button
     /// registered the click and nothing on screen changed.
     pub fn set_error(&mut self, msg: String) {
-        self.error = Some(msg);
+        self.traced("set_error", move |s| s.error = Some(msg))
     }
 
     /// The pane's current error banner text, for the coordinator's tests.
@@ -1486,6 +1672,49 @@ impl TxBuilderApp {
         } else {
             "the approval revoke flash approval runs after the batch".to_string()
         }
+    }
+
+    /// What the preflight verdict on screen does *not* cover, for the batch
+    /// shape actually queued.
+    ///
+    /// [`crate::txbuilder::sim::to_steps`] enumerates the model's limits, and
+    /// that docstring was brought in line with the truth — but the docstring is
+    /// read by whoever maintains the simulator, and the person about to sign
+    /// reads a green box that says "Simulation passed" and nothing else. Every
+    /// item here is a way that box can be wrong in the user's disfavour, so it
+    /// belongs beside the box.
+    ///
+    /// Derived from the queue rather than listed flat: a two-call Safe batch
+    /// and a single EOA call have different blind spots, and a list padded with
+    /// caveats that can't apply here is one the user learns to skip.
+    fn sim_blind_spots(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.ctx.is_safe {
+            // The wrapper is the whole difference between "these calls work"
+            // and "this transaction works", and a guard can reject a batch
+            // every sub-call of which succeeds here.
+            out.push(
+                "the execTransaction wrapper — its signature checks, and any transaction guard \
+                 installed on this Safe",
+            );
+            // Only wrong for a Safe: for an EOA the sender really is the origin.
+            out.push("tx.origin, which is the Safe here and the broadcasting account on chain");
+        } else if self.effective_calls().len() > 1 {
+            // The multi-call EOA path is the only one that can install a
+            // designator, and the first delegation is the case the user has
+            // least intuition for.
+            out.push(
+                "the delegation designator, if this transaction is the one installing it — a \
+                 callee reading msg.sender.code.length sees the opposite here",
+            );
+        }
+        if self.effective_calls().len() > 1 {
+            out.push(
+                "transient storage (EIP-1153), wiped between steps here and kept for the whole \
+                 transaction on chain",
+            );
+        }
+        out
     }
 
     /// Whether the active identity can execute more than one call atomically —
@@ -1713,14 +1942,65 @@ impl TxBuilderApp {
 
     /// Why this batch can't be taken to a signature, if it can't. `None` when
     /// the active identity can sign.
-    fn no_signer_reason(&self) -> Option<String> {
-        (!self.can_sign()).then(|| {
-            format!(
+    ///
+    /// Two independent reasons, both settled before the ceremony rather than
+    /// inside it: no key at all (watch-only), and a Safe whose contract version
+    /// this wallet won't sign for. See [`Self::safe_version_block`] for why the
+    /// second one used to surface as late as it did.
+    pub(super) fn no_signer_reason(&self) -> Option<String> {
+        if !self.can_sign() {
+            return Some(format!(
                 "{} is watch-only — Kao holds no key for it, so this batch can't be signed. \
                  Compose and simulate freely; to send it, switch to an account with a key.",
                 crate::wallet::short_address(self.owner),
-            )
-        })
+            ));
+        }
+        self.safe_version_block()
+    }
+
+    /// The active Safe's version, if it is one this pane can't sign for.
+    ///
+    /// The Send flow answers the same question at the top of its own flow
+    /// (`version_block`, `send.rs`). The Builder took the version in through
+    /// `set_context` and then never read it — the field carried
+    /// `#[allow(dead_code)]` — so the refusal came out of
+    /// `build_txbuilder_request` at Review instead: after a whole batch had
+    /// been composed, simulated green, and confirmed.
+    ///
+    /// Both gates are consulted. `ensure_signable_version` owns the EIP-712
+    /// domain question, and `multisend_call_only` owns whether the batch can be
+    /// routed at all — and because the Builder wraps even a *single* call in
+    /// MultiSend, a version with no known deployment blocks the whole pane and
+    /// not just multi-call batches. They agree today; checking both means a
+    /// future version added to one and not the other refuses here rather than
+    /// at the overlay.
+    fn safe_version_block(&self) -> Option<String> {
+        if !self.ctx.is_safe {
+            return None;
+        }
+        let Some(version) = self.ctx.safe_version.as_deref() else {
+            // Only reachable if the descriptor lost its version between
+            // `txbuilder_identity` and here. The version decides both the
+            // signing domain and the MultiSend routing, so not knowing it is a
+            // refusal, not a default.
+            return Some(
+                "Kao hasn't read this Safe's contract version. That version picks both the \
+                 signing domain and the MultiSend library the batch runs through, so there is \
+                 nothing safe to assume — reopen the Safe to refresh it."
+                    .into(),
+            );
+        };
+        if let Err(e) = crate::safe::tx::ensure_signable_version(version) {
+            return Some(e);
+        }
+        crate::txbuilder::multisend::multisend_call_only(version)
+            .err()
+            .map(|e| {
+                format!(
+                    "{e}. Every Builder batch runs through MultiSend, including a \
+                              single call, so this Safe can't send from this pane."
+                )
+            })
     }
 
     /// Fire the composed read query as an `eth_call` on the active network.
@@ -2121,6 +2401,225 @@ mod tests {
             Vec::new(),
         );
         app
+    }
+
+    /// A Safe on a version outside the signable range. Reachable in the wild:
+    /// a 1.2.0 Safe is a perfectly normal deployment, Kao just can't sign for
+    /// its EIP-712 domain.
+    fn old_safe_app() -> TxBuilderApp {
+        let mut app = TxBuilderApp::new(SAFE);
+        app.set_context(
+            SAFE,
+            Chain::Mainnet,
+            true,
+            Some("1.2.0".into()),
+            false,
+            true,
+            Vec::new(),
+        );
+        app
+    }
+
+    // ── 4.3a · the pane reports its own state machine ───────────────────
+
+    /// What `RUST_LOG=kao::gui=debug` gets out of one message, without
+    /// standing up a subscriber.
+    fn traced_by(app: &mut TxBuilderApp, msg: Message) -> Vec<&'static str> {
+        let before = app.trace_snapshot();
+        app.update(msg);
+        before.changed_fields(&app.trace_snapshot())
+    }
+
+    #[test]
+    fn a_mode_switch_is_reported() {
+        let mut app = safe_app();
+        assert_eq!(traced_by(&mut app, Message::SetMode(Mode::Raw)), ["mode"]);
+    }
+
+    /// A keystroke is not a state transition. The pane sends one message per
+    /// character typed into the address box; logging each at DEBUG would bury
+    /// the transitions that matter under the ones that don't.
+    #[test]
+    fn typing_reports_nothing() {
+        let mut app = safe_app();
+        assert!(traced_by(&mut app, Message::AbiPasteChanged("[".into())).is_empty());
+    }
+
+    /// Several distinct paths end with an empty queue — an edit, a network
+    /// switch, an identity switch, a template load, a receipt. `batch: 2 -> 0`
+    /// on its own doesn't say which, which is why the message name rides along
+    /// as the cause.
+    #[test]
+    fn clearing_the_queue_is_reported_with_its_cause() {
+        let mut app = safe_app();
+        app.batch = sample_batch(&mut app.next_id, app.owner);
+        let before = app.trace_snapshot();
+        app.update(Message::ClearBatch);
+        let after = app.trace_snapshot();
+        let changes = before.changes(&after);
+        let batch = changes
+            .iter()
+            .find(|(what, ..)| *what == "batch")
+            .expect("the queue emptied");
+        assert_eq!((batch.1.as_str(), batch.2.as_str()), ("2", "0"));
+    }
+
+    /// The transitions worth watching are the ones the user didn't cause and
+    /// can't replay — they arrive through the coordinator's direct callbacks,
+    /// which the `update` wrapper never sees.
+    #[test]
+    fn an_async_verdict_is_reported_too() {
+        let mut app = safe_app();
+        app.batch = sample_batch(&mut app.next_id, app.owner);
+        let Some(Outcome::Simulate { seq, .. }) = app.update(Message::Simulate) else {
+            panic!("expected a Simulate");
+        };
+        let before = app.trace_snapshot();
+        app.on_sim(seq, Err("light client is still syncing".into()));
+        let reported = before.changed_fields(&app.trace_snapshot());
+        assert!(reported.contains(&"sim_busy"), "{reported:?}");
+        assert!(reported.contains(&"sim_verdict"), "{reported:?}");
+    }
+
+    // ── 4.3b · the Safe version is read where it can still change the plan ──
+
+    #[test]
+    fn a_signable_safe_version_blocks_nothing() {
+        assert!(
+            safe_app().no_signer_reason().is_none(),
+            "1.4.1 is in range and routes to a MultiSend deployment"
+        );
+    }
+
+    /// The regression: `Ctx::safe_version` was written by `set_context` and
+    /// carried `#[allow(dead_code)]`, so the refusal came out of
+    /// `build_txbuilder_request` at Review — after the batch was composed,
+    /// simulated and confirmed.
+    #[test]
+    fn an_unsignable_safe_version_is_refused_before_anything_is_composed() {
+        let app = old_safe_app();
+        let why = app
+            .no_signer_reason()
+            .expect("1.2.0 is outside the signable range");
+        assert!(why.contains("1.2.0"), "name the version: {why}");
+        assert!(
+            why.contains("signable range"),
+            "say what the problem is: {why}"
+        );
+    }
+
+    #[test]
+    fn an_unsignable_safe_version_never_reaches_the_review() {
+        let mut app = old_safe_app();
+        app.batch = sample_batch(&mut app.next_id, app.owner);
+        assert!(
+            app.update(Message::Review).is_none(),
+            "no review may open for a Safe this wallet can't sign for"
+        );
+        assert!(app.error.as_deref().is_some_and(|e| e.contains("1.2.0")));
+    }
+
+    /// The version reaches this pane as an `Option`, and "not known yet" is a
+    /// refusal rather than a default: it picks both the signing domain and the
+    /// MultiSend library, so there is nothing safe to assume.
+    #[test]
+    fn a_safe_with_no_known_version_is_refused_too() {
+        let mut app = TxBuilderApp::new(SAFE);
+        app.set_context(SAFE, Chain::Mainnet, true, None, false, true, Vec::new());
+        let why = app.no_signer_reason().expect("an unknown version blocks");
+        assert!(why.contains("version"), "{why}");
+    }
+
+    /// Watch-only comes first: it's the more specific answer, and a watch-only
+    /// EOA has no Safe version to talk about.
+    #[test]
+    fn watch_only_still_reports_the_missing_key() {
+        let why = view_only_app().no_signer_reason().expect("no key");
+        assert!(why.contains("watch-only"), "{why}");
+    }
+
+    // ── 4.4 · the export names the account that will execute ────────────
+
+    /// `meta.safe` used to name the construction-time EOA, because `owner` was
+    /// written once in `new()` and never refreshed — the same stale field that
+    /// made the identity chip render "Safe multisig" over the EOA's address.
+    #[test]
+    fn the_exported_bundle_names_the_active_safe() {
+        let mut app = safe_app();
+        app.batch = sample_batch(&mut app.next_id, app.owner);
+        app.update(Message::OpenSave);
+
+        let v: serde_json::Value =
+            serde_json::from_str(&app.json_text).expect("the export is valid JSON");
+        let named = v["meta"]["safe"].as_str().expect("meta.safe is stamped");
+        assert_eq!(
+            named.to_lowercase(),
+            SAFE.to_string().to_lowercase(),
+            "the bundle must name the Safe that will execute it, not the EOA \
+             the pane was constructed with"
+        );
+        assert_ne!(named.to_lowercase(), EOA.to_string().to_lowercase());
+    }
+
+    /// The mirror image: a plain EOA has no Safe, and stamping one would tell
+    /// a re-importing wallet to look for a multisig that isn't there.
+    #[test]
+    fn an_eoa_export_stamps_no_safe() {
+        let mut app = eoa_app();
+        app.batch = sample_batch(&mut app.next_id, app.owner);
+        app.update(Message::OpenSave);
+
+        let v: serde_json::Value = serde_json::from_str(&app.json_text).expect("valid JSON");
+        assert!(
+            v["meta"].get("safe").is_none(),
+            "no Safe was active: {}",
+            app.json_text
+        );
+    }
+
+    // ── 4.1 · the preflight box states what it didn't model ─────────────
+
+    #[test]
+    fn a_safe_batch_names_the_wrapper_and_the_guard() {
+        let mut app = safe_app();
+        app.batch = sample_batch(&mut app.next_id, app.owner);
+        let spots = app.sim_blind_spots().join(" | ");
+        assert!(spots.contains("execTransaction"), "{spots}");
+        assert!(spots.contains("guard"), "{spots}");
+        assert!(spots.contains("tx.origin"), "{spots}");
+        assert!(
+            spots.contains("transient storage"),
+            "two steps carry the EIP-1153 caveat: {spots}"
+        );
+    }
+
+    /// The list is derived from the queue, not printed flat: an EOA has no
+    /// wrapper and no guard, and telling it about them teaches the user to
+    /// skip the list.
+    #[test]
+    fn an_eoa_batch_names_the_delegation_and_not_the_wrapper() {
+        let mut app = eoa_app();
+        app.batch = sample_batch(&mut app.next_id, app.owner);
+        let spots = app.sim_blind_spots().join(" | ");
+        assert!(spots.contains("delegation designator"), "{spots}");
+        assert!(!spots.contains("execTransaction"), "{spots}");
+        assert!(
+            !spots.contains("tx.origin"),
+            "an EOA *is* the origin: {spots}"
+        );
+    }
+
+    /// One call is one transaction: no delegation is installed for it and
+    /// there is no "between steps" for transient storage to be wiped at.
+    #[test]
+    fn a_single_eoa_call_has_nothing_to_caveat() {
+        let mut app = eoa_app();
+        app.batch = vec![sample_batch(&mut app.next_id, app.owner).remove(0)];
+        assert!(
+            app.sim_blind_spots().is_empty(),
+            "{:?}",
+            app.sim_blind_spots()
+        );
     }
 
     // ── 2.5 · a simulator failure is a reason, not a shrug ──────────────

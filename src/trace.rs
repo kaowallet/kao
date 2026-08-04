@@ -20,7 +20,8 @@
 //!     pane ("app", "unlock", "dashboard", "send", …). Variants that are
 //!     pure redraw kicks (per-frame animation ticks) may be skipped with a
 //!     comment to keep the trace stream readable.
-//!   * Coarse transitions are logged via [`state`] by diffing a name
+//!   * Coarse transitions are logged via [`state`] (or [`state_caused`],
+//!     which also names the message responsible) by diffing a name
 //!     before/after dispatch in a thin `update` wrapper around the
 //!     original body (renamed `update_inner`) — this catches every
 //!     assignment site without instrumenting each one.
@@ -79,6 +80,27 @@ pub fn clamp_debug(value: &impl fmt::Debug) -> String {
 /// value actually changed.
 pub fn state(scope: &str, what: &str, from: impl fmt::Display, to: impl fmt::Display) {
     tracing::debug!(target: "kao::gui", scope, what, %from, %to, "state");
+}
+
+/// Log a coarse state transition together with the message that caused it.
+///
+/// Same as [`state`], plus a `cause` field naming the message variant. Use it
+/// where the transition alone doesn't identify the path taken — a pane whose
+/// queue can be cleared by an edit, a network switch, an identity switch, a
+/// template load and a successful broadcast logs `batch: 3 -> 0` five ways,
+/// and which one it was is the whole question.
+///
+/// `cause` must be a variant *name*, never a Debug format: message payloads
+/// carry pasted ABIs, bundle JSON and user input, and one of them will
+/// eventually carry a secret.
+pub fn state_caused(
+    scope: &str,
+    cause: &str,
+    what: &str,
+    from: impl fmt::Display,
+    to: impl fmt::Display,
+) {
+    tracing::debug!(target: "kao::gui", scope, cause, what, %from, %to, "state");
 }
 
 /// Log a child→parent outcome signal at DEBUG, by variant name only —

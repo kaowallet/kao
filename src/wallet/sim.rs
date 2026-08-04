@@ -531,10 +531,23 @@ pub enum GasFit {
 #[derive(Debug, Clone)]
 pub struct BatchSimResult {
     pub outcome: BatchOutcome,
-    /// Sum of gas metered by the executed sub-calls. Advisory: excludes the
-    /// MultiSend loop, the `execTransaction` wrapper, and signature-check
-    /// overhead — the review pairs it with a real `eth_estimateGas` at
-    /// execute time.
+    /// Sum of gas metered by the executed sub-calls.
+    ///
+    /// Advisory, and in both directions. It over-counts by `(N − 1) × 21000`
+    /// (each step pays its own intrinsic cost; the real transaction pays one)
+    /// and under-counts the MultiSend loop, the `execTransaction` wrapper,
+    /// calldata cost and per-owner signature verification. Treat it as an
+    /// order of magnitude, not a quote.
+    ///
+    /// This used to claim "the review pairs it with a real `eth_estimateGas`
+    /// at execute time". It does not: no `SignStep` on the Builder path
+    /// carries a gas field, and the only `estimate_gas` in the flow runs
+    /// inside the broadcast helpers, after every signature is collected. The
+    /// one place this figure is load-bearing rather than decorative is
+    /// [`BatchSimResult::gas_fit`], which compares it against the block gas
+    /// limit. The two errors don't cancel and their net sign isn't known, so
+    /// that check deliberately treats "over half a block" as already too
+    /// close to call rather than trusting the number near the boundary.
     pub gas_used: u64,
     /// Net token transfers observed across all sub-calls. Only meaningful on
     /// `Success` — a reverting batch performs no net transfer, so it's

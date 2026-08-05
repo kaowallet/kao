@@ -355,15 +355,23 @@ impl AppsPane {
         portfolio: &'a [LiveToken],
         orders: &[&'a TrackedOrder],
         names_available: bool,
+        swap_available: bool,
         recipients: super::send::ContactsView,
     ) -> Element<'a, Message> {
         let content = match self.view {
-            AppsView::Launcher => self.launcher_view(t, orders, names_available),
+            AppsView::Launcher => self.launcher_view(t, orders, names_available, swap_available),
+            // Swap is unavailable for a Safe with no CoW market (the launcher
+            // hides the card) — same fallback as Names, for the same reason.
+            AppsView::Swap if !swap_available => {
+                self.launcher_view(t, orders, names_available, swap_available)
+            }
             AppsView::Swap => self.swap_view(t, portfolio, orders),
             // Names is unavailable for a non-Mainnet Safe (the launcher hides the
             // card). Fall back to the launcher if we landed on the Names view
             // before switching to such an identity.
-            AppsView::Names if !names_available => self.launcher_view(t, orders, names_available),
+            AppsView::Names if !names_available => {
+                self.launcher_view(t, orders, names_available, swap_available)
+            }
             AppsView::Names => self.names.view(t).map(Message::Names),
             AppsView::PrivacyPools => self.pool.view(t, portfolio, recipients).map(Message::Pool),
             AppsView::TxBuilder => self.tx_builder.view(t).map(Message::TxBuilder),
@@ -403,14 +411,21 @@ impl AppsPane {
     }
 
     /// The app launcher: a card per available app. The order list lives inside
-    /// the Swap app; the card shows a count of open orders. `names_available`
-    /// gates the Names card — names register/resolve against the active identity
-    /// (an EOA, or a Mainnet Safe), so it's hidden for a non-Mainnet Safe.
+    /// the Swap app; the card shows a count of open orders.
+    ///
+    /// Both gates here are about *reach*, never about keys. `names_available`
+    /// hides Names for a non-Mainnet Safe (names register/resolve against the
+    /// active identity — an EOA, or a Mainnet Safe); `swap_available` hides Swap
+    /// for a Safe with no CoW market or too few linked owners. A watch-only
+    /// account still sees every card it could reach: composing, quoting,
+    /// simulating and reading all work without a signer, and each app's write
+    /// action refuses on its own terms when the key isn't there.
     fn launcher_view<'a>(
         &self,
         t: KaoTheme,
         orders: &[&'a TrackedOrder],
         names_available: bool,
+        swap_available: bool,
     ) -> Element<'a, Message> {
         let open_count = orders.iter().filter(|o| !o.status.is_terminal()).count();
         let swap_sub = if open_count > 0 {
@@ -418,21 +433,31 @@ impl AppsPane {
         } else {
             "Trade tokens via CoW Protocol".to_string()
         };
-        let subtitle = if names_available {
-            "On-chain apps — swaps and name registration"
-        } else {
-            "On-chain apps — swaps"
+        // Names and Swap come and go with the identity; Privacy Pools and the
+        // Transaction Builder are always there, so the subtitle never claims
+        // less than the four cards below it.
+        let subtitle = match (swap_available, names_available) {
+            (true, true) => "On-chain apps — swaps, names, privacy and transactions",
+            (true, false) => "On-chain apps — swaps, privacy and transactions",
+            (false, true) => "On-chain apps — names, privacy and transactions",
+            (false, false) => "On-chain apps — privacy and transactions",
         };
 
-        let mut col = column![
-            screen_title(t, "Apps"),
-            Space::new().height(6),
-            screen_subtitle(t, subtitle),
-            Space::new().height(20),
-            app_card(t, "(⇌ω⇌)", "Swap", &swap_sub, Message::OpenSwapApp),
-        ];
+        // The cards carry their own `spacing`, so any card can be the first one
+        // without leaving a leading gap — the list used to hang each card off a
+        // preceding `Space`, which only worked while Swap was unconditional.
+        let mut cards = column![].spacing(10).width(Length::Fill);
+        if swap_available {
+            cards = cards.push(app_card(
+                t,
+                "(⇌ω⇌)",
+                "Swap",
+                &swap_sub,
+                Message::OpenSwapApp,
+            ));
+        }
         if names_available {
-            col = col.push(Space::new().height(10)).push(app_card(
+            cards = cards.push(app_card(
                 t,
                 "(✎ω✎)",
                 "Names",
@@ -442,7 +467,7 @@ impl AppsPane {
         }
         // Privacy Pools is its own EOA-independent identity with its own chain
         // selector (Ethereum + Optimism), so the card is always available.
-        col = col.push(Space::new().height(10)).push(app_card(
+        cards = cards.push(app_card(
             t,
             "(≖ᴗ≖)",
             "Privacy Pools",
@@ -451,14 +476,24 @@ impl AppsPane {
         ));
         // Transaction Builder works for both a plain EOA (single call) and a
         // Safe (atomic MultiSend batch), so the card is always available.
-        col = col.push(Space::new().height(10)).push(app_card(
+        cards = cards.push(app_card(
             t,
             "( •̀ω•́ )✧",
             "Transaction Builder",
             "Compose contract calls & batch them atomically",
             Message::OpenTxBuilderApp,
         ));
-        col.width(Length::Fill).max_width(560).into()
+
+        column![
+            screen_title(t, "Apps"),
+            Space::new().height(6),
+            screen_subtitle(t, subtitle),
+            Space::new().height(20),
+            cards,
+        ]
+        .width(Length::Fill)
+        .max_width(560)
+        .into()
     }
 
     /// The Swap app: a back link, the inline composer, and the live order list

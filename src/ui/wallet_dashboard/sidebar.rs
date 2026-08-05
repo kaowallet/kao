@@ -35,7 +35,6 @@ pub fn view<'a>(
     display_name: String,
     display_addr: Address,
     is_safe: bool,
-    show_apps: bool,
     hardware: Option<HardwareStatus>,
     network_name: &'a str,
     verification: VerificationStatus,
@@ -49,22 +48,18 @@ pub fn view<'a>(
         divider(t),
         Space::new().height(14),
         nav_item(t, nav, Nav::Home, "(◕‿◕)", "Portfolio", "this account"),
+        Space::new().height(8),
+        // Apps is unconditional. It used to be hidden whenever the identity
+        // couldn't place a CoW swap, which was written when Swap was the only
+        // app; it since became the sole doorway to Names, Privacy Pools and the
+        // Transaction Builder, and hid all four from the identities three of
+        // them were written for — a Safe below its local signing threshold, a
+        // Safe on a chain CoW never deployed to, and every watch-only account.
+        // Reading, composing and simulating need no key; the write actions
+        // inside each app refuse on their own, naming the reason.
+        nav_item(t, nav, Nav::Apps, "(ᵔᴥᵔ)", "Apps", "on-chain apps"),
     ]
     .width(Length::Fill);
-
-    // The Apps (swap) section is hidden for identities that can't swap —
-    // view-only accounts and Safe mode.
-    if show_apps {
-        body = body.push(Space::new().height(8));
-        body = body.push(nav_item(
-            t,
-            nav,
-            Nav::Apps,
-            "(ᵔᴥᵔ)",
-            "Apps",
-            "on-chain apps",
-        ));
-    }
 
     body = body.push(Space::new().height(8));
     body = body.push(nav_item(

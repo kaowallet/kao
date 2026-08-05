@@ -826,10 +826,18 @@ pub struct WalletScreen {
     tracked_orders: Vec<TrackedOrder>,
     /// True while the EOA signer is parked for an in-flight CoW order op
     /// (place or cancel). During that window `self.signer` is a view-only
-    /// placeholder, so `can_swap()` would read false and transiently hide the
-    /// sidebar Apps tab + redirect `Nav::Apps` to the portfolio. The Apps
-    /// surface keys off `apps_available()` (which ORs this in) so it stays put
-    /// until the order op resolves in `CowPlaced` / `CowCancel`.
+    /// placeholder, which is *not* the same fact as the account being
+    /// watch-only — so anything that would otherwise mistake the placeholder
+    /// for the real capability ORs this in.
+    ///
+    /// It used to hold the Apps tab open too, back when that tab was gated on
+    /// `can_swap()`. Apps is unconditional now and `swap_available()` never
+    /// consults the signer, so neither can observe the placeholder and neither
+    /// needs the reprieve. The two consumers that still do are
+    /// [`Self::is_signing_busy`] (which gates leaving the dashboard, so the
+    /// real signer can't be stranded in the task's handoff) and
+    /// [`Self::hardware_status`] (so a mid-signature Ledger doesn't render as
+    /// disconnected). Cleared when the op resolves in `CowPlaced` / `CowCancel`.
     order_op_in_flight: bool,
     /// The Apps (swap workspace) pane state — its inline swap composer. The
     /// order list it renders comes from `tracked_orders`, not the pane.
@@ -1269,20 +1277,35 @@ impl WalletScreen {
         self.signer.can_sign()
     }
 
-    /// Whether the Swap quick action / modal should be live. In EOA mode:
-    /// needs a signer that can actually sign (orders are EIP-712-signed;
-    /// ERC-20 sells and the EthFlow path also broadcast on-chain). In Safe
-    /// mode: true when we can build a valid Safe-swap context — a recognized
-    /// Safe on a CoW-supported chain with ≥`threshold` signable owners — in
-    /// which case orders are placed via EIP-1271 (see [`Self::build_safe_swap_ctx`]).
-    /// CoW only runs on Mainnet/Base; for an EOA the composer surfaces that by
-    /// listing only swappable balances, while a Safe is pinned to one chain so
-    /// the gate checks it directly.
+    /// Whether the Swap **app** can function for the active identity at all —
+    /// deliberately signer-independent, so it answers "is there a CoW market
+    /// this identity could trade on?" and not "can we sign right now?".
+    ///
+    /// Safe mode: needs a valid Safe-swap context — a recognized Safe on a
+    /// CoW-supported chain with ≥`threshold` signable owners linked, which
+    /// places orders via EIP-1271 (see [`Self::build_safe_swap_ctx`]). CoW only
+    /// runs on Mainnet/Base and a Safe is pinned to one chain, so the gate
+    /// checks it directly. For an EOA there is nothing to check: the account
+    /// isn't pinned to a chain, and the composer already surfaces CoW's reach
+    /// by listing only swappable balances.
+    ///
+    /// This gates the launcher *card*. Quoting and composing need no key, so a
+    /// watch-only account is free to price a swap it cannot place.
+    fn swap_available(&self) -> bool {
+        self.active_safe.is_none() || self.build_safe_swap_ctx().is_some()
+    }
+
+    /// Whether a swap can actually be **signed** right now — [`Self::swap_available`]
+    /// plus a key. Gates the Home quick action and the Swap modal, both of
+    /// which open straight onto a signature.
+    ///
+    /// In EOA mode the key must be present (orders are EIP-712-signed; ERC-20
+    /// sells and the EthFlow path also broadcast on-chain). In Safe mode the
+    /// owner signer is built on demand at signing time, so the active EOA's
+    /// own signer is irrelevant — the linked-owner count `swap_available`
+    /// already checked is the whole question.
     fn can_swap(&self) -> bool {
-        if self.active_safe.is_some() {
-            return self.build_safe_swap_ctx().is_some();
-        }
-        self.signer.can_sign()
+        self.swap_available() && (self.active_safe.is_some() || self.signer.can_sign())
     }
 
     /// The address that owns / receives CoW orders for the active identity —
@@ -1421,7 +1444,7 @@ impl WalletScreen {
 
     /// Spawn the right order-placement task for the active identity, parking
     /// the active signer for the async path (Safe swaps don't use it, but
-    /// parking keeps `order_op_in_flight` / the Apps reprieve consistent and
+    /// parking keeps `order_op_in_flight` / the busy gate consistent and
     /// the same `CowPlaced` handler restores it). Surfaces a clear error on the
     /// host pane if a Safe swap is somehow no longer placeable.
     /// Surface a CoW placement error. The place overlay is kept open across the
@@ -1510,18 +1533,6 @@ impl WalletScreen {
         }
     }
 
-    /// Whether the Apps (Swap) surface should be available for the active
-    /// identity. Same as [`Self::can_swap`], but stays true while an order is
-    /// being placed or cancelled: the signer is parked as a view-only
-    /// placeholder for the async sign path, which would otherwise flip
-    /// `can_swap()` false and transiently yank the sidebar Apps tab (and
-    /// redirect `Nav::Apps` to the portfolio) mid-order. Drives the sidebar
-    /// gate and the nav fallback only — starting a *new* swap still keys off
-    /// the live `can_swap()`.
-    fn apps_available(&self) -> bool {
-        self.can_swap() || self.order_op_in_flight
-    }
-
     /// Hardware-device status for the active account, used to render the
     /// sidebar's connection card. `None` for software / view-only accounts.
     /// "Connected" means we hold a live signer: either it can sign, or it's
@@ -1554,10 +1565,10 @@ impl WalletScreen {
 
     /// Park the live EOA signer for an in-flight CoW order op (place/cancel),
     /// returning the handoff cell the async task signs with — the swap analogue
-    /// of the Send broadcast handoff. Flags `order_op_in_flight` so the Apps
-    /// surface stays available (see [`Self::apps_available`]) while the signer
-    /// is momentarily a view-only placeholder; the flag is cleared when the
-    /// signer is reclaimed in `CowPlaced` / `CowCancel`.
+    /// of the Send broadcast handoff. Flags [`Self::order_op_in_flight`] so the
+    /// busy gate and the hardware card keep reading the *real* signer while
+    /// this one is momentarily a view-only placeholder; the flag is cleared
+    /// when the signer is reclaimed in `CowPlaced` / `CowCancel`.
     fn park_signer_for_order(&mut self) -> SignerHandoff {
         self.order_op_in_flight = true;
         let signer = mem::replace(&mut self.signer, KaoSigner::ViewOnly(self.address));
@@ -2146,6 +2157,25 @@ impl WalletScreen {
                 self.build_eoa_context().is_ok(),
             ),
         }
+    }
+
+    /// Push the live identity into the Transaction Builder pane.
+    ///
+    /// Called before the pane processes a message, and again the moment a Safe
+    /// is activated or stepped out of. That second call used to be missing, and
+    /// was invisible while a non-swappable Safe also bounced the user off the
+    /// Apps tab entirely: now that Apps is always reachable, the user stays on
+    /// the Builder across the switch, and without this the pane would keep
+    /// rendering the previous identity's chip, refusal banner and queue over the
+    /// new one. The pane drops the queue itself when the identity moves.
+    fn refresh_txbuilder_context(&mut self) {
+        let (addr, chain, is_safe, version, can_batch, can_sign) = self.txbuilder_identity();
+        let customs: Vec<(u64, String)> = settings::enabled_custom_networks()
+            .into_iter()
+            .map(|n| (n.chain_id, n.name))
+            .collect();
+        self.apps
+            .set_txbuilder_context(addr, chain, is_safe, version, can_batch, can_sign, customs);
     }
 
     fn handle_txbuilder_outcome(&mut self, o: tx_builder::Outcome) -> Task<Message> {
@@ -3021,6 +3051,15 @@ impl WalletScreen {
         // that address and refuse a watch-only signer — the shown `from` can't
         // diverge from who signs. (A non-Mainnet / unsignable Safe is already
         // refused upstream in `handle_name_outcome`.)
+        // Both refusals below have to reach the pane, not just the log. They
+        // used to `return Task::none()` bare, which was survivable while the
+        // Apps tab was hidden from every keyless identity — the second arm was
+        // simply unreachable. With Apps always open, a watch-only account gets
+        // the full Names app and a live Register / Renew / Set-recipient
+        // button, and a bare return makes pressing it do nothing at all: no
+        // overlay, no error, no spinner, nothing to read. `fail_name_pane`
+        // routes the reason to the pane handler for this specific write, which
+        // is where the user is looking.
         match self.build_signer_context(SafeNeed::Name) {
             Ok(ctx) if ctx.display_from() == from => {}
             Ok(ctx) => {
@@ -3029,10 +3068,17 @@ impl WalletScreen {
                     signer = %ctx.display_from(),
                     "name review: shown from != signer — refusing",
                 );
+                self.fail_name_pane(
+                    &sign,
+                    "This name write is addressed to a different account than the one that would \
+                     sign it. Switch accounts and try again."
+                        .into(),
+                );
                 return Task::none();
             }
             Err(msg) => {
                 warn!(%msg, "name review: no signable context — refusing");
+                self.fail_name_pane(&sign, msg);
                 return Task::none();
             }
         }
@@ -3157,6 +3203,19 @@ impl WalletScreen {
     /// "this is what you're cancelling" panel the user confirms.
     fn open_cow_cancel_review(&mut self, host: CowHost, uid: String) -> Task<Message> {
         if self.sign_review.is_some() {
+            return Task::none();
+        }
+        // Refuse before opening, exactly as `open_cow_review` does. A
+        // cancellation is a signature like any other, and this was the one CoW
+        // write path that never asked. It didn't show while the Apps tab was
+        // hidden from every keyless identity — but "Fetch" pulls an address's
+        // full order history without a key, so a watch-only account that once
+        // held these orders can now reach a Cancel button for each of them.
+        // Without this the overlay opened with Confirm live over a signature
+        // that cannot be produced, and confirming parked the view-only signer
+        // (blocking add-account) to buy an alloy `UnsupportedOperation` string.
+        if let Err(msg) = self.build_signer_context(SafeNeed::Swap) {
+            self.resolve_cow_error(host, msg);
             return Task::none();
         }
         let Some(o) = self.tracked_orders.iter().find(|o| o.uid == uid) else {
@@ -4076,6 +4135,14 @@ impl WalletScreen {
                 if let SettingsPane::Safes(p) = &mut self.settings_pane {
                     p.set_safes(self.safes.clone());
                 }
+                // Third and last place the active identity's facts can move
+                // under the Builder. A re-fetch can revise the active Safe's
+                // *version*, which is the one ctx field not re-read live at
+                // build time — leaving the pane's standing refusal banner
+                // silent about a version that is now outside the signable
+                // range. The write path still refuses correctly; this is so the
+                // screen says so before the user composes a batch for it.
+                self.refresh_txbuilder_context();
                 // The pending queue's lifecycle states were derived against the
                 // *old* descriptors (threshold/owners). Rebuild it against the
                 // refreshed ones so a changed threshold can't leave a stale
@@ -4918,21 +4985,7 @@ impl WalletScreen {
                 // Refresh the Transaction Builder's identity context before it
                 // processes a message, so batch-cap / known-contract lookup see
                 // the live chain and whether a Safe is active. Cheap.
-                let (txb_addr, txb_chain, txb_is_safe, txb_ver, txb_can_batch, txb_can_sign) =
-                    self.txbuilder_identity();
-                let txb_customs: Vec<(u64, String)> = settings::enabled_custom_networks()
-                    .into_iter()
-                    .map(|n| (n.chain_id, n.name))
-                    .collect();
-                self.apps.set_txbuilder_context(
-                    txb_addr,
-                    txb_chain,
-                    txb_is_safe,
-                    txb_ver,
-                    txb_can_batch,
-                    txb_can_sign,
-                    txb_customs,
-                );
+                self.refresh_txbuilder_context();
                 let outcome = self.apps.update(child);
                 // After pumping the pane, dispatch a forward name resolution if
                 // the Privacy Pools withdrawal target now points at a name-shaped
@@ -5766,6 +5819,10 @@ impl WalletScreen {
                         // same gesture.
                         let was_safe = self.active_safe.is_some();
                         self.active_safe = None;
+                        // Stepping out of Safe mode onto the *same* EOA doesn't
+                        // rebuild the dashboard, so nothing else would tell the
+                        // Builder its identity moved.
+                        self.refresh_txbuilder_context();
                         if was_safe {
                             // Drop the Safe's history so the EOA's
                             // history lazy-loads on the next Activity
@@ -5808,6 +5865,9 @@ impl WalletScreen {
                         self.modal = Modal::None;
                         if idx < self.safes.len() {
                             self.active_safe = Some(idx);
+                            // Activating a Safe never rebuilds the dashboard,
+                            // so the Builder learns the new identity here.
+                            self.refresh_txbuilder_context();
                             // Seed the Safe portfolio from cache if
                             // we've viewed it before; kick a fresh
                             // fetch either way so on-chain state
@@ -6469,7 +6529,6 @@ impl WalletScreen {
             self.display_name(),
             self.display_address(),
             self.active_safe.is_some(),
-            self.apps_available(),
             self.hardware_status(),
             self.network_short_name(),
             self.verification,
@@ -6625,17 +6684,11 @@ impl WalletScreen {
             Some(g) => g,
             None => &empty_book,
         };
-        // If Apps got hidden (switched to a view-only/Safe identity while on it),
-        // fall back to the portfolio so the pane is never blank. Uses
-        // `apps_available()` (not `can_swap()`) so an in-flight place/cancel —
-        // which momentarily parks the signer — doesn't bounce the user off the
-        // Apps pane and back mid-order.
-        let active_nav = if matches!(self.nav, Nav::Apps) && !self.apps_available() {
-            Nav::Home
-        } else {
-            self.nav
-        };
-        let body: Element<'_, Message> = match active_nav {
+        // Apps is always reachable, so there is no nav fallback: switching
+        // identity while standing in an app leaves the user where they were,
+        // holding whatever they had composed. The per-app cards below decide
+        // what that identity can actually reach.
+        let body: Element<'_, Message> = match self.nav {
             Nav::Home => home::view(
                 t,
                 self.can_send(),
@@ -6654,6 +6707,10 @@ impl WalletScreen {
                 // for Safes — it operates on the active EOA, not the Safe.
                 let orders = self.active_cow_orders();
                 let names_available = self.names_available_for_active();
+                // Reach, not keys: a Safe with no CoW market hides the Swap
+                // card, while a watch-only account keeps every card and is
+                // refused at the write action instead.
+                let swap_available = self.swap_available();
                 // The Privacy Pools withdrawal picker lists saved contacts plus
                 // the wallet's own Kao accounts and Safes. Built from the
                 // already-held guard rather than re-locking.
@@ -6665,6 +6722,7 @@ impl WalletScreen {
                         &self.portfolio,
                         &orders,
                         names_available,
+                        swap_available,
                         pool_recipients,
                     )
                     .map(Message::Apps)
@@ -12028,7 +12086,7 @@ mod tests {
     }
 
     #[test]
-    fn placing_an_order_keeps_apps_available_until_it_resolves() {
+    fn placing_an_order_keeps_the_swap_card_up_until_it_resolves() {
         use crate::wallet::local_account;
         use alloy::signers::local::PrivateKeySigner;
 
@@ -12046,15 +12104,17 @@ mod tests {
             None,
         );
         assert!(s.can_swap());
-        assert!(s.apps_available());
+        assert!(s.swap_available());
 
         // Parking the signer (what RequestPlace/RequestCancel do) makes the
-        // live signer unable to sign — but the Apps surface must NOT vanish.
+        // live signer unable to sign — but the Swap surface must NOT vanish.
+        // `swap_available` is signer-independent precisely so this window needs
+        // no special-case reprieve: it never observes the parked placeholder.
         let handoff = s.park_signer_for_order();
         assert!(!s.can_swap(), "parked signer can't sign right now");
         assert!(
-            s.apps_available(),
-            "Apps tab must stay available while an order is in flight",
+            s.swap_available(),
+            "the Swap card must stay up while an order is in flight",
         );
 
         // Resolving the op (here an errored placement) reclaims the signer and
@@ -12071,7 +12131,181 @@ mod tests {
             "in-flight flag must clear on resolve"
         );
         assert!(s.can_swap(), "signer reclaimed after the op resolves");
-        assert!(s.apps_available());
+        assert!(s.swap_available());
+    }
+
+    // ── Apps reachability ───────────────────────────────────────────────────
+    //
+    // The Apps tab is the only doorway to Swap, Names, Privacy Pools and the
+    // Transaction Builder, and it used to be hidden behind `can_swap()`. That
+    // predicate answers a CoW question, so three identity classes that three of
+    // those four apps explicitly support could never open any of them: a Safe
+    // below its local signing threshold, a Safe on a chain CoW never deployed
+    // to, and every watch-only account. The tab is now unconditional and the
+    // key is demanded at the write action instead; these pin the split so the
+    // two questions cannot be reconnected by accident.
+
+    #[test]
+    fn cancelling_an_order_without_a_key_refuses_instead_of_opening_a_review() {
+        // "Fetch" pulls an address's whole CoW history with no key, so opening
+        // Apps to a watch-only account puts a live Cancel button on every past
+        // order. Cancel was the one CoW write that never checked for a signer:
+        // it opened the overlay with Confirm live, and confirming parked the
+        // view-only placeholder — which blocks add-account — to buy an alloy
+        // `UnsupportedOperation` string in the composer.
+        let active = addr(0xAA);
+        let mut s = screen_for(active, new_cache());
+        s.tracked_orders
+            .push(tracked_order("0xpast", active, OrderStatus::Open, 100));
+
+        let _ = s.update(Message::Apps(apps::Message::Cancel("0xpast".into())));
+
+        assert!(
+            s.sign_review.is_none(),
+            "no review may open over a signature that cannot be produced",
+        );
+        assert!(
+            !s.order_op_in_flight,
+            "the refusal must not park the signer",
+        );
+        assert!(
+            !s.is_signing_busy(),
+            "a refused cancel must not leave the wallet in a busy state",
+        );
+    }
+
+    #[test]
+    fn a_name_write_without_a_key_reports_instead_of_doing_nothing() {
+        // The Names card is gated on chain/identity, not on a key, so a
+        // watch-only account reaches the full app. The write refusals used to
+        // `return Task::none()` bare: the button did nothing at all — no
+        // overlay, no error, nothing to read.
+        let mut s = screen_for(addr(0xAA), new_cache());
+        assert!(
+            s.build_eoa_context().is_err(),
+            "precondition: this account holds no key",
+        );
+
+        let _ = s.handle_name_outcome(names_app::Outcome::Renew {
+            namespace: Namespace::Ens,
+            label: "alice".into(),
+            years: 1,
+        });
+
+        assert!(s.sign_review.is_none(), "still no unsignable review");
+        let notice = s.apps.names_pane().manage_notice().cloned();
+        let Some((is_error, text)) = notice else {
+            panic!("the pane must carry a reason the user can read, not nothing");
+        };
+        assert!(is_error, "and it must read as a refusal, not a success");
+        assert!(!text.is_empty());
+    }
+
+    #[test]
+    fn a_watch_only_account_can_reach_swap_but_not_sign_one() {
+        // `screen_for` builds a ViewOnly signer — the class that was locked out
+        // of the whole Apps surface.
+        let s = screen_for(addr(0xAA), new_cache());
+        assert!(
+            s.swap_available(),
+            "quoting and composing need no key, so the card stays",
+        );
+        assert!(
+            !s.can_swap(),
+            "the write gate still demands a key it doesn't have",
+        );
+    }
+
+    #[test]
+    fn a_safe_below_its_local_threshold_keeps_swap_off_but_stays_a_valid_identity() {
+        // 2-of-3 Safe, one owner key linked — the canonical multisig, and the
+        // exact shape the propose-to-co-signers path was written for.
+        let mut safe = safe_descriptor(0x55, Chain::Mainnet.chain_id());
+        safe.threshold = 2;
+        safe.linked_signer_indices = vec![0];
+        let mut s = screen_with_safes(addr(1), vec![safe]);
+        s.active_safe = Some(0);
+
+        assert!(
+            !s.swap_available(),
+            "one key can't reach a 2-of-3 EIP-1271 signature, so no Swap card",
+        );
+        assert!(!s.can_swap());
+        // The point of the split: Swap being unreachable says nothing about the
+        // identity itself, which the Builder still composes and proposes for.
+        let (identity, _, is_safe, _, _, _) = s.txbuilder_identity();
+        assert!(is_safe);
+        assert_eq!(identity, Address::from([0x55; 20]));
+    }
+
+    #[test]
+    fn a_safe_on_a_chain_without_cow_keeps_swap_off_but_stays_a_valid_identity() {
+        // Optimism has no CoW deployment. MultiSend does deploy there, and the
+        // Builder's Safe batch path supports it.
+        let safe = safe_descriptor(0x66, Chain::Optimism.chain_id());
+        let mut s = screen_with_safes(addr(1), vec![safe]);
+        s.active_safe = Some(0);
+
+        assert!(
+            !s.swap_available(),
+            "CoW never deployed to Optimism, so no Swap card",
+        );
+        let (identity, chain, is_safe, _, _, _) = s.txbuilder_identity();
+        assert!(is_safe);
+        assert_eq!(chain, Chain::Optimism);
+        assert_eq!(identity, Address::from([0x66; 20]));
+    }
+
+    #[test]
+    fn activating_a_safe_retires_the_eoa_settled_strip_in_the_builder() {
+        // Regression: the Builder's identity context was refreshed only inside
+        // `Message::Apps`, so activating a Safe left the pane rendering the
+        // EOA's chip, refusal banner and settled strip over the Safe. It was
+        // invisible while a non-swappable Safe also bounced the user off the
+        // Apps tab; now that the tab persists, the switch has to be told.
+        let mut s = screen_with_safes(addr(1), vec![safe_descriptor(0x55, 1)]);
+        // Seed the pane with the live EOA identity, then settle a batch on it.
+        s.refresh_txbuilder_context();
+        s.apps.txbuilder_pane().on_executed(B256::repeat_byte(0xAB));
+        assert!(
+            s.apps.txbuilder_pane().settled_state().is_some(),
+            "the EOA's own outcome shows while composing as the EOA",
+        );
+
+        // Activate the Safe the way the account dropdown does.
+        s.modal = Modal::AccountDropdown(AccountDropdown::new());
+        let _ = s.update(Message::AccountDropdown(
+            account_dropdown::Message::SelectSafe(0),
+        ));
+        assert_eq!(s.active_safe, Some(0));
+
+        assert!(
+            s.apps.txbuilder_pane().settled_state().is_none(),
+            "a hash from the EOA must not be captioned under the Safe",
+        );
+    }
+
+    #[test]
+    fn stepping_out_of_safe_mode_onto_the_same_eoa_refreshes_the_builder() {
+        // The mirror case, and the one with no rebuild to fall back on: leaving
+        // Safe mode for the *same* EOA index doesn't rebuild the dashboard, so
+        // this is the only thing that tells the Builder its identity moved.
+        let mut s = screen_with_safes(addr(1), vec![safe_descriptor(0x55, 1)]);
+        s.active_safe = Some(0);
+        s.refresh_txbuilder_context();
+        s.apps.txbuilder_pane().on_executed(B256::repeat_byte(0xCD));
+        assert!(s.apps.txbuilder_pane().settled_state().is_some());
+
+        s.modal = Modal::AccountDropdown(AccountDropdown::new());
+        let _ = s.update(Message::AccountDropdown(account_dropdown::Message::Select(
+            0,
+        )));
+        assert_eq!(s.active_safe, None);
+
+        assert!(
+            s.apps.txbuilder_pane().settled_state().is_none(),
+            "the Safe's outcome must not follow the user back to the EOA",
+        );
     }
 
     #[test]
@@ -13199,8 +13433,14 @@ mod tests {
     fn cow_cancel_opens_gasless_review() {
         // Cancelling an order opens a confirm gate (an off-chain EIP-712 message),
         // with no legs to decode and no order panel.
-        let me = addr(0xAB);
-        let mut screen = screen_for(me, new_cache());
+        //
+        // The screen holds a real key. This used to be a view-only one, which
+        // was incidental to what the test checks — the review's *shape* — but
+        // it did assert that the overlay opens for an account that cannot sign,
+        // which is now refused up front. See
+        // `cancelling_an_order_without_a_key_refuses_instead_of_opening_a_review`.
+        let mut screen = screen_with_key();
+        let me = screen.address;
         screen.tracked_orders.push(TrackedOrder {
             uid: "0xdeadbeef".repeat(7),
             chain: Chain::Mainnet,

@@ -97,7 +97,10 @@ pub fn coerce_param(ty: &DynSolType, raw: &str) -> Result<DynSolValue, String> {
         return Err(EIP55_REASON.into());
     }
     ty.coerce_str(s)
-        .map_err(|_| format!("expected {}", ty.sol_type_name()))
+        // Solidity's spelling, so this names the same type as the field's own
+        // pill and the signature on the review — `sol_type_name` would say
+        // `(uint256,)` where every other surface says `(uint256)`.
+        .map_err(|_| format!("expected {}", super::abi::canonical_sol_type(ty)))
 }
 
 /// Cheap validity check for live UI feedback (the `✓ valid` / `needs T`

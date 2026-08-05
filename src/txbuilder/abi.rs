@@ -271,6 +271,62 @@ pub struct LoadedContract {
 // Selector / signature helpers
 // ============================================================================
 
+/// A [`DynSolType`] rendered as **Solidity's** canonical type string — the
+/// exact preimage a selector hashes over.
+///
+/// Not `DynSolType::sol_type_name`, which renders Rust's tuple syntax: it
+/// appends a trailing comma to a 1-tuple (`(uint256,)`), because that is how a
+/// one-element tuple is written in Rust. Solidity writes `(uint256)`, and
+/// `keccak256` does not forgive the difference — a single-field struct
+/// parameter hashed through `sol_type_name` yields a selector for a function
+/// that does not exist on the target. Nothing downstream could catch it either,
+/// because the review, the queue card and the decode panel all read the same
+/// string, so they agreed with each other and with nothing on chain.
+///
+/// Every leaf renders identically in both dialects; only the tuple brackets
+/// differ. `CustomStruct` flattens to its tuple, which is what a signature
+/// carries — struct names are not part of the ABI preimage.
+///
+/// Matched exhaustively on purpose: a new `DynSolType` variant that can contain
+/// a tuple must not reach a selector through a catch-all arm.
+pub fn canonical_sol_type(ty: &DynSolType) -> String {
+    fn write(ty: &DynSolType, out: &mut String) {
+        match ty {
+            DynSolType::Bool
+            | DynSolType::Int(_)
+            | DynSolType::Uint(_)
+            | DynSolType::FixedBytes(_)
+            | DynSolType::Address
+            | DynSolType::Function
+            | DynSolType::Bytes
+            | DynSolType::String => out.push_str(&ty.sol_type_name()),
+            DynSolType::Array(inner) => {
+                write(inner, out);
+                out.push_str("[]");
+            }
+            DynSolType::FixedArray(inner, n) => {
+                write(inner, out);
+                out.push_str(&format!("[{n}]"));
+            }
+            DynSolType::Tuple(items) => write_tuple(items, out),
+            DynSolType::CustomStruct { tuple, .. } => write_tuple(tuple, out),
+        }
+    }
+    fn write_tuple(items: &[DynSolType], out: &mut String) {
+        out.push('(');
+        for (i, item) in items.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            write(item, out);
+        }
+        out.push(')');
+    }
+    let mut out = String::new();
+    write(ty, &mut out);
+    out
+}
+
 /// Build the canonical signature `name(t1,t2,…)` and its 4-byte selector
 /// from a name and parameter types.
 fn signature_and_selector(name: &str, inputs: &[AbiParam]) -> (String, [u8; 4]) {
@@ -303,10 +359,12 @@ fn method(name: &str, payable: bool, params: &[(&str, &str)]) -> AbiMethod {
                 .unwrap_or_else(|e| panic!("known-contract type {ty:?} must parse: {e}"));
             AbiParam {
                 name: (*pname).to_string(),
-                ty_str: parsed.sol_type_name().into_owned(),
+                ty_str: canonical_sol_type(&parsed),
                 ty: parsed,
                 // (ty_str is derived from the parsed type, not the input
-                // string, so it's always canonical — matches the selector.)
+                // string, so it's always canonical — matches the selector.
+                // Canonical *Solidity*: see `canonical_sol_type`, which is not
+                // the same string as alloy's `sol_type_name` for a 1-tuple.)
             }
         })
         .collect();
@@ -338,7 +396,7 @@ fn read_method(name: &str, params: &[(&str, &str)], outputs: &[(&str, &str)]) ->
             let parsed = parse(ty);
             AbiParam {
                 name: (*pname).to_string(),
-                ty_str: parsed.sol_type_name().into_owned(),
+                ty_str: canonical_sol_type(&parsed),
                 ty: parsed,
             }
         })
@@ -349,7 +407,7 @@ fn read_method(name: &str, params: &[(&str, &str)], outputs: &[(&str, &str)]) ->
             let parsed = parse(ty);
             AbiParam {
                 name: (*oname).to_string(),
-                ty_str: parsed.sol_type_name().into_owned(),
+                ty_str: canonical_sol_type(&parsed),
                 ty: parsed,
             }
         })
@@ -691,7 +749,7 @@ fn params_from_json(list: &[AbiJsonParam]) -> Result<Vec<AbiParam>, TxBuilderErr
             .map_err(|e| TxBuilderError::Abi(format!("unsupported type {ty_str:?}: {e}")))?;
         out.push(AbiParam {
             name: p.name.clone().unwrap_or_default(),
-            ty_str: ty.sol_type_name().into_owned(),
+            ty_str: canonical_sol_type(&ty),
             ty,
         });
     }
@@ -843,7 +901,7 @@ pub fn from_bytecode(code: &[u8], address: Address, code_verified: bool) -> Opti
             .iter()
             .map(|ty| AbiParam {
                 name: String::new(),
-                ty_str: ty.sol_type_name().into_owned(),
+                ty_str: canonical_sol_type(ty),
                 ty: ty.clone(),
             })
             .collect();
@@ -931,6 +989,124 @@ pub fn from_bytecode_behind_proxy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Selectors below are `cast sig "<signature>"`, not values this module
+    /// produced — an oracle that shares no code with the thing under test.
+    /// A 1-tuple hashed through alloy's `sol_type_name` yields a *different*,
+    /// self-consistent selector, so an assertion derived from our own
+    /// `signature_and_selector` would have agreed with the bug.
+    fn abi_json_with_param(fn_name: &str, ty: &str, components: &str) -> String {
+        format!(
+            r#"[{{"type":"function","name":"{fn_name}","stateMutability":"nonpayable",
+                 "inputs":[{{"name":"p","type":"{ty}","components":{components}}}],
+                 "outputs":[]}}]"#
+        )
+    }
+
+    fn sel_hex(m: &AbiMethod) -> String {
+        format!("0x{}", alloy::hex::encode(m.selector))
+    }
+
+    #[test]
+    fn a_single_field_struct_param_hashes_soliditys_spelling_not_rusts() {
+        // The bug: `(uint256,)` — Rust's 1-tuple syntax, which alloy's
+        // `sol_type_name` emits — was hashed instead of Solidity's
+        // `(uint256)`. The composed call then addressed a function that does
+        // not exist on the target, and nothing downstream disagreed because
+        // review, queue card and decode all read the same wrong string.
+        let json = abi_json_with_param("deposit", "tuple", r#"[{"name":"a","type":"uint256"}]"#);
+        let c = parse_abi_json(&json, Address::ZERO).expect("parses");
+        let m = &c.methods[0];
+        assert_eq!(m.signature, "deposit((uint256))");
+        assert_eq!(sel_hex(m), "0xd1e92c11", "cast sig \"deposit((uint256))\"");
+    }
+
+    #[test]
+    fn single_field_structs_are_canonical_under_arrays_and_nesting() {
+        // A 1-tuple can hide anywhere in a type tree; the walk has to be
+        // recursive, not a special case at the top level.
+        let cases: [(&str, &str, &str, &str, &str); 3] = [
+            (
+                "batch",
+                "tuple[]",
+                r#"[{"name":"a","type":"uint256"}]"#,
+                "batch((uint256)[])",
+                "0xc4a1ec7d",
+            ),
+            (
+                "fixed",
+                "tuple[2]",
+                r#"[{"name":"a","type":"uint256"}]"#,
+                "fixed((uint256)[2])",
+                "0x9170ef34",
+            ),
+            (
+                "nested",
+                "tuple",
+                r#"[{"name":"w","type":"address"},
+                    {"name":"i","type":"tuple","components":[{"name":"a","type":"uint256"}]}]"#,
+                "nested((address,(uint256)))",
+                "0xf8bf647f",
+            ),
+        ];
+        for (name, ty, components, want_sig, want_sel) in cases {
+            let json = abi_json_with_param(name, ty, components);
+            let c = parse_abi_json(&json, Address::ZERO).expect("parses");
+            let m = &c.methods[0];
+            assert_eq!(m.signature, want_sig);
+            assert_eq!(sel_hex(m), want_sel, "cast sig {want_sig:?}");
+        }
+    }
+
+    #[test]
+    fn multi_field_and_flat_params_are_unchanged() {
+        // The control: these never went through the trailing-comma branch, so
+        // the fix must leave them exactly as they were.
+        let json = abi_json_with_param(
+            "many",
+            "tuple",
+            r#"[{"name":"a","type":"uint256"},{"name":"b","type":"address"}]"#,
+        );
+        let c = parse_abi_json(&json, Address::ZERO).expect("parses");
+        assert_eq!(c.methods[0].signature, "many((uint256,address))");
+        assert_eq!(sel_hex(&c.methods[0]), "0xcf512256");
+
+        let json = r#"[{"type":"function","name":"transfer","stateMutability":"nonpayable",
+            "inputs":[{"name":"to","type":"address"},{"name":"v","type":"uint256"}],
+            "outputs":[]}]"#;
+        let c = parse_abi_json(json, Address::ZERO).expect("parses");
+        assert_eq!(c.methods[0].signature, "transfer(address,uint256)");
+        assert_eq!(sel_hex(&c.methods[0]), "0xa9059cbb");
+    }
+
+    #[test]
+    fn canonical_sol_type_never_emits_a_trailing_comma() {
+        // Direct on the walker, including the leaves it delegates.
+        let one = DynSolType::Tuple(vec![DynSolType::Uint(256)]);
+        assert_eq!(canonical_sol_type(&one), "(uint256)");
+        assert_eq!(
+            one.sol_type_name(),
+            "(uint256,)",
+            "precondition: alloy still spells 1-tuples Rust-style — if this \
+             fails alloy changed and the walker can be re-reviewed",
+        );
+        assert_eq!(
+            canonical_sol_type(&DynSolType::Array(Box::new(one.clone()))),
+            "(uint256)[]"
+        );
+        assert_eq!(
+            canonical_sol_type(&DynSolType::FixedArray(Box::new(one), 2)),
+            "(uint256)[2]"
+        );
+        assert_eq!(canonical_sol_type(&DynSolType::Bytes), "bytes");
+        assert_eq!(canonical_sol_type(&DynSolType::FixedBytes(20)), "bytes20");
+        assert_eq!(canonical_sol_type(&DynSolType::Int(8)), "int8");
+        assert_eq!(
+            canonical_sol_type(&DynSolType::Tuple(vec![])),
+            "()",
+            "an empty tuple has no comma to get wrong either way",
+        );
+    }
 
     #[test]
     fn known_contracts_all_build() {

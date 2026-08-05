@@ -509,7 +509,7 @@ fn method_from_meta(cm: &ContractMethod) -> Result<AbiMethod, TxBuilderError> {
             })?;
             Ok(AbiParam {
                 name: String::new(),
-                ty_str: ty.sol_type_name().into_owned(),
+                ty_str: super::abi::canonical_sol_type(&ty),
                 ty,
             })
         })

@@ -500,6 +500,21 @@ fn call_from_tx(tx: &BundleTx, id: u64) -> Result<QueuedCall, TxBuilderError> {
 /// `arg0` / `arg1`. Less pretty, but every label on that card is then derived
 /// from something the bytes commit to.
 fn method_from_meta(cm: &ContractMethod) -> Result<AbiMethod, TxBuilderError> {
+    // The parameter names below are dropped, but the *method* name can't be:
+    // it is hashed into the selector, and it is the one attacker-supplied
+    // string that reaches the queue-card title. The selector match that guards
+    // the rest of this metadata is no defence here — whoever writes the bundle
+    // writes both halves, so they can name the method
+    // `approve\u{202E}drainAll`, derive that name's selector, and ship calldata
+    // carrying it. The two then agree by construction, and the card renders the
+    // override.
+    if !super::abi::is_solidity_identifier(&cm.name) {
+        return Err(TxBuilderError::Assembly(format!(
+            "{:?} is not a function name Solidity can spell — a batch describing its calls that \
+             way is not one this wallet will render",
+            crate::sanitize::sanitize_display(&cm.name, 40),
+        )));
+    }
     let inputs = cm
         .inputs
         .iter()
@@ -720,6 +735,64 @@ mod tests {
             Some("approve(address,uint256)")
         );
         assert_eq!(calls[0].decoded_args[1].value, U256::MAX.to_string());
+    }
+
+    /// The selector match that binds the rest of the metadata proves nothing
+    /// about the name: whoever writes the bundle writes the calldata too, so a
+    /// hostile name and its own selector agree by construction.
+    #[test]
+    fn import_refuses_a_method_name_that_is_not_a_solidity_identifier() {
+        // `approve` + U+202E RIGHT-TO-LEFT OVERRIDE + `drainAll`, with calldata
+        // carrying that very name's selector so the two agree.
+        let hostile = "approve\u{202E}drainAll";
+        let sig = format!("{hostile}(address,uint256)");
+        let sel = alloy::primitives::keccak256(sig.as_bytes());
+        let data = format!(
+            "0x{}{}{}",
+            alloy::hex::encode(&sel[..4]),
+            "000000000000000000000000000000000000000000000000000000000000dead",
+            "f".repeat(64),
+        );
+        let json = format!(
+            r#"{{
+            "version":"1.0","chainId":"1",
+            "meta":{{"name":"x","txBuilderVersion":"other"}},
+            "transactions":[{{
+                "to":"0x000000000000000000000000000000000000dEaD","value":"0",
+                "data":"{data}",
+                "contractMethod":{{"name":"{hostile}","payable":false,"inputs":[
+                    {{"name":"a","type":"address"}},
+                    {{"name":"b","type":"uint256"}}]}}
+            }}]
+        }}"#
+        );
+        let err = import(&json, 1, None).unwrap_err();
+        assert!(
+            err.to_string().contains("Solidity can spell"),
+            "expected the identifier refusal, got {err}"
+        );
+    }
+
+    /// And the length is bounded too — a name long enough to push the target
+    /// address off the card is its own kind of hiding.
+    #[test]
+    fn import_refuses_an_absurdly_long_method_name() {
+        let hostile = "a".repeat(5000);
+        let sig = format!("{hostile}()");
+        let sel = alloy::primitives::keccak256(sig.as_bytes());
+        let json = format!(
+            r#"{{
+            "version":"1.0","chainId":"1",
+            "meta":{{"name":"x","txBuilderVersion":"other"}},
+            "transactions":[{{
+                "to":"0x000000000000000000000000000000000000dEaD","value":"0",
+                "data":"0x{}",
+                "contractMethod":{{"name":"{hostile}","payable":false,"inputs":[]}}
+            }}]
+        }}"#,
+            alloy::hex::encode(&sel[..4]),
+        );
+        assert!(import(&json, 1, None).is_err());
     }
 
     #[test]

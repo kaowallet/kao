@@ -167,6 +167,12 @@ struct TraceState {
     sim: bool,
     errored: bool,
     settled: bool,
+    /// The name-resolution states in play, as `slot=Variant`, joined and
+    /// sorted. A summary rather than the map itself: what a trace reader needs
+    /// is that a field went `Resolving → Resolved`, and the name and address
+    /// themselves are per-keystroke user input that this snapshot deliberately
+    /// keeps out (the same reason `addr_input` and `args` are absent).
+    names: String,
 }
 
 impl TraceState {
@@ -245,6 +251,9 @@ impl TraceState {
         if self.settled != to.settled {
             log("settled", self.settled.to_string(), to.settled.to_string());
         }
+        if self.names != to.names {
+            log("names", self.names.clone(), to.names.clone());
+        }
         out
     }
 
@@ -255,6 +264,15 @@ impl TraceState {
             .into_iter()
             .map(|(what, ..)| what)
             .collect()
+    }
+}
+
+fn slot_name(s: NameSlot) -> String {
+    match s {
+        NameSlot::Contract => "contract".into(),
+        NameSlot::RawTo => "raw_to".into(),
+        NameSlot::Arg(i) => format!("arg{i}"),
+        NameSlot::ReadArg(i) => format!("read_arg{i}"),
     }
 }
 
@@ -497,6 +515,77 @@ pub const PREFLIGHT_STALE_AFTER: std::time::Duration = std::time::Duration::from
 /// half-typed and starts being an answer worth contradicting.
 const ADDRESS_TEXT_LEN: usize = 42;
 
+/// Which address field a name lookup belongs to.
+///
+/// The Builder has four surfaces that take an address, and all four can now
+/// take a name instead. They share one lookup pipeline and one generation
+/// counter, so the answer has to say which field it belongs to — a slot is
+/// what `Outcome::ResolveName` carries out and `on_name_resolved` matches back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NameSlot {
+    /// The contract-address box, shared by the Write and Read composers.
+    Contract,
+    /// The Raw-hex tab's `To` field.
+    RawTo,
+    /// An address-typed argument of the selected write method.
+    Arg(usize),
+    /// An address-typed argument of the selected read method.
+    ReadArg(usize),
+}
+
+/// What a name-shaped entry in an address field resolved to.
+///
+/// `Resolving` carries the generation it was dispatched at *and* the name it
+/// was dispatched for, so a late answer is matched on both — the same double
+/// gate the Send pane uses. One counter serves every slot, so without the slot
+/// key a lookup for one field would retire another's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NameState {
+    Resolving {
+        seq: u64,
+        name: String,
+    },
+    /// `ns` is the registry that vouches for the name (`"ENS"` / `"GNS"` /
+    /// `"WNS"` / `"XNS"`), so the UI can say which one did.
+    Resolved {
+        name: String,
+        addr: Address,
+        ns: &'static str,
+    },
+    /// The name is well-formed but holds no address record.
+    NotFound {
+        name: String,
+    },
+    /// The lookup failed, or completed against reads the light client could not
+    /// verify. Fail closed: this yields no address.
+    Error {
+        name: String,
+        msg: String,
+    },
+}
+
+impl NameState {
+    /// The address this field stands for, if the name resolved. Deliberately
+    /// `None` while resolving and on every failure — a field whose name has not
+    /// come back is not an address, and must not encode as one.
+    pub fn address(&self) -> Option<Address> {
+        match self {
+            Self::Resolved { addr, .. } => Some(*addr),
+            _ => None,
+        }
+    }
+
+    /// Variant name for the GUI state trace.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Resolving { .. } => "Resolving",
+            Self::Resolved { .. } => "Resolved",
+            Self::NotFound { .. } => "NotFound",
+            Self::Error { .. } => "Error",
+        }
+    }
+}
+
 impl Preflight {
     /// Whether the confirm button should read as a deliberate override rather
     /// than a routine confirmation.
@@ -597,6 +686,18 @@ pub enum Outcome {
         net: NetworkId,
         address: Address,
     },
+    /// Forward-resolve `name` (ENS / GNS / WNS / XNS) for the address field
+    /// `slot`. Answered via [`TxBuilderApp::on_name_resolved`].
+    ///
+    /// Carries no chain: [`crate::names::resolve_name`] is pinned to Ethereum
+    /// mainnet for every namespace, whatever network the Builder is pointed at.
+    /// That pin is the reason the UI discloses it — see
+    /// [`TxBuilderApp::resolves_off_mainnet`].
+    ResolveName {
+        seq: u64,
+        slot: NameSlot,
+        name: String,
+    },
     /// Simulate the batch on `chain` (built-in only). Answered via
     /// [`TxBuilderApp::on_sim`].
     Simulate {
@@ -657,6 +758,7 @@ impl Outcome {
             Outcome::ResolveContract { .. } => "ResolveContract",
             Outcome::Read { .. } => "Read",
             Outcome::ProbeCode { .. } => "ProbeCode",
+            Outcome::ResolveName { .. } => "ResolveName",
             Outcome::Simulate { .. } => "Simulate",
             Outcome::Review { .. } => "Review",
             Outcome::PersistTemplates { .. } => "PersistTemplates",
@@ -786,6 +888,15 @@ pub struct TxBuilderApp {
     raw_value: String,
     raw_data: String,
 
+    // ── name resolution ──
+    /// What each address field's name-shaped text resolved to, keyed by slot.
+    /// Absent ⇒ the field holds a literal address (or nothing) and no lookup is
+    /// in play; the field's own text stays authoritative.
+    names: std::collections::HashMap<NameSlot, NameState>,
+    /// Generation guard shared by every slot. Monotonic, never reset — a stale
+    /// answer is dropped by comparing against the `Resolving` state's own copy.
+    name_seq: u64,
+
     // ── batch ──
     batch: Vec<QueuedCall>,
     next_id: u64,
@@ -864,6 +975,8 @@ impl TxBuilderApp {
             raw_to: String::new(),
             raw_value: "0".into(),
             raw_data: String::new(),
+            names: std::collections::HashMap::new(),
+            name_seq: 0,
             batch: Vec::new(),
             next_id: 1,
             expanded: None,
@@ -1063,13 +1176,241 @@ impl TxBuilderApp {
                 return;
             }
             let Ok(has_code) = result else { return };
-            if s.raw_to.trim().parse::<Address>() == Ok(address) {
+            // Through `raw_to_address`, not a bare parse of the field text: the
+            // box may hold a *name*, in which case the address this verdict is
+            // about is the one that name resolved to and the text will never
+            // match it. A bare parse silently dropped the verdict — the "wrong
+            // chain, nothing deployed" warning this probe exists for would
+            // simply not appear for a name.
+            if s.raw_to_address() == Some(address) {
                 s.raw_nothing_deployed = !has_code;
             }
             if s.resolve_target == Some(address) {
                 s.nothing_deployed = !has_code;
             }
         })
+    }
+
+    /// Forward-resolve `name` for `slot`, retiring whatever that slot held.
+    ///
+    /// The generation is bumped for *every* dispatch and stored alongside the
+    /// name, so `on_name_resolved` can match on both.
+    fn resolve_name_for(&mut self, slot: NameSlot, name: &str) -> Option<Outcome> {
+        self.name_seq += 1;
+        let name = name.trim().to_string();
+        self.names.insert(
+            slot,
+            NameState::Resolving {
+                seq: self.name_seq,
+                name: name.clone(),
+            },
+        );
+        Some(Outcome::ResolveName {
+            seq: self.name_seq,
+            slot,
+            name,
+        })
+    }
+
+    /// Route a change to an address-shaped field: start a lookup if the text is
+    /// a name this wallet can resolve, and otherwise clear any stale one.
+    ///
+    /// Returns `true` when a lookup was started, so callers can skip the
+    /// "that isn't an address" complaint they would otherwise raise.
+    ///
+    /// The gate is "a registry could actually hold this": a first-class TLD
+    /// (`.eth` / `.gwei` / `.wei`) or an XNS-shaped `label.namespace`. Not the
+    /// loose `looks_like_name` the Send recipient uses, which fires on any
+    /// dotted string — the Builder's boxes are paste targets for explorer
+    /// output and calldata, and a lookup per pasted URL is noise.
+    ///
+    /// XNS namespaces are permissionless, so the second half of that gate is a
+    /// grammar check rather than a TLD list, and it necessarily admits some
+    /// things that are not names (`uniswap.org` is XNS-shaped). That is the
+    /// unavoidable cost of supporting namespaces nobody has to register with
+    /// this wallet first; what it buys is that `alice.crops` resolves at all.
+    /// Multi-dot strings and every `0x…` are still rejected without a call.
+    fn route_name_input(&mut self, slot: NameSlot, text: &str) -> (bool, Option<Outcome>) {
+        let trimmed = text.trim();
+        if crate::names::looks_like_known_name(trimmed)
+            || crate::names::looks_like_xns_name(trimmed)
+        {
+            // Already resolved / resolving this exact name for this slot — the
+            // keystroke that produced this text changed something else.
+            let same = self.names.get(&slot).is_some_and(|s| match s {
+                NameState::Resolving { name, .. }
+                | NameState::Resolved { name, .. }
+                | NameState::NotFound { name }
+                | NameState::Error { name, .. } => name == trimmed,
+            });
+            if same {
+                return (true, None);
+            }
+            return (true, self.resolve_name_for(slot, trimmed));
+        }
+        self.names.remove(&slot);
+        (false, None)
+    }
+
+    /// Apply a finished name lookup.
+    ///
+    /// May bubble a follow-up: a resolved *contract* name still needs its ABI
+    /// fetched and a resolved raw-`To` still needs its code probed, and neither
+    /// could be asked for until the address was known.
+    pub fn on_name_resolved(
+        &mut self,
+        seq: u64,
+        slot: NameSlot,
+        name: String,
+        result: Result<Option<(Address, crate::names::Registry)>, String>,
+    ) -> Option<Outcome> {
+        self.traced("on_name_resolved", move |s| {
+            // Both gates, as in the Send pane: the generation must be the one
+            // this slot is waiting on, and the name must be the one it asked
+            // about. Anything else is a lookup the user has already typed past.
+            match s.names.get(&slot) {
+                Some(NameState::Resolving {
+                    seq: want,
+                    name: pending,
+                }) if *want == seq && *pending == name => {}
+                _ => return None,
+            }
+            let next = match result {
+                // The badge comes from whichever registry answered, not from
+                // the TLD: an XNS namespace is permissionless, so `alice.crops`
+                // has no TLD-derived answer and `alice.org` could have come
+                // from either side.
+                Ok(Some((addr, registry))) => NameState::Resolved {
+                    ns: registry.label(),
+                    name: name.clone(),
+                    addr,
+                },
+                Ok(None) => NameState::NotFound { name: name.clone() },
+                Err(msg) => NameState::Error {
+                    name: name.clone(),
+                    msg,
+                },
+            };
+            let resolved = next.address();
+            s.names.insert(slot, next);
+            match (slot, resolved) {
+                // The contract box now has an address — run it through the same
+                // path a pasted address takes, so the ABI tiers, the curated
+                // registry and the code probe all behave identically whether
+                // the user typed a name or the hex it stands for.
+                (NameSlot::Contract, Some(addr)) => s.begin_contract_resolve(addr),
+                (NameSlot::RawTo, Some(addr)) => {
+                    s.raw_nothing_deployed = false;
+                    s.probe_code(addr)
+                }
+                _ => None,
+            }
+        })
+    }
+
+    /// Whether a name resolved here stands for an address looked up on a
+    /// *different* chain than the one this batch will run on.
+    ///
+    /// Every namespace this wallet reads — ENS, GNS, WNS, XNS — is pinned to
+    /// Ethereum mainnet, so a name typed while the Builder points at Base or a
+    /// custom network resolves against mainnet records and is then used
+    /// somewhere else. For a recipient that is usually what the user wants (the
+    /// same EOA or Safe address exists across EVM chains). For a *contract* it
+    /// is a trap: the address a mainnet name stands for may hold a different
+    /// contract on the selected chain, or none. The code probe already catches
+    /// "none"; nothing catches "something else", so the UI says so instead.
+    pub fn resolves_off_mainnet(&self) -> bool {
+        !matches!(self.net, NetworkId::Builtin(Chain::Mainnet))
+    }
+
+    /// The resolution state of an address field, if it holds a name.
+    pub fn name_state(&self, slot: NameSlot) -> Option<&NameState> {
+        self.names.get(&slot)
+    }
+
+    /// How to name the contract composer's target in prose: the checksummed
+    /// address it resolved to, or the raw text when there is nothing better.
+    pub fn contract_target_label(&self) -> String {
+        self.resolve_target
+            .map(|a| a.to_checksum(None))
+            .unwrap_or_else(|| self.addr_input.trim().to_string())
+    }
+
+    /// The Raw tab's equivalent of [`Self::contract_target_label`].
+    pub fn raw_target_label(&self) -> String {
+        self.raw_to_address()
+            .map(|a| a.to_checksum(None))
+            .unwrap_or_else(|| self.raw_to.trim().to_string())
+    }
+
+    /// The address the Raw tab's `To` field stands for: its literal text, or
+    /// what the name in it resolved to.
+    fn raw_to_address(&self) -> Option<Address> {
+        encode::parse_address(&self.raw_to).ok().or_else(|| {
+            self.names
+                .get(&NameSlot::RawTo)
+                .and_then(NameState::address)
+        })
+    }
+
+    /// The argument list as it will actually be **encoded**: every address-typed
+    /// slot holding a resolved name replaced by that name's checksummed address.
+    ///
+    /// This is what keeps a name from ever reaching the ABI encoder. The
+    /// reviewed bytes have to come from the address, not the label — the label
+    /// is what the user reads, but a name is not calldata, and `coerce_param`
+    /// would (correctly) refuse it. Substituting here rather than teaching
+    /// `encode` about names also keeps the domain layer free of any notion of a
+    /// registry, which is the reason it can stay pure.
+    fn effective_args(&self, read: bool) -> Vec<String> {
+        let (src, method) = if read {
+            (&self.read_args, self.selected_read_method())
+        } else {
+            (&self.args, self.selected_method())
+        };
+        let Some(m) = method else {
+            return src.clone();
+        };
+        src.iter()
+            .enumerate()
+            .map(|(i, raw)| {
+                let is_addr = m
+                    .inputs
+                    .get(i)
+                    .is_some_and(|p| matches!(p.ty, alloy::dyn_abi::DynSolType::Address));
+                if !is_addr {
+                    return raw.clone();
+                }
+                let slot = if read {
+                    NameSlot::ReadArg(i)
+                } else {
+                    NameSlot::Arg(i)
+                };
+                match self.names.get(&slot).and_then(NameState::address) {
+                    // Checksummed, so it round-trips `parse_address`'s EIP-55
+                    // check the same way a hand-pasted address does.
+                    Some(addr) => addr.to_checksum(None),
+                    None => raw.clone(),
+                }
+            })
+            .collect()
+    }
+
+    /// Whether argument `i` of the selected method (write or read) is a plain
+    /// `address`, and so may be given a name instead of hex.
+    ///
+    /// Scalar `address` only. A name inside `address[]` or `(address,uint256)`
+    /// would have to be substituted into the middle of a composite literal the
+    /// user is typing by hand, where there is no way to show which token became
+    /// which address — so those keep taking hex, as before.
+    fn arg_is_address(&self, i: usize, read: bool) -> bool {
+        let m = if read {
+            self.selected_read_method()
+        } else {
+            self.selected_method()
+        };
+        m.and_then(|m| m.inputs.get(i))
+            .is_some_and(|p| matches!(p.ty, alloy::dyn_abi::DynSolType::Address))
     }
 
     /// Bubble a code probe for `address` if it is worth asking about.
@@ -1264,6 +1605,18 @@ impl TxBuilderApp {
             sim: self.sim.is_some(),
             errored: self.error.is_some(),
             settled: self.settled.is_some(),
+            names: {
+                // Sorted so the string is a function of the state and not of
+                // the hash map's iteration order — otherwise every snapshot
+                // would "differ" from the last and log a change that isn't one.
+                let mut v: Vec<String> = self
+                    .names
+                    .iter()
+                    .map(|(slot, st)| format!("{}={}", slot_name(*slot), st.label()))
+                    .collect();
+                v.sort();
+                v.join(",")
+            },
         }
     }
 
@@ -1337,6 +1690,10 @@ impl TxBuilderApp {
                 if let Some(slot) = self.args.get_mut(i) {
                     *slot = v;
                 }
+                if self.arg_is_address(i, false) {
+                    let text = self.args.get(i).cloned().unwrap_or_default();
+                    return self.route_name_input(NameSlot::Arg(i), &text).1;
+                }
             }
             Message::BoolArg(i, b) => {
                 if let Some(slot) = self.args.get_mut(i) {
@@ -1356,6 +1713,10 @@ impl TxBuilderApp {
                     *slot = v;
                 }
                 self.invalidate_read();
+                if self.arg_is_address(i, true) {
+                    let text = self.read_args.get(i).cloned().unwrap_or_default();
+                    return self.route_name_input(NameSlot::ReadArg(i), &text).1;
+                }
             }
             Message::ReadBoolArg(i, b) => {
                 if let Some(slot) = self.read_args.get_mut(i) {
@@ -1386,8 +1747,14 @@ impl TxBuilderApp {
                 self.raw_nothing_deployed = false;
                 self.probe_seq += 1;
                 if let Ok(addr) = encode::parse_address(self.raw_to.trim()) {
+                    self.names.remove(&NameSlot::RawTo);
                     return self.probe_code(addr);
                 }
+                // Not hex — it may still be a name. The probe for whatever it
+                // resolves to is issued by `on_name_resolved`, since the
+                // address isn't known until then.
+                let text = self.raw_to.trim().to_string();
+                return self.route_name_input(NameSlot::RawTo, &text).1;
             }
             Message::RawValueChanged(v) => self.raw_value = v,
             Message::RawDataChanged(v) => self.raw_data = v,
@@ -1612,18 +1979,18 @@ impl TxBuilderApp {
     fn on_addr_changed(&mut self, v: String) -> Option<Outcome> {
         self.addr_input = v;
         self.error = None;
-        let trimmed = self.addr_input.trim();
+        let trimmed = self.addr_input.trim().to_string();
         // A full-length string is a finished answer, so contradicting it is
-        // useful; anything shorter is still being typed. Read before the parse
-        // so the borrow on `addr_input` ends here.
+        // useful; anything shorter is still being typed.
         let looks_complete = trimmed.len() >= ADDRESS_TEXT_LEN;
         // Through `parse_address`, not `parse::<Address>()`, so a mixed-case
         // address that fails its EIP-55 checksum is refused here rather than
         // silently resolved against whatever those 20 bytes turn out to be.
-        let parsed = encode::parse_address(trimmed);
-        match parsed {
+        match encode::parse_address(&trimmed) {
             Ok(addr) => {
                 self.addr_error = None;
+                // A literal address supersedes any name previously in the box.
+                self.names.remove(&NameSlot::Contract);
                 // Already resolved / resolving this exact address — no-op.
                 // A *failed* resolve is deliberately not in this list: it is
                 // the one settled state worth leaving, so re-entering the same
@@ -1633,46 +2000,73 @@ impl TxBuilderApp {
                 {
                     return None;
                 }
-                self.reset_composer_keep_addr();
-                self.resolve_target = Some(addr);
-                match self.net.builtin() {
-                    // Built-in chain: curated registry first, else fetch the
-                    // verified bytecode and recover the ABI.
-                    Some(chain) => {
-                        // A curated hit shows immediately — its names are
-                        // authoritative and it needs no round trip — and then
-                        // the fetch runs anyway to fill in everything the
-                        // hand-written subset leaves out. `set_loaded` bumps
-                        // the sequence, so the request must read it afterwards.
-                        if let Some(loaded) = abi::known_by_address(chain, addr) {
-                            self.set_loaded(loaded);
-                        }
-                        // `reset_composer_keep_addr` above already bumped the
-                        // sequence, retiring any earlier fetch; this request
-                        // rides whatever value it left behind.
-                        self.resolving = self.loaded.is_none();
-                        Some(Outcome::ResolveContract {
-                            seq: self.resolve_seq,
-                            chain,
-                            address: addr,
-                        })
-                    }
-                    // Custom (unverified) network: no verified-bytecode fetch
-                    // and no curated registry — prompt straight for a pasted
-                    // ABI. Whether anything is *deployed* there is still worth
-                    // asking, and the configured RPC can answer it: pasting an
-                    // ABI proves nothing about the account it is aimed at, and
-                    // this is the composer with the least else to go on.
-                    None => {
-                        self.not_found = true;
-                        self.probe_code(addr)
-                    }
-                }
+                self.begin_contract_resolve(addr)
             }
             Err(reason) => {
+                // A name is not a malformed address. Route it before the
+                // complaint, so `vitalik.eth` starts a lookup instead of
+                // producing the silence it used to: the old code reset the
+                // composer and set `addr_error` only once the text reached 42
+                // characters, which a name never does.
+                let (is_name, out) = self.route_name_input(NameSlot::Contract, &trimmed);
+                if is_name {
+                    // Only tear the composer down when a *new* lookup starts —
+                    // otherwise every keystroke past a resolved name would wipe
+                    // the ABI that name just loaded.
+                    if out.is_some() {
+                        self.reset_composer_keep_addr();
+                    }
+                    self.addr_error = None;
+                    return out;
+                }
                 self.reset_composer_keep_addr();
                 self.addr_error = looks_complete.then_some(reason);
                 None
+            }
+        }
+    }
+
+    /// Start the ABI pipeline for a known contract address, however the box
+    /// arrived at it — pasted hex or a resolved name.
+    ///
+    /// Extracted so both entry points get the curated-registry hit, the
+    /// verified-bytecode fetch and the custom-network code probe on identical
+    /// terms; a second copy for the name path would be a second place for the
+    /// sequence handling to drift.
+    fn begin_contract_resolve(&mut self, addr: Address) -> Option<Outcome> {
+        self.reset_composer_keep_addr();
+        self.resolve_target = Some(addr);
+        match self.net.builtin() {
+            // Built-in chain: curated registry first, else fetch the
+            // verified bytecode and recover the ABI.
+            Some(chain) => {
+                // A curated hit shows immediately — its names are
+                // authoritative and it needs no round trip — and then
+                // the fetch runs anyway to fill in everything the
+                // hand-written subset leaves out. `set_loaded` bumps
+                // the sequence, so the request must read it afterwards.
+                if let Some(loaded) = abi::known_by_address(chain, addr) {
+                    self.set_loaded(loaded);
+                }
+                // `reset_composer_keep_addr` above already bumped the
+                // sequence, retiring any earlier fetch; this request
+                // rides whatever value it left behind.
+                self.resolving = self.loaded.is_none();
+                Some(Outcome::ResolveContract {
+                    seq: self.resolve_seq,
+                    chain,
+                    address: addr,
+                })
+            }
+            // Custom (unverified) network: no verified-bytecode fetch
+            // and no curated registry — prompt straight for a pasted
+            // ABI. Whether anything is *deployed* there is still worth
+            // asking, and the configured RPC can answer it: pasting an
+            // ABI proves nothing about the account it is aimed at, and
+            // this is the composer with the least else to go on.
+            None => {
+                self.not_found = true;
+                self.probe_code(addr)
             }
         }
     }
@@ -1752,6 +2146,10 @@ impl TxBuilderApp {
         self.addr_input.clear();
         self.reset_composer_keep_addr();
         self.reset_raw_composer();
+        // Last, and unconditional: the two partial resets each keep the slots
+        // that are none of their business, and the address box has just been
+        // emptied, so nothing is left for any name to stand for.
+        self.invalidate_names();
     }
 
     /// The Raw tab's half of [`Self::reset_composer`].
@@ -1773,6 +2171,16 @@ impl TxBuilderApp {
         self.raw_value = "0".into();
         self.raw_data.clear();
         self.raw_nothing_deployed = false;
+        self.names.remove(&NameSlot::RawTo);
+    }
+
+    /// Drop every field's name state and retire any lookup in flight.
+    ///
+    /// Bumping the generation is belt-and-braces: `on_name_resolved` gates on
+    /// the *stored* `Resolving` entry, which clearing the map already removes.
+    fn invalidate_names(&mut self) {
+        self.name_seq += 1;
+        self.names.clear();
     }
 
     fn reset_composer_keep_addr(&mut self) {
@@ -1798,6 +2206,13 @@ impl TxBuilderApp {
         self.read_menu_open = false;
         self.read_args.clear();
         self.invalidate_read();
+        // The argument boxes just went away, so any name standing for one of
+        // them is stale. The *contract* slot deliberately survives: this runs
+        // while resolving the very name in that box, and clearing it here would
+        // erase the label the user is watching resolve.
+        self.names
+            .retain(|slot, _| matches!(slot, NameSlot::Contract | NameSlot::RawTo));
+        self.name_seq += 1;
     }
 
     /// Retire any resolve still in flight. `on_contract_resolved` applies its
@@ -2252,10 +2667,15 @@ impl TxBuilderApp {
                 if self.args.len() != m.inputs.len() {
                     return false;
                 }
+                // Validated against the *effective* arguments, so an
+                // address-typed field holding a resolved name reads as the
+                // address it stands for. A name that is still resolving, or
+                // that failed, substitutes nothing and so still fails here —
+                // the CTA must not light up over a lookup that hasn't landed.
                 let args_ok = m
                     .inputs
                     .iter()
-                    .zip(&self.args)
+                    .zip(&self.effective_args(false))
                     .all(|(inp, v)| encode::is_valid(&inp.ty, v));
                 let value_ok = !m.payable || encode::parse_wei(&self.value_input).is_ok();
                 args_ok && value_ok
@@ -2265,7 +2685,7 @@ impl TxBuilderApp {
             // refusal then arrived as a banner at the foot of the page rather
             // than beside the field that caused it.
             Mode::Raw => {
-                encode::parse_address(&self.raw_to).is_ok()
+                self.raw_to_address().is_some()
                     && encode::parse_wei(&self.raw_value).is_ok()
                     && encode::parse_data(&self.raw_data).is_ok()
             }
@@ -2281,7 +2701,7 @@ impl TxBuilderApp {
         self.read_args.len() == m.inputs.len()
             && m.inputs
                 .iter()
-                .zip(&self.read_args)
+                .zip(&self.effective_args(true))
                 .all(|(inp, v)| encode::is_valid(&inp.ty, v))
     }
 
@@ -2305,12 +2725,18 @@ impl TxBuilderApp {
                     addr,
                     &name,
                     &m,
-                    &self.args,
+                    // Effective, not raw: a resolved name is encoded as the
+                    // address it stands for. The queued call keeps only bytes,
+                    // so this is the last point at which a label could have
+                    // leaked into what gets signed.
+                    &self.effective_args(false),
                     &self.value_input,
                 )
             }
             Mode::Raw => {
-                let to = encode::parse_address(&self.raw_to).map_err(TxBuilderError::Input)?;
+                let to = self.raw_to_address().ok_or_else(|| {
+                    TxBuilderError::Input("not a 20-byte 0x… address or a resolved name".into())
+                })?;
                 encode::build_raw_call(self.next_id, to, &self.raw_value, &self.raw_data)
             }
             Mode::Read => Err(TxBuilderError::Input("read methods are not sent".into())),
@@ -2463,7 +2889,7 @@ impl TxBuilderApp {
         }
         let m = self.selected_read_method()?.clone();
         let to = self.loaded.as_ref()?.address;
-        let data = match encode::encode_call(&m, &self.read_args) {
+        let data = match encode::encode_call(&m, &self.effective_args(true)) {
             Ok(d) => d,
             Err(e) => {
                 self.error = Some(e.to_string());
@@ -3507,6 +3933,335 @@ mod tests {
     /// synchronously (no light-client round-trip).
     fn usdc() -> Address {
         address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
+    }
+
+    // ── name resolution (ENS / GNS / WNS / XNS) ─────────────────────────────
+
+    const NAMED: Address = address!("0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045");
+
+    /// Drive a slot from "user typed a name" to "it resolved", the way the
+    /// coordinator does. `reg` is the registry that answered — for an XNS name
+    /// that is a fact about the lookup, not about the TLD.
+    fn resolve_as(
+        app: &mut TxBuilderApp,
+        slot: NameSlot,
+        name: &str,
+        to: Address,
+        reg: crate::names::Registry,
+    ) -> Option<Outcome> {
+        let seq = match app.names.get(&slot) {
+            Some(NameState::Resolving { seq, .. }) => *seq,
+            other => panic!("{slot:?} is not awaiting a lookup: {other:?}"),
+        };
+        app.on_name_resolved(seq, slot, name.into(), Ok(Some((to, reg))))
+    }
+
+    fn resolve(app: &mut TxBuilderApp, slot: NameSlot, name: &str, to: Address) -> Option<Outcome> {
+        resolve_as(app, slot, name, to, crate::names::Registry::Ens)
+    }
+
+    #[test]
+    fn a_name_in_the_contract_box_is_looked_up_not_rejected() {
+        let mut app = safe_app();
+        let out = app.update(Message::AddrChanged("vitalik.eth".into()));
+        assert!(
+            matches!(
+                out,
+                Some(Outcome::ResolveName {
+                    slot: NameSlot::Contract,
+                    ..
+                })
+            ),
+            "a name starts a lookup",
+        );
+        // The box must not read as a malformed address while that runs — the
+        // old code produced silence here, and only complained once the text
+        // reached 42 characters, which a name never does.
+        assert!(app.addr_error.is_none());
+
+        // The answer feeds the ordinary contract pipeline, so the ABI tiers and
+        // the code probe behave exactly as they do for a pasted address.
+        let out = resolve(&mut app, NameSlot::Contract, "vitalik.eth", usdc());
+        assert!(matches!(out, Some(Outcome::ResolveContract { address, .. }) if address == usdc()));
+        assert_eq!(app.resolve_target, Some(usdc()));
+        assert!(matches!(
+            app.name_state(NameSlot::Contract),
+            Some(NameState::Resolved { ns: "ENS", .. })
+        ));
+    }
+
+    /// The badge names whichever registry answered. For ENS/GNS/WNS the TLD
+    /// determines that; for XNS it cannot, because namespaces are
+    /// permissionless — so the registry rides back with the address.
+    #[test]
+    fn a_resolved_name_is_badged_by_the_registry_that_answered() {
+        use crate::names::Registry;
+        for (name, reg, want) in [
+            ("vitalik.eth", Registry::Ens, "ENS"),
+            ("alice.gwei", Registry::Gns, "GNS"),
+            ("bob.wei", Registry::Wns, "WNS"),
+            ("carol.xns", Registry::Xns, "XNS"),
+            // Arbitrary XNS namespaces — nothing in the string says XNS.
+            ("dave.crops", Registry::Xns, "XNS"),
+            ("erin.cheese", Registry::Xns, "XNS"),
+            // Shaped like an XNS name, but ENS is what held it.
+            ("frank.org", Registry::Ens, "ENS"),
+        ] {
+            let mut app = safe_app();
+            app.update(Message::AddrChanged(name.into()));
+            resolve_as(&mut app, NameSlot::Contract, name, NAMED, reg);
+            assert!(
+                matches!(app.name_state(NameSlot::Contract), Some(NameState::Resolved { ns, .. }) if *ns == want),
+                "{name} should be badged {want}",
+            );
+        }
+    }
+
+    /// The gate has to admit permissionless namespaces, or `alice.crops` never
+    /// gets asked about at all — which is what used to happen.
+    #[test]
+    fn an_arbitrary_xns_namespace_starts_a_lookup() {
+        for name in ["dave.crops", "erin.cheese", "a.b", "team-1.my-ns"] {
+            let mut app = safe_app();
+            let out = app.update(Message::AddrChanged(name.into()));
+            assert!(
+                matches!(
+                    out,
+                    Some(Outcome::ResolveName {
+                        slot: NameSlot::Contract,
+                        ..
+                    })
+                ),
+                "{name} is XNS-shaped and must be looked up",
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_typed_past_is_dropped_when_it_lands() {
+        let mut app = safe_app();
+        app.update(Message::AddrChanged("vitalik.eth".into()));
+        let stale = match app.names.get(&NameSlot::Contract) {
+            Some(NameState::Resolving { seq, .. }) => *seq,
+            _ => panic!("awaiting a lookup"),
+        };
+        // The user keeps typing; the first lookup is now for a name that is no
+        // longer in the box.
+        app.update(Message::AddrChanged("someone-else.eth".into()));
+        let out = app.on_name_resolved(
+            stale,
+            NameSlot::Contract,
+            "vitalik.eth".into(),
+            Ok(Some((usdc(), crate::names::Registry::Ens))),
+        );
+        assert!(
+            out.is_none(),
+            "a superseded lookup starts no follow-up work"
+        );
+        assert!(
+            matches!(
+                app.name_state(NameSlot::Contract),
+                Some(NameState::Resolving { name, .. }) if name == "someone-else.eth"
+            ),
+            "and does not overwrite the lookup that replaced it",
+        );
+        assert_eq!(app.resolve_target, None);
+    }
+
+    /// The property that matters most: a label never reaches the encoder. What
+    /// gets queued — and therefore signed — is the address the name resolved
+    /// to, and the queued call keeps only bytes.
+    #[test]
+    fn an_address_argument_encodes_the_resolved_address_not_the_name() {
+        let mut app = safe_app();
+        app.update(Message::AddrChanged(usdc().to_string()));
+        // USDC's curated `transfer(address,uint256)`.
+        let idx = app
+            .loaded
+            .as_ref()
+            .unwrap()
+            .methods
+            .iter()
+            .position(|m| m.name == "transfer")
+            .expect("curated USDC exposes transfer");
+        app.update(Message::PickMethod(idx));
+
+        let out = app.update(Message::ArgChanged(0, "vitalik.eth".into()));
+        assert!(matches!(
+            out,
+            Some(Outcome::ResolveName {
+                slot: NameSlot::Arg(0),
+                ..
+            })
+        ));
+        // Unresolved, the call must not be composable — the CTA cannot light up
+        // over a lookup that hasn't landed.
+        app.update(Message::ArgChanged(1, "5".into()));
+        assert!(!app.compose_valid(), "an in-flight name is not an address");
+
+        resolve(&mut app, NameSlot::Arg(0), "vitalik.eth", NAMED);
+        assert!(app.compose_valid(), "a resolved name is");
+
+        let call = app.compose_call().expect("composes");
+        // `transfer(address,uint256)` — the recipient is the second word.
+        assert_eq!(&call.data[16..36], NAMED.as_slice());
+        assert!(
+            !call.decoded_args.iter().any(|a| a.value.contains(".eth")),
+            "the queued call records the address, never the label: {:?}",
+            call.decoded_args,
+        );
+    }
+
+    #[test]
+    fn a_failed_argument_lookup_keeps_the_call_uncomposable() {
+        let mut app = safe_app();
+        app.update(Message::AddrChanged(usdc().to_string()));
+        let idx = app
+            .loaded
+            .as_ref()
+            .unwrap()
+            .methods
+            .iter()
+            .position(|m| m.name == "transfer")
+            .unwrap();
+        app.update(Message::PickMethod(idx));
+        app.update(Message::ArgChanged(0, "nobody.eth".into()));
+        app.update(Message::ArgChanged(1, "5".into()));
+
+        let seq = match app.names.get(&NameSlot::Arg(0)) {
+            Some(NameState::Resolving { seq, .. }) => *seq,
+            _ => panic!("awaiting a lookup"),
+        };
+        app.on_name_resolved(seq, NameSlot::Arg(0), "nobody.eth".into(), Ok(None));
+        assert!(matches!(
+            app.name_state(NameSlot::Arg(0)),
+            Some(NameState::NotFound { .. })
+        ));
+        assert!(!app.compose_valid());
+        assert!(app.compose_call().is_err());
+    }
+
+    #[test]
+    fn the_raw_tab_takes_a_name_and_probes_what_it_resolves_to() {
+        let mut app = eoa_app();
+        app.update(Message::SetMode(Mode::Raw));
+        let out = app.update(Message::RawToChanged("vitalik.eth".into()));
+        assert!(matches!(
+            out,
+            Some(Outcome::ResolveName {
+                slot: NameSlot::RawTo,
+                ..
+            })
+        ));
+        assert!(!app.compose_valid(), "nothing to send to yet");
+
+        // The probe can only be issued once the address is known, so it rides
+        // out on the resolution rather than the keystroke.
+        let out = resolve(&mut app, NameSlot::RawTo, "vitalik.eth", NAMED);
+        assert!(matches!(
+            out,
+            Some(Outcome::ProbeCode { address, .. }) if address == NAMED
+        ));
+
+        app.update(Message::RawValueChanged("0".into()));
+        app.update(Message::RawDataChanged("0x".into()));
+        assert!(app.compose_valid());
+        assert_eq!(app.compose_call().expect("composes").to, NAMED);
+    }
+
+    /// The probe's verdict is about an *address*. It used to be re-matched
+    /// against the field text, which a name never equals — so the
+    /// "nothing deployed here" warning silently never fired for one.
+    #[test]
+    fn a_probe_verdict_reaches_a_raw_field_holding_a_name() {
+        let mut app = eoa_app();
+        app.update(Message::SetMode(Mode::Raw));
+        app.update(Message::RawToChanged("vitalik.eth".into()));
+        resolve(&mut app, NameSlot::RawTo, "vitalik.eth", NAMED);
+        app.on_code_probed(app.probe_seq, app.net, NAMED, Ok(false));
+        assert!(
+            app.raw_nothing_deployed,
+            "the warning has to reach a field holding a name",
+        );
+    }
+
+    /// What the gate still refuses. Permissionless namespaces mean the gate is
+    /// a grammar check, so it cannot reject `uniswap.org` — nothing about that
+    /// string distinguishes it from an XNS name until the contract is asked.
+    /// What it does reject, without a network call: anything multi-dot (a URL
+    /// with a subdomain, which no XNS label can contain), anything undotted,
+    /// and every address.
+    #[test]
+    fn junk_that_no_registry_could_hold_fires_no_lookup() {
+        for text in [
+            "docs.uniswap.org",
+            "app.aave.com",
+            "notanaddress",
+            "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+            "toolongalabelfortheXNScontract.ns",
+        ] {
+            let mut app = safe_app();
+            let out = app.update(Message::AddrChanged(text.into()));
+            // Not "no outcome" — a real address still starts an ABI fetch.
+            // Specifically: no *name* lookup, and no name state left behind.
+            assert!(
+                !matches!(out, Some(Outcome::ResolveName { .. })),
+                "{text} must not fire a name lookup",
+            );
+            assert!(app.name_state(NameSlot::Contract).is_none(), "{text}");
+        }
+    }
+
+    #[test]
+    fn resolution_off_mainnet_is_disclosed() {
+        let mut app = eoa_app();
+        assert!(
+            !app.resolves_off_mainnet(),
+            "on Mainnet the lookup and the batch agree"
+        );
+        // Every namespace is pinned to Ethereum mainnet, so a name resolved
+        // while the Builder points elsewhere stands for an address looked up
+        // somewhere other than where it will be used.
+        app.update(Message::SetNetwork(NetworkId::Builtin(Chain::Base)));
+        assert!(app.resolves_off_mainnet());
+        app.update(Message::SetNetwork(NetworkId::Custom(11155111)));
+        assert!(app.resolves_off_mainnet());
+    }
+
+    #[test]
+    fn a_network_switch_retires_a_name_in_flight() {
+        let mut app = eoa_app();
+        app.update(Message::AddrChanged("vitalik.eth".into()));
+        let seq = match app.names.get(&NameSlot::Contract) {
+            Some(NameState::Resolving { seq, .. }) => *seq,
+            _ => panic!("awaiting a lookup"),
+        };
+        app.update(Message::SetNetwork(NetworkId::Builtin(Chain::Base)));
+        assert!(app.name_state(NameSlot::Contract).is_none(), "cleared");
+        // And the answer that outlived the switch lands on nothing: the address
+        // it stands for was looked up for a composer that no longer exists.
+        let out = app.on_name_resolved(
+            seq,
+            NameSlot::Contract,
+            "vitalik.eth".into(),
+            Ok(Some((usdc(), crate::names::Registry::Ens))),
+        );
+        assert!(out.is_none());
+        assert!(app.name_state(NameSlot::Contract).is_none());
+        assert_eq!(app.resolve_target, None);
+    }
+
+    #[test]
+    fn a_literal_address_supersedes_a_name_in_the_same_box() {
+        let mut app = safe_app();
+        app.update(Message::AddrChanged("vitalik.eth".into()));
+        assert!(app.name_state(NameSlot::Contract).is_some());
+        app.update(Message::AddrChanged(usdc().to_string()));
+        assert!(
+            app.name_state(NameSlot::Contract).is_none(),
+            "pasting hex over a name leaves no label behind to describe it",
+        );
+        assert_eq!(app.resolve_target, Some(usdc()));
     }
 
     #[test]

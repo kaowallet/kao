@@ -390,12 +390,17 @@ fn compose_cta(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
 /// banner / not-found / empty-hint status, common to the Write and Read tabs.
 /// The caller appends the method-specific UI when a contract is loaded.
 fn contract_head(app: &TxBuilderApp, t: KaoTheme) -> Column<'_, Message> {
-    let addr_invalid =
-        !app.addr_input.trim().is_empty() && encode::parse_address(&app.addr_input).is_err();
+    let name = name_row(app, t, super::NameSlot::Contract);
+    // A name is not a malformed address. Without this the box turns red on the
+    // first character of `uniswap.eth` and stays red the whole time it is
+    // resolving, contradicting a lookup that is about to succeed.
+    let addr_invalid = name.is_none()
+        && !app.addr_input.trim().is_empty()
+        && encode::parse_address(&app.addr_input).is_err();
     let placeholder = if app.is_custom() {
-        "0x… contract address (paste its ABI to load)"
+        "0x… or a name (paste its ABI to load)"
     } else {
-        "0x… paste a verified contract"
+        "0x… or vitalik.eth"
     };
 
     let addr_field = labelled(
@@ -418,6 +423,13 @@ fn contract_head(app: &TxBuilderApp, t: KaoTheme) -> Column<'_, Message> {
 
     let mut col = column![addr_field].width(Length::Fill);
 
+    // Sits directly under the box, above the ABI ladder below: it describes
+    // what is *in the field*, where the ladder describes what was found at the
+    // address the field stands for.
+    if let Some(n) = name {
+        col = col.push(Space::new().height(6)).push(n);
+    }
+
     if app.resolving {
         col = col.push(Space::new().height(14)).push(info_box(
             t,
@@ -431,11 +443,10 @@ fn contract_head(app: &TxBuilderApp, t: KaoTheme) -> Column<'_, Message> {
         // Ahead of the proxy note: "there is no contract here" outranks any
         // observation about which ABI is on screen.
         if app.nothing_deployed {
-            col = col.push(Space::new().height(8)).push(nothing_deployed_note(
-                app,
-                t,
-                app.addr_input.trim(),
-            ));
+            let target = app.contract_target_label();
+            col = col
+                .push(Space::new().height(8))
+                .push(nothing_deployed_note(app, t, &target));
         }
         if app.proxy_unverified {
             col = col
@@ -529,6 +540,8 @@ fn call_composer(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
                         &inp.ty,
                         &val,
                         false,
+                        app.name_state(super::NameSlot::Arg(i))
+                            .map(|s| (s, app.resolves_off_mainnet())),
                     ));
                 }
             }
@@ -572,6 +585,8 @@ fn read_composer(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
                             &inp.ty,
                             &val,
                             true,
+                            app.name_state(super::NameSlot::ReadArg(i))
+                                .map(|s| (s, app.resolves_off_mainnet())),
                         ));
                     }
                 }
@@ -605,7 +620,11 @@ fn raw_composer(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
     // refusal that used to arrive as a banner at the foot of the page lands
     // beside the box that caused it — the treatment `to` already had, and the
     // one the Write tab gives every parameter.
-    let to_err = (!app.raw_to.trim().is_empty())
+    // A name in this box is handled by `to_name` below, so it must not also be
+    // reported here as "not a 20-byte 0x… address" — the field would go red on
+    // the first character of a name that is about to resolve.
+    let to_name = name_row(app, t, super::NameSlot::RawTo);
+    let to_err = (to_name.is_none() && !app.raw_to.trim().is_empty())
         .then(|| encode::parse_address(&app.raw_to).err())
         .flatten();
     let value_err = encode::parse_wei(&app.raw_value).err();
@@ -616,7 +635,7 @@ fn raw_composer(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
     let mut col = column![labelled(
         t,
         "To",
-        text_input("0x… target address", &app.raw_to)
+        text_input("0x… or a name", &app.raw_to)
             .on_input(Message::RawToChanged)
             .padding(Padding::from([11, 13]))
             .size(13)
@@ -634,13 +653,17 @@ fn raw_composer(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
     if let Some(e) = &to_err {
         col = col.push(Space::new().height(6)).push(field_error(t, e));
     }
+    if let Some(n) = to_name {
+        col = col.push(Space::new().height(6)).push(n);
+    }
     // A well-formed address with nothing behind it. Not a field error — the
     // input is valid — but the call would succeed having done nothing, so it
     // sits with the field rather than in a banner at the bottom of the page.
     if app.raw_nothing_deployed {
-        col =
-            col.push(Space::new().height(8))
-                .push(nothing_deployed_note(app, t, app.raw_to.trim()));
+        let target = app.raw_target_label();
+        col = col
+            .push(Space::new().height(8))
+            .push(nothing_deployed_note(app, t, &target));
     }
 
     col = col.push(Space::new().height(14)).push(labelled(
@@ -706,6 +729,77 @@ fn field_error<'a>(t: KaoTheme, msg: &str) -> Element<'a, Message> {
         .wrapping(Wrapping::WordOrGlyph)
         .width(Length::Fill)
         .into()
+}
+
+/// What a name-shaped address field resolved to, as a line under that field.
+///
+/// One renderer for all four surfaces (contract box, raw `To`, write argument,
+/// read argument), because the states are the same everywhere and a name that
+/// reads one way beside the contract and another beside an argument is a name
+/// the user has to interpret twice.
+///
+/// The resolved case always shows the **address**, never the name alone: the
+/// name is a label the user typed, the address is what will be signed over, and
+/// the whole point of showing this is that the two can be checked against each
+/// other before anything is queued.
+fn name_status<'a>(
+    t: KaoTheme,
+    state: &'a super::NameState,
+    off_mainnet: bool,
+) -> Element<'a, Message> {
+    use super::NameState;
+    match state {
+        NameState::Resolving { name, .. } => text(format!("Resolving {name}…"))
+            .size(10)
+            .color(t.sub)
+            .font(mono())
+            .width(Length::Fill)
+            .into(),
+        NameState::Resolved { addr, ns, .. } => {
+            let mut col = column![
+                row![
+                    pill(t, ns, t.up),
+                    Space::new().width(6),
+                    text(format!("= {}", addr.to_checksum(None)))
+                        .size(10)
+                        .color(t.sub)
+                        .font(mono())
+                        .wrapping(Wrapping::WordOrGlyph),
+                ]
+                .align_y(Alignment::Center)
+            ]
+            .width(Length::Fill);
+            // Every namespace this wallet reads lives on Ethereum mainnet. When
+            // the batch is bound for anywhere else, the address on screen was
+            // looked up somewhere other than where it will be used — and for a
+            // contract that is a different contract, or none.
+            if off_mainnet {
+                col = col.push(Space::new().height(3)).push(
+                    text("resolved on Ethereum mainnet — check it means the same here")
+                        .size(10)
+                        .color(t.down)
+                        .font(mono())
+                        .wrapping(Wrapping::WordOrGlyph)
+                        .width(Length::Fill),
+                );
+            }
+            col.into()
+        }
+        NameState::NotFound { name } => field_error(t, &format!("{name} has no address record")),
+        NameState::Error { name, msg } => {
+            field_error(t, &format!("couldn't resolve {name} — {msg}"))
+        }
+    }
+}
+
+/// The name-status line for `slot`, or nothing when that field holds no name.
+fn name_row<'a>(
+    app: &'a TxBuilderApp,
+    t: KaoTheme,
+    slot: super::NameSlot,
+) -> Option<Element<'a, Message>> {
+    app.name_state(slot)
+        .map(|s| name_status(t, s, app.resolves_off_mainnet()))
 }
 
 fn method_picker(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
@@ -854,6 +948,14 @@ fn method_picker(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
 
 /// A labelled parameter input. `read` swaps the emitted messages so the same
 /// widget drives either the Write composer args or the Read query args.
+///
+/// `name_state` is the resolution of a name typed into an `address` parameter,
+/// when there is one. It changes three things: the ✓/needs-address annotation
+/// reads the *resolved* address rather than the label, the red border is
+/// withheld while a lookup is in flight, and the resolved address is printed
+/// under the field — the same slot `encoded_preview` uses to say what a string
+/// really encodes to, for the same reason.
+#[allow(clippy::too_many_arguments)]
 fn param_row<'a>(
     t: KaoTheme,
     index: usize,
@@ -862,10 +964,18 @@ fn param_row<'a>(
     ty: &alloy::dyn_abi::DynSolType,
     value: &str,
     read: bool,
+    name_state: Option<(&'a super::NameState, bool)>,
 ) -> Element<'a, Message> {
     let touched = !value.trim().is_empty();
-    let ok = encode::is_valid(ty, value);
-    let annotation: Element<'a, Message> = if touched {
+    // A name stands in for its address, so validity is a question about what it
+    // resolved to. Unresolved (in flight, not found, failed) is *not* valid —
+    // the CTA must not light up over a lookup that hasn't landed.
+    let ok = match name_state {
+        Some((s, _)) => s.address().is_some(),
+        None => encode::is_valid(ty, value),
+    };
+    let resolving = matches!(name_state, Some((super::NameState::Resolving { .. }, _)));
+    let annotation: Element<'a, Message> = if touched && !resolving {
         text(if ok {
             "✓ valid".to_string()
         } else {
@@ -908,8 +1018,16 @@ fn param_row<'a>(
         .width(Length::Fill)
         .into()
     } else {
-        let invalid = touched && !ok;
-        text_input(&encode::type_hint(ty_str), value)
+        // Withheld while a lookup is in flight: a name that is about to resolve
+        // is not a wrong answer yet, and reddening the box under the user's
+        // cursor as they finish typing it says otherwise.
+        let invalid = touched && !ok && !resolving;
+        let hint = if name_state.is_some() || matches!(ty, alloy::dyn_abi::DynSolType::Address) {
+            "0x… or a name".to_string()
+        } else {
+            encode::type_hint(ty_str)
+        };
+        text_input(&hint, value)
             .on_input(move |v| {
                 if read {
                     Message::ReadArgChanged(index, v)
@@ -931,6 +1049,15 @@ fn param_row<'a>(
     };
 
     let mut col = column![head, Space::new().height(6), input].width(Length::Fill);
+    // A resolved name occupies the same slot as `encoded_preview` below and for
+    // the same reason: it is what this string actually encodes to. Only one of
+    // the two can apply — a name never coerces, so `encoded_preview` is `None`
+    // whenever this is `Some`.
+    if let Some((s, off_mainnet)) = name_state {
+        col = col
+            .push(Space::new().height(5))
+            .push(name_status(t, s, off_mainnet));
+    }
     // What this string actually encodes to, when that isn't what it says.
     // `1 ether` into a 6-decimal token's uint256 is 10¹² of it, and the field
     // annotates it ✓ valid either way — so the number being agreed to belongs
@@ -2707,10 +2834,14 @@ fn resolve_error_box<'a>(app: &'a TxBuilderApp, t: KaoTheme, err: &'a str) -> El
 /// else in the flow will say this, so it is said here and kept on screen for as
 /// long as it is true — a pasted ABI answers a different question and does not
 /// retire it.
+/// `address` is the *address* the field stands for, not the text in it. Callers
+/// pass the resolved address when the box holds a name: this warning is about
+/// an account having no code, so naming the label instead of the account would
+/// leave the reader without the one value they can check against an explorer.
 fn nothing_deployed_note<'a>(
     app: &'a TxBuilderApp,
     t: KaoTheme,
-    address: &'a str,
+    address: &str,
 ) -> Element<'a, Message> {
     let col = column![
         text("⚠ Nothing is deployed at this address")

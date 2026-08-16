@@ -179,37 +179,151 @@ pub fn looks_like_known_name(input: &str) -> bool {
 }
 
 /// The short display label for the namespace a resolved name belongs to,
-/// by TLD: `.gwei` → `"GNS"`, `.wei` → `"WNS"`, everything else (`.eth`,
-/// DNS names) → `"ENS"`. Used to badge a saved contact's name with the
+/// by TLD: `.gwei` → `"GNS"`, `.wei` → `"WNS"`, `.xns` → `"XNS"`, everything
+/// else (`.eth`, DNS names) → `"ENS"`. Used to badge a resolved name with the
 /// service that vouches for it instead of always saying "ENS".
+///
+/// The `.xns` arm matches [`resolve_name`]'s own routing. Without it a name
+/// this dispatcher deliberately sends to the XNS contract came back badged as
+/// ENS — naming the wrong registry as the thing vouching for an address, on a
+/// label whose whole job is to say which one does.
 pub fn namespace_label(name: &str) -> &'static str {
     let lc = name.to_ascii_lowercase();
     if lc.ends_with(crate::names::gns::GNS.tld) {
         "GNS"
     } else if lc.ends_with(crate::names::wns::WNS.tld) {
         "WNS"
+    } else if lc.ends_with(".xns") {
+        "XNS"
     } else {
         "ENS"
     }
 }
 
-/// Forward resolution dispatched by TLD: `.gwei` → GNS, `.wei` → WNS,
-/// everything else (`.eth`, DNS names) → ENS. Signature mirrors
-/// [`ens::resolve_name`] so the call sites are namespace-agnostic.
+/// Which registry vouched for a resolved name.
+///
+/// Returned alongside the address because for an XNS name the TLD alone can't
+/// say: XNS namespaces are permissionless, so `alice.crops` is XNS-shaped and
+/// `alice.org` is *both* XNS-shaped and a name ENS could hold. Only the
+/// resolution knows which one answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Registry {
+    Ens,
+    Gns,
+    Wns,
+    Xns,
+}
+
+impl Registry {
+    /// The short badge shown beside a resolved name.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ens => "ENS",
+            Self::Gns => "GNS",
+            Self::Wns => "WNS",
+            Self::Xns => "XNS",
+        }
+    }
+}
+
+/// Whether `input` could be an XNS `label.namespace` name.
+///
+/// XNS namespaces are permissionless, so there is no list to check against —
+/// the only test available is the contract's own grammar: exactly one dot,
+/// both halves lowercase `[a-z0-9-]` of 1–20 characters. That rejects
+/// `docs.uniswap.org` for free (the label half would contain a dot) and every
+/// `0x…` address, but it necessarily admits things like `uniswap.org`, because
+/// nothing about that string distinguishes it from a real XNS name until the
+/// contract is asked.
+///
+/// First-class TLDs are excluded: `.eth` / `.gwei` / `.wei` have their own
+/// registries and XNS must never be given the chance to vouch for one — the
+/// same rule [`xns_lookup_address`] applies in the reverse direction.
+pub fn looks_like_xns_name(input: &str) -> bool {
+    let lc = input.trim().to_ascii_lowercase();
+    if is_first_class_tld(&lc) {
+        return false;
+    }
+    lc.rsplit_once('.').is_some_and(|(label, namespace)| {
+        xns::is_valid_label(label) && xns::is_valid_label(namespace)
+    })
+}
+
+/// Forward resolution dispatched by TLD, discarding which registry answered.
+/// Signature mirrors [`ens::resolve_name`] so the call sites are
+/// namespace-agnostic.
 pub async fn resolve_name(net: &dyn BalanceFetcher, name: &str) -> Result<Option<Address>, String> {
+    Ok(resolve_name_tagged(net, name).await?.map(|(addr, _)| addr))
+}
+
+/// Forward resolution that also reports which registry vouched for the name.
+///
+/// - `.gwei` → GNS, `.wei` → WNS, `.eth` and anything not XNS-shaped → ENS.
+/// - Anything XNS-shaped (`alice.xns`, `alice.crops`, `alice.org`) is asked of
+///   **both** XNS and ENS.
+///
+/// That last case is the whole reason this function exists. XNS namespaces are
+/// permissionless and live in one contract, so `label.namespace` names cannot
+/// be routed by TLD the way the single-namespace services can: `.crops` is
+/// XNS-only in practice, but a real DNS TLD like `.org` can be held in ENS
+/// (via DNSSEC import) *and* registered as an XNS namespace by anyone. Asking
+/// only one of them would let whichever was asked first quietly answer for a
+/// name the user meant for the other.
+///
+/// So both are asked, and the four outcomes are:
+///
+/// | XNS | ENS | result |
+/// |---|---|---|
+/// | — | — | `Ok(None)` |
+/// | addr | — | XNS |
+/// | — | addr | ENS |
+/// | a | a | XNS (they agree; the badge names the stricter registry) |
+/// | a | b | **`Err`** — refuse, and say both |
+///
+/// The conflict case is a refusal rather than a precedence rule on purpose. A
+/// resolved address becomes a signed recipient or a call target, and there is
+/// no ordering of two registries that is right for every user: whichever this
+/// picked, the other one's owner could have registered the colliding name
+/// precisely to be picked. Naming both and declining is the only answer that
+/// doesn't silently choose a side.
+///
+/// An `Err` from *either* read propagates, including when the other succeeded.
+/// An unverified read means "couldn't find out", and "couldn't find out whether
+/// the other registry also claims this name" is not a basis for handing back an
+/// address.
+pub async fn resolve_name_tagged(
+    net: &dyn BalanceFetcher,
+    name: &str,
+) -> Result<Option<(Address, Registry)>, String> {
     let lc = name.trim().to_ascii_lowercase();
     if lc.ends_with(crate::names::gns::GNS.tld) {
-        crate::names::gns::GNS.resolve_name(net, name).await
-    } else if lc.ends_with(crate::names::wns::WNS.tld) {
-        crate::names::wns::WNS.resolve_name(net, name).await
-    } else if let Some(label) = lc.strip_suffix(".xns") {
-        // `.xns` is the canonical XNS namespace — route it to the XNS contract.
-        // Arbitrary XNS namespaces (`.crops`, `.cheese`, …) are *not* claimed by
-        // this wallet-wide resolver (they'd collide with ENS DNS names); the
-        // names app resolves those through its own XNS path instead.
-        xns_forward(net, label, "xns").await
-    } else {
-        ens::resolve_name(net, name).await
+        return Ok(crate::names::gns::GNS
+            .resolve_name(net, name)
+            .await?
+            .map(|a| (a, Registry::Gns)));
+    }
+    if lc.ends_with(crate::names::wns::WNS.tld) {
+        return Ok(crate::names::wns::WNS
+            .resolve_name(net, name)
+            .await?
+            .map(|a| (a, Registry::Wns)));
+    }
+    if !looks_like_xns_name(&lc) {
+        return Ok(ens::resolve_name(net, name)
+            .await?
+            .map(|a| (a, Registry::Ens)));
+    }
+    let (label, namespace) = lc.rsplit_once('.').expect("checked XNS-shaped");
+    let xns_hit = xns_forward(net, label, namespace).await?;
+    let ens_hit = ens::resolve_name(net, &lc).await?;
+    match (xns_hit, ens_hit) {
+        (Some(x), Some(e)) if x != e => Err(format!(
+            "{lc} resolves to two different addresses — XNS says {x}, ENS says {e}. \
+             Refusing to guess which you meant; use the address itself."
+        )),
+        (Some(x), _) => Ok(Some((x, Registry::Xns))),
+        (None, Some(e)) => Ok(Some((e, Registry::Ens))),
+        (None, None) => Ok(None),
     }
 }
 
@@ -883,5 +997,140 @@ mod tests {
             lookup_address(&net, TARGET).await.unwrap(),
             Some("alice.gwei".to_string()),
         );
+    }
+
+    // ── arbitrary XNS namespaces ────────────────────────────────────────────
+
+    const OTHER: Address = address!("0x1111111111111111111111111111111111111111");
+
+    /// Wire XNS's `getAddress(label, namespace)` to answer `addr`.
+    fn mock_xns_forward(net: &CallMock, label: &str, namespace: &str, addr: Address) {
+        let (to, cd) = xns::get_address_call(label, namespace);
+        net.set_call(to, cd, abi_address(addr), true);
+    }
+
+    /// Wire the ENS forward path (`registry.resolver(node)` → `resolver.addr(node)`).
+    fn mock_ens_forward(net: &CallMock, name: &str, addr: Address) {
+        let resolver = address!("0x4444444444444444444444444444444444444444");
+        let node = namehash(name);
+        net.set_call(
+            ens::ENS_REGISTRY,
+            calldata(ens::RESOLVER_SELECTOR, node),
+            abi_address(resolver),
+            true,
+        );
+        net.set_call(
+            resolver,
+            calldata([0x3b, 0x3b, 0x57, 0xde], node),
+            abi_address(addr),
+            true,
+        );
+    }
+
+    /// The gap this fixed: a namespace nobody registered with *this wallet*
+    /// still has to resolve, because XNS namespaces are permissionless.
+    #[tokio::test]
+    async fn an_arbitrary_xns_namespace_resolves() {
+        let net = CallMock::new();
+        mock_xns_forward(&net, "dave", "crops", TARGET);
+        assert_eq!(
+            resolve_name_tagged(&net, "dave.crops").await.unwrap(),
+            Some((TARGET, Registry::Xns)),
+        );
+        // And through the untagged wrapper every other surface uses.
+        assert_eq!(
+            resolve_name(&net, "dave.crops").await.unwrap(),
+            Some(TARGET)
+        );
+    }
+
+    /// An XNS-shaped name ENS holds and XNS does not is an ENS name.
+    #[tokio::test]
+    async fn an_xns_shaped_name_only_ens_holds_is_ens() {
+        let net = CallMock::new();
+        mock_xns_forward(&net, "frank", "org", Address::ZERO);
+        mock_ens_forward(&net, "frank.org", TARGET);
+        assert_eq!(
+            resolve_name_tagged(&net, "frank.org").await.unwrap(),
+            Some((TARGET, Registry::Ens)),
+        );
+    }
+
+    /// The security case. A real DNS TLD can be held in ENS *and* registered as
+    /// an XNS namespace by anyone, so a collision is something an attacker can
+    /// manufacture. Any precedence rule picks a side; the owner of the losing
+    /// side registered the colliding name precisely to be picked. So: refuse,
+    /// and name both.
+    #[tokio::test]
+    async fn a_name_two_registries_disagree_on_is_refused() {
+        let net = CallMock::new();
+        mock_xns_forward(&net, "frank", "org", TARGET);
+        mock_ens_forward(&net, "frank.org", OTHER);
+        let err = resolve_name_tagged(&net, "frank.org")
+            .await
+            .expect_err("a contested name must not resolve");
+        assert!(err.contains("XNS") && err.contains("ENS"), "{err}");
+        assert!(
+            err.contains(&TARGET.to_string()) && err.contains(&OTHER.to_string()),
+            "both addresses have to be on screen: {err}",
+        );
+        // Fail closed all the way out to the untagged wrapper.
+        assert!(resolve_name(&net, "frank.org").await.is_err());
+    }
+
+    /// Agreement is not a conflict.
+    #[tokio::test]
+    async fn a_name_both_registries_agree_on_resolves() {
+        let net = CallMock::new();
+        mock_xns_forward(&net, "frank", "org", TARGET);
+        mock_ens_forward(&net, "frank.org", TARGET);
+        assert_eq!(
+            resolve_name_tagged(&net, "frank.org").await.unwrap(),
+            Some((TARGET, Registry::Xns)),
+        );
+    }
+
+    /// XNS must never be given the chance to answer for a first-class TLD —
+    /// the forward-direction twin of the rule `xns_lookup_address` enforces in
+    /// reverse. `alice.eth` is an ENS question, whatever XNS says.
+    #[tokio::test]
+    async fn xns_is_never_asked_about_a_first_class_tld() {
+        for tld in ["eth", "gwei", "wei"] {
+            assert!(
+                !looks_like_xns_name(&format!("alice.{tld}")),
+                "alice.{tld} must not route to XNS",
+            );
+        }
+        let net = CallMock::new();
+        // XNS would happily claim `alice.eth` if asked. It must not be asked:
+        // no ENS record is wired, so any XNS answer would show through.
+        mock_xns_forward(&net, "alice", "eth", OTHER);
+        assert_eq!(resolve_name(&net, "alice.eth").await.unwrap(), None);
+    }
+
+    #[test]
+    fn xns_shape_is_the_contracts_own_grammar() {
+        for ok in [
+            "a.b",
+            "dave.crops",
+            "team-1.my-ns",
+            "carol.xns",
+            // Case-folded before the grammar check, exactly as `normalize_label`
+            // folds it before the read — so a name typed in caps still resolves.
+            "Dave.CROPS",
+        ] {
+            assert!(looks_like_xns_name(ok), "{ok}");
+        }
+        for bad in [
+            "docs.uniswap.org",                           // label can't hold a dot
+            "notanaddress",                               // no namespace
+            "toolongalabelfortheXNScontract.ns",          // over 20 chars
+            "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", // an address
+            "alice.eth",                                  // first-class TLD
+            "alice.gwei",
+            "alice.wei",
+        ] {
+            assert!(!looks_like_xns_name(bad), "{bad}");
+        }
     }
 }

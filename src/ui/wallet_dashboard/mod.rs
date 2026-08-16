@@ -458,6 +458,16 @@ pub enum Message {
         address: Address,
         result: Result<bool, String>,
     },
+    /// A Transaction Builder address field's name resolved. `slot` says which
+    /// field asked and `name` which name was looked up; the pane matches both
+    /// against what that slot is still waiting for, so an answer the user has
+    /// typed past is dropped rather than applied to the box that replaced it.
+    TxBuilderNameResolved {
+        seq: u64,
+        slot: tx_builder::NameSlot,
+        name: String,
+        result: Result<Option<(Address, crate::names::Registry)>, String>,
+    },
     /// Names app: reverse-lookup discovery finished. `owner` is the account the
     /// scan was spawned for — the handler drops it if the active account changed.
     NameReverseScanned {
@@ -2206,6 +2216,9 @@ impl WalletScreen {
             }
             O::ProbeCode { seq, net, address } => {
                 spawn_txbuilder_code_probe(self.network.clone(), seq, net, address)
+            }
+            O::ResolveName { seq, slot, name } => {
+                spawn_txbuilder_name_resolve(self.network.clone(), seq, slot, name)
             }
             O::Simulate { seq, chain, calls } => {
                 let from = self
@@ -5067,6 +5080,26 @@ impl WalletScreen {
                     .on_code_probed(seq, net, address, result);
                 return (Task::none(), None);
             }
+            Message::TxBuilderNameResolved {
+                seq,
+                slot,
+                name,
+                result,
+            } => {
+                // A resolved name can have follow-on work — the contract box
+                // still needs its ABI, the raw target still needs its code
+                // probed — so this one routes back through the outcome
+                // dispatcher rather than ending here.
+                let out = self
+                    .apps
+                    .txbuilder_pane()
+                    .on_name_resolved(seq, slot, name, result);
+                let task = match out {
+                    Some(o) => self.handle_txbuilder_outcome(o),
+                    None => Task::none(),
+                };
+                return (task, None);
+            }
             Message::TxBuilderRead { seq, result } => {
                 self.apps.txbuilder_pane().on_read(seq, result);
             }
@@ -7144,6 +7177,42 @@ async fn resolve_contract_code(
 /// a configured RPC. An untrusted endpoint could lie in both directions, but
 /// "an RPC might be lying about there being no contract here" is still a better
 /// position than never asking.
+/// Forward name resolution for one of the Transaction Builder's address fields.
+///
+/// Same shape as `spawn_ens_resolve_task`; differs in carrying the `slot` so the
+/// pane can tell which of its four address boxes the answer belongs to.
+///
+/// Mainnet-pinned, like every other caller of `crate::names::resolve_name` — the
+/// registries live there whatever chain the Builder is composing for, which is a
+/// fact the pane discloses rather than hides (`resolves_off_mainnet`). Verified
+/// through the light client, so an unverified answer arrives as `Err` and
+/// resolves to no address at all: the resolved value becomes a call target or an
+/// ABI argument, so it has to fail closed.
+///
+/// Through the **tagged** resolver, so the pane can badge the name with the
+/// registry that actually vouched for it. For an XNS name the TLD can't say:
+/// namespaces are permissionless, so `alice.crops` has no TLD to route on and
+/// `alice.org` could be answered by either XNS or ENS.
+fn spawn_txbuilder_name_resolve(
+    network: Arc<dyn BalanceFetcher>,
+    seq: u64,
+    slot: tx_builder::NameSlot,
+    name: String,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            let result = crate::names::resolve_name_tagged(network.as_ref(), &name).await;
+            (name, result)
+        },
+        move |(name, result)| Message::TxBuilderNameResolved {
+            seq,
+            slot,
+            name,
+            result,
+        },
+    )
+}
+
 fn spawn_txbuilder_code_probe(
     network: Arc<dyn BalanceFetcher>,
     seq: u64,

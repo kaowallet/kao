@@ -149,14 +149,18 @@ pub struct DelegationReview {
     /// transaction reuses the existing delegation and signs no new
     /// authorization at all.
     pub already_active: bool,
-    /// The delegate the account runs *today*, when that is some other contract
-    /// — another wallet's smart-account implementation, say. Signing here
-    /// **replaces** it, which is a materially different act from delegating an
-    /// undelegated account and has to be said so.
+    /// The delegate the account runs *today*, whatever it is: `None` for an
+    /// undelegated account, `Some(delegate)` for one already on the delegate
+    /// this review installs, `Some(other)` for one running someone else's
+    /// smart-account implementation.
     ///
-    /// `None` covers both an undelegated account and one already on
-    /// `delegate` (see `already_active`).
-    pub replacing: Option<Address>,
+    /// Unfiltered on purpose. This is the value the send path pins and
+    /// re-checks against chain, and the three cases have to stay distinct to do
+    /// that: collapsing "nothing installed" into "someone else's contract
+    /// installed" is exactly the drift that used to slip through, because both
+    /// answered `false` to the only question being asked. [`Self::replacing`]
+    /// is the display-side reading of this field.
+    pub incumbent: Option<Address>,
     /// The `nonce` the authorization commits to, resolved at prepare.
     ///
     /// Self-sponsored, so it is the outer transaction's nonce **+ 1**. Pinning
@@ -170,6 +174,20 @@ pub struct DelegationReview {
     pub auth_nonce: Option<u64>,
     /// ERC-8213 digest of the authorization tuple, over `auth_nonce`.
     pub auth_digest: Option<B256>,
+}
+
+impl DelegationReview {
+    /// The incumbent delegate *worth naming to the user* — some other wallet's
+    /// smart-account implementation that signing here would displace.
+    ///
+    /// `None` for an undelegated account and for one already running
+    /// [`Self::delegate`], because neither is being replaced by anything. A
+    /// method rather than a second field: it is entirely determined by
+    /// [`Self::incumbent`] and [`Self::delegate`], and two stored fields that
+    /// must agree eventually don't.
+    pub fn replacing(&self) -> Option<Address> {
+        self.incumbent.filter(|d| *d != self.delegate)
+    }
 }
 
 /// The CoW GPv2 order the user signs as EIP-712 typed data. Every field here is a
@@ -1435,7 +1453,7 @@ fn delegation_panel<'a>(t: KaoTheme, d: &'a DelegationReview) -> Element<'a, Mes
     .width(Length::Fill);
     col = col.push(Space::new().height(2));
     col = col.push(
-        text(match (d.already_active, d.replacing.is_some()) {
+        text(match (d.already_active, d.replacing().is_some()) {
             (true, _) => "Your account already runs this code",
             (false, true) => "Your account will be re-pointed to different code",
             (false, false) => "Your account will start running contract code",
@@ -1448,7 +1466,7 @@ fn delegation_panel<'a>(t: KaoTheme, d: &'a DelegationReview) -> Element<'a, Mes
     col = col.push(addr_kv(t, "Your account", d.authority));
     // Naming the incumbent first makes the swap legible as a swap: without it,
     // an account already delegated elsewhere reads identically to a fresh one.
-    if let Some(prev) = d.replacing {
+    if let Some(prev) = d.replacing() {
         col = col.push(addr_kv(t, "Currently delegated to", prev));
     }
     col = col.push(addr_kv(t, "Delegates to", d.delegate));
@@ -1469,7 +1487,7 @@ fn delegation_panel<'a>(t: KaoTheme, d: &'a DelegationReview) -> Element<'a, Mes
     // The persistence is the part a user can't infer from the transaction
     // panel below, so it is stated rather than implied.
     col = col.push(
-        text(match (d.already_active, d.replacing.is_some()) {
+        text(match (d.already_active, d.replacing().is_some()) {
             (true, _) => {
                 "This delegation is already in place, so no new authorization is signed — \
                  the transaction below is an ordinary call into the code your account \
@@ -2218,7 +2236,7 @@ mod tests {
             chain_id: 1,
             net: crate::chain::NetworkId::Builtin(Chain::Mainnet),
             already_active: true,
-            replacing: None,
+            incumbent: None,
             auth_nonce: None,
             auth_digest: None,
         };
@@ -2238,7 +2256,7 @@ mod tests {
             chain_id: 1,
             net: crate::chain::NetworkId::Builtin(Chain::Mainnet),
             already_active: false,
-            replacing: None,
+            incumbent: None,
             auth_nonce: Some(42),
             auth_digest: Some(h),
         };

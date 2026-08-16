@@ -129,6 +129,51 @@ pub fn build_authorization(chain_id: u64, auth_nonce: u64) -> Authorization {
     }
 }
 
+/// Build the authorization tuple that **removes** an account's delegation.
+///
+/// EIP-7702 gives the zero address a special meaning: an authorization to
+/// `0x0` does not write a designator, it clears the account's code and resets
+/// its code hash to the empty hash. The account is a plain EOA again.
+///
+/// This is a *sibling* of [`build_authorization`] rather than a `delegate`
+/// parameter on it, and deliberately so. The delegates this wallet will sign
+/// for are meant to be readable off the source — [`EF_SIMPLE_7702_ACCOUNT`] to
+/// install, zero to remove, and nothing else. A free `delegate: Address`
+/// parameter would let the wallet sign an authorization for any address handed
+/// to it, including one read off-chain from an incumbent it did not install,
+/// and the only thing left deciding what gets signed would be the caller. Two
+/// named constructors keep that decision in this module.
+///
+/// `auth_nonce` follows the same rule as [`build_authorization`]: the
+/// revocation is self-sponsored, so the outer transaction consumes the
+/// account's nonce first and the tuple commits to that value **+ 1**.
+pub fn build_revocation(chain_id: u64, auth_nonce: u64) -> Authorization {
+    Authorization {
+        chain_id: U256::from(chain_id),
+        address: Address::ZERO,
+        nonce: auth_nonce,
+    }
+}
+
+/// What one EIP-7702 authorization tuple costs up front, in gas.
+///
+/// The protocol charges `PER_EMPTY_ACCOUNT_COST` per tuple and refunds
+/// `PER_EMPTY_ACCOUNT_COST - PER_AUTH_BASE_COST` (12,500) when the authority
+/// already exists in the trie — which it always does here, since it is the
+/// account paying for the transaction.
+///
+/// The refund is not a discount on the limit. EIP-3529 caps a transaction's
+/// total refund at `gas_used / 5`, so a revocation using ~36,800 gas gets at
+/// most ~7,400 back, and a gas limit set to the post-refund figure fails
+/// intrinsic validation before it executes. Budget the full cost.
+pub const PER_AUTH_GAS: u64 = 25_000;
+
+/// A safe gas limit for a bare revocation transaction: the 21,000 intrinsic
+/// plus one authorization, with headroom. The transaction has no calldata and
+/// executes no code — by the time the frame runs, the authorization has
+/// already cleared the account — so nothing here scales with user input.
+pub const REVOKE_GAS_LIMIT: u64 = 21_000 + PER_AUTH_GAS + 10_000;
+
 /// If `code` is an EIP-7702 delegation designator (`0xef0100 ‖ address`),
 /// return the delegate address; otherwise `None`. Used to skip re-authorizing
 /// an account that already delegates to [`EF_SIMPLE_7702_ACCOUNT`].
@@ -144,7 +189,7 @@ pub fn delegated_to(code: &[u8]) -> Option<Address> {
 mod tests {
     use super::*;
     use alloy::dyn_abi::DynSolType;
-    use alloy::primitives::{U256, address, keccak256};
+    use alloy::primitives::{B256, U256, address, keccak256};
 
     fn call(to: Address, value: u64, data: &[u8]) -> QueuedCall {
         QueuedCall {
@@ -256,5 +301,81 @@ mod tests {
         assert_eq!(delegated_to(&[]), None);
         // A normal contract's runtime code is not a designator.
         assert_eq!(delegated_to(&[0x60, 0x80, 0x60, 0x40]), None);
+    }
+
+    #[test]
+    fn build_revocation_targets_the_zero_address() {
+        let auth = build_revocation(1, 7);
+        assert_eq!(auth.chain_id, U256::from(1u64));
+        assert_eq!(
+            auth.address,
+            Address::ZERO,
+            "a revocation is an authorization to 0x0 — any other address INSTALLS a delegation"
+        );
+        assert_eq!(auth.nonce, 7);
+    }
+
+    #[test]
+    fn install_and_revoke_are_the_only_two_tuples_and_they_differ() {
+        // Same chain and nonce, so the only thing separating the digest the
+        // user checks on their device from its exact inverse is the delegate.
+        let install = build_authorization(1, 3);
+        let revoke = build_revocation(1, 3);
+        assert_ne!(install.address, revoke.address);
+        assert_ne!(
+            install.signature_hash(),
+            revoke.signature_hash(),
+            "installing and revoking must never share a digest"
+        );
+    }
+
+    /// `keccak256(MAGIC ‖ rlp([chain_id, address, nonce]))`, with the preimage
+    /// assembled by hand.
+    ///
+    /// Every other assertion that touches this digest recomputes it with the
+    /// same production expression it is meant to be checking, so none of them
+    /// can see a change to the preimage — a different MAGIC byte, a reordered
+    /// field, a chain id that stopped being encoded. This is the one signature
+    /// in the wallet whose effect outlives its transaction; it gets a vector
+    /// that does not go through `Authorization` at all.
+    fn expected_auth_digest(chain_id_byte: u8, delegate: Address, nonce_byte: Option<u8>) -> B256 {
+        let mut rlp = Vec::new();
+        // chain_id: a single byte < 0x80 encodes as itself.
+        rlp.push(chain_id_byte);
+        // address: a 20-byte string → 0x80 + 20.
+        rlp.push(0x94);
+        rlp.extend_from_slice(delegate.as_slice());
+        // nonce: 0 is the empty string (0x80); otherwise a single byte < 0x80.
+        rlp.push(nonce_byte.unwrap_or(0x80));
+        // list header: payload is 23 bytes, well under 56 → 0xc0 + len.
+        let mut preimage = vec![0x05u8, 0xc0 + rlp.len() as u8];
+        preimage.extend_from_slice(&rlp);
+        keccak256(preimage)
+    }
+
+    #[test]
+    fn the_authorization_digest_matches_a_hand_built_preimage() {
+        // Install, mainnet, nonce 0.
+        assert_eq!(
+            build_authorization(1, 0).signature_hash(),
+            expected_auth_digest(0x01, EF_SIMPLE_7702_ACCOUNT, None),
+        );
+        // Install, mainnet, nonce 7 — moves the last RLP item off the 0x80
+        // empty-string encoding, so a nonce dropped from the preimage shows up.
+        assert_eq!(
+            build_authorization(1, 7).signature_hash(),
+            expected_auth_digest(0x01, EF_SIMPLE_7702_ACCOUNT, Some(0x07)),
+        );
+        // Revocation, mainnet, nonce 7.
+        assert_eq!(
+            build_revocation(1, 7).signature_hash(),
+            expected_auth_digest(0x01, Address::ZERO, Some(0x07)),
+        );
+        // A different chain must move the digest — a 7702 authorization that
+        // dropped its chain scoping would be valid on every chain at once.
+        assert_ne!(
+            build_authorization(1, 0).signature_hash(),
+            build_authorization(8, 0).signature_hash(),
+        );
     }
 }

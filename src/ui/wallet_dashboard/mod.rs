@@ -8061,7 +8061,39 @@ async fn preflight_before_signing(
             warn!(reason = %reason, "tx-builder: execute-time preflight couldn't run — continuing");
             Ok(())
         }
-        BatchOutcome::Success | BatchOutcome::Unavailable => Ok(()),
+        // A run that succeeded but cannot be *mined*. The composer's own
+        // `TooMuchGas` warning is advisory and stays that way — it compares the
+        // raw metered sum, which over-counts, so it can only say "this looks
+        // too big". `unmineable` compares the floor instead: if even the
+        // lowest honest reading is over the block limit, no builder can pack
+        // this transaction, and that is categorical rather than a judgement.
+        //
+        // Worth catching *here* specifically because nothing upstream stops
+        // it. The compose-time verdict may not exist at all (Review does not
+        // require a simulation, and any queue edit clears one), may have been
+        // taken against state the batch will not meet, and never blocks even
+        // when it is present and right. Downstream, the only real gas check is
+        // the `estimate_gas` inside the broadcast helpers — which on the Safe
+        // path runs after every owner has been prompted, and on the 7702 path
+        // after the delegation authorization is signed. That authorization is
+        // the one signature here whose effect outlives the transaction
+        // carrying it, so burning it on a batch that was never mineable is the
+        // expensive failure this whole function exists to prevent.
+        BatchOutcome::Success => match result.unmineable(calls.len()) {
+            Some((floor, limit)) => {
+                warn!(
+                    floor,
+                    limit, "tx-builder: batch cannot be mined — aborting before any signature"
+                );
+                Err(format!(
+                    "This batch needs at least {floor} gas, and the block gas limit on this chain \
+                     is {limit} — no block can include it, and the real figure is higher still. \
+                     Nothing has been signed. Split it into smaller batches."
+                ))
+            }
+            None => Ok(()),
+        },
+        BatchOutcome::Unavailable => Ok(()),
     }
 }
 
@@ -15957,6 +15989,57 @@ mod tests {
             "{err}"
         );
         assert!(err.contains("Nothing has been signed"), "{err}");
+    }
+
+    /// The other expensive failure, and the one nothing upstream catches. A
+    /// batch that succeeds but cannot be *mined* used to sail through every
+    /// device prompt: the composer's `TooMuchGas` warning never blocks (and may
+    /// not exist — Review needs no simulation, and any queue edit clears one),
+    /// and the only real gas check is the `estimate_gas` inside the broadcast
+    /// helpers, which on the 7702 path runs *after* the delegation
+    /// authorization is signed.
+    #[tokio::test]
+    async fn a_batch_that_cannot_be_mined_is_refused_before_any_signature() {
+        let calls = vec![
+            queued(1, addr(0xC1), 0, vec![0x01]),
+            queued(2, addr(0xC2), 0, vec![0x02]),
+        ];
+        let mock = CallMock::new();
+        // Put the ceiling within reach of two trivial calls rather than
+        // metering 30M of real revm execution: it is the same comparison.
+        mock.set_block_gas_limit(21_000);
+        let network: Arc<dyn BalanceFetcher> = Arc::new(mock);
+        let err = preflight_before_signing(&network, Chain::Mainnet, addr(0x5A), &calls)
+            .await
+            .expect_err("an unmineable batch must not reach a device");
+        assert!(err.contains("no block can include it"), "{err}");
+        assert!(err.contains("Nothing has been signed"), "{err}");
+        // The remedy has to be the one that works. Re-simulating produces this
+        // same verdict forever; splitting the batch is the way out.
+        assert!(err.contains("Split it"), "{err}");
+    }
+
+    /// `block_gas_limit` rides on a header that can fall back to a raw exec
+    /// RPC. If an unverified scalar could veto a signature, any endpoint the
+    /// wallet fell back to could refuse every batch it ever signs by reporting
+    /// one small `gasLimit`. Everywhere else here an unverified read softens a
+    /// verdict rather than hardening one.
+    #[tokio::test]
+    async fn an_unverified_block_limit_cannot_veto_a_signature() {
+        let calls = vec![
+            queued(1, addr(0xC1), 0, vec![0x01]),
+            queued(2, addr(0xC2), 0, vec![0x02]),
+        ];
+        let mock = CallMock::new();
+        mock.set_block_gas_limit(21_000);
+        mock.set_block_verified(false);
+        let network: Arc<dyn BalanceFetcher> = Arc::new(mock);
+        assert!(
+            preflight_before_signing(&network, Chain::Mainnet, addr(0x5A), &calls)
+                .await
+                .is_ok(),
+            "an unverified ceiling is not a basis for refusing to sign",
+        );
     }
 
     /// The other half of the line: a simulator *gap* is not a prediction, and

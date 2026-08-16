@@ -1694,6 +1694,15 @@ pub struct CallMock {
     calls: std::sync::Mutex<std::collections::HashMap<(Address, Bytes), (Bytes, bool)>>,
     code: std::sync::Mutex<std::collections::HashMap<Address, (Bytes, bool)>>,
     storage: std::sync::Mutex<std::collections::HashMap<(Address, B256), (B256, bool)>>,
+    /// Overrides the served block gas limit. `None` serves the 30M default.
+    ///
+    /// Exists so a test can put the *ceiling* within reach of a trivial batch.
+    /// The alternative — metering tens of millions of gas through revm under
+    /// the debug profile to cross a fixed 30M — is slow enough that the
+    /// block-limit checks would simply go untested.
+    block_gas_limit: std::sync::Mutex<Option<u64>>,
+    /// Whether `latest_block` reports its read as light-client verified.
+    block_verified: std::sync::Mutex<Option<bool>>,
 }
 
 #[cfg(test)]
@@ -1720,6 +1729,18 @@ impl CallMock {
             .lock()
             .unwrap()
             .insert((addr, slot), (value, verified));
+    }
+
+    /// Serve `limit` as the block gas limit instead of the 30M default.
+    #[allow(dead_code)]
+    pub fn set_block_gas_limit(&self, limit: u64) {
+        *self.block_gas_limit.lock().unwrap() = Some(limit);
+    }
+
+    /// Serve `verified` as `latest_block`'s verification flag.
+    #[allow(dead_code)]
+    pub fn set_block_verified(&self, verified: bool) {
+        *self.block_verified.lock().unwrap() = Some(verified);
     }
 }
 
@@ -1799,13 +1820,13 @@ impl BalanceFetcher for CallMock {
                 number: 0,
                 hash: B256::ZERO,
                 timestamp: 0,
-                gas_limit: 30_000_000,
+                gas_limit: self.block_gas_limit.lock().unwrap().unwrap_or(30_000_000),
                 base_fee_per_gas: 0,
                 prevrandao: B256::ZERO,
                 beneficiary: Address::ZERO,
                 excess_blob_gas: None,
             },
-            verified: true,
+            verified: self.block_verified.lock().unwrap().unwrap_or(true),
         })
     }
     async fn get_code_raw(

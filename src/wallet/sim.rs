@@ -588,6 +588,55 @@ impl BatchSimResult {
         }
     }
 
+    /// A **lower bound** on the gas the assembled transaction will need, given
+    /// the batch ran as `n_calls` steps — or `None` when no honest bound is
+    /// available.
+    ///
+    /// [`Self::gas_used`] is the sum of per-step metering, and the one error in
+    /// it whose sign and size are both known is the intrinsic cost: each step
+    /// pays its own 21,000, where the real transaction pays that once. Removing
+    /// `(n − 1) × 21,000` therefore yields a figure the real transaction cannot
+    /// come in **under** — every remaining un-modelled term (the MultiSend
+    /// dispatch loop, the `execTransaction` wrapper, per-owner signature
+    /// verification, the per-call MultiSend headers) only adds to the true
+    /// figure.
+    ///
+    /// That direction is the whole point: it makes the bound safe to *refuse*
+    /// on. `gas_fit`'s bands are calibrated for a warning and compare the raw
+    /// sum, which over-counts — fine for "this looks too big", not fine for a
+    /// wall a user cannot get past.
+    ///
+    /// `None` unless the run actually succeeded (a partial run's metering
+    /// describes a transaction that doesn't exist), a block was read, and that
+    /// read was **verified**. The last is deliberate: `block_gas_limit` comes
+    /// off a header that can fall back to a raw exec RPC, and an unverified
+    /// scalar must not be able to veto a signature — everywhere else in this
+    /// wallet an unverified read softens a verdict rather than hardening one.
+    pub fn gas_floor(&self, n_calls: usize) -> Option<u64> {
+        if !matches!(self.outcome, BatchOutcome::Success)
+            || !self.verified
+            || self.block_gas_limit == 0
+        {
+            return None;
+        }
+        let intrinsic_overcount = (n_calls.saturating_sub(1) as u64).saturating_mul(21_000);
+        Some(self.gas_used.saturating_sub(intrinsic_overcount))
+    }
+
+    /// `Some((floor, block_gas_limit))` when this batch **cannot be mined at
+    /// all**: even the lower bound of [`Self::gas_floor`] is at or over the
+    /// limit of the block it ran against.
+    ///
+    /// Distinct from `GasFit::Exceeds`, and deliberately stricter. `Exceeds`
+    /// says "the estimate is over the limit" and is advisory — the estimate
+    /// over-counts, so it can say that about a batch that would have fit. This
+    /// says "no reading of the meter puts it under", which is categorical, and
+    /// is the only form of the claim strong enough to refuse a signature over.
+    pub fn unmineable(&self, n_calls: usize) -> Option<(u64, u64)> {
+        let floor = self.gas_floor(n_calls)?;
+        (floor >= self.block_gas_limit).then_some((floor, self.block_gas_limit))
+    }
+
     /// How this batch's metered gas sits against the block it would be mined
     /// in. See [`GasFit`] for why the bands are where they are.
     pub fn gas_fit(&self) -> GasFit {
@@ -1046,6 +1095,74 @@ mod tests {
             metered(45_000_000, 45_000_000).gas_fit(),
             GasFit::Exceeds { .. }
         ));
+    }
+
+    /// The floor removes the one error whose sign and size are both known, so
+    /// the figure it yields is one the real transaction cannot come in under.
+    #[test]
+    fn gas_floor_removes_the_intrinsic_over_count() {
+        // 10 steps: nine of the ten 21,000 intrinsics are an artefact of
+        // simulating each call as its own transaction.
+        let r = metered(5_000_000, 45_000_000);
+        assert_eq!(r.gas_floor(10), Some(5_000_000 - 9 * 21_000));
+        // A single call pays exactly one intrinsic in both worlds.
+        assert_eq!(r.gas_floor(1), Some(5_000_000));
+        assert_eq!(r.gas_floor(0), Some(5_000_000));
+    }
+
+    /// The distinction that lets one of these refuse a signature and the other
+    /// only warn: `Exceeds` compares the raw over-counting sum, `unmineable`
+    /// compares the floor.
+    #[test]
+    fn a_batch_exceeds_can_still_be_mineable() {
+        // 200 calls carry 199 × 21,000 = 4.179M of intrinsic over-count, so a
+        // metered 45M is really no more than ~40.8M — over the warning band,
+        // under the limit. The warning fires; the wall must not.
+        let r = metered(45_000_000, 45_000_000);
+        assert!(matches!(r.gas_fit(), GasFit::Exceeds { .. }));
+        assert_eq!(
+            r.unmineable(200),
+            None,
+            "a batch that could still be mined must never be refused",
+        );
+        // The same meter reading with few enough calls to have no such slack
+        // is unmineable on any reading.
+        assert_eq!(r.unmineable(1), Some((45_000_000, 45_000_000)));
+    }
+
+    #[test]
+    fn unmineable_needs_a_successful_verified_run_against_a_real_block() {
+        let base = metered(125_000_000, 45_000_000);
+        assert_eq!(
+            base.unmineable(5),
+            Some((125_000_000 - 4 * 21_000, 45_000_000))
+        );
+
+        // A partial run's metering describes a transaction that doesn't exist.
+        let reverted = BatchSimResult {
+            outcome: BatchOutcome::Revert {
+                step: 1,
+                reason: "nope".into(),
+            },
+            ..base.clone()
+        };
+        assert_eq!(reverted.unmineable(5), None);
+
+        // `block_gas_limit` can come off a raw exec RPC. An unverified scalar
+        // must not be able to veto a signature — one small `gasLimit` field
+        // would otherwise refuse every batch this wallet ever signs.
+        let unverified = BatchSimResult {
+            verified: false,
+            ..base.clone()
+        };
+        assert_eq!(unverified.unmineable(5), None);
+
+        // No block read ⇒ no ceiling to compare against.
+        let no_block = BatchSimResult {
+            block_gas_limit: 0,
+            ..base
+        };
+        assert_eq!(no_block.unmineable(5), None);
     }
 
     #[test]

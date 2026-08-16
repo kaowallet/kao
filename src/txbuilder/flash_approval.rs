@@ -152,13 +152,24 @@ impl AllowanceVerdict {
         // An unscoreable grant is not evidence of danger — it is the absence of
         // evidence of safety, so it withholds the guarantee rather than
         // sharpening the warning.
-        if self.standing.is_empty() && !self.unmodelled.is_empty() {
-            let what = self
-                .unmodelled
+        //
+        // It is also an *independent* fact, which is why this is computed up
+        // front rather than inside a branch. A standing ERC-20 allowance does
+        // not absorb it: `approve(USDC, router, 1000)` alongside
+        // `setApprovalForAll(attacker, true)` used to print only the USDC line,
+        // so the one grant no revoke can close — the blanket operator approval
+        // this list exists to catch — was named nowhere on the last screen
+        // before a signature.
+        let unmodelled = (!self.unmodelled.is_empty()).then(|| {
+            self.unmodelled
                 .iter()
                 .map(|(t, n)| format!("{n} on {}", crate::wallet::short_address(*t)))
                 .collect::<Vec<_>>()
-                .join(", ");
+                .join(", ")
+        });
+        if self.standing.is_empty()
+            && let Some(what) = &unmodelled
+        {
             return Some(format!(
                 "⚠ This batch grants approvals this wallet can't account for ({what}), so it \
                  can't promise nothing is left standing — read those calls yourself."
@@ -202,6 +213,14 @@ impl AllowanceVerdict {
                 self.reset.len(),
                 if self.reset.len() == 1 { "" } else { "s" },
                 names(&self.reset),
+            ));
+        }
+        // Named after the standing allowances, not instead of them: the reader
+        // has to leave this screen knowing about both.
+        if let Some(what) = &unmodelled {
+            s.push_str(&format!(
+                " It also grants approvals this wallet can't account for ({what}) — read those \
+                 calls yourself."
             ));
         }
         Some(s)
@@ -493,6 +512,73 @@ mod tests {
             d.contains("setApprovalForAll"),
             "and name what it can't score: {d}"
         );
+    }
+
+    /// The pairing the module doc names, with the ERC-20 side left *standing*
+    /// rather than reset — which is what the previous branch structure could
+    /// not say. `standing` non-empty took the warning path and returned before
+    /// `unmodelled` was ever read, so a batch granting a router 1000 USDC and
+    /// handing an attacker blanket operator rights over an NFT collection
+    /// disclosed only the USDC line. The grant no revoke can close was the one
+    /// that went unnamed.
+    #[test]
+    fn a_standing_allowance_does_not_swallow_an_unscoreable_grant() {
+        let nft = address!("0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D");
+        let mut blanket = approve("0");
+        blanket.to = nft;
+        let mut data = Vec::from(UNMODELLED_GRANTS[0].0); // setApprovalForAll
+        data.extend_from_slice(&[0u8; 12]);
+        data.extend_from_slice(SPENDER.as_slice());
+        data.extend_from_slice(&U256::from(1u64).to_be_bytes::<32>()); // true
+        blanket.data = Bytes::from(data);
+
+        // Unwrapped: the ERC-20 approve is left standing when the batch ends.
+        let v = allowance_verdict(&[approve("1000"), blanket]);
+        assert_eq!(v.standing, vec![(USDC, SPENDER)]);
+        assert_eq!(v.unmodelled, vec![(nft, "setApprovalForAll")]);
+
+        let d = v.disclosure().unwrap();
+        assert!(
+            d.contains("still standing"),
+            "the standing allowance is still named: {d}"
+        );
+        assert!(
+            d.contains("setApprovalForAll") && d.contains("can't account for"),
+            "and so is the grant this scan can't score: {d}"
+        );
+    }
+
+    /// The same fix seen from the reset side: a batch whose ERC-20 legs are all
+    /// reset *and* which carries an unscoreable grant must not read as the
+    /// absolute guarantee. Pins the branch order — `unmodelled` outranks the
+    /// flash-approval sentence, and both outrank silence.
+    #[test]
+    fn an_unscoreable_grant_is_named_whatever_the_erc20_legs_do() {
+        let nft = address!("0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D");
+        let mut blanket = approve("0");
+        blanket.to = nft;
+        let mut data = Vec::from(UNMODELLED_GRANTS[0].0);
+        data.extend_from_slice(&[0u8; 12]);
+        data.extend_from_slice(SPENDER.as_slice());
+        data.extend_from_slice(&U256::from(1u64).to_be_bytes::<32>());
+        blanket.data = Bytes::from(data);
+
+        for erc20 in [
+            vec![approve("1000")],                            // standing
+            wrap_with_flash_approval(&[approve("1000")], 50), // reset
+        ] {
+            let d = allowance_verdict(&[erc20, vec![blanket.clone()]].concat())
+                .disclosure()
+                .expect("a batch that grants anything discloses something");
+            assert!(
+                d.contains("setApprovalForAll"),
+                "the unscoreable grant is named either way: {d}"
+            );
+            assert!(
+                !d.contains("every allowance this batch grants is reset"),
+                "and the absolute guarantee is never made over it: {d}"
+            );
+        }
     }
 
     #[test]

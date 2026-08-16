@@ -640,6 +640,11 @@ fn warning_strip<'a, M: 'a>(t: KaoTheme, w: &'a Warning) -> Element<'a, M> {
                 truncate(&names.join(", "), 48)
             )
         }
+        Warning::UnaccountedCalldata { decoded, total } => format!(
+            "⚠ {} byte(s) of calldata are not shown above — the arguments account for {decoded} \
+             of {total}",
+            total.saturating_sub(*decoded),
+        ),
     };
     caution_strip(t, line)
 }

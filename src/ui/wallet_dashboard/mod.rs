@@ -841,7 +841,8 @@ pub struct WalletScreen {
     /// [`Self::is_signing_busy`] (which gates leaving the dashboard, so the
     /// real signer can't be stranded in the task's handoff) and
     /// [`Self::hardware_status`] (so a mid-signature Ledger doesn't render as
-    /// disconnected). Cleared when the op resolves in `CowPlaced` / `CowCancel`.
+    /// disconnected). Cleared when the op resolves, in the shared
+    /// `Message::Signed` tail.
     order_op_in_flight: bool,
     /// The Apps (swap workspace) pane state — its inline swap composer. The
     /// order list it renders comes from `tracked_orders`, not the pane.
@@ -1567,12 +1568,19 @@ impl WalletScreen {
             })
     }
 
-    /// Park the live EOA signer for an in-flight CoW order op (place/cancel),
-    /// returning the handoff cell the async task signs with — the swap analogue
-    /// of the Send broadcast handoff. Flags [`Self::order_op_in_flight`] so the
-    /// busy gate and the hardware card keep reading the *real* signer while
-    /// this one is momentarily a view-only placeholder; the flag is cleared
-    /// when the signer is reclaimed in `CowPlaced` / `CowCancel`.
+    /// Park the live EOA signer for an in-flight signing op, returning the
+    /// handoff cell the async task signs with — the analogue of the Send
+    /// broadcast handoff for every flow that has no host modal to mark busy
+    /// (CoW place/cancel, name-service writes, Privacy Pools, the Transaction
+    /// Builder's EOA send). Flags [`Self::order_op_in_flight`] so the busy gate
+    /// and the hardware card keep reading the *real* signer while this one is
+    /// momentarily a view-only placeholder; the flag is cleared when the signer
+    /// is reclaimed in the shared `Message::Signed` tail.
+    ///
+    /// Prefer this over a bare `mem::replace`: the replace alone parks the
+    /// signer without raising the flag, which leaves [`Self::is_signing_busy`]
+    /// reading `false` for the whole window and lets `begin_add_account` strand
+    /// the real signer in the in-flight task.
     fn park_signer_for_order(&mut self) -> SignerHandoff {
         self.order_op_in_flight = true;
         let signer = mem::replace(&mut self.signer, KaoSigner::ViewOnly(self.address));
@@ -2825,8 +2833,18 @@ impl WalletScreen {
                     return Task::none();
                 }
                 let desc = self.active_signer_descriptor();
-                let signer = mem::replace(&mut self.signer, KaoSigner::ViewOnly(self.address));
-                let handoff = handoff_with(signer);
+                // Park through the shared helper, not by hand: it also raises
+                // `order_op_in_flight`, which is the only thing that makes
+                // `is_signing_busy` true for this flow. The Send path gets away
+                // with a bare `mem::replace` because `Modal::Send::mark_busy`
+                // covers it; the Builder has no host modal — `sign_review` is a
+                // separate overlay field, not a `Modal` variant — so a hand-rolled
+                // park leaves the gate reading `false` for the whole sign +
+                // broadcast window, and `begin_add_account` would tear the
+                // dashboard down and hand `into_signer()` the `ViewOnly`
+                // placeholder. The reclaim tail already clears the flag for every
+                // `Message::Signed`, so this was asymmetric by omission.
+                let handoff = self.park_signer_for_order();
                 info!(
                     from = %ereq.from,
                     calls = ereq.calls.len(),
@@ -16259,6 +16277,62 @@ mod tests {
                 .as_ref()
                 .is_some_and(|r| r.signing_since.is_some()),
             "a known-empty queue proposes as it always did",
+        );
+    }
+
+    #[test]
+    fn dispatching_a_builder_eoa_send_marks_the_wallet_signing_busy() {
+        // The signer is parked into the broadcast task for the whole sign +
+        // broadcast window, so `is_signing_busy` has to read true across it:
+        // that is the gate `begin_add_account` uses to refuse tearing the
+        // dashboard down, and without it `into_signer()` hands back the
+        // `ViewOnly` placeholder and the real signer is stranded in the task's
+        // handoff. The Send path is carried by `Modal::Send::mark_busy`; the
+        // Builder has no host modal — `sign_review` is a separate overlay
+        // field, not a `Modal` variant — so `order_op_in_flight` is the only
+        // thing that can carry it, and a hand-rolled `mem::replace` didn't.
+        let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
+        let mut s = screen_for(addr(0xAA), new_cache());
+        s.sign_review_seq = 1;
+        s.sign_review = Some(sign_review::SignReview::pending(
+            "Batch".into(),
+            None,
+            Vec::new(),
+            None,
+            1,
+            sign_review::SignAction::TxBuilder {
+                req: tx_builder::BatchSignRequest::Eoa(eoa_batch_req(
+                    crate::chain::NetworkId::Builtin(Chain::Mainnet),
+                    calls,
+                )),
+                can_execute: true,
+                preflight: PASSED_CLEAN,
+            },
+        ));
+        assert!(!s.is_signing_busy(), "nothing is in flight yet");
+
+        let _ = s.dispatch_txbuilder(true);
+
+        assert!(
+            s.order_op_in_flight,
+            "parking the signer must raise the in-flight flag",
+        );
+        assert!(
+            s.is_signing_busy(),
+            "and the busy gate must see it — leaving the dashboard now would strand the signer",
+        );
+
+        // The shared `Message::Signed` tail is what lets go again, however the
+        // send resolved — a rejected signature has to clear it too, or the
+        // wallet stays wedged as busy for the rest of the session.
+        s.update(Message::Signed {
+            tag: SignTag::TxBuilderEoa,
+            signer: None,
+            result: Err("user rejected".into()),
+        });
+        assert!(
+            !s.is_signing_busy(),
+            "and it clears when the send resolves, including a rejection",
         );
     }
 

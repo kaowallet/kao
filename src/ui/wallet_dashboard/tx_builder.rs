@@ -1040,9 +1040,26 @@ impl TxBuilderApp {
     /// arrives after the user has moved on lands nowhere. A failed probe is
     /// silent: not being able to ask is not evidence of an empty account, and
     /// this warning must never fire on an RPC hiccup.
-    pub fn on_code_probed(&mut self, seq: u64, address: Address, result: Result<bool, String>) {
+    pub fn on_code_probed(
+        &mut self,
+        seq: u64,
+        net: NetworkId,
+        address: Address,
+        result: Result<bool, String>,
+    ) {
         self.traced("on_code_probed", move |s| {
             if seq != s.probe_seq {
+                return;
+            }
+            // "Nothing is deployed here" is a fact about an address *on a
+            // chain*. The sequence alone can't express that: the raw tab and
+            // the contract composer share the counter, so one field's probe
+            // retires the other's, and a reply that outlived a network switch
+            // would otherwise be applied to the new chain's context — where
+            // the same address may well hold nothing, and the warning that
+            // would have said so has just been suppressed by a verdict from
+            // the chain the user left.
+            if net != s.net {
                 return;
             }
             let Ok(has_code) = result else { return };
@@ -1279,7 +1296,23 @@ impl TxBuilderApp {
             Message::ShowAbiPaste => {
                 self.paste_open = true;
             }
-            Message::AbiPasteChanged(v) => self.abi_paste = v,
+            Message::AbiPasteChanged(v) => {
+                // Same wall as `JsonChanged` below, for the same reason: this
+                // is a single-line `text_input`, so it re-lays-out its whole
+                // content every keystroke and every frame, and `parse_abi_json`
+                // only gets a say once "Load ABI" is pressed — by which point
+                // the widget has been holding the blob all along.
+                if v.len() > abi::MAX_ABI_BYTES {
+                    self.error = Some(format!(
+                        "that paste is {} bytes, and this wallet reads ABIs up to {} — it hasn't \
+                         been put in the box",
+                        v.len(),
+                        abi::MAX_ABI_BYTES,
+                    ));
+                    return None;
+                }
+                self.abi_paste = v;
+            }
             Message::LoadPastedAbi => {
                 if let Ok(addr) = encode::parse_address(&self.addr_input) {
                     match abi::parse_abi_json(&self.abi_paste, addr) {
@@ -1709,9 +1742,37 @@ impl TxBuilderApp {
         self.read_args = vec![String::new(); n];
     }
 
+    /// Drop everything the composers hold, on both tabs.
+    ///
+    /// Every caller is a "the ground moved" event — the network was re-pinned,
+    /// or the acting identity changed — and each already drops the queue for
+    /// exactly the reason that applies here too: an address means a different
+    /// thing on a different chain.
     fn reset_composer(&mut self) {
         self.addr_input.clear();
         self.reset_composer_keep_addr();
+        self.reset_raw_composer();
+    }
+
+    /// The Raw tab's half of [`Self::reset_composer`].
+    ///
+    /// It used to have none, so a network switch cleared sixteen fields of the
+    /// contract composer and left the Raw tab holding its address, its value,
+    /// its calldata — and, worst of the four, `raw_nothing_deployed` still
+    /// `false` from a probe against the chain the user just left. Nothing
+    /// re-probed, and the CTA stayed live. Sending it is the wrong-chain paste
+    /// this flag exists to catch: a call to an address holding no contract
+    /// **succeeds** having executed nothing, taking any attached ETH with it,
+    /// and the revm preflight reproduces that success exactly rather than
+    /// flagging it.
+    fn reset_raw_composer(&mut self) {
+        // Retire any probe still in flight: its answer describes the address
+        // and chain being left behind.
+        self.probe_seq += 1;
+        self.raw_to.clear();
+        self.raw_value = "0".into();
+        self.raw_data.clear();
+        self.raw_nothing_deployed = false;
     }
 
     fn reset_composer_keep_addr(&mut self) {
@@ -2682,6 +2743,20 @@ pub struct EoaBatchRequest {
 pub struct PreparedDelegation {
     /// The delegate the reviewed authorization points at.
     pub delegate: Address,
+    /// What the account ran at review time — `None` for an undelegated
+    /// account, `Some(addr)` for whatever designator was installed.
+    ///
+    /// The re-check used to be `live_delegate == Some(pinned.delegate)`
+    /// compared against `already_active`, which is a *boolean* answer to a
+    /// three-way question. `pinned.delegate` is always the EF account, so
+    /// "nothing installed" and "another wallet's smart account installed" both
+    /// answered `false` and were indistinguishable — and every transition
+    /// between them passed a gate whose whole job is to notice that the ground
+    /// moved. An account that acquired a delegation between review and send got
+    /// it silently re-pointed; one that lost the incumbent the review named got
+    /// a different act than the one on screen. Pinning the incumbent itself
+    /// makes the comparison exact, and subsumes `already_active`.
+    pub incumbent: Option<Address>,
     /// True when the account already ran `delegate`'s code at review time, so
     /// the review told the user no new authorization would be signed.
     pub already_active: bool,
@@ -2762,6 +2837,13 @@ fn wei_to_eth(v: U256) -> String {
     format_token_balance(v, 18).0
 }
 
+/// How much of one decoded return value the Read panel will render.
+///
+/// Generous for anything with a real answer — a name, a symbol, a URI — and
+/// still bounded for a contract that answers with a novel. The untruncated
+/// bytes stay one click away on the panel's raw-hex row.
+const MAX_READ_VALUE_CHARS: usize = 512;
+
 /// Decode an `eth_call` result into typed [`ReadRow`]s against a method's
 /// declared outputs. Returns empty when the method has no outputs or the bytes
 /// don't decode (a malformed / reverted response) — the raw hex is still shown.
@@ -2786,7 +2868,18 @@ fn decode_read_rows(m: &AbiMethod, bytes: &[u8]) -> Vec<ReadRow> {
                 out.name.clone()
             },
             ty: out.ty_str.clone(),
-            value: encode::format_sol_value(&val),
+            // A `string` return is whatever the contract chose to put there.
+            // This panel is the one surface in the Builder that renders it and
+            // is never re-rendered through the sign overlay, so nothing
+            // downstream would strip it: a `name()` answering with a
+            // right-to-left override reorders the row it lands in, and one
+            // answering with 5,000 characters pushes the rest of the panel off
+            // screen. Every other decoded value is bounded by its own type.
+            value: crate::sanitize::sanitize_display(
+                &encode::format_sol_value(&val),
+                MAX_READ_VALUE_CHARS,
+            )
+            .into_owned(),
         })
         .collect()
 }
@@ -4305,6 +4398,120 @@ mod tests {
         );
     }
 
+    /// The Read panel renders whatever the contract returns, and is the one
+    /// Builder surface never re-rendered through the sign overlay's sanitizer.
+    #[test]
+    fn a_hostile_string_return_is_stripped_and_clamped() {
+        use alloy::dyn_abi::DynSolValue;
+        let m = AbiMethod {
+            name: "name".into(),
+            inputs: Vec::new(),
+            outputs: vec![abi::AbiParam {
+                name: "n".into(),
+                ty_str: "string".into(),
+                ty: alloy::dyn_abi::DynSolType::String,
+            }],
+            payable: false,
+            selector: [0x06, 0xfd, 0xde, 0x03],
+            signature: "name()".into(),
+            provenance: abi::MethodProvenance::Declared,
+            inferred_mutability: None,
+        };
+
+        let hostile = format!("USD\u{202E}Coin{}", "x".repeat(5000));
+        let encoded = DynSolValue::Tuple(vec![DynSolValue::String(hostile)]).abi_encode_params();
+        let rows = decode_read_rows(&m, &encoded);
+
+        assert_eq!(rows.len(), 1);
+        assert!(
+            !rows[0].value.contains('\u{202E}'),
+            "a direction override must never reach the row"
+        );
+        assert!(
+            rows[0].value.chars().count() <= MAX_READ_VALUE_CHARS + 1,
+            "and the panel must stay a panel (got {} chars)",
+            rows[0].value.chars().count(),
+        );
+    }
+
+    /// The contract composer was cleared on a network switch and the Raw tab
+    /// was not, so its address, value, calldata and — worst — its "something is
+    /// deployed here" verdict all survived onto a chain they were never checked
+    /// against.
+    #[test]
+    fn a_network_switch_clears_the_raw_tab_too() {
+        let mut app = safe_app();
+        let addr = address!("0x00000000000000000000000000000000C0FFEE00");
+        let Some(Outcome::ProbeCode { seq, .. }) =
+            app.update(Message::RawToChanged(addr.to_string()))
+        else {
+            panic!("expected a probe");
+        };
+        app.update(Message::RawValueChanged("1000".into()));
+        app.update(Message::RawDataChanged("0xdeadbeef".into()));
+        // Mainnet says a contract is there, so no warning is showing.
+        app.on_code_probed(seq, app.net, addr, Ok(true));
+        assert!(!app.raw_nothing_deployed);
+
+        let from = app.net;
+        app.net = NetworkId::Builtin(crate::chain::Chain::Base);
+        app.on_network_reset(from);
+
+        assert!(app.raw_to.is_empty(), "the address was for the old chain");
+        assert_eq!(app.raw_value, "0");
+        assert!(app.raw_data.is_empty());
+        assert!(
+            !app.raw_nothing_deployed,
+            "and no verdict is carried over either way"
+        );
+    }
+
+    /// The two composers share one probe counter, so binding the reply to the
+    /// address alone is not enough — it has to be the same chain as well.
+    #[test]
+    fn a_code_probe_that_outlived_a_network_switch_is_dropped() {
+        let mut app = safe_app();
+        let addr = address!("0x00000000000000000000000000000000C0FFEE00");
+        let Some(Outcome::ProbeCode { seq, net, .. }) =
+            app.update(Message::RawToChanged(addr.to_string()))
+        else {
+            panic!("expected a probe");
+        };
+        // The user moves to another chain, then Mainnet's answer arrives.
+        app.net = NetworkId::Builtin(crate::chain::Chain::Base);
+        app.raw_to = addr.to_string();
+        app.on_code_probed(seq, net, addr, Ok(true));
+        assert!(
+            !app.raw_nothing_deployed,
+            "a verdict from the chain we left must not caption this one"
+        );
+    }
+
+    /// The twin of the bundle-box gate: the ABI box is the same widget with the
+    /// same untrusted input, and had no wall at all.
+    #[test]
+    fn an_abi_paste_over_the_read_limit_never_reaches_the_box() {
+        let mut app = safe_app();
+        app.update(Message::ShowAbiPaste);
+        let huge = "a".repeat(abi::MAX_ABI_BYTES + 1);
+        app.update(Message::AbiPasteChanged(huge));
+        assert!(app.abi_paste.is_empty(), "the widget was never handed it");
+        assert!(app.error.is_some());
+        assert!(app.paste_open, "the user still needs somewhere to put it");
+    }
+
+    /// And the domain layer refuses on its own, so the wall doesn't depend on
+    /// which caller reached it.
+    #[test]
+    fn parse_abi_json_refuses_an_oversized_blob_without_the_ui() {
+        let huge = "a".repeat(abi::MAX_ABI_BYTES + 1);
+        let err = abi::parse_abi_json(&huge, Address::repeat_byte(0xAB)).unwrap_err();
+        assert!(
+            err.to_string().contains("reads ABIs up to"),
+            "expected the size refusal, got {err}"
+        );
+    }
+
     /// N identical queued calls, for the shape-derived caveat tests.
     fn n_calls(n: u64) -> Vec<QueuedCall> {
         (0..n)
@@ -4386,11 +4593,11 @@ mod tests {
         };
         assert_eq!(address, addr);
 
-        app.on_code_probed(seq, addr, Ok(false));
+        app.on_code_probed(seq, app.net, addr, Ok(false));
         assert!(app.raw_nothing_deployed, "empty account is reported");
 
         // A contract there says nothing.
-        app.on_code_probed(seq, addr, Ok(true));
+        app.on_code_probed(seq, app.net, addr, Ok(true));
         assert!(!app.raw_nothing_deployed);
     }
 
@@ -4406,13 +4613,13 @@ mod tests {
 
         // Not being able to ask is not evidence of an empty account — this
         // warning must never fire on an RPC hiccup.
-        app.on_code_probed(seq, addr, Err("connection reset".into()));
+        app.on_code_probed(seq, app.net, addr, Err("connection reset".into()));
         assert!(!app.raw_nothing_deployed);
 
         // And a reply for an address the user has since retyped lands nowhere.
         let other = address!("0x00000000000000000000000000000000C0FFEE11");
         app.update(Message::RawToChanged(other.to_string()));
-        app.on_code_probed(seq, addr, Ok(false));
+        app.on_code_probed(seq, app.net, addr, Ok(false));
         assert!(
             !app.raw_nothing_deployed,
             "a superseded probe must not caption the new address",
@@ -4434,7 +4641,7 @@ mod tests {
         };
         assert_eq!(address, addr);
         assert_eq!(net, NetworkId::Custom(31337));
-        app.on_code_probed(seq, addr, Ok(false));
+        app.on_code_probed(seq, app.net, addr, Ok(false));
         assert!(app.nothing_deployed);
     }
 

@@ -329,6 +329,41 @@ pub fn canonical_sol_type(ty: &DynSolType) -> String {
 
 /// Build the canonical signature `name(t1,t2,…)` and its 4-byte selector
 /// from a name and parameter types.
+/// The longest function name this wallet will accept from a declared ABI.
+///
+/// Solidity identifiers in the wild are short; this is far above anything a
+/// compiler emits, and it bounds a name that becomes a queue-card title.
+const MAX_FN_NAME_CHARS: usize = 128;
+
+/// Whether `s` is spelled the way Solidity spells an identifier:
+/// `[A-Za-z_$][A-Za-z0-9_$]*`, and not absurdly long.
+///
+/// Function names get *validated* rather than sanitized, unlike every other
+/// attacker-supplied string on this path, and the reason is that a name is not
+/// merely displayed: [`signature_and_selector`] hashes it, so it decides which
+/// function the call actually reaches. Quietly rewriting one would change the
+/// selector and leave the label and the bytes describing different functions —
+/// swapping a display problem for an execution problem.
+///
+/// Rejecting costs nothing real: this grammar is exactly what the Solidity
+/// compiler accepts, so no genuine ABI is refused, while a name carrying a
+/// right-to-left override (`approve<U+202E>drainAll`) or zero-width joiners
+/// can't be a real function to begin with — it can only be there to make the
+/// method menu and the queue card read as something they aren't.
+pub(crate) fn is_solidity_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_' || first == '$') {
+        return false;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$') {
+        return false;
+    }
+    s.chars().count() <= MAX_FN_NAME_CHARS
+}
+
 fn signature_and_selector(name: &str, inputs: &[AbiParam]) -> (String, [u8; 4]) {
     let mut sig = String::with_capacity(name.len() + 2);
     sig.push_str(name);
@@ -748,7 +783,16 @@ fn params_from_json(list: &[AbiJsonParam]) -> Result<Vec<AbiParam>, TxBuilderErr
             .parse()
             .map_err(|e| TxBuilderError::Abi(format!("unsupported type {ty_str:?}: {e}")))?;
         out.push(AbiParam {
-            name: p.name.clone().unwrap_or_default(),
+            // Display-only — the signature is built from `ty_str`, never from
+            // this — so unlike a function name it is safe to rewrite rather
+            // than refuse. It still lands on the review's `name = value` rows,
+            // so it goes through the same strip-and-clamp as every other
+            // attacker-supplied label in the wallet.
+            name: crate::sanitize::sanitize_display(
+                p.name.as_deref().unwrap_or_default(),
+                MAX_FN_NAME_CHARS,
+            )
+            .into_owned(),
             ty_str: canonical_sol_type(&ty),
             ty,
         });
@@ -756,12 +800,46 @@ fn params_from_json(list: &[AbiJsonParam]) -> Result<Vec<AbiParam>, TxBuilderErr
     Ok(out)
 }
 
+/// The largest ABI blob this wallet will parse, in bytes.
+///
+/// Generous by an order of magnitude — a large verified contract publishes tens
+/// of kilobytes, and a diamond proxy's flattened ABI still lands well inside
+/// this — so it never refuses a real artifact, while still bounding a paste box
+/// whose input is untrusted in size as well as in content.
+pub const MAX_ABI_BYTES: usize = 256 * 1024;
+
+/// The most ABI entries one blob may declare.
+///
+/// The byte cap is the real wall; this one bounds what reaches the *method
+/// menu*, which lays out a row per entry and is a list a person scrolls.
+pub const MAX_ABI_ENTRIES: usize = 2048;
+
 /// Parse a standard Solidity JSON ABI array into a [`LoadedContract`],
 /// splitting state-mutating functions (`methods`) from `view`/`pure` reads
 /// (`read_methods`, which carry decodable `outputs`).
 pub fn parse_abi_json(json: &str, address: Address) -> Result<LoadedContract, TxBuilderError> {
-    let entries: Vec<AbiEntry> = serde_json::from_str(json.trim())
+    let json = json.trim();
+    // The paste box gates on this too, but the domain layer has to refuse
+    // independently: the box is one caller, and the cost of a hostile blob is
+    // paid in the parse and then again in every frame that lays out the method
+    // menu it produces. Same reasoning as `bundle::MAX_BUNDLE_BYTES`, which had
+    // this wall from the start while its sibling here did not.
+    if json.len() > MAX_ABI_BYTES {
+        return Err(TxBuilderError::Abi(format!(
+            "that ABI is {} bytes, and this wallet reads ABIs up to {MAX_ABI_BYTES} — no \
+             contract's published ABI comes close",
+            json.len(),
+        )));
+    }
+    let entries: Vec<AbiEntry> = serde_json::from_str(json)
         .map_err(|e| TxBuilderError::Abi(format!("not a JSON ABI array — {e}")))?;
+    if entries.len() > MAX_ABI_ENTRIES {
+        return Err(TxBuilderError::Abi(format!(
+            "that ABI declares {} entries, and this wallet reads up to {MAX_ABI_ENTRIES} — the \
+             method menu is something a person picks from",
+            entries.len(),
+        )));
+    }
 
     let mut methods = Vec::new();
     let mut read_methods = Vec::new();
@@ -771,6 +849,15 @@ pub fn parse_abi_json(json: &str, address: Address) -> Result<LoadedContract, Tx
         }
         let Some(name) = entry.name.clone() else {
             continue;
+        };
+        // Refused outright rather than skipped: a menu quietly missing the one
+        // entry the user pasted the ABI for is a worse answer than saying why.
+        if !is_solidity_identifier(&name) {
+            return Err(TxBuilderError::Abi(format!(
+                "{:?} is not a function name Solidity can spell — an ABI naming it does not \
+                 describe a contract this wallet can call",
+                crate::sanitize::sanitize_display(&name, 40),
+            )));
         };
         let inputs = params_from_json(&entry.inputs)?;
         let (signature, selector) = signature_and_selector(&name, &inputs);
@@ -1229,6 +1316,33 @@ mod tests {
     fn parse_json_abi_empty_or_garbage_errors() {
         let no_fns = r#"[{"type":"event","name":"Transfer","inputs":[]}]"#;
         assert!(parse_abi_json(no_fns, Address::ZERO).is_err());
+        // A name Solidity could never emit is refused rather than rendered:
+        // it decides the selector, so rewriting it would point the call
+        // somewhere else while the label kept its promise. (Built with escapes
+        // — rustc refuses a bidi codepoint written literally in a source
+        // literal, for the same reason this check exists.)
+        for hostile in [
+            "approve\u{202E}drainAll", // right-to-left override
+            "trans\u{200B}fer",        // zero-width space
+            "approve\u{0000}",         // NUL
+            "app rove",                // a space is not an identifier char
+            "2approve",                // nor a leading digit
+            "",                        // nor nothing at all
+        ] {
+            let json = format!(
+                r#"[{{"type":"function","name":{},
+                "stateMutability":"nonpayable","inputs":[],"outputs":[]}}]"#,
+                serde_json::to_string(hostile).unwrap(),
+            );
+            assert!(
+                parse_abi_json(&json, Address::ZERO).is_err(),
+                "{hostile:?} must not parse as a callable method",
+            );
+        }
+        // But an ordinary name with `$` and `_` still parses.
+        let ok = r#"[{"type":"function","name":"$do_thing2",
+            "stateMutability":"nonpayable","inputs":[],"outputs":[]}]"#;
+        assert!(parse_abi_json(ok, Address::ZERO).is_ok());
         assert!(parse_abi_json("not json", Address::ZERO).is_err());
     }
 

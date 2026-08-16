@@ -447,10 +447,14 @@ pub enum Message {
         hash: TxHash,
         fate: tx_builder::BatchFate,
     },
-    /// Whether anything is deployed at `address`. `address` rides along so the
-    /// pane can drop a reply for a field the user has since retyped.
+    /// Whether anything is deployed at `address`. `address` and `net` ride along
+    /// so the pane can drop a reply for a field the user has since retyped, or
+    /// for a chain it has since left — "nothing is deployed here" is a fact
+    /// about a specific address on a specific chain, and applying it to either
+    /// one changing is how a stale verdict becomes a spent transaction.
     TxBuilderCodeProbed {
         seq: u64,
+        net: crate::chain::NetworkId,
         address: Address,
         result: Result<bool, String>,
     },
@@ -5036,12 +5040,13 @@ impl WalletScreen {
             }
             Message::TxBuilderCodeProbed {
                 seq,
+                net,
                 address,
                 result,
             } => {
                 self.apps
                     .txbuilder_pane()
-                    .on_code_probed(seq, address, result);
+                    .on_code_probed(seq, net, address, result);
                 return (Task::none(), None);
             }
             Message::TxBuilderRead { seq, result } => {
@@ -5266,6 +5271,7 @@ impl WalletScreen {
                             sign_review::SignStep::Delegation(d) => {
                                 Some(tx_builder::PreparedDelegation {
                                     delegate: d.delegate,
+                                    incumbent: d.incumbent,
                                     already_active: d.already_active,
                                     auth_nonce: d.auth_nonce,
                                 })
@@ -7148,6 +7154,7 @@ fn spawn_txbuilder_code_probe(
         },
         move |result| Message::TxBuilderCodeProbed {
             seq,
+            net,
             address,
             result,
         },
@@ -7678,10 +7685,11 @@ async fn build_txbuilder_steps(
                     chain_id: chain.chain_id(),
                     net: e.net,
                     already_active: already_ef,
-                    // An account already delegated elsewhere (another wallet's
-                    // smart-account implementation) is not being delegated —
-                    // it's being re-pointed, and the incumbent has to be named.
-                    replacing: current_delegate.filter(|d| *d != eip7702::EF_SIMPLE_7702_ACCOUNT),
+                    // Unfiltered: `replacing()` does the display-side reading,
+                    // and the send path needs the raw three-way answer so it
+                    // can tell "nothing installed" from "someone else's
+                    // contract installed" when it re-checks against chain.
+                    incumbent: current_delegate,
                     auth_nonce,
                     auth_digest,
                 };
@@ -7742,7 +7750,7 @@ async fn build_txbuilder_steps(
                                 // no authorization and no digest to compare
                                 // against a device.
                                 already_active: true,
-                                replacing: None,
+                                incumbent: Some(current),
                                 auth_nonce: None,
                                 auth_digest: None,
                             },
@@ -8214,15 +8222,22 @@ async fn send_eoa_batch(
             .await
             .map_err(|e| format!("get_code: {}", crate::net::redact_urls(&e.to_string())))?;
         let live_delegate = eip7702::delegated_to(&code);
-        let live_already = live_delegate == Some(pinned.delegate);
-        if live_already != pinned.already_active {
-            // Both directions abort. Signing an authorization the review said
-            // would not be signed is the worse one — its effect outlives this
-            // transaction — but the other direction is a silent no-op batch, so
-            // neither gets to pick a side on the user's behalf.
+        // Compared as the three-way value it is, not as "is it the EF account".
+        // That boolean answered `false` for an undelegated account and `false`
+        // for one running someone else's smart-account implementation, so every
+        // transition between those two — none → foreign, foreign → other
+        // foreign, foreign → revoked — walked straight through the one gate
+        // whose job is to notice the ground moved, and the review's account of
+        // what this signature displaces stopped being true.
+        if live_delegate != pinned.incumbent {
+            // Every direction aborts. Signing an authorization the review said
+            // would not be signed is the worst one — its effect outlives this
+            // transaction — but a silent no-op batch and a displacement the
+            // user was never shown are both wrong too, so none of them gets to
+            // pick a side on the user's behalf.
             warn!(
-                reviewed = pinned.already_active,
-                live = live_already,
+                reviewed = ?pinned.incumbent,
+                live = ?live_delegate,
                 "tx-builder: 7702 delegation state changed between review and send"
             );
             return Err(
@@ -8231,6 +8246,11 @@ async fn send_eoa_batch(
                     .to_string(),
             );
         }
+        debug_assert_eq!(
+            live_delegate == Some(pinned.delegate),
+            pinned.already_active,
+            "the pinned incumbent decides `already_active`; they cannot disagree",
+        );
         if !pinned.already_active {
             // Self-sponsored: the outer tx consumes `nonce`, so the
             // authorization commits to `nonce + 1`. Signed first (device
@@ -14963,7 +14983,7 @@ mod tests {
         };
         assert_eq!(d.delegate, incumbent);
         assert!(d.already_active, "a disclosure, not a decision");
-        assert!(d.replacing.is_none(), "nothing is being replaced");
+        assert!(d.replacing().is_none(), "nothing is being replaced");
         assert_eq!(leg.calldata, call.data, "reviewed bytes == queued bytes");
     }
 
@@ -15212,7 +15232,7 @@ mod tests {
         assert_eq!(d.chain_id, Chain::Mainnet.chain_id());
         assert_ne!(d.chain_id, 0, "a chain id of 0 delegates on every chain");
         assert!(!d.already_active, "a fresh delegation is being authorized");
-        assert!(d.replacing.is_none(), "nothing is being displaced");
+        assert!(d.replacing().is_none(), "nothing is being displaced");
         assert_eq!(leg.title, "executeBatch · 2 calls");
         assert_eq!(leg.to, from, "the batch self-calls the delegated account");
         assert_eq!(leg.value, U256::ZERO);
@@ -15265,7 +15285,73 @@ mod tests {
         };
         assert!(d.already_active);
         assert_eq!(d.delegate, eip7702::EF_SIMPLE_7702_ACCOUNT);
-        assert!(d.replacing.is_none(), "the incumbent IS the EF delegate");
+        assert!(d.replacing().is_none(), "the incumbent IS the EF delegate");
+    }
+
+    /// The pin carries the *incumbent*, not a boolean about it. Two accounts
+    /// that are both "not delegated to the EF contract" — one running nothing,
+    /// one running another wallet's implementation — used to pin identically,
+    /// so drifting from either to the other passed the re-check that exists to
+    /// catch exactly that.
+    #[tokio::test]
+    async fn txbuilder_pins_which_delegation_it_saw_not_merely_whether_it_was_ours() {
+        let calls = vec![
+            queued(1, addr(0xC1), 0, vec![0x01]),
+            queued(2, addr(0xC2), 0, vec![0x02]),
+        ];
+        let foreign = addr(0x77);
+
+        let undelegated = {
+            let req = eoa_batch_req(
+                crate::chain::NetworkId::Builtin(Chain::Mainnet),
+                calls.clone(),
+            );
+            let mock = CallMock::new();
+            mock.set_code(
+                eip7702::EF_SIMPLE_7702_ACCOUNT,
+                Bytes::from(vec![0x60u8]),
+                true,
+            );
+            let steps = prepared_steps(&mock, tx_builder::BatchSignRequest::Eoa(req))
+                .await
+                .unwrap();
+            let [sign_review::SignStep::Delegation(d), _] = steps.as_slice() else {
+                panic!("expected a delegation card");
+            };
+            d.clone()
+        };
+
+        let displaced = {
+            let req = eoa_batch_req(crate::chain::NetworkId::Builtin(Chain::Mainnet), calls);
+            let mock = CallMock::new();
+            let mut code = vec![0xef, 0x01, 0x00];
+            code.extend_from_slice(foreign.as_slice());
+            mock.set_code(req.from, Bytes::from(code), true);
+            mock.set_code(
+                eip7702::EF_SIMPLE_7702_ACCOUNT,
+                Bytes::from(vec![0x60u8]),
+                true,
+            );
+            let steps = prepared_steps(&mock, tx_builder::BatchSignRequest::Eoa(req))
+                .await
+                .unwrap();
+            let [sign_review::SignStep::Delegation(d), _] = steps.as_slice() else {
+                panic!("expected a delegation card");
+            };
+            d.clone()
+        };
+
+        assert_eq!(undelegated.incumbent, None);
+        assert_eq!(displaced.incumbent, Some(foreign));
+        assert_eq!(
+            (undelegated.already_active, displaced.already_active),
+            (false, false),
+            "the boolean cannot tell these two apart — that was the bug",
+        );
+        assert_ne!(
+            undelegated.incumbent, displaced.incumbent,
+            "so the pinned value has to, or drift between them is invisible",
+        );
     }
 
     #[tokio::test]
@@ -15296,7 +15382,7 @@ mod tests {
             panic!("expected a delegation card then the batch leg, got {steps:?}");
         };
         assert!(!d.already_active, "a fresh authorization will be signed");
-        assert_eq!(d.replacing, Some(incumbent));
+        assert_eq!(d.replacing(), Some(incumbent));
     }
 
     /// The one signature in this wallet whose effect outlives its own
@@ -16468,7 +16554,9 @@ mod tests {
                     chain_id: 1,
                     net: crate::chain::NetworkId::Builtin(Chain::Mainnet),
                     already_active: true,
-                    replacing: None,
+                    // `already_active` *means* the incumbent is the delegate;
+                    // the two are one fact, so the fixture states it once.
+                    incumbent: Some(eip7702::EF_SIMPLE_7702_ACCOUNT),
                     auth_nonce: None,
                     auth_digest: None,
                 },
@@ -16486,6 +16574,7 @@ mod tests {
             ereq.prepared,
             Some(tx_builder::PreparedDelegation {
                 delegate: eip7702::EF_SIMPLE_7702_ACCOUNT,
+                incumbent: Some(eip7702::EF_SIMPLE_7702_ACCOUNT),
                 already_active: true,
                 auth_nonce: None,
             }),

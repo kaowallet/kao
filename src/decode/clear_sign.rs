@@ -25,7 +25,10 @@ use clear_signing::{
 
 use crate::chain::Chain;
 use crate::decode::proxy;
-use crate::decode::render::{DecodedCall, ResolutionState, decode_call, read_token_meta};
+use crate::decode::render::{
+    DecodedCall, ResolutionState, Warning, decode_args_inner, decode_call, read_token_meta,
+    unaccounted_calldata,
+};
 use crate::net::BalanceFetcher;
 
 // ---------------------------------------------------------------------------
@@ -191,6 +194,17 @@ pub enum DecodeResult {
         diagnostics: Vec<FormatDiagnostic>,
         proxy_hops: Vec<Address>,
         all_verified: bool,
+        /// Mechanical cross-checks on the raw bytes, independent of anything
+        /// the descriptor claims (see [`bytes_warnings`]).
+        ///
+        /// A descriptor renders the fields it was authored to render; it does
+        /// not attest that the calldata contains nothing else. This is the only
+        /// thing on the clear-signed path that reads the bytes rather than the
+        /// authored view of them, which matters most here precisely because
+        /// this is the variant the review presents with the most confidence —
+        /// destination, value and the whole function panel fold away behind
+        /// *Show details* when a descriptor matched.
+        warnings: Vec<Warning>,
     },
     /// Descriptor returned Fallback (partial match). Show DisplayModel
     /// but carry heuristic decode for cross-reference.
@@ -429,11 +443,16 @@ pub async fn decode_transaction(
                                 diagnostics = diagnostics.len(),
                                 "clear-sign: clear-signed result"
                             );
+                            // Read the bytes, not the authored view of them.
+                            // Pure and local — no second network round-trip on
+                            // what is the common, good path.
+                            let warnings = bytes_warnings(&descriptors, &calldata);
                             return DecodeResult::ClearSigned {
                                 model,
                                 diagnostics,
                                 proxy_hops,
                                 all_verified: all_verified && data_provider.all_verified(),
+                                warnings,
                             };
                         }
                         Ok(FormatOutcome::Fallback {
@@ -486,6 +505,79 @@ pub async fn decode_transaction(
     debug!(%selector, "clear-sign: using heuristic pipeline");
     let decoded = decode_call(net, chain, to, calldata).await;
     DecodeResult::Heuristic(decoded)
+}
+
+/// The ERC-7730 `display.formats` key that describes `selector`, if the
+/// resolved descriptors carry one.
+///
+/// Keys are function signatures (`"transfer(address,uint256)"`); the spec also
+/// permits a bare `"0x…"` selector, which carries no argument types and so is
+/// no use here. Matching on the selector rather than taking the first format is
+/// what makes this the format that was actually rendered: a descriptor may
+/// describe many functions, and the transaction names exactly one.
+fn matched_signature(
+    descriptors: &[clear_signing::ResolvedDescriptor],
+    selector: [u8; 4],
+) -> Option<&str> {
+    descriptors
+        .iter()
+        .flat_map(|d| d.descriptor.display.formats.keys())
+        .map(String::as_str)
+        .find(|key| {
+            !key.starts_with("0x") && alloy::primitives::keccak256(key.as_bytes())[..4] == selector
+        })
+}
+
+/// Mechanical checks on the raw calldata, run alongside a descriptor rather
+/// than in place of it.
+///
+/// Only one check today, and it is the one a descriptor structurally cannot
+/// make: **does the calldata carry bytes the rendered arguments don't
+/// explain?** Both decoders in play are non-consuming — alloy's reads the types
+/// it was asked for, and `clear_signing`'s walks `head_size()` per parameter
+/// without ever comparing the total against `data.len()` — so a call can render
+/// a complete, authored, entirely truthful set of fields and still carry a tail
+/// that reaches the contract. An ERC-2771 forwarder takes the spoofed sender
+/// from exactly that tail.
+///
+/// The composer refuses such a call outright (`txbuilder::encode::decode_args`)
+/// because it is producing the bytes that get signed. Here the bytes already
+/// exist and the user is being asked to vet them, so it is surfaced as a
+/// warning beside a decode still worth reading — the same trade the heuristic
+/// path already makes.
+///
+/// Returns nothing when the signature can't be recovered or its types don't
+/// parse: an unprovable claim is not a finding, and a false alarm on the
+/// wallet's most-trusted screen is worse than silence.
+fn bytes_warnings(
+    descriptors: &[clear_signing::ResolvedDescriptor],
+    calldata: &[u8],
+) -> Vec<Warning> {
+    // Derived here rather than taken as an argument so the slicing below can
+    // never be reached with calldata too short to hold a selector.
+    let Some(selector) = calldata.get(..4).and_then(|s| <[u8; 4]>::try_from(s).ok()) else {
+        return Vec::new();
+    };
+    let Some(sig) = matched_signature(descriptors, selector) else {
+        return Vec::new();
+    };
+    let Some(arg_types) = crate::decode::matcher::parse_signature_args(sig) else {
+        return Vec::new();
+    };
+    let body = &calldata[4..];
+    let values = decode_args_inner(&arg_types, body);
+    match unaccounted_calldata(&values, body) {
+        Some((decoded, total)) => {
+            warn!(
+                %sig,
+                decoded,
+                total,
+                "clear-sign: descriptor rendered a call with unaccounted calldata"
+            );
+            vec![Warning::UnaccountedCalldata { decoded, total }]
+        }
+        None => Vec::new(),
+    }
 }
 
 #[cfg(test)]
@@ -727,6 +819,7 @@ mod tests {
             diagnostics: Vec::new(),
             proxy_hops: Vec::new(),
             all_verified: true,
+            warnings: Vec::new(),
         }
         .headline()
         .unwrap();
@@ -743,6 +836,7 @@ mod tests {
             diagnostics: Vec::new(),
             proxy_hops: vec![Address::repeat_byte(0x22)],
             all_verified: true,
+            warnings: Vec::new(),
         }
         .headline()
         .unwrap();
@@ -759,6 +853,7 @@ mod tests {
             diagnostics: Vec::new(),
             proxy_hops: Vec::new(),
             all_verified: false,
+            warnings: Vec::new(),
         }
         .headline()
         .unwrap();
@@ -839,6 +934,122 @@ mod tests {
             DecodeResult::Heuristic(call(ResolutionState::Empty, None))
                 .headline()
                 .is_none()
+        );
+    }
+
+    // ── Mechanical cross-check on a clear-signed call ───────────────────────
+
+    /// A descriptor whose `display.formats` names exactly `sigs`. Only the
+    /// format keys are read by the check, but it is built through
+    /// `Descriptor::from_json` rather than a struct literal so the fixture
+    /// stays honest about the shape the registry actually ships.
+    fn descriptors_for(sigs: &[&str]) -> Vec<clear_signing::ResolvedDescriptor> {
+        let formats: String = sigs
+            .iter()
+            .map(|s| format!(r#""{s}": {{ "fields": [] }}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(
+            r#"{{
+                "context": {{ "contract": {{ "deployments": [] }} }},
+                "metadata": {{}},
+                "display": {{ "formats": {{ {formats} }} }}
+            }}"#
+        );
+        vec![clear_signing::ResolvedDescriptor {
+            descriptor: clear_signing::Descriptor::from_json(&json)
+                .expect("fixture descriptor parses"),
+            chain_id: 1,
+            address: format!("{:#x}", Address::repeat_byte(0x11)),
+        }]
+    }
+
+    /// `transfer(address,uint256)` calldata, plus `tail` extra bytes that no
+    /// argument accounts for.
+    fn transfer_with_tail(tail: &[u8]) -> Bytes {
+        let mut d = alloy::primitives::keccak256(b"transfer(address,uint256)")[..4].to_vec();
+        d.extend_from_slice(
+            alloy::primitives::B256::left_padding_from(Address::repeat_byte(0xBB).as_slice())
+                .as_slice(),
+        );
+        d.extend_from_slice(&U256::from(1_000u64).to_be_bytes::<32>());
+        d.extend_from_slice(tail);
+        Bytes::from(d)
+    }
+
+    /// The attack the check exists for. A descriptor renders the two arguments
+    /// it was authored to render and says nothing about a trailing word — and
+    /// on this path the review folds destination, value and the whole function
+    /// panel behind *Show details* precisely because a descriptor matched. An
+    /// ERC-2771 forwarder reads the spoofed sender from exactly that tail.
+    #[test]
+    fn a_clear_signed_call_still_reports_calldata_its_arguments_dont_explain() {
+        let suffix =
+            alloy::primitives::B256::left_padding_from(Address::repeat_byte(0xEE).as_slice());
+        let calldata = transfer_with_tail(suffix.as_slice());
+        let w = bytes_warnings(&descriptors_for(&["transfer(address,uint256)"]), &calldata);
+        match w.as_slice() {
+            [Warning::UnaccountedCalldata { decoded, total }] => {
+                assert_eq!(*decoded, 64, "two words are explained");
+                assert_eq!(*total, 96, "three are present");
+            }
+            other => panic!("expected an unaccounted-calldata warning, got {other:?}"),
+        }
+    }
+
+    /// The other half: an exactly-encoded call must stay silent. A false alarm
+    /// on the wallet's most-trusted screen costs more than it buys.
+    #[test]
+    fn an_exactly_encoded_clear_signed_call_warns_about_nothing() {
+        let calldata = transfer_with_tail(&[]);
+        assert!(
+            bytes_warnings(&descriptors_for(&["transfer(address,uint256)"]), &calldata).is_empty()
+        );
+    }
+
+    /// The format is chosen by selector, not by position — a descriptor
+    /// describing many functions must be measured against the one the
+    /// transaction actually calls.
+    #[test]
+    fn the_check_measures_the_format_the_selector_names() {
+        let calldata = transfer_with_tail(&[0u8; 32]);
+        let d = descriptors_for(&[
+            "approve(address,uint256)",
+            "transfer(address,uint256)",
+            "permit(address,address,uint256,uint256,uint8,bytes32,bytes32)",
+        ]);
+        assert!(
+            matches!(
+                bytes_warnings(&d, &calldata).as_slice(),
+                [Warning::UnaccountedCalldata { .. }]
+            ),
+            "the transfer format is the one that had to be measured"
+        );
+    }
+
+    /// No recoverable signature ⇒ no claim. A selector-keyed format carries no
+    /// argument types, and a descriptor that doesn't describe this selector
+    /// says nothing about it either. Silence, not a guess.
+    #[test]
+    fn an_unrecoverable_signature_makes_no_claim() {
+        let calldata = transfer_with_tail(&[0u8; 32]);
+        for d in [
+            descriptors_for(&["0xa9059cbb"]),
+            descriptors_for(&["approve(address,uint256)"]),
+            descriptors_for(&[]),
+        ] {
+            assert!(
+                bytes_warnings(&d, &calldata).is_empty(),
+                "an unprovable claim is not a finding"
+            );
+        }
+        // Too short to even hold a selector — must not panic on the slice.
+        assert!(
+            bytes_warnings(
+                &descriptors_for(&["transfer(address,uint256)"]),
+                &[0x01, 0x02]
+            )
+            .is_empty()
         );
     }
 }

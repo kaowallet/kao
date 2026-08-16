@@ -322,7 +322,7 @@ pub async fn decode_call(
 /// describing bytes that already exist. Dropping the decode entirely would
 /// leave the review with less to show, not more, so the mismatch is surfaced as
 /// a warning beside a decode that is still worth reading.
-fn unaccounted_calldata(values: &[DynSolValue], data: &[u8]) -> Option<(usize, usize)> {
+pub(super) fn unaccounted_calldata(values: &[DynSolValue], data: &[u8]) -> Option<(usize, usize)> {
     if values.is_empty() {
         // Nothing decoded, so nothing is claiming to account for anything —
         // the raw-calldata view is what the user reads here.
@@ -332,7 +332,7 @@ fn unaccounted_calldata(values: &[DynSolValue], data: &[u8]) -> Option<(usize, u
     (reencoded.as_slice() != data).then_some((reencoded.len(), data.len()))
 }
 
-fn decode_args_inner(arg_types: &[DynSolType], data: &[u8]) -> Vec<DynSolValue> {
+pub(super) fn decode_args_inner(arg_types: &[DynSolType], data: &[u8]) -> Vec<DynSolValue> {
     if arg_types.is_empty() {
         return Vec::new();
     }

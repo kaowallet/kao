@@ -70,8 +70,11 @@ pub fn view<'a, M: CopyKick + 'a>(
     let said = decoded.and_then(DecodeResult::headline).map(|h| h.text);
     match decoded? {
         DecodeResult::ClearSigned {
-            model, diagnostics, ..
-        } => clear_signed_panel(t, model, diagnostics, &[], said.as_deref()),
+            model,
+            diagnostics,
+            warnings,
+            ..
+        } => clear_signed_panel(t, model, diagnostics, warnings, said.as_deref()),
         DecodeResult::Fallback {
             model,
             diagnostics,
@@ -244,13 +247,19 @@ fn clear_signed_panel<'a, M: CopyKick + 'a>(
     let mut col = column![].spacing(6);
     let mut rendered = false;
 
-    // Spoof / ambiguity signals from the cross-referenced heuristic decode
-    // (Fallback path) lead the panel — they cast doubt on the headline above,
-    // so the user must meet them before reading the entries.
+    // Signals from the mechanical cross-check lead the panel — they cast doubt
+    // on the headline above, so the user must meet them before reading the
+    // entries. Spoof/ambiguity come from the heuristic decode on the Fallback
+    // path; unaccounted calldata is computed from the bytes on both descriptor
+    // paths, and is the one finding an authored descriptor cannot make about
+    // itself: it renders the fields it knows, and says nothing about a tail it
+    // was never told to look for.
     for w in heuristic_warnings {
         if matches!(
             w,
-            Warning::BytecodeMismatch { .. } | Warning::AmbiguousSignature { .. }
+            Warning::BytecodeMismatch { .. }
+                | Warning::AmbiguousSignature { .. }
+                | Warning::UnaccountedCalldata { .. }
         ) {
             col = col.push(warning_strip(t, w));
             rendered = true;

@@ -178,25 +178,32 @@ pub fn looks_like_known_name(input: &str) -> bool {
     })
 }
 
-/// The short display label for the namespace a resolved name belongs to,
-/// by TLD: `.gwei` → `"GNS"`, `.wei` → `"WNS"`, `.xns` → `"XNS"`, everything
-/// else (`.eth`, DNS names) → `"ENS"`. Used to badge a resolved name with the
-/// service that vouches for it instead of always saying "ENS".
+/// The registry a name's **TLD alone** identifies: `.gwei` → GNS, `.wei` → WNS,
+/// `.xns` → XNS, `.eth` and any non-XNS-shaped name → ENS.
 ///
-/// The `.xns` arm matches [`resolve_name`]'s own routing. Without it a name
-/// this dispatcher deliberately sends to the XNS contract came back badged as
-/// ENS — naming the wrong registry as the thing vouching for an address, on a
-/// label whose whole job is to say which one does.
-pub fn namespace_label(name: &str) -> &'static str {
-    let lc = name.to_ascii_lowercase();
+/// `None` when the TLD doesn't settle it — an XNS-shaped `label.namespace` like
+/// `dave.crops` or `frank.org`. Namespaces are permissionless, so nothing in
+/// such a string says which registry holds it; only the lookup knows, and that
+/// answer arrives as a [`Registry`] from [`resolve_name_tagged`].
+///
+/// This used to return `&'static str` with a bare `else { "ENS" }`, which meant
+/// it *asserted* ENS for every name it could not identify. On a label whose one
+/// job is to say which service vouches for an address, guessing is worse than
+/// declining: callers can render the name unbadged, but they cannot un-see a
+/// wrong badge.
+pub fn namespace_label(name: &str) -> Option<&'static str> {
+    let lc = name.trim().to_ascii_lowercase();
     if lc.ends_with(crate::names::gns::GNS.tld) {
-        "GNS"
+        Some("GNS")
     } else if lc.ends_with(crate::names::wns::WNS.tld) {
-        "WNS"
+        Some("WNS")
     } else if lc.ends_with(".xns") {
-        "XNS"
+        Some("XNS")
+    } else if looks_like_xns_name(&lc) {
+        // Could be XNS, could be an ENS DNS name. Say neither.
+        None
     } else {
-        "ENS"
+        Some("ENS")
     }
 }
 
@@ -784,13 +791,26 @@ mod tests {
     }
 
     #[test]
-    fn namespace_label_reflects_tld() {
-        assert_eq!(namespace_label("apoorv.gwei"), "GNS");
-        assert_eq!(namespace_label("alice.wei"), "WNS");
-        assert_eq!(namespace_label("vitalik.eth"), "ENS");
-        assert_eq!(namespace_label("APOORV.GWEI"), "GNS");
-        // DNS / unknown TLDs fall back to ENS (ENS resolves DNS names too).
-        assert_eq!(namespace_label("foo.xyz"), "ENS");
+    fn namespace_label_names_only_what_the_tld_settles() {
+        assert_eq!(namespace_label("apoorv.gwei"), Some("GNS"));
+        assert_eq!(namespace_label("alice.wei"), Some("WNS"));
+        assert_eq!(namespace_label("vitalik.eth"), Some("ENS"));
+        assert_eq!(namespace_label("APOORV.GWEI"), Some("GNS"));
+        assert_eq!(namespace_label("carol.xns"), Some("XNS"));
+        // Multi-dot can't be an XNS name (labels hold no dot), so ENS is the
+        // only registry left that could hold it.
+        assert_eq!(namespace_label("sub.domain.com"), Some("ENS"));
+    }
+
+    /// The case the old `else { "ENS" }` got wrong. An XNS namespace is
+    /// permissionless, so these could be XNS *or* an ENS DNS name — and a
+    /// badge that guesses is worse than one that stays quiet, because it names
+    /// the wrong service as the thing vouching for an address.
+    #[test]
+    fn namespace_label_declines_to_guess_an_xns_shaped_name() {
+        for ambiguous in ["dave.crops", "erin.cheese", "frank.org", "foo.xyz"] {
+            assert_eq!(namespace_label(ambiguous), None, "{ambiguous}");
+        }
     }
 
     #[test]

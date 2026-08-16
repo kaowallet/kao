@@ -79,6 +79,31 @@ fn addresses_are_unambiguous(ty: &DynSolType) -> bool {
     addr && !hexish
 }
 
+/// Whether every integer leaf of `v` fits the width its own type declares.
+///
+/// The coercer enforces a narrow signed integer's *upper* bound and not its
+/// lower one: `int8` refuses `128` and accepts `-129`, `-200`, `-255` alike
+/// (`-256` is where the word finally wraps). Nothing downstream looks again —
+/// the round-trip in [`build_contract_call`] passes, because the value
+/// round-trips through alloy perfectly well, and [`encoded_preview`] returns
+/// `None` because the string reads as what it encodes. So the field says
+/// `✓ valid`, the call queues, and the revert arrives on chain, after the whole
+/// ceremony and with the atomic batch failing as a unit.
+///
+/// Checking the width here rather than trusting the coercer also keeps the
+/// guarantee off a dependency's patch version, where it is invisible.
+fn ints_fit_their_width(v: &DynSolValue) -> bool {
+    match v {
+        DynSolValue::Int(i, bits) => i.bits() as usize <= *bits,
+        DynSolValue::Uint(u, bits) => u.bit_len() <= *bits,
+        DynSolValue::Array(items) | DynSolValue::FixedArray(items) | DynSolValue::Tuple(items) => {
+            items.iter().all(ints_fit_their_width)
+        }
+        DynSolValue::CustomStruct { tuple, .. } => tuple.iter().all(ints_fit_their_width),
+        _ => true,
+    }
+}
+
 /// Validate a single parameter value against its type by coercing it. Ok
 /// carries the encodable value; Err is a short, user-facing reason.
 pub fn coerce_param(ty: &DynSolType, raw: &str) -> Result<DynSolValue, String> {
@@ -96,11 +121,19 @@ pub fn coerce_param(ty: &DynSolType, raw: &str) -> Result<DynSolValue, String> {
     {
         return Err(EIP55_REASON.into());
     }
-    ty.coerce_str(s)
+    let v = ty
+        .coerce_str(s)
         // Solidity's spelling, so this names the same type as the field's own
         // pill and the signature on the review — `sol_type_name` would say
         // `(uint256,)` where every other surface says `(uint256)`.
-        .map_err(|_| format!("expected {}", super::abi::canonical_sol_type(ty)))
+        .map_err(|_| format!("expected {}", super::abi::canonical_sol_type(ty)))?;
+    if !ints_fit_their_width(&v) {
+        return Err(format!(
+            "is out of range for {}",
+            super::abi::canonical_sol_type(ty)
+        ));
+    }
+    Ok(v)
 }
 
 /// Cheap validity check for live UI feedback (the `✓ valid` / `needs T`
@@ -228,6 +261,29 @@ pub fn decode_args(m: &AbiMethod, data: &[u8]) -> Option<Vec<DecodedArg>> {
         return None;
     };
     if vals.len() != m.inputs.len() {
+        return None;
+    }
+    // Alloy's decoder is non-consuming: it reads the arguments it was asked for
+    // and ignores whatever follows, so a body carrying a suffix past the last
+    // argument decodes exactly as cleanly as one that doesn't. That suffix is
+    // still calldata. A target reading `msg.data` past the argument region — an
+    // ERC-2771 forwarder taking the spoofed sender from the tail, say — acts on
+    // it, and nothing downstream would ever have shown it: the queue card, the
+    // review, and every per-leg decode are all built from these `DecodedArg`s,
+    // so an imported bundle could name `transfer(address,uint256)`, display two
+    // clean arguments, and carry live bytes nobody signed for.
+    //
+    // Re-encoding the values and demanding the body back is what makes
+    // "decodes" mean "every byte is accounted for". It also rejects a
+    // *non-canonical* encoding of the same values — dirty high bits above an
+    // address, a non-minimal offset — which is the same problem wearing a
+    // different hat: bytes that survive into execution without appearing on
+    // screen.
+    if DynSolValue::Tuple(vals.clone())
+        .abi_encode_params()
+        .as_slice()
+        != body
+    {
         return None;
     }
     Some(
@@ -631,5 +687,79 @@ mod tests {
         assert_eq!(parse_wei("1000").unwrap(), U256::from(1000u64));
         assert_eq!(parse_wei("0x10").unwrap(), U256::from(16u64));
         assert!(parse_wei("12.5").is_err());
+    }
+
+    /// A bundle can name a method, carry arguments that decode against it, and
+    /// append whatever it likes — the decoder reads the arguments it was asked
+    /// for and stops. Every surface that vets a batch is built from the decoded
+    /// arguments, so those extra bytes would ride to the chain unshown.
+    #[test]
+    fn calldata_with_a_suffix_past_the_last_argument_does_not_decode() {
+        let c = usdc();
+        let transfer = c.methods.iter().find(|m| m.name == "transfer").unwrap();
+        let to = address!("0x000000000000000000000000000000000000dEaD");
+        let clean = encode_call(transfer, &[to.to_string(), "1000000".to_string()]).unwrap();
+        assert!(
+            decode_args(transfer, &clean).is_some(),
+            "the exactly-accounted-for encoding still decodes"
+        );
+
+        // One byte is enough: this is about accounting, not about size.
+        for suffix in [
+            vec![0u8; 32],
+            vec![0xffu8; 7],
+            vec![0x11u8; 20],
+            vec![0xabu8],
+        ] {
+            let mut padded = clean.to_vec();
+            padded.extend_from_slice(&suffix);
+            assert!(
+                decode_args(transfer, &padded).is_none(),
+                "{} trailing byte(s) must not decode as a clean call",
+                suffix.len(),
+            );
+        }
+    }
+
+    /// The high bits above a narrow argument are just as unaccounted-for as
+    /// bytes past the end of one.
+    #[test]
+    fn a_non_canonical_encoding_of_the_same_arguments_does_not_decode() {
+        let c = usdc();
+        let transfer = c.methods.iter().find(|m| m.name == "transfer").unwrap();
+        let to = address!("0x000000000000000000000000000000000000dEaD");
+        let mut data = encode_call(transfer, &[to.to_string(), "1000000".to_string()])
+            .unwrap()
+            .to_vec();
+        // Dirty the padding above the address — it still decodes to the same
+        // address, and it is still a byte nobody agreed to.
+        data[4] = 0xff;
+        assert!(decode_args(transfer, &data).is_none());
+    }
+
+    /// The coercer enforces a narrow signed integer's ceiling but not its
+    /// floor, so this has to be checked here or not at all.
+    #[test]
+    fn a_signed_integer_below_its_types_floor_is_refused() {
+        let i8_ty: DynSolType = "int8".parse().unwrap();
+        for ok in ["-128", "-1", "0", "127"] {
+            assert!(is_valid(&i8_ty, ok), "int8 must accept {ok}");
+        }
+        for bad in ["-129", "-200", "-255", "-256", "128"] {
+            assert!(!is_valid(&i8_ty, bad), "int8 must refuse {bad}");
+        }
+
+        let i24: DynSolType = "int24".parse().unwrap();
+        assert!(is_valid(&i24, "-8388608"));
+        assert!(!is_valid(&i24, "-8388609"));
+
+        // The full width has no narrowing to do.
+        let i256: DynSolType = "int256".parse().unwrap();
+        assert!(is_valid(&i256, "-1"));
+
+        // And the check reaches leaves nested inside compounds.
+        let arr: DynSolType = "int8[]".parse().unwrap();
+        assert!(is_valid(&arr, "[-128, 127]"));
+        assert!(!is_valid(&arr, "[1, -129]"));
     }
 }

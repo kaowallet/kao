@@ -920,6 +920,9 @@ pub struct TxBuilderApp {
 
     // ── templates ──
     templates: Vec<Template>,
+    /// Whether [`Self::templates`] is everything the store holds. `false` when
+    /// the load couldn't decode some rows — see [`Self::set_templates`].
+    templates_complete: bool,
     template_menu_open: bool,
     /// Index of the template currently being renamed inline, plus the edit
     /// buffer; `None` when no rename is in flight.
@@ -986,6 +989,7 @@ impl TxBuilderApp {
             sim_busy: false,
             sim_seq: 0,
             templates: Vec::new(),
+            templates_complete: true,
             template_menu_open: false,
             rename_idx: None,
             rename_buf: String::new(),
@@ -998,8 +1002,22 @@ impl TxBuilderApp {
     }
 
     /// Adopt the user's saved templates (loaded from redb by the coordinator).
-    pub fn set_templates(&mut self, templates: Vec<Template>) {
-        self.templates = templates;
+    pub fn set_templates(&mut self, loaded: crate::txbuilder::templates::Loaded) {
+        // A load that lost rows makes the list on screen a *subset* of the
+        // store, and `templates::save` is a wipe-and-reinsert — so persisting
+        // it would delete the rows that didn't decode. Latch that here and
+        // refuse to persist rather than silently narrowing the store on the
+        // next rename or save.
+        self.templates_complete = loaded.is_complete();
+        self.templates = loaded.templates;
+        if !self.templates_complete {
+            self.error = Some(
+                "Some saved templates were written by a different version of Kao and can't be \
+                 read. They're still on disk, so saving templates is off this session — nothing \
+                 will overwrite them."
+                    .into(),
+            );
+        }
     }
 
     /// The active network the coordinator should resolve / simulate / broadcast
@@ -1858,7 +1876,7 @@ impl TxBuilderApp {
                     );
                     self.templates.push(t);
                     self.template_menu_open = true;
-                    return Some(self.persist(rollback));
+                    return self.persist(rollback);
                 }
             }
             Message::DeleteTemplate(i) => {
@@ -1866,7 +1884,7 @@ impl TxBuilderApp {
                     self.cancel_rename();
                     let rollback = self.templates.clone();
                     self.templates.remove(i);
-                    return Some(self.persist(rollback));
+                    return self.persist(rollback);
                 }
             }
             Message::StartRename(i) => {
@@ -3029,16 +3047,29 @@ impl TxBuilderApp {
         let t = self.templates.get_mut(idx)?;
         t.name = name;
         self.cancel_rename();
-        Some(self.persist(rollback))
+        self.persist(rollback)
     }
 
     /// Ask the coordinator to write the template list, handing it the
     /// pre-mutation snapshot to restore if the write fails.
-    fn persist(&self, rollback: Vec<Template>) -> Outcome {
-        Outcome::PersistTemplates {
+    ///
+    /// `None` — writing nothing at all — when the load that produced this list
+    /// dropped rows. The store is written by wipe-and-reinsert, so a partial
+    /// list is not a partial write: every row missing from it is deleted. The
+    /// in-memory edit still stands for the session; only the disk write is
+    /// withheld. The `rollback` snapshot can't help here, because the write
+    /// would *succeed* — it is the wrong content, not a failed commit.
+    fn persist(&self, rollback: Vec<Template>) -> Option<Outcome> {
+        if !self.templates_complete {
+            tracing::warn!(
+                "templates: write refused — the loaded list is missing undecodable rows"
+            );
+            return None;
+        }
+        Some(Outcome::PersistTemplates {
             list: self.templates.clone(),
             rollback,
-        }
+        })
     }
 
     /// Dismiss the JSON overlay and drop what was in it. `Close` never cleared
@@ -6033,6 +6064,61 @@ mod tests {
             other => panic!("expected PersistTemplates, got {other:?}"),
         }
         assert!(app.templates.is_empty());
+    }
+
+    /// The write is withheld entirely when the list on screen is a subset of
+    /// the store. `templates::save` wipes and reinserts, so a partial list is
+    /// not a partial write — every row missing from it is deleted. The
+    /// in-memory edit still stands for the session; only the disk write goes.
+    #[test]
+    fn a_lossy_template_load_disables_every_write() {
+        let mut app = safe_app();
+        app.set_templates(crate::txbuilder::templates::Loaded {
+            templates: vec![template_named("survivor")],
+            dropped: 1,
+        });
+        assert!(
+            app.error.is_some(),
+            "and the user is told why saving went quiet",
+        );
+
+        // Save, rename and delete all funnel through `persist`, so all three
+        // must stay off disk.
+        app.batch = sample_batch(&mut app.next_id, app.owner);
+        assert!(
+            app.update(Message::SaveTemplate).is_none(),
+            "saving a new template must not rewrite the table",
+        );
+        assert!(
+            app.update(Message::DeleteTemplate(0)).is_none(),
+            "deleting must not rewrite the table",
+        );
+        app.update(Message::StartRename(0));
+        app.update(Message::RenameChanged("renamed".into()));
+        assert!(
+            app.update(Message::CommitRename).is_none(),
+            "renaming must not rewrite the table",
+        );
+    }
+
+    /// The complete case still writes — the gate must not be a blanket refusal.
+    #[test]
+    fn a_clean_template_load_still_writes() {
+        let mut app = safe_app();
+        app.set_templates(crate::txbuilder::templates::Loaded {
+            templates: vec![template_named("survivor")],
+            dropped: 0,
+        });
+        assert!(app.error.is_none());
+        app.batch = sample_batch(&mut app.next_id, app.owner);
+        assert!(matches!(
+            app.update(Message::SaveTemplate),
+            Some(Outcome::PersistTemplates { .. })
+        ));
+    }
+
+    fn template_named(name: &str) -> Template {
+        Template::from_batch(name, "(°ᴗ°)", Chain::Mainnet, SAFE, &[])
     }
 
     #[test]

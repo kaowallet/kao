@@ -148,40 +148,78 @@ pub fn db_path() -> PathBuf {
     crate::paths::data_dir().join("templates.redb")
 }
 
-/// Load every saved template, in insertion order. Tolerant: a missing file,
-/// missing table, or an undecodable row collapses to an empty/partial list
-/// rather than an error — templates are a convenience, never load-blocking.
-pub fn load() -> Vec<Template> {
+/// The outcome of a load: the rows that decoded, and how many didn't.
+///
+/// `dropped` exists because [`save`] is a wipe-and-reinsert, so persisting a
+/// list that silently lost rows deletes those rows for good. A load that was
+/// not complete must therefore disable saving rather than quietly narrow the
+/// store on the next edit — the same rule the contacts book follows, for the
+/// same reason.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Loaded {
+    pub templates: Vec<Template>,
+    /// Rows present on disk that no known layout could decode.
+    pub dropped: usize,
+}
+
+impl Loaded {
+    /// Whether what's in `templates` is everything that is on disk.
+    pub fn is_complete(&self) -> bool {
+        self.dropped == 0
+    }
+}
+
+/// Load every saved template, in insertion order.
+///
+/// Tolerant of a missing file or table — templates are a convenience and must
+/// never block the app. An **undecodable row** is different: it is reported via
+/// [`Loaded::dropped`] rather than passed over in silence, because the row is
+/// still on disk and the next save would delete it.
+pub fn load() -> Loaded {
     load_from(&db_path())
 }
 
-fn load_from(path: &PathBuf) -> Vec<Template> {
+fn load_from(path: &PathBuf) -> Loaded {
     let db = match Database::open(path) {
         Ok(db) => db,
-        Err(_) => return Vec::new(), // no file yet, or unreadable — start empty
+        Err(_) => return Loaded::default(), // no file yet, or unreadable — start empty
     };
     let Ok(txn) = db.begin_read() else {
-        return Vec::new();
+        return Loaded::default();
     };
     let tbl = match txn.open_table(TEMPLATES_TABLE) {
         Ok(t) => t,
-        Err(_) => return Vec::new(),
+        Err(_) => return Loaded::default(),
     };
     let Ok(iter) = tbl.iter() else {
-        return Vec::new();
+        return Loaded::default();
     };
     let mut rows: Vec<(u32, Template)> = Vec::new();
+    let mut dropped = 0usize;
     for entry in iter.flatten() {
         let (k, v) = entry;
-        if let Ok(mut t) = postcard::from_bytes::<Template>(v.value()) {
-            // `chain_id` is not on disk (see the field's note) — recover it
-            // from the bundle the row does carry.
-            t.hydrate_chain();
-            rows.push((k.value(), t));
+        match postcard::from_bytes::<Template>(v.value()) {
+            Ok(mut t) => {
+                // `chain_id` is not on disk (see the field's note) — recover it
+                // from the bundle the row does carry.
+                t.hydrate_chain();
+                rows.push((k.value(), t));
+            }
+            // Counted, not swallowed. Postcard is positional, so this is what a
+            // row written by a build with a different `Template` shape looks
+            // like — and the row is still there. Reporting it is what stops the
+            // next save from wiping it.
+            Err(e) => {
+                tracing::warn!(row = k.value(), error = %e, "templates: undecodable row");
+                dropped += 1;
+            }
         }
     }
     rows.sort_by_key(|(i, _)| *i);
-    rows.into_iter().map(|(_, t)| t).collect()
+    Loaded {
+        templates: rows.into_iter().map(|(_, t)| t).collect(),
+        dropped,
+    }
 }
 
 /// Persist the full template list, replacing whatever was there. Wipe + insert
@@ -281,6 +319,39 @@ mod tests {
         )
     }
 
+    /// A row this build cannot decode is *reported*, not passed over.
+    ///
+    /// This is what a template written by a build with a different `Template`
+    /// shape looks like — postcard is positional, so an added field makes every
+    /// older row short. The row is still on disk, and `save` is a
+    /// wipe-and-reinsert, so a load that quietly returned the survivors would
+    /// have the next rename or delete erase the rest.
+    #[test]
+    fn an_undecodable_row_is_counted_not_swallowed() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("templates.redb");
+        save_to(&path, &[sample_template("keeper")]).unwrap();
+
+        // Plant a row no `Template` shape can read, at a fresh index.
+        {
+            let db = Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut tbl = txn.open_table(TEMPLATES_TABLE).unwrap();
+                tbl.insert(1u32, [0xffu8, 0xff, 0xff].as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let loaded = load_from(&path);
+        assert_eq!(loaded.templates.len(), 1, "the good row still loads");
+        assert_eq!(loaded.dropped, 1, "and the bad one is reported");
+        assert!(
+            !loaded.is_complete(),
+            "so the caller can refuse to write over what it couldn't read",
+        );
+    }
+
     #[test]
     fn save_load_round_trip_and_overwrite() {
         let dir = tempdir().unwrap();
@@ -289,18 +360,23 @@ mod tests {
         let a = vec![sample_template("one"), sample_template("two")];
         save_to(&path, &a).unwrap();
         let back = load_from(&path);
-        assert_eq!(back, a);
+        assert_eq!(back.templates, a);
+        assert!(back.is_complete());
 
         // A smaller list drops removed rows.
         let small = vec![a[0].clone()];
         save_to(&path, &small).unwrap();
-        assert_eq!(load_from(&path), small);
+        assert_eq!(load_from(&path).templates, small);
     }
 
     #[test]
     fn load_missing_file_is_empty() {
         let dir = tempdir().unwrap();
-        assert!(load_from(&dir.path().join("nope.redb")).is_empty());
+        assert!(
+            load_from(&dir.path().join("nope.redb"))
+                .templates
+                .is_empty()
+        );
     }
 
     #[test]
@@ -390,7 +466,7 @@ mod tests {
             &sample_calls(),
         );
         save_to(&path, std::slice::from_ref(&t)).unwrap();
-        let back = load_from(&path);
+        let back = load_from(&path).templates;
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].chain(), Some(Chain::Base));
         assert_eq!(back[0], t, "hydration restores the skipped field exactly");

@@ -2240,7 +2240,13 @@ impl WalletScreen {
                     // and a rename that never reached disk looked like it had.
                     warn!(error = %e, "tx-builder: failed to persist templates");
                     let pane = self.apps.txbuilder_pane();
-                    pane.set_templates(rollback);
+                    // Complete by construction: `persist` only emits this
+                    // outcome when the loaded list was whole, so its
+                    // pre-mutation snapshot is whole too.
+                    pane.set_templates(crate::txbuilder::templates::Loaded {
+                        templates: rollback,
+                        dropped: 0,
+                    });
                     pane.set_error(format!(
                         "Couldn't save your templates: {e}. The list has been put back the way \
                          it was — nothing changed on disk."
@@ -16392,7 +16398,9 @@ mod tests {
         req.prepared = Some((0, B256::ZERO));
         req.queued_nonces = None;
         let mut s = screen_with_txbuilder_preflight(req, true, PASSED_CLEAN);
-        s.apps.txbuilder_pane().set_templates(Vec::new());
+        s.apps
+            .txbuilder_pane()
+            .set_templates(crate::txbuilder::templates::Loaded::default());
 
         // Propose (the secondary action) is refused with a reason.
         let _ = s.dispatch_txbuilder(false);
@@ -16422,7 +16430,9 @@ mod tests {
         req.prepared = Some((0, B256::ZERO));
         req.queued_nonces = Some(Vec::new());
         let mut s = screen_with_txbuilder_preflight(req, true, PASSED_CLEAN);
-        s.apps.txbuilder_pane().set_templates(Vec::new());
+        s.apps
+            .txbuilder_pane()
+            .set_templates(crate::txbuilder::templates::Loaded::default());
         let _ = s.dispatch_txbuilder(false);
         assert!(
             s.sign_review
@@ -16554,7 +16564,9 @@ mod tests {
         let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
         let mut s =
             screen_with_txbuilder_preflight(safe_batch_req(&calls, 1, vec![0]), true, PASSED_CLEAN);
-        s.apps.txbuilder_pane().set_templates(Vec::new());
+        s.apps
+            .txbuilder_pane()
+            .set_templates(crate::txbuilder::templates::Loaded::default());
 
         let hash = B256::repeat_byte(0x7A);
         s.update(Message::TxBuilderMined {
@@ -16582,7 +16594,9 @@ mod tests {
             let mut req = safe_batch_req(&calls, 1, vec![0]);
             req.prepared = Some((0, B256::ZERO));
             let mut s = screen_with_txbuilder_preflight(req, true, PASSED_CLEAN);
-            s.apps.txbuilder_pane().set_templates(Vec::new());
+            s.apps
+                .txbuilder_pane()
+                .set_templates(crate::txbuilder::templates::Loaded::default());
             s
         };
 
@@ -16634,7 +16648,9 @@ mod tests {
         let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
         let mut s =
             screen_with_txbuilder_preflight(safe_batch_req(&calls, 1, vec![0]), true, PASSED_CLEAN);
-        s.apps.txbuilder_pane().set_templates(Vec::new());
+        s.apps
+            .txbuilder_pane()
+            .set_templates(crate::txbuilder::templates::Loaded::default());
         let hash = B256::repeat_byte(0x7A);
         s.update(Message::TxBuilderMined {
             hash,
@@ -16656,7 +16672,9 @@ mod tests {
         let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
         let mut s =
             screen_with_txbuilder_preflight(safe_batch_req(&calls, 1, vec![0]), true, PASSED_CLEAN);
-        s.apps.txbuilder_pane().set_templates(Vec::new());
+        s.apps
+            .txbuilder_pane()
+            .set_templates(crate::txbuilder::templates::Loaded::default());
         let hash = B256::repeat_byte(0x7A);
         s.update(Message::TxBuilderMined {
             hash,

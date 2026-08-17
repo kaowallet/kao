@@ -165,20 +165,40 @@ pub fn encoded_preview(ty: &DynSolType, raw: &str) -> Option<String> {
 /// wrong about the units and wrong about the decimals (a bare `1.5` *is*
 /// refused; `2.5 gwei` is not). The field annotates the number that actually
 /// gets encoded — see [`encoded_preview`].
+/// Arrays and tuples are tested **first**, and that ordering is the point. The
+/// scalar arms below are prefix tests, so `uint256[]` used to match the integer
+/// arm and `bytes32[]` the bytes arm — each field then advertised the grammar of
+/// its *element* as if it were the grammar of the whole value, with nothing on
+/// screen anywhere saying a list is written `[a, b]`. The encoder has always
+/// accepted the composite syntax (`coerce_str` parses it); only the hint was
+/// missing, so the whole type surface was unreachable in practice.
 pub fn type_hint(ty_str: &str) -> String {
-    if ty_str == "address" {
-        "0x… (20-byte address)".into()
-    } else if ty_str == "bool" {
-        "true / false".into()
-    } else if ty_str.starts_with("uint") || ty_str.starts_with("int") {
-        "base units — 1e18 / 1 gwei / 1 ether / 0x10 also parse".into()
-    } else if ty_str.starts_with("bytes") {
-        "0x… hex".into()
-    } else if ty_str == "string" {
-        "text".into()
-    } else {
-        ty_str.into()
+    if let Some(elem) = array_element(ty_str) {
+        return format!("[{elem}, {elem}] — comma-separated in brackets, [] for none");
     }
+    if ty_str.starts_with('(') {
+        return "(a, b) — comma-separated in parens, in declaration order".into();
+    }
+    match ty_str {
+        "address" => "0x… (20-byte address)".into(),
+        "bool" => "true / false".into(),
+        "string" => "text — \"\" for empty".into(),
+        "bytes" => "0x… hex — 0x for empty".into(),
+        _ if ty_str.starts_with("uint") || ty_str.starts_with("int") => {
+            "base units — 1e18 / 1 gwei / 1 ether / 0x10 also parse".into()
+        }
+        _ if ty_str.starts_with("bytes") => "0x… hex".into(),
+        _ => ty_str.into(),
+    }
+}
+
+/// The element type of an array type string: `uint256[]` and `uint256[3]` both
+/// yield `uint256`, `(address,uint256)[]` yields the tuple. `None` when the
+/// type isn't an array. Strips one level, so a nested `uint256[][]` describes
+/// itself as a list of `uint256[]` — which is what the outer field takes.
+fn array_element(ty: &str) -> Option<&str> {
+    let open = ty.strip_suffix(']')?.rfind('[')?;
+    Some(&ty[..open])
 }
 
 /// Parse a wei value string — decimal or `0x`-prefixed hex.
@@ -647,6 +667,52 @@ mod tests {
         let ty: DynSolType = "uint256".parse().unwrap();
         assert!(is_valid(&ty, "2.5 gwei"));
         assert!(!is_valid(&ty, "1.5"), "a bare fraction really is refused");
+    }
+
+    /// The bug this replaced: the scalar arms are prefix tests, so an array
+    /// took its *element's* hint. `uint256[]` advertised "base units — 1e18 …"
+    /// and `bytes32[]` advertised "0x… hex", each describing one item of a list
+    /// the field actually wants written `[a, b]`.
+    #[test]
+    fn a_list_is_not_hinted_as_one_of_its_items() {
+        for ty in ["uint256[]", "bytes32[]", "address[]", "uint8[3]"] {
+            let hint = type_hint(ty);
+            assert!(hint.starts_with('['), "{ty} → {hint}");
+            assert!(hint.contains("[] for none"), "{ty} → {hint}");
+        }
+        // Specifically not the scalar hints they used to inherit.
+        assert!(!type_hint("uint256[]").contains("base units"));
+        assert!(!type_hint("bytes32[]").starts_with("0x…"));
+        // Tuples get the syntax they need too.
+        let tup = type_hint("(address,uint256)");
+        assert!(tup.starts_with('('), "{tup}");
+    }
+
+    /// The hints have to describe a grammar the encoder actually accepts —
+    /// otherwise they're a new way to be wrong. Each composite hint is checked
+    /// against a value written the way it says.
+    #[test]
+    fn every_hinted_shape_actually_coerces() {
+        let addr = CHECKSUMMED;
+        for (ty_str, value) in [
+            ("uint256[]", "[1, 2]"),
+            ("uint256[]", "[]"),
+            ("address[]", &format!("[{addr}, {addr}]")[..]),
+            ("uint8[3]", "[1, 2, 3]"),
+            ("(address,uint256)", &format!("({addr}, 5)")[..]),
+            ("bytes", "0x"),
+            ("string", ""),
+        ] {
+            let ty: DynSolType = ty_str.parse().unwrap();
+            // `string`'s empty case is the one exception: an empty field reads
+            // as "not filled in" everywhere else, so `coerce_param` refuses it
+            // and the hint says `""` rather than nothing at all.
+            if value.is_empty() {
+                assert!(type_hint(ty_str).contains("\"\""), "{ty_str}");
+                continue;
+            }
+            assert!(is_valid(&ty, value), "{ty_str} should accept {value}");
+        }
     }
 
     #[test]

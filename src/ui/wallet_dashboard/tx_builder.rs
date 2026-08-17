@@ -515,6 +515,39 @@ pub const PREFLIGHT_STALE_AFTER: std::time::Duration = std::time::Duration::from
 /// half-typed and starts being an answer worth contradicting.
 const ADDRESS_TEXT_LEN: usize = 42;
 
+/// How the simulator's step indices map back onto the queue's own numbering.
+///
+/// The simulator enumerates the *effective* calls — the queue plus whatever
+/// flash approval wrapped around it — while the queue cards are numbered over
+/// `batch` alone. With the wrap on, the prepended resets shift every position,
+/// so a bare `step + 1` names a call the user cannot see, inspect or remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct QueueMap {
+    /// Synthetic allowance resets inserted ahead of the queue. Zero when flash
+    /// approval isn't wrapping this batch, which makes the mapping the identity.
+    pub prepends: usize,
+    /// How many calls the user actually queued.
+    pub queued: usize,
+}
+
+/// Name the effective-call at `step` in terms the user can point at.
+///
+/// Free and pure so both the composer (which has the pane) and the
+/// execute-time preflight (which runs in a spawned task and has only a
+/// [`QueueMap`]) phrase the same failure the same way.
+pub fn describe_effective_step(step: usize, map: QueueMap) -> String {
+    if map.prepends == 0 {
+        return format!("call #{}", step + 1);
+    }
+    if step < map.prepends {
+        "the allowance reset flash approval runs before the batch".to_string()
+    } else if step < map.prepends + map.queued {
+        format!("call #{}", step - map.prepends + 1)
+    } else {
+        "the approval revoke flash approval runs after the batch".to_string()
+    }
+}
+
 /// Which address field a name lookup belongs to.
 ///
 /// The Builder has four surfaces that take an address, and all four can now
@@ -710,6 +743,9 @@ pub enum Outcome {
     /// selected network to build the request.
     Review {
         calls: Vec<QueuedCall>,
+        /// How `calls` (the *effective* list) maps back onto the queue the user
+        /// sees, so an execute-time abort names a call they can point at.
+        queue_map: QueueMap,
         /// What the preflight found, carried across so the overlay's confirm
         /// button can't read as a routine "sign this" over a batch the user
         /// just watched revert.
@@ -1843,6 +1879,7 @@ impl TxBuilderApp {
                 };
                 return Some(Outcome::Review {
                     calls,
+                    queue_map: self.queue_map(),
                     preflight: self.preflight(),
                     // Same `self.sim` the verdict above was derived from.
                     sim: self.sim.clone().map(Box::new),
@@ -2467,17 +2504,21 @@ impl TxBuilderApp {
     /// see, inspect or remove, and the prepended resets shift *every* queue
     /// position, so the mismatch is no longer just off the end.
     fn describe_step(&self, step: usize) -> String {
-        if !self.flash_wrapped() {
-            return format!("call #{}", step + 1);
-        }
-        let opens = flash_approval::prepend_count(&self.batch);
-        let queued = self.batch.len();
-        if step < opens {
-            "the allowance reset flash approval runs before the batch".to_string()
-        } else if step < opens + queued {
-            format!("call #{}", step - opens + 1)
-        } else {
-            "the approval revoke flash approval runs after the batch".to_string()
+        describe_effective_step(step, self.queue_map())
+    }
+
+    /// How the effective-call list maps back onto the queue the user can see.
+    /// Carried into the sign request so the execute-time preflight — which runs
+    /// in a spawned task with no pane to ask — can name a failing call the same
+    /// way the composer does.
+    pub fn queue_map(&self) -> QueueMap {
+        QueueMap {
+            prepends: if self.flash_wrapped() {
+                flash_approval::prepend_count(&self.batch)
+            } else {
+                0
+            },
+            queued: self.batch.len(),
         }
     }
 
@@ -2820,6 +2861,11 @@ impl TxBuilderApp {
                 self.error = None;
                 Some(Outcome::Review {
                     calls: vec![call],
+                    // One call, never flash-wrapped: the identity mapping.
+                    queue_map: QueueMap {
+                        prepends: 0,
+                        queued: 1,
+                    },
                     // This path only exists on custom networks, where there is
                     // no simulator to have run.
                     preflight: Preflight::Unsupported,
@@ -3107,6 +3153,8 @@ pub enum BatchSignRequest {
 /// exactly what was shown.
 #[derive(Debug, Clone)]
 pub struct SafeBatchRequest {
+    /// Queue numbering for the calls packed into `input`. See [`QueueMap`].
+    pub queue_map: QueueMap,
     pub safe: Address,
     pub chain: Chain,
     pub version: String,
@@ -3156,6 +3204,9 @@ pub struct SafeBatchRequest {
 /// not decide it a second time.
 #[derive(Debug, Clone)]
 pub struct EoaBatchRequest {
+    /// Queue numbering for `calls`, so an abort can name a failing call the
+    /// way the composer's cards do. See [`QueueMap`].
+    pub queue_map: QueueMap,
     /// The network to broadcast on. A [`NetworkId`] so the same request shape
     /// covers a built-in chain and a user-defined custom network (single call
     /// only on custom — atomic batching is built-in-chains only).

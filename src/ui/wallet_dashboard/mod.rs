@@ -2228,10 +2228,17 @@ impl WalletScreen {
             }
             O::Review {
                 calls,
+                queue_map,
                 preflight,
                 sim,
                 fee_caveats,
-            } => self.open_txbuilder_review(calls, preflight, sim.map(|s| *s), fee_caveats),
+            } => self.open_txbuilder_review(
+                calls,
+                queue_map,
+                preflight,
+                sim.map(|s| *s),
+                fee_caveats,
+            ),
             O::PersistTemplates { list, rollback } => {
                 if let Err(e) = crate::txbuilder::templates::save(&list) {
                     // The pane already applied the change optimistically. Put
@@ -2262,6 +2269,7 @@ impl WalletScreen {
     fn open_txbuilder_review(
         &mut self,
         calls: Vec<crate::txbuilder::QueuedCall>,
+        queue_map: tx_builder::QueueMap,
         preflight: tx_builder::Preflight,
         sim: Option<crate::txbuilder::sim::BatchSimResult>,
         fee_caveats: Vec<String>,
@@ -2269,7 +2277,7 @@ impl WalletScreen {
         if self.sign_review.is_some() || calls.is_empty() {
             return Task::none();
         }
-        let req = match self.build_txbuilder_request(&calls) {
+        let req = match self.build_txbuilder_request(&calls, queue_map) {
             Ok(r) => r,
             Err(e) => {
                 // Drive the reason onto the pane the user is looking at. A bare
@@ -2606,6 +2614,7 @@ impl WalletScreen {
     fn build_txbuilder_request(
         &self,
         calls: &[crate::txbuilder::QueuedCall],
+        queue_map: tx_builder::QueueMap,
     ) -> Result<tx_builder::BatchSignRequest, String> {
         match self.active_safe_descriptor() {
             Some(d) => {
@@ -2652,6 +2661,7 @@ impl WalletScreen {
                         owner_count: d.owners.len(),
                         signable_indices,
                         input,
+                        queue_map,
                         call_count: calls.len(),
                         prepared: None,
                         // `None` when this wallet has not actually established
@@ -2704,6 +2714,7 @@ impl WalletScreen {
                         net,
                         from: self.address,
                         calls: calls.to_vec(),
+                        queue_map,
                         // Filled in from the prepared Delegation card; a
                         // multi-call dispatch with this still `None` is refused.
                         prepared: None,
@@ -7946,7 +7957,7 @@ async fn execute_txbuilder_safe_batch(
                     decoded_args: Vec::new(),
                 })
                 .collect::<Vec<_>>();
-            preflight_before_signing(&network, chain, sreq.safe, &inner).await?;
+            preflight_before_signing(&network, chain, sreq.safe, &inner, sreq.queue_map).await?;
             let provider = match network.provider(chain).await {
                 Some(p) => p,
                 None => return Err("no execution RPCs configured".into()),
@@ -8039,6 +8050,7 @@ async fn preflight_before_signing(
     chain: Chain,
     from: Address,
     calls: &[crate::txbuilder::QueuedCall],
+    queue_map: tx_builder::QueueMap,
 ) -> Result<(), String> {
     use crate::wallet::sim::BatchOutcome;
     if calls.is_empty() {
@@ -8056,11 +8068,15 @@ async fn preflight_before_signing(
     match result.outcome {
         BatchOutcome::Revert { step, reason } | BatchOutcome::Halt { step, reason } => {
             warn!(step, reason = %reason, "tx-builder: execute-time preflight failed — aborting before any signature");
+            // Named in the *queue's* numbering, not the simulator's. The two
+            // differ whenever flash approval wrapped the batch: its prepended
+            // resets shift every position, so a bare `step + 1` pointed at a
+            // call the user cannot see, inspect or remove.
             Err(format!(
-                "This batch reverts against the chain as it stands right now, at call #{}: \
+                "This batch reverts against the chain as it stands right now, at {}: \
                  {reason}. Nothing has been signed. Go back and re-simulate — the state it was \
                  composed against has moved.",
-                step + 1,
+                tx_builder::describe_effective_step(step, queue_map),
             ))
         }
         BatchOutcome::Error(reason) => {
@@ -8172,7 +8188,8 @@ fn spawn_txbuilder_eoa_send(
             // verified state to simulate against and are skipped, matching the
             // `Preflight::Unsupported` the review shows for them.
             if let Some(chain) = ereq.net.builtin() {
-                preflight_before_signing(&network, chain, ereq.from, &ereq.calls).await?;
+                preflight_before_signing(&network, chain, ereq.from, &ereq.calls, ereq.queue_map)
+                    .await?;
             }
             // Not gated on the chain being built-in: a balance and a fee
             // estimate come off the provider, not off verified state, so a
@@ -14688,6 +14705,7 @@ mod tests {
         let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
         let _ = s.open_txbuilder_review(
             calls,
+            tx_builder::QueueMap::default(),
             tx_builder::Preflight::Passed {
                 stale: true,
                 verified: true,
@@ -14713,6 +14731,7 @@ mod tests {
         let calls = vec![queued(1, addr(0xC1), 250_000_000_000_000_000, vec![0x01])];
         let _ = s.open_txbuilder_review(
             calls,
+            tx_builder::QueueMap::default(),
             PASSED_CLEAN,
             Some(sim_ok(Vec::new(), 21_000)),
             vec!["excludes the priority tip".to_string()],
@@ -14747,6 +14766,10 @@ mod tests {
             owner_count: 3,
             signable_indices: signable,
             input: multisend::build_multisend_input(calls, "1.4.1").expect("multisend wrapper"),
+            queue_map: tx_builder::QueueMap {
+                prepends: 0,
+                queued: calls.len(),
+            },
             call_count: calls.len(),
             prepared: None,
             queued_nonces: Some(Vec::new()),
@@ -14761,6 +14784,10 @@ mod tests {
         tx_builder::EoaBatchRequest {
             net,
             from: addr(0xE0),
+            queue_map: tx_builder::QueueMap {
+                prepends: 0,
+                queued: calls.len(),
+            },
             calls,
             prepared: None,
         }
@@ -15685,7 +15712,13 @@ mod tests {
             queued(1, addr(0xC1), 0, vec![0x01]),
             queued(2, addr(0xC2), 0, vec![0x02]),
         ];
-        let _ = s.open_txbuilder_review(calls, PASSED_CLEAN, None, Vec::new());
+        let _ = s.open_txbuilder_review(
+            calls,
+            tx_builder::QueueMap::default(),
+            PASSED_CLEAN,
+            None,
+            Vec::new(),
+        );
         assert!(s.sign_review.is_none(), "no overlay opened");
         let err = s
             .apps
@@ -15702,6 +15735,7 @@ mod tests {
         let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
         let _ = s.open_txbuilder_review(
             calls,
+            tx_builder::QueueMap::default(),
             tx_builder::Preflight::Fails {
                 at: "call #1".to_string(),
                 reason: "reverted".into(),
@@ -15987,14 +16021,65 @@ mod tests {
             true,
         );
         let network: Arc<dyn BalanceFetcher> = Arc::new(mock);
-        let err = preflight_before_signing(&network, Chain::Mainnet, addr(0x5A), &calls)
-            .await
-            .expect_err("a reverting batch must not reach a device");
+        let err = preflight_before_signing(
+            &network,
+            Chain::Mainnet,
+            addr(0x5A),
+            &calls,
+            tx_builder::QueueMap::default(),
+        )
+        .await
+        .expect_err("a reverting batch must not reach a device");
         assert!(
             err.contains("reverts against the chain as it stands"),
             "{err}"
         );
         assert!(err.contains("Nothing has been signed"), "{err}");
+    }
+
+    /// A revert is named in the numbering on the user's screen, not the
+    /// simulator's.
+    ///
+    /// Flash approval prepends an allowance reset per granted pair, so the
+    /// effective list the simulator walks is offset from the queue cards. A
+    /// bare `step + 1` therefore pointed at a call the user cannot see, inspect
+    /// or remove — and off by exactly the number of synthetic resets, which is
+    /// invisible from the message.
+    #[tokio::test]
+    async fn a_revert_is_named_in_the_queues_own_numbering() {
+        // The list handed to the preflight is the *effective* one: two
+        // synthetic allowance resets, then the two calls the user queued. The
+        // reverting one is queue position 2 — effective step 3.
+        let calls = vec![
+            queued(1, addr(0xA1), 0, vec![0x01]), // reset (synthetic)
+            queued(2, addr(0xA2), 0, vec![0x02]), // reset (synthetic)
+            queued(3, addr(0xC1), 0, vec![0x03]), // queued call #1
+            queued(4, addr(0xC2), 0, vec![0x04]), // queued call #2 — reverts
+        ];
+        let mock = CallMock::new();
+        mock.set_code(
+            addr(0xC2),
+            Bytes::from(vec![0x60, 0x00, 0x60, 0x00, 0xfd]),
+            true,
+        );
+        let network: Arc<dyn BalanceFetcher> = Arc::new(mock);
+        let err = preflight_before_signing(
+            &network,
+            Chain::Mainnet,
+            addr(0x5A),
+            &calls,
+            tx_builder::QueueMap {
+                prepends: 2,
+                queued: 2,
+            },
+        )
+        .await
+        .expect_err("the second call reverts");
+        assert!(
+            err.contains("call #2"),
+            "the second *queued* call, not the fourth effective step: {err}",
+        );
+        assert!(!err.contains("call #4"), "{err}");
     }
 
     /// The other expensive failure, and the one nothing upstream catches. A
@@ -16015,9 +16100,15 @@ mod tests {
         // metering 30M of real revm execution: it is the same comparison.
         mock.set_block_gas_limit(21_000);
         let network: Arc<dyn BalanceFetcher> = Arc::new(mock);
-        let err = preflight_before_signing(&network, Chain::Mainnet, addr(0x5A), &calls)
-            .await
-            .expect_err("an unmineable batch must not reach a device");
+        let err = preflight_before_signing(
+            &network,
+            Chain::Mainnet,
+            addr(0x5A),
+            &calls,
+            tx_builder::QueueMap::default(),
+        )
+        .await
+        .expect_err("an unmineable batch must not reach a device");
         assert!(err.contains("no block can include it"), "{err}");
         assert!(err.contains("Nothing has been signed"), "{err}");
         // The remedy has to be the one that works. Re-simulating produces this
@@ -16041,9 +16132,15 @@ mod tests {
         mock.set_block_verified(false);
         let network: Arc<dyn BalanceFetcher> = Arc::new(mock);
         assert!(
-            preflight_before_signing(&network, Chain::Mainnet, addr(0x5A), &calls)
-                .await
-                .is_ok(),
+            preflight_before_signing(
+                &network,
+                Chain::Mainnet,
+                addr(0x5A),
+                &calls,
+                tx_builder::QueueMap::default()
+            )
+            .await
+            .is_ok(),
             "an unverified ceiling is not a basis for refusing to sign",
         );
     }
@@ -16056,9 +16153,15 @@ mod tests {
         let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
         let network: Arc<dyn BalanceFetcher> = Arc::new(MockFetcher::new());
         assert!(
-            preflight_before_signing(&network, Chain::Mainnet, addr(0x5A), &calls)
-                .await
-                .is_ok(),
+            preflight_before_signing(
+                &network,
+                Chain::Mainnet,
+                addr(0x5A),
+                &calls,
+                tx_builder::QueueMap::default()
+            )
+            .await
+            .is_ok(),
             "an outage must not be mistaken for a verdict"
         );
     }
@@ -16067,9 +16170,15 @@ mod tests {
     async fn an_empty_batch_has_nothing_to_preflight() {
         let network: Arc<dyn BalanceFetcher> = Arc::new(MockFetcher::new());
         assert!(
-            preflight_before_signing(&network, Chain::Mainnet, addr(0x5A), &[])
-                .await
-                .is_ok()
+            preflight_before_signing(
+                &network,
+                Chain::Mainnet,
+                addr(0x5A),
+                &[],
+                tx_builder::QueueMap::default()
+            )
+            .await
+            .is_ok()
         );
     }
 

@@ -374,15 +374,39 @@ fn load_from(path: &Path, pw: &SecretString) -> Result<WalletDescriptor, WalletE
     })
 }
 
-/// Decode one decrypted Safe row, tolerating the pre-`tx_service_url`
-/// layout.
+/// Decode one decrypted Safe row, tolerating every layout ever persisted.
 ///
-/// Postcard isn't self-describing: appending a field to
-/// `SafeDescriptor` makes blobs written before the field one byte
-/// short, and a plain `from_bytes` would hard-fail the whole wallet
-/// load. Try the current shape first; on failure re-read as the legacy
-/// shape and default the new field. New fields MUST keep appending to
-/// the end of `SafeDescriptor` and extend the legacy fallback here.
+/// Postcard isn't self-describing: appending a field to `SafeDescriptor` makes
+/// blobs written before the field one or more bytes short, and a plain
+/// `from_bytes` would hard-fail the whole wallet load. So the shapes are tried
+/// **newest first**, and the first that decodes wins.
+///
+/// # Adding a field — read this before you do
+///
+/// The order is not a preference, it is the only correct one, and the reason is
+/// that `postcard::from_bytes` **ignores trailing bytes** (it has no
+/// "consumed the whole input" check; `take_from_bytes` is the one that reports
+/// a remainder). Two consequences, and they are asymmetric:
+///
+/// - A *longer* shape read from a *shorter* blob reliably errors: every
+///   appendable type — `Option`, `bool`, any integer varint, `String`, `Vec`,
+///   an enum discriminant — begins by popping at least one byte, and there is
+///   none left. That is what makes the fallback fire.
+/// - A *shorter* shape read from a *longer* blob **always succeeds**, silently
+///   discarding the trailing field.
+///
+/// So the procedure is: **snapshot the current shape as a new `LegacySafeVn`
+/// struct *before* appending the field, and add it to the chain below in
+/// newest-to-oldest order.** Never edit an existing rung, and never skip one.
+///
+/// Extending the newest rung in place instead — which the previous wording of
+/// this comment could be read as suggesting — is the failure this note exists
+/// to prevent: a row written with the field populated would fall past the
+/// current shape, decode through a rung that predates the field, and lose it
+/// with no error. That failure is also **value-dependent**: a row whose new
+/// field is `None`/default decodes "correctly" through the wrong rung, so a
+/// test fixture that leaves it empty will not catch it. Test the fallback with
+/// the field *populated* (see `decode_safe_never_loses_a_populated_field`).
 fn decode_safe(plaintext: &[u8], idx: u32) -> Result<SafeDescriptor, WalletError> {
     /// `SafeDescriptor` exactly as persisted before `tx_service_url`
     /// shipped. Field order/types must never change.
@@ -635,12 +659,40 @@ fn load_contacts_from(path: &Path, pw: &SecretString) -> Result<Vec<Contact>, Wa
         let idx = k.value();
         let aad = contact_aad(idx);
         let plaintext = decrypt_blob(master_key.as_slice(), &aad, v.value())?;
-        let contact: Contact = postcard::from_bytes(&plaintext)
-            .map_err(|e| WalletError::Encryption(format!("deserialize contact {idx}: {e}")))?;
-        entries.push((idx, contact));
+        entries.push((idx, decode_contact(&plaintext, idx)?));
     }
     entries.sort_by_key(|(i, _)| *i);
     Ok(entries.into_iter().map(|(_, c)| c).collect())
+}
+
+/// Decode one decrypted contact row, tolerating every layout ever persisted.
+///
+/// The counterpart of [`decode_safe`], and its doc comment is the one to read
+/// before adding a field — the rule, the reason, and the failure mode are
+/// identical. In short: **snapshot the current shape as a new rung before
+/// appending, try rungs newest-first, never edit or skip one.**
+///
+/// One thing here is *worse* than the Safe case and worth stating on its own.
+/// `Contact` nests `Option<ContactEns>`, so a field appended to `ContactEns`
+/// changes the bytes only for contacts that actually carry a name — a row with
+/// `ens: None` is byte-identical across the versions. A migration test built on
+/// a nameless fixture therefore passes without executing this fallback at all.
+/// Any test of a rung below has to use a contact whose `ens` is `Some`.
+///
+/// Postcard offers no way to resume mid-stream, so a rung must mirror the whole
+/// outer record even when only the nested type changed; there is no byte offset
+/// at which to restart at the `ens` boundary.
+fn decode_contact(plaintext: &[u8], idx: u32) -> Result<Contact, WalletError> {
+    if let Ok(contact) = postcard::from_bytes::<Contact>(plaintext) {
+        return Ok(contact);
+    }
+    // No rung below the current shape yet — `Contact` has not changed since it
+    // shipped. The indirection exists so the *first* field addition is a
+    // localized edit here rather than a change to the load loop, and so the
+    // rule above is stated somewhere the next person will look.
+    Err(WalletError::Encryption(format!(
+        "deserialize contact {idx}: no known layout matches this row"
+    )))
 }
 
 /// Persist the Privacy Pools mnemonic under the existing wallet's master key.
@@ -1378,6 +1430,60 @@ mod tests {
         let rich = rich_safe(0x42);
         let bytes = postcard::to_stdvec(&rich).unwrap();
         assert_eq!(decode_safe(&bytes, 1).unwrap(), rich);
+    }
+
+    /// The guard on the *next* field addition, and the one the fallback test
+    /// above cannot provide.
+    ///
+    /// `postcard::from_bytes` ignores trailing bytes, so a shape shorter than
+    /// the blob always decodes — silently dropping whatever it didn't read. A
+    /// future field appended without first snapshotting the current shape as a
+    /// new rung would therefore make every populated `tx_service_url` fall
+    /// through to `LegacySafeV1` and come back `None`, with no error anywhere.
+    ///
+    /// It is deliberately asserted on a **populated** URL: the existing
+    /// fallback test uses `minimal_safe`, whose `tx_service_url` is `None`, and
+    /// `None` decodes identically through the right rung and the wrong one. A
+    /// fixture that leaves the newest field empty cannot distinguish them.
+    #[test]
+    fn decode_safe_never_loses_a_populated_field() {
+        let rich = rich_safe(0x42);
+        assert!(
+            rich.tx_service_url.is_some(),
+            "the whole point is a populated newest field",
+        );
+        let bytes = postcard::to_stdvec(&rich).unwrap();
+        assert_eq!(
+            decode_safe(&bytes, 0).unwrap().tx_service_url,
+            rich.tx_service_url,
+            "the newest shape has to win over any legacy rung that also parses",
+        );
+
+        // And the mechanism behind that requirement, stated as a fact about the
+        // codec rather than about this struct: the legacy shape *does* accept
+        // the longer blob, so rung order is the only thing keeping it out.
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct ShorterThanCurrent {
+            name: Option<String>,
+            chain_id: u64,
+            address: [u8; 20],
+            version: String,
+            trust: crate::wallet::SafeTrust,
+            threshold: u32,
+            owners: Vec<[u8; 20]>,
+            modules: Vec<[u8; 20]>,
+            guard: Option<[u8; 20]>,
+            fallback_handler: Option<[u8; 20]>,
+            linked_signer_indices: Vec<u32>,
+            sibling_chains: Vec<u64>,
+            cached_at: u64,
+        }
+        assert!(
+            postcard::from_bytes::<ShorterThanCurrent>(&bytes).is_ok(),
+            "postcard ignores trailing bytes — a shorter rung will happily \
+             swallow a longer row, which is why rungs are tried newest first",
+        );
     }
 
     fn wallet_with_safes(safes: Vec<SafeDescriptor>) -> WalletDescriptor {

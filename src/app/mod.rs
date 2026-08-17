@@ -223,6 +223,21 @@ pub struct App {
     /// single-threaded, so the lock is always uncontested in practice;
     /// it exists to keep the type plumbing honest, not for contention.
     contacts: Arc<RwLock<ContactsBook>>,
+    /// Whether the contacts book on screen is the whole book on disk.
+    ///
+    /// `false` from unlock until a load succeeds, and permanently after one
+    /// fails. It gates saving, because the contacts table is written by
+    /// **wipe-and-reinsert**: persisting an in-memory book that is missing rows
+    /// deletes those rows for good.
+    ///
+    /// The path this closes is short and entirely silent. One row fails to
+    /// decode — a missed migration rung, a row written by a newer build, disk
+    /// bit-rot — and `load_contacts_from` fails the *whole* load. That error
+    /// used to reach nothing but a `warn!`, so the book stayed empty, the
+    /// unlock succeeded, and the Contacts pane rendered as though the user had
+    /// never saved anyone. Adding or deleting one contact then wrote that empty
+    /// book over every row. No error was shown at any point.
+    contacts_loaded: bool,
     /// Latest wallet-error toast, or `None` when nothing is on screen.
     /// Cleared by the auto-dismiss `Task::perform` spawned when the
     /// toast lands, or replaced by a newer error mid-lifetime.
@@ -289,6 +304,10 @@ impl App {
                 network,
                 portfolio_cache,
                 contacts,
+                // A wallet file exists, so contacts may exist too — nothing may
+                // be written over them until a load has said what they are.
+                // Flipped by `Message::ContactsLoaded`, which unlock dispatches.
+                contacts_loaded: false,
                 toast: None,
                 toast_gen: 0,
                 send_reconnect: None,
@@ -309,6 +328,11 @@ impl App {
                 network,
                 portfolio_cache,
                 contacts,
+                // No wallet file, so no contacts table: the empty book on
+                // screen *is* the whole book on disk. A fresh wallet never
+                // dispatches a contacts load (only unlock does), so starting
+                // this `false` would block the first contact from ever saving.
+                contacts_loaded: true,
                 toast: None,
                 toast_gen: 0,
                 send_reconnect: None,
@@ -1675,6 +1699,22 @@ impl App {
                         self.request_send_reconnect(nav, open_send)
                     }
                     Some(WalletDashboardOutcome::SaveContacts(new_contacts)) => {
+                        // Refuse to write a book that isn't known to be the
+                        // whole book. The table is persisted by wipe-and-
+                        // reinsert, so saving a partial list is not a partial
+                        // save — it deletes every row the list is missing.
+                        if !self.contacts_loaded {
+                            error!("contacts save refused — the book on screen is incomplete");
+                            return iced::Task::batch(vec![
+                                cmd.map(Message::WalletDashboard),
+                                iced::Task::done(Message::WalletError(
+                                    "Kao couldn't read your contacts this session, so it won't \
+                                     save over them. Your saved contacts are untouched on disk — \
+                                     restart to try loading them again."
+                                        .to_string(),
+                                )),
+                            ]);
+                        }
                         // Update the in-memory book synchronously so the
                         // dashboard's view picks up the change on the very
                         // next redraw, then dispatch the disk write off
@@ -1731,11 +1771,21 @@ impl App {
                     Ok(vec) => {
                         if let Ok(mut book) = self.contacts.write() {
                             *book = ContactsBook::from_vec(vec);
+                            self.contacts_loaded = true;
                         } else {
                             warn!("contacts lock poisoned; skipping load");
                         }
                     }
-                    Err(e) => warn!(error = %e, "contacts load failed"),
+                    // Loud, and latching. The book stays empty either way, but
+                    // an empty book that is *known* to be incomplete must not
+                    // be written back over the rows it is missing.
+                    Err(e) => {
+                        error!(error = %e, "contacts load failed — saving is disabled this session");
+                        return iced::Task::done(Message::WalletError(format!(
+                            "Couldn't read your contacts ({e}). They're still on disk — Kao won't \
+                             save over them this session. Restart to try again."
+                        )));
+                    }
                 }
                 iced::Task::none()
             }
@@ -1983,6 +2033,7 @@ mod tests {
             screen,
             passphrase: None,
             wallet: None,
+            contacts_loaded: true,
             pp_seed: None,
             pp_loaded: false,
             setup_context: None,

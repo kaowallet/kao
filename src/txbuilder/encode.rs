@@ -226,6 +226,15 @@ pub fn parse_wei(raw: &str) -> Result<U256, String> {
         return Ok(U256::ZERO);
     }
     if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        // A bare prefix is a truncated paste, not a value. ruint parses the
+        // empty hex string as a clean zero (the whole from_str_radix family
+        // starts from `ZERO` and only ever accumulates digits), so without
+        // this the composer's value gate read "0x" as valid — the CTA lit
+        // up, and the call queued carrying 0 wei. An intentional zero is
+        // typed `0` (the field's own placeholder) and still parses.
+        if hex.is_empty() {
+            return Err("hex value is missing its digits".into());
+        }
         U256::from_str_radix(hex, 16).map_err(|_| "invalid hex wei value".into())
     } else {
         s.parse::<U256>().map_err(|_| "invalid wei value".into())
@@ -791,6 +800,13 @@ mod tests {
         assert_eq!(parse_wei("1000").unwrap(), U256::from(1000u64));
         assert_eq!(parse_wei("0x10").unwrap(), U256::from(16u64));
         assert!(parse_wei("12.5").is_err());
+        // A bare prefix is a truncated paste. ruint parses "" as a clean
+        // zero, so this used to light the value gate green and queue a call
+        // carrying 0 wei.
+        assert!(parse_wei("0x").is_err());
+        assert!(parse_wei("0X").is_err());
+        // An intentional zero is typed `0` and still parses.
+        assert_eq!(parse_wei("0").unwrap(), U256::ZERO);
     }
 
     /// A bundle can name a method, carry arguments that decode against it, and

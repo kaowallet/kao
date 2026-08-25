@@ -51,13 +51,34 @@ pub const INCREASE_ALLOWANCE_SELECTOR: [u8; 4] = [0x39, 0x50, 0x93, 0x51];
 /// Rather than chase every approval shape, the ones below are detected purely
 /// so the guarantee can be **withheld** — they land in
 /// [`AllowanceVerdict::unmodelled`] and the copy drops to naming them.
-const UNMODELLED_GRANTS: [([u8; 4], &str); 3] = [
+///
+/// Permit2 gets two entries of its own because its allowances live in Permit2's
+/// own `(owner, token, spender)` mapping, not the token's, so they are
+/// invisible to this scan in both directions — an ERC-20 `approve(spender, 0)`
+/// on the token closes nothing, and the words of a Permit2 call can't be
+/// scored by ERC-20 rules (its `approve` takes
+/// `(token, spender, amount, expiration)`, and `expiration == 0` means the
+/// allowance never expires). The entries exist to make the scan *honest*, not
+/// to discourage anything: a user who composes a Permit2 grant on purpose sees
+/// it named, gets no false claim of safety over it, and signs it all the same.
+/// Before they were listed, a batch whose only grant was a Permit2 approval
+/// scored `standing = []`, `unmodelled = []` — no disclosure at all — and a
+/// batch pairing it with a revoked ERC-20 approve printed the absolute
+/// guarantee over a live allowance no revoke in the batch could touch.
+const UNMODELLED_GRANTS: [([u8; 4], &str); 5] = [
     // setApprovalForAll(address,bool) — ERC-721/1155 blanket operator rights.
     ([0xa2, 0x2c, 0xb4, 0x65], "setApprovalForAll"),
     // permit(address,address,uint256,uint256,uint8,bytes32,bytes32) — EIP-2612.
     ([0xd5, 0x05, 0xac, 0xcf], "permit"),
     // DAI-style permit(address,address,uint256,uint256,bool,uint8,bytes32,bytes32).
     ([0x8f, 0xcb, 0xaf, 0x0c], "permit"),
+    // Permit2 approve(address,address,uint160,uint48). Labelled `Permit2 …` so
+    // the disclosure line can't be read as a plain ERC-20 approve on the same
+    // target: the grant lives in Permit2's mapping, not the token's.
+    ([0x87, 0x51, 0x7c, 0x45], "Permit2 approve"),
+    // Permit2 permit(address,address,uint160,uint48,uint48,address,uint256) —
+    // the same grant installed by signature instead of by call.
+    ([0x10, 0x6c, 0xb3, 0x9a], "Permit2 permit"),
 ];
 
 /// If `data` is a non-zero `approve(address,uint256)` call, return its
@@ -482,6 +503,37 @@ mod tests {
         }
     }
 
+    /// The two Permit2 entries, pinned to their canonical signatures with the
+    /// labels the disclosure prints. The wrong selector is silent: a batch
+    /// whose only grant is a Permit2 approval goes back to scoring clean, and
+    /// the absolute guarantee gets printed over a live allowance again.
+    #[test]
+    fn permit2_selectors_are_canonical_and_labelled() {
+        for (sig, sel, label) in [
+            (
+                "approve(address,address,uint160,uint48)",
+                UNMODELLED_GRANTS[3].0,
+                UNMODELLED_GRANTS[3].1,
+            ),
+            (
+                "permit(address,address,uint160,uint48,uint48,address,uint256)",
+                UNMODELLED_GRANTS[4].0,
+                UNMODELLED_GRANTS[4].1,
+            ),
+        ] {
+            assert_eq!(
+                &keccak256(sig.as_bytes())[..4],
+                &sel,
+                "selector drifted for {sig}"
+            );
+            assert!(
+                label.starts_with("Permit2"),
+                "the label must say Permit2, or it reads as a plain ERC-20 \
+                 approve on the same target: {label}"
+            );
+        }
+    }
+
     /// The guarantee is absolute, so the scan behind it has to be exhaustive —
     /// and it isn't. A batch pairing a fully-revoked ERC-20 approve with an
     /// NFT `setApprovalForAll` must not earn it.
@@ -592,6 +644,76 @@ mod tests {
         let v = allowance_verdict(&[p]);
         assert_eq!(v.unmodelled, vec![(token, "permit")]);
         assert!(v.disclosure().unwrap().contains("can't account for"));
+    }
+
+    /// The hole this list had: a batch whose only grant is a Permit2 approval
+    /// scored clean. The grant lives in Permit2's mapping, not the token's, so
+    /// no ERC-20 reasoning in this scan sees it, and no revoke the wrap
+    /// appends could close it. It must land in `unmodelled`, and the absolute
+    /// guarantee must be withheld over it — the entry doesn't judge the grant,
+    /// it keeps the scan from claiming more than it knows.
+    #[test]
+    fn a_permit2_grant_withholds_the_guarantee() {
+        let permit2 = address!("0x000000000022D473030F116dDEE9F6B43aC78BA3");
+        let usdc = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let mut p2 = approve("0");
+        p2.to = permit2;
+        // approve(token, spender, amount, expiration) with a non-zero amount.
+        let mut data = Vec::from(UNMODELLED_GRANTS[3].0); // Permit2 approve
+        data.extend_from_slice(&[0u8; 12]);
+        data.extend_from_slice(usdc.as_slice()); // token
+        data.extend_from_slice(&[0u8; 12]);
+        data.extend_from_slice(SPENDER.as_slice()); // spender
+        data.extend_from_slice(&U256::from(1_000u64).to_be_bytes::<32>()); // amount
+        data.extend_from_slice(&[0u8; 32]); // expiration: 0 = never
+        p2.data = Bytes::from(data);
+
+        let v = allowance_verdict(&[p2]);
+        assert_eq!(v.standing, vec![], "nothing in ERC-20 terms");
+        assert_eq!(v.unmodelled, vec![(permit2, "Permit2 approve")]);
+        let d = v.disclosure().unwrap();
+        assert!(
+            d.contains("can't account for") && d.contains("Permit2 approve"),
+            "the Permit2 grant is named: {d}"
+        );
+        assert!(
+            !d.contains("every allowance this batch grants is reset"),
+            "the guarantee must not survive a Permit2 grant: {d}"
+        );
+    }
+
+    /// The pairing that matters for honesty: an ERC-20 leg the wrap fully
+    /// revokes, next to a Permit2 grant no revoke can touch. The ERC-20 side
+    /// alone earned the absolute guarantee; the batch as a whole must not —
+    /// the user meant to grant the Permit2 allowance, and the review owes them
+    /// the truth that it still stands, not a claim that covers it.
+    #[test]
+    fn a_revoked_erc20_pair_does_not_earn_the_guarantee_over_permit2() {
+        let permit2 = address!("0x000000000022D473030F116dDEE9F6B43aC78BA3");
+        let usdc = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let mut p2 = approve("0");
+        p2.to = permit2;
+        let mut data = Vec::from(UNMODELLED_GRANTS[4].0); // Permit2 permit
+        data.extend_from_slice(&[0u8; 12]);
+        data.extend_from_slice(usdc.as_slice());
+        data.extend_from_slice(&[0u8; 12]);
+        data.extend_from_slice(SPENDER.as_slice());
+        data.extend_from_slice(&[0u8; 32 * 4]); // amount, expiration, sig, salt
+        p2.data = Bytes::from(data);
+
+        // ERC-20 leg: granted and revoked, alone spotless.
+        let wrapped = wrap_with_flash_approval(&[approve("5000000000")], 50);
+        let v = allowance_verdict(&[wrapped, vec![p2]].concat());
+        assert_eq!(v.standing, vec![]);
+        assert_eq!(v.reset, vec![(USDC, SPENDER)]);
+        assert_eq!(v.unmodelled, vec![(permit2, "Permit2 permit")]);
+        let d = v.disclosure().unwrap();
+        assert!(
+            !d.contains("every allowance this batch grants is reset"),
+            "a Permit2 grant beside a revoked ERC-20 pair must withhold the \
+             guarantee: {d}"
+        );
+        assert!(d.contains("Permit2 permit"), "and name it: {d}");
     }
 
     #[test]

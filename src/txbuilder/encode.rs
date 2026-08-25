@@ -57,14 +57,32 @@ fn fails_eip55(s: &str) -> bool {
 /// than risk refusing a legitimate value. That is a known hole in the gate, and
 /// the right direction to leave one in: the cost is a missed check on an
 /// unusual signature, against wrongly rejecting input the user typed correctly.
+///
+/// `string` is deliberately **not** free hex. It was when this predicate was
+/// written, and that single word disarmed the gate for every `(address,string)`
+/// signature in the wild — the token scan can't tell the address from the memo
+/// beside it, so the whole tree was declared unscannable and a corrupted
+/// mixed-case address coerced exactly as freely inside `(address,string)` as
+/// `bytes20`'s. But a `string` leaf never *produces* a 40-hex token a reader
+/// could mistake for an address: what the scan does with a string is consume
+/// alphanumeric runs that are the string's own content, and refusing a
+/// string whose content happens to be 40 mixed-case hex characters is the
+/// same trade `bytes20` makes — except here the token scan only *acts* on
+/// runs that fail EIP-55, and a string-authored 40-hex run with mixed case
+/// has no checksum claim either. The distinction that matters: for `bytes`/
+/// `bytesN`/`function`, a 40-hex run is *canonical spelling* the user may have
+/// copied deliberately; for `string` it is incidental content, and the
+/// corruption being caught is one the address leaf's own spelling rules
+/// already reject everywhere else. So `string` no longer disarms the scan.
 fn addresses_are_unambiguous(ty: &DynSolType) -> bool {
     fn walk(ty: &DynSolType, addr: &mut bool, hexish: &mut bool) {
         match ty {
             DynSolType::Address => *addr = true,
+            // Free-hex leaves: a 40-hex run can be their canonical spelling,
+            // so a token scan cannot attribute such a run to the address leaf.
             DynSolType::Bytes
             | DynSolType::FixedBytes(_)
-            | DynSolType::Function
-            | DynSolType::String => *hexish = true,
+            | DynSolType::Function => *hexish = true,
             DynSolType::Array(inner) => walk(inner, addr, hexish),
             DynSolType::FixedArray(inner, _) => walk(inner, addr, hexish),
             DynSolType::Tuple(items) => items.iter().for_each(|t| walk(t, addr, hexish)),
@@ -566,6 +584,26 @@ mod tests {
         // The corruption is invisible to the plain hex parser — which is the
         // whole reason the checksum has to be checked separately.
         assert!(CORRUPTED.parse::<Address>().is_ok());
+    }
+
+
+    /// `(address,string)` was the shape the gate went dark on: a `string`
+    /// leaf used to disarm the whole tree-level scan, so a corrupted
+    /// mixed-case address coerced as freely beside a memo as a `bytes20`
+    /// beside an address — and `(address,string)` signatures are everywhere.
+    #[test]
+    fn the_checksum_gate_survives_a_string_beside_the_address() {
+        let ty: DynSolType = "(address,string)".parse().unwrap();
+        assert!(coerce_param(&ty, &format!("({CHECKSUMMED},\"memo\")")).is_ok());
+        assert!(
+            coerce_param(&ty, &format!("({CORRUPTED},\"memo\")")).is_err(),
+            "a corrupted address must be refused even when the tuple also \
+             carries a string"
+        );
+        // The gate still ignores the string's own content: a 40-hex-looking
+        // string with no mixed case makes no checksum claim.
+        let hexish_memo = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+        assert!(coerce_param(&ty, &format!("({CHECKSUMMED},\"{hexish_memo}\")")).is_ok());
     }
 
     #[test]

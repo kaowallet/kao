@@ -613,17 +613,12 @@ fn method_from_meta(cm: &ContractMethod) -> Result<AbiMethod, TxBuilderError> {
 }
 
 fn parse_value(s: &str) -> Result<U256, TxBuilderError> {
-    let t = s.trim();
-    if t.is_empty() {
-        return Ok(U256::ZERO);
-    }
-    if let Some(hex) = t.strip_prefix("0x") {
-        U256::from_str_radix(hex, 16)
-            .map_err(|_| TxBuilderError::Assembly(format!("bad value: {s}")))
-    } else {
-        t.parse::<U256>()
-            .map_err(|_| TxBuilderError::Assembly(format!("bad value: {s}")))
-    }
+    // Through the composer's own parser so both surfaces agree on what a
+    // value string means — it had a private copy here, and the two drifted
+    // exactly where it mattered: ruint parses the empty hex string as a
+    // clean zero, so a bundle carrying `"value":"0x"` imported a 0-wei call
+    // through this copy while the composer refused the same paste.
+    super::encode::parse_wei(s).map_err(|e| TxBuilderError::Assembly(format!("bad value: {e}")))
 }
 
 fn parse_hex(s: &str) -> Result<Bytes, TxBuilderError> {

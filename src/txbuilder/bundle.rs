@@ -59,6 +59,34 @@ fn is_zero_u64(v: &u64) -> bool {
     *v == 0
 }
 
+
+/// `operation` arrives from Safe{Wallet}-world as either a JSON number or a
+/// quoted digit — the same field both ways across versions of the official
+/// builder, exactly as `value` and `chainId` are strings everywhere there.
+/// Accept both; anything else is not an operation byte and is refused by the
+/// range check in [`call_from_tx`] rather than by a parse panic.
+fn de_operation<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+    struct V;
+    impl serde::de::Visitor<'_> for V {
+        type Value = u64;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("an operation number, 0 or 1")
+        }
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<u64, E> {
+            Ok(v)
+        }
+        fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<u64, E> {
+            u64::try_from(v).map_err(|_| E::invalid_value(serde::de::Unexpected::Signed(v), &self))
+        }
+        fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<u64, E> {
+            s.trim()
+                .parse()
+                .map_err(|_| E::invalid_value(serde::de::Unexpected::Str(s), &self))
+        }
+    }
+    d.deserialize_any(V)
+}
+
 /// Seconds since the Unix epoch, for [`Bundle::created_at`]. Saturates to 0
 /// (i.e. "not stamped") if the host clock is before 1970.
 fn now_secs() -> u64 {
@@ -138,6 +166,19 @@ impl Meta {
 pub struct BundleTx {
     pub to: String,
     pub value: String,
+    /// The Safe operation this row carries: `0` = CALL, `1` = DELEGATECALL.
+    ///
+    /// Every bundle the official Safe Transaction Builder writes carries it,
+    /// so it is *not* an optional extra in the format — this wallet just never
+    /// read it, and a DELEGATECALL row imported as a plain CALL lands in
+    /// [`super::multisend::encode_packed`], which hard-codes `0` for every
+    /// call it packs. The re-shape is silent and semantic: the sub-call runs
+    /// as the Safe's own storage instead of against the target's. Import
+    /// therefore refuses a non-CALL row rather than queueing it as something
+    /// it isn't; `export` never writes one, so nothing this wallet emits
+    /// carries a field its own round-trip would refuse.
+    #[serde(default, skip_serializing_if = "is_zero_u64", deserialize_with = "de_operation")]
+    pub operation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<String>,
     #[serde(
@@ -283,6 +324,8 @@ fn tx_from_call(c: &QueuedCall) -> BundleTx {
         to: c.to.to_string(),
         value: c.value.to_string(),
         data: Some(format!("0x{}", alloy::hex::encode(&c.data))),
+        // Every call this wallet composes is a plain CALL; see the field.
+        operation: 0,
         contract_method,
         contract_inputs_values,
     }
@@ -363,6 +406,18 @@ fn call_from_tx(tx: &BundleTx, id: u64) -> Result<QueuedCall, TxBuilderError> {
     // round-trips; only genuine mixed-case corruption is refused.
     let to = super::encode::parse_address(&tx.to)
         .map_err(|e| TxBuilderError::Assembly(format!("bad `to` address: {} — {e}", tx.to)))?;
+    // A DELEGATECALL row is not a variant of a call this wallet can queue: a
+    // [`QueuedCall`] has no operation, and `multisend::encode_packed` would
+    // re-pack it as a plain CALL — silently swapping whose storage the
+    // sub-call runs against. Refused, not reshaped; the number is given so the
+    // author of the bundle can find the offending row.
+    if tx.operation != 0 {
+        return Err(TxBuilderError::Assembly(format!(
+            "transaction {id} carries operation {} (delegatecall), and this wallet only queues \
+             plain calls — refusing to import it as a call it isn't",
+            tx.operation,
+        )));
+    }
     let value = parse_value(&tx.value)?;
 
     // Prefer the literal calldata; fall back to re-encoding from the method.
@@ -793,6 +848,64 @@ mod tests {
             alloy::hex::encode(&sel[..4]),
         );
         assert!(import(&json, 1, None).is_err());
+    }
+
+    /// The official Safe Transaction Builder writes an `operation` per
+    /// transaction, and `1` means DELEGATECALL — a different call than the
+    /// plain one the bytes otherwise describe, running against the Safe's own
+    /// storage. This wallet has no way to queue one: a `QueuedCall` carries no
+    /// operation and `multisend::encode_packed` re-packs everything as CALL,
+    /// so importing such a row used to silently re-shape it. Refused now, with
+    /// the row number so the bundle's author can find it.
+    #[test]
+    fn import_refuses_a_delegatecall_row() {
+        let json = r#"{
+            "version":"1.0","chainId":"1",
+            "meta":{"name":"x","txBuilderVersion":"other"},
+            "transactions":[
+                {"to":"0x000000000000000000000000000000000000dEaD","value":"0","data":"0x","operation":"1"},
+                {"to":"0x000000000000000000000000000000000000dEaD","value":"0","data":"0x"}
+            ]
+        }"#;
+        let err = import(json, 1, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("operation 1 (delegatecall)"),
+            "expected the delegatecall refusal, got {msg}"
+        );
+        // The first row is the offender; the id it was assigned names it.
+        assert!(msg.contains("transaction 1"), "names the offending row: {msg}");
+    }
+
+    /// `0` is the format's plain CALL and the only operation this wallet
+    /// composes, so a bundle carrying it explicitly imports like one that
+    /// omits it — the field the official builder always writes.
+    #[test]
+    fn import_takes_an_explicit_call_operation() {
+        let json = r#"{
+            "version":"1.0","chainId":"1",
+            "meta":{"name":"x","txBuilderVersion":"other"},
+            "transactions":[{"to":"0x000000000000000000000000000000000000dEaD","value":"0","data":"0xdeadbeef","operation":"0"}]
+        }"#;
+        let calls = import(json, 1, None).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].data.as_ref(), &[0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    /// Everything this wallet exports is a plain CALL, and the official Safe
+    /// builder treats a missing `operation` as `0` — so the field is omitted
+    /// rather than stamped, keeping the export byte-compatible with what older
+    /// Kao versions and other consumers already write.
+    #[test]
+    fn export_omits_the_operation_field() {
+        let batch = sample_batch();
+        let json = export(Chain::Mainnet, None, Address::repeat_byte(0xAA), &batch);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            v["transactions"][0].get("operation").is_none(),
+            "export must not write an operation it never composes: {}",
+            v["transactions"][0]
+        );
     }
 
     #[test]

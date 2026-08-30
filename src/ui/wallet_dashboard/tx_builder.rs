@@ -4946,6 +4946,71 @@ mod tests {
     }
 
     #[test]
+    fn a_mined_revocation_names_itself_and_clears_the_banner() {
+        let mut app = eoa_app();
+        let (seq, ..) = app.take_pending_delegation_probe().unwrap();
+        app.on_delegation_probed(
+            seq,
+            Ok(Some(crate::txbuilder::eip7702::EF_SIMPLE_7702_ACCOUNT)),
+        );
+        let hash = B256::repeat_byte(0x77);
+        app.on_revoked(hash);
+        assert!(
+            app.current_delegation().is_none(),
+            "the banner must not keep claiming a designator the receipt just cleared"
+        );
+        assert_eq!(app.visible_settled(), Some(&Settled::Revoked { hash }));
+        assert!(
+            app.take_pending_delegation_probe().is_some(),
+            "re-read the account: a foreign wallet could have re-delegated in the same window"
+        );
+    }
+
+    #[test]
+    fn a_mined_batch_reprobes_in_case_it_installed_a_delegation() {
+        let mut app = eoa_app();
+        assert!(app.take_pending_delegation_probe().is_some());
+        app.on_executed(B256::repeat_byte(0x7A));
+        let probe = app
+            .take_pending_delegation_probe()
+            .expect("a successful 7702 batch leaves a designator the banner has to see");
+        assert_eq!(probe.1, Chain::Mainnet);
+        assert_eq!(probe.2, EOA);
+    }
+
+    #[test]
+    fn switching_to_a_custom_network_drops_the_delegation_banner() {
+        let mut app = eoa_app();
+        let (seq, ..) = app.take_pending_delegation_probe().unwrap();
+        app.on_delegation_probed(
+            seq,
+            Ok(Some(crate::txbuilder::eip7702::EF_SIMPLE_7702_ACCOUNT)),
+        );
+        app.update(Message::SetNetwork(NetworkId::Custom(11155111)));
+        assert!(
+            app.current_delegation().is_none(),
+            "a Mainnet designator is not a claim about Sepolia"
+        );
+        assert!(!app.can_revoke_delegation());
+        assert!(
+            app.take_pending_delegation_probe().is_none(),
+            "custom nets have no 7702 path, so they must not probe either"
+        );
+    }
+
+    #[test]
+    fn switching_builtin_chain_reprobes_delegation() {
+        let mut app = eoa_app();
+        assert!(app.take_pending_delegation_probe().is_some());
+        app.update(Message::SetNetwork(NetworkId::Builtin(Chain::Base)));
+        let probe = app
+            .take_pending_delegation_probe()
+            .expect("Base is a different account-code");
+        assert_eq!(probe.1, Chain::Base);
+        assert_eq!(probe.2, EOA);
+    }
+
+    #[test]
     fn auto_revoke_wraps_effective_calls_at_both_ends() {
         use crate::txbuilder::abi;
         use crate::txbuilder::encode::build_contract_call;
@@ -5468,6 +5533,132 @@ mod tests {
         assert_eq!(app.loaded.as_ref().unwrap().source, AbiSource::Bytecode);
         assert!(app.error.as_deref().unwrap().contains("Sourcify"));
         assert!(!app.abi_fetching);
+    }
+
+    #[test]
+    fn a_failed_verified_abi_fetch_keeps_the_bytecode_menu() {
+        let mut app = eoa_app();
+        let addr = address!("0x00000000000000000000000000000000C0FFEE00");
+        app.update(Message::AddrChanged(addr.to_string()));
+        let code = crate::decode::bytecode::tiny_transfer_runtime();
+        app.on_contract_resolved(app.resolve_seq, Ok(plain_code(addr, &code)));
+        app.update(Message::FetchVerifiedAbi);
+        let seq = app.abi_fetch_seq;
+        app.on_verified_abi(seq, Err("sourcify status: 503".into()));
+        assert_eq!(app.loaded.as_ref().unwrap().source, AbiSource::Bytecode);
+        assert_eq!(app.error.as_deref(), Some("sourcify status: 503"));
+        assert!(!app.abi_fetching);
+    }
+
+    #[test]
+    fn a_stale_verified_abi_is_dropped() {
+        let mut app = eoa_app();
+        let a = address!("0x00000000000000000000000000000000C0FFEE00");
+        app.update(Message::AddrChanged(a.to_string()));
+        app.update(Message::FetchVerifiedAbi);
+        let stale = app.abi_fetch_seq;
+        let b = address!("0x00000000000000000000000000000000BEEF0000");
+        app.update(Message::AddrChanged(b.to_string()));
+        app.on_verified_abi(
+            stale,
+            Ok(Some(crate::txbuilder::explorer::VerifiedAbi {
+                json: r#"[{"type":"function","name":"drain","stateMutability":"nonpayable",
+                     "inputs":[]}]"#
+                    .into(),
+                contract_name: "Malice".into(),
+                implementation: None,
+                origin: crate::txbuilder::explorer::AbiOrigin::Sourcify,
+            })),
+        );
+        assert!(
+            app.loaded.is_none(),
+            "a fetch for the previous address must not name this one"
+        );
+        assert!(!app.abi_fetching);
+    }
+
+    #[test]
+    fn fetch_verified_abi_carries_the_walked_implementation() {
+        let mut app = eoa_app();
+        let proxy = address!("0x00000000000000000000000000000000C0FFEE00");
+        let impl_addr = address!("0x00000000000000000000000000000000BEEF0000");
+        app.update(Message::AddrChanged(proxy.to_string()));
+        app.on_contract_resolved(
+            app.resolve_seq,
+            Ok(ResolvedCode {
+                nothing_deployed: false,
+                code: Bytes::from(crate::decode::bytecode::tiny_transfer_runtime()),
+                implementation: impl_addr,
+                all_verified: true,
+                code_verified: true,
+                beacon: false,
+            }),
+        );
+        let Some(Outcome::FetchVerifiedAbi {
+            address, walked, ..
+        }) = app.update(Message::FetchVerifiedAbi)
+        else {
+            panic!("expected FetchVerifiedAbi");
+        };
+        assert_eq!(address, proxy);
+        assert_eq!(
+            walked,
+            Some(impl_addr),
+            "the explorer often tags the proxy without publishing the impl ABI; the walk is the fallback"
+        );
+    }
+
+    #[test]
+    fn fetch_verified_abi_on_a_custom_network_uses_that_chain_id() {
+        let mut app = eoa_app();
+        app.update(Message::SetNetwork(NetworkId::Custom(11155111)));
+        let addr = address!("0x00000000000000000000000000000000C0FFEE00");
+        app.update(Message::AddrChanged(addr.to_string()));
+        let Some(Outcome::FetchVerifiedAbi { chain_id, .. }) =
+            app.update(Message::FetchVerifiedAbi)
+        else {
+            panic!("expected FetchVerifiedAbi");
+        };
+        assert_eq!(
+            chain_id, 11155111,
+            "Sourcify keys contracts by chain; a Mainnet ABI on Sepolia would be the wrong contract"
+        );
+    }
+
+    #[test]
+    fn a_verified_abi_retires_the_proxy_caution() {
+        let mut app = eoa_app();
+        let proxy = address!("0x00000000000000000000000000000000C0FFEE00");
+        app.update(Message::AddrChanged(proxy.to_string()));
+        app.on_contract_resolved(
+            app.resolve_seq,
+            Ok(ResolvedCode {
+                nothing_deployed: false,
+                code: Bytes::new(),
+                implementation: proxy,
+                all_verified: false,
+                code_verified: true,
+                beacon: false,
+            }),
+        );
+        assert!(app.proxy_unverified);
+        app.update(Message::FetchVerifiedAbi);
+        let seq = app.abi_fetch_seq;
+        app.on_verified_abi(
+            seq,
+            Ok(Some(crate::txbuilder::explorer::VerifiedAbi {
+                json: r#"[{"type":"function","name":"transfer","stateMutability":"nonpayable",
+                     "inputs":[{"name":"to","type":"address"},{"name":"amount","type":"uint256"}]}]"#
+                    .into(),
+                contract_name: "Token".into(),
+                implementation: None,
+                origin: crate::txbuilder::explorer::AbiOrigin::Sourcify,
+            })),
+        );
+        assert!(
+            !app.proxy_unverified,
+            "an explorer ABI is authoritative; the unverified-slot caution is about the bytecode walk"
+        );
     }
 
     #[test]

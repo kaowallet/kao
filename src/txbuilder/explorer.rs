@@ -468,6 +468,152 @@ mod tests {
         assert_eq!(page.contract_name, "X");
     }
 
+    #[test]
+    fn sourcify_abi_that_is_not_an_array_is_dropped() {
+        // An explorer object in the ABI slot is not a Solidity JSON ABI.
+        let body = r#"{"abi":{"name":"transfer"},"compilation":{"name":"X"}}"#;
+        let page = parse_sourcify_body(body).unwrap().unwrap();
+        assert!(page.abi_json.is_none());
+    }
+
+    #[test]
+    fn sourcify_garbage_is_an_error_not_a_miss() {
+        let err = parse_sourcify_body("not json").unwrap_err();
+        assert!(err.contains("sourcify decode"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_verified_result_is_an_error() {
+        let err =
+            parse_source_envelope(r#"{"status":"1","message":"OK","result":[]}"#).unwrap_err();
+        assert!(err.contains("empty"), "{err}");
+    }
+
+    #[test]
+    fn parse_impl_keeps_a_real_address() {
+        let a = "0xa2327a938FebF21FFE548b55E06C0aa8C020a6a1";
+        assert_eq!(parse_impl(a), Some(a.parse().unwrap()));
+        assert_eq!(parse_impl(&format!("  {a}  ")), Some(a.parse().unwrap()));
+    }
+
+    #[test]
+    fn urlencode_leaves_unreserved_bytes_and_percent_encodes_the_rest() {
+        assert_eq!(urlencode("Abc-._~0123"), "Abc-._~0123");
+        assert_eq!(urlencode("a b"), "a%20b");
+        assert_eq!(urlencode("0x11"), "0x11");
+        // API keys can contain `/` `+` `=`; those must not land in the query
+        // string raw, or the request is a different key than the one stored.
+        assert_eq!(urlencode("a+b/c="), "a%2Bb%2Fc%3D");
+    }
+
+    fn page(
+        abi: Option<&str>,
+        name: &str,
+        implementation: Option<Address>,
+        is_proxy: bool,
+    ) -> SourcePage {
+        SourcePage {
+            abi_json: abi.map(str::to_string),
+            contract_name: name.into(),
+            implementation,
+            is_proxy,
+        }
+    }
+
+    #[test]
+    fn assemble_prefers_the_implementation_abi_on_a_tagged_proxy() {
+        let proxy = Address::repeat_byte(0x11);
+        let impl_addr = Address::repeat_byte(0x22);
+        let got = assemble(
+            Some(page(Some("[]"), "FiatTokenProxy", Some(impl_addr), true)),
+            proxy,
+            Some(impl_addr),
+            Some(page(Some(TRANSFER_ABI), "FiatTokenV2", None, false)),
+            AbiOrigin::Sourcify,
+        )
+        .expect("impl ABI");
+        assert_eq!(got.json, TRANSFER_ABI);
+        assert_eq!(got.contract_name, "FiatTokenV2");
+        assert_eq!(got.implementation, Some(impl_addr));
+        assert_eq!(got.origin, AbiOrigin::Sourcify);
+    }
+
+    #[test]
+    fn assemble_falls_back_to_the_proxy_name_when_the_impl_is_unnamed() {
+        // Sourcify sometimes tags the proxy and leaves the implementation's
+        // compilation.name empty. The chip still has to say *something*.
+        let proxy = Address::repeat_byte(0x11);
+        let impl_addr = Address::repeat_byte(0x22);
+        let got = assemble(
+            Some(page(None, "UsdC", Some(impl_addr), true)),
+            proxy,
+            Some(impl_addr),
+            Some(page(Some(TRANSFER_ABI), "", None, false)),
+            AbiOrigin::Etherscan,
+        )
+        .unwrap();
+        assert_eq!(got.contract_name, "UsdC");
+        assert_eq!(got.origin, AbiOrigin::Etherscan);
+    }
+
+    #[test]
+    fn assemble_keeps_a_proxy_abi_when_the_impl_lookup_misses() {
+        let proxy = Address::repeat_byte(0x11);
+        let impl_addr = Address::repeat_byte(0x22);
+        let got = assemble(
+            Some(page(
+                Some(TRANSFER_ABI),
+                "FiatTokenProxy",
+                Some(impl_addr),
+                true,
+            )),
+            proxy,
+            Some(impl_addr),
+            None,
+            AbiOrigin::Sourcify,
+        )
+        .unwrap();
+        assert_eq!(got.json, TRANSFER_ABI);
+        assert_eq!(
+            got.implementation,
+            Some(impl_addr),
+            "calls still go to the proxy; the pointer has to survive so a later fetch can follow it"
+        );
+    }
+
+    #[test]
+    fn assemble_does_not_claim_the_typed_address_is_its_own_implementation() {
+        let addr = Address::repeat_byte(0x11);
+        let got = assemble(
+            Some(page(Some(TRANSFER_ABI), "Token", None, false)),
+            addr,
+            Some(addr),
+            None,
+            AbiOrigin::Sourcify,
+        )
+        .unwrap();
+        assert!(
+            got.implementation.is_none(),
+            "a non-proxy must not badge itself as behind a proxy"
+        );
+    }
+
+    #[test]
+    fn assemble_returns_none_when_neither_page_has_an_abi() {
+        let addr = Address::repeat_byte(0x11);
+        assert!(
+            assemble(
+                Some(page(None, "X", None, false)),
+                addr,
+                None,
+                None,
+                AbiOrigin::Sourcify,
+            )
+            .is_none()
+        );
+        assert!(assemble(None, addr, None, None, AbiOrigin::Etherscan).is_none());
+    }
+
     #[tokio::test]
     async fn fetch_verified_abi_is_inert_in_unit_tests() {
         let got = fetch_verified_abi(Chain::Mainnet.chain_id(), Address::repeat_byte(0x11), None)

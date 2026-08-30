@@ -1498,6 +1498,54 @@ mod tests {
     }
 
     #[test]
+    fn from_explorer_abi_badges_a_sourcify_hit() {
+        let verified = crate::txbuilder::explorer::VerifiedAbi {
+            json: r#"[{"type":"function","name":"transfer","stateMutability":"nonpayable",
+                 "inputs":[{"name":"to","type":"address"},{"name":"amount","type":"uint256"}]}]"#
+                .into(),
+            contract_name: "Token".into(),
+            implementation: None,
+            origin: crate::txbuilder::explorer::AbiOrigin::Sourcify,
+        };
+        let c = from_explorer_abi(&verified, Address::ZERO).unwrap();
+        assert_eq!(c.source, AbiSource::Sourcify);
+        assert_eq!(c.label, "Sourcify verified ABI");
+        assert_eq!(c.name, "Token");
+    }
+
+    #[test]
+    fn from_explorer_abi_strips_a_hostile_contract_name() {
+        // The name comes off an explorer the user opted into, not the light
+        // client. A bidi override in it would reorder the composer header.
+        let verified = crate::txbuilder::explorer::VerifiedAbi {
+            json: r#"[{"type":"function","name":"transfer","stateMutability":"nonpayable",
+                 "inputs":[]}]"#
+                .into(),
+            contract_name: "Fiat\u{202E}Token".into(),
+            implementation: None,
+            origin: crate::txbuilder::explorer::AbiOrigin::Sourcify,
+        };
+        let c = from_explorer_abi(&verified, Address::ZERO).unwrap();
+        assert!(!c.name.contains('\u{202E}'), "got {:?}", c.name);
+        assert_eq!(c.name, "FiatToken");
+    }
+
+    #[test]
+    fn from_explorer_abi_does_not_record_the_typed_address_as_its_own_impl() {
+        let addr = Address::repeat_byte(0x11);
+        let verified = crate::txbuilder::explorer::VerifiedAbi {
+            json: r#"[{"type":"function","name":"transfer","stateMutability":"nonpayable",
+                 "inputs":[]}]"#
+                .into(),
+            contract_name: "Token".into(),
+            implementation: Some(addr),
+            origin: crate::txbuilder::explorer::AbiOrigin::Etherscan,
+        };
+        let c = from_explorer_abi(&verified, addr).unwrap();
+        assert!(c.proxy_impl.is_none());
+    }
+
+    #[test]
     fn explorer_abi_wins_names_and_bytecode_fills_extra_selectors() {
         let verified = crate::txbuilder::explorer::VerifiedAbi {
             json: r#"[{"type":"function","name":"transfer","stateMutability":"nonpayable",

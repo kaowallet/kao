@@ -50,6 +50,7 @@ use crate::chain::Chain;
 use crate::net::BalanceFetcher;
 use crate::wallet::{SafeDescriptor, SafeTrust, short_address};
 
+pub mod admin;
 pub mod service;
 pub mod sim;
 pub mod tx;
@@ -767,6 +768,47 @@ async fn read_version(
     let ret = net.call_raw(addr, Bytes::from(calldata), chain).await?;
     // Single-return sol! decode returns the bare value, not a tuple struct.
     decode_ret::<VERSIONCall>(&ret.value)
+}
+
+/// Read just the owner set and threshold, live. A targeted two-call read for
+/// the pre-signing gate: [`refresh_one`] answers the same question but pays
+/// for a full `inspect_on_chain` (implementation, version, modules, guard,
+/// fallback handler) to do it, which is far too much to run in front of a
+/// hardware prompt.
+///
+/// The cached [`SafeDescriptor`] is refreshed once, at unlock. A co-owner can
+/// rotate keys or raise the threshold at any point in a long session, and
+/// neither the pinned nonce nor the pinned `safeTxHash` commits to the owner
+/// set — so without this read, the drift is invisible until `execTransaction`
+/// reverts GS020/GS026 with every device already prompted and the gas spent.
+pub async fn read_owner_set(
+    net: &dyn BalanceFetcher,
+    chain: Chain,
+    addr: Address,
+) -> Result<(Vec<Address>, u32), String> {
+    let owners = read_owners(net, chain, addr).await?;
+    let threshold = read_threshold(net, chain, addr).await?;
+    Ok((owners, threshold))
+}
+
+/// Read the installed transaction guard, live. Same rationale as
+/// [`read_owner_set`]: the cached [`SafeDescriptor`] learns about guards once,
+/// at unlock, and a guard installed since then is precisely the one a user
+/// doesn't know to expect — while being the one that can reject the
+/// transaction they are about to collect signatures for.
+pub async fn read_guard_live(
+    net: &dyn BalanceFetcher,
+    chain: Chain,
+    addr: Address,
+) -> Result<Option<Address>, String> {
+    read_guard(net, chain, addr).await
+}
+
+/// The storage slot [`read_guard_live`] reads, so tests elsewhere can plant a
+/// guard without reaching into this module's private const.
+#[cfg(test)]
+pub(crate) fn guard_storage_slot() -> B256 {
+    GUARD_STORAGE_SLOT
 }
 
 async fn read_owners(

@@ -21,6 +21,7 @@ use crate::portfolio::{LiveToken, format_token_balance};
 
 use super::names_app::{self, NamesApp};
 use super::pool_app::{self, PoolApp};
+use super::tx_builder::{self, TxBuilderApp};
 use crate::ui::kao_theme::{KaoTheme, with_alpha};
 use crate::ui::kao_widgets::{
     avatar, bold, ghost_button, kao_scrollable_style, mono, mono_bold, screen_subtitle,
@@ -38,10 +39,14 @@ pub enum Message {
     OpenNamesApp,
     /// Open the Privacy Pools app from the launcher.
     OpenPrivacyPoolsApp,
+    /// Open the Transaction Builder app from the launcher.
+    OpenTxBuilderApp,
     /// Messages for the embedded Names app.
     Names(names_app::Message),
     /// Messages for the embedded Privacy Pools app.
     Pool(pool_app::Message),
+    /// Messages for the embedded Transaction Builder app.
+    TxBuilder(tx_builder::Message),
     /// Return from a sub-app to the launcher.
     BackHome,
     Composer(composer::Message),
@@ -62,6 +67,7 @@ enum AppsView {
     Swap,
     Names,
     PrivacyPools,
+    TxBuilder,
 }
 
 impl AppsView {
@@ -72,6 +78,7 @@ impl AppsView {
             AppsView::Swap => "Swap",
             AppsView::Names => "Names",
             AppsView::PrivacyPools => "PrivacyPools",
+            AppsView::TxBuilder => "TxBuilder",
         }
     }
 }
@@ -102,6 +109,11 @@ pub enum Outcome {
     /// services it (discover/sync/quote/prove/submit, seed plumbing) and feeds
     /// the result back via [`AppsPane::pool_pane`].
     Pool(pool_app::Outcome),
+    /// A request bubbled up from the embedded Transaction Builder app
+    /// (resolve a contract, simulate a batch, or open the sign-review for
+    /// it); the coordinator services it and feeds results back via
+    /// [`AppsPane::txbuilder_pane`].
+    TxBuilder(tx_builder::Outcome),
 }
 
 impl Outcome {
@@ -115,6 +127,7 @@ impl Outcome {
             Outcome::RefreshOrders => "RefreshOrders",
             Outcome::Name(_) => "Name",
             Outcome::Pool(_) => "Pool",
+            Outcome::TxBuilder(_) => "TxBuilder",
         }
     }
 }
@@ -124,17 +137,62 @@ pub struct AppsPane {
     composer: SwapComposer,
     names: NamesApp,
     pool: PoolApp,
+    tx_builder: TxBuilderApp,
     view: AppsView,
 }
 
 impl AppsPane {
     pub fn new(owner: Address) -> Self {
+        // Load the user's saved Transaction-Builder templates once, at build
+        // time (a tiny plaintext redb read; tolerant of a missing file).
+        let mut tx_builder = TxBuilderApp::new(owner);
+        tx_builder.set_templates(crate::txbuilder::templates::load());
         Self {
             composer: SwapComposer::new(),
             names: NamesApp::new(owner),
             pool: PoolApp::new(),
+            tx_builder,
             view: AppsView::Launcher,
         }
+    }
+
+    /// Mutable access to the Transaction Builder app so the coordinator can
+    /// deliver async results (resolved contract code, batch simulation,
+    /// post-execute cleanup).
+    pub fn txbuilder_pane(&mut self) -> &mut TxBuilderApp {
+        &mut self.tx_builder
+    }
+
+    /// Refresh the builder's identity context (the acting address + active
+    /// chain + whether a Safe is active + enabled custom networks) before it
+    /// processes a message, so batch-cap, known-contract lookup, the network
+    /// switcher and the identity chip all see the live identity.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_txbuilder_context(
+        &mut self,
+        identity: alloy::primitives::Address,
+        chain: crate::chain::Chain,
+        is_safe: bool,
+        safe_version: Option<String>,
+        eoa_can_batch: bool,
+        can_sign: bool,
+        custom_networks: Vec<(u64, String)>,
+    ) {
+        self.tx_builder.set_context(
+            identity,
+            chain,
+            is_safe,
+            safe_version,
+            eoa_can_batch,
+            can_sign,
+            custom_networks,
+        );
+    }
+
+    /// The network the Transaction Builder is composing against — read by the
+    /// coordinator to build the EOA request / route resolve + broadcast.
+    pub fn txbuilder_selected_net(&self) -> crate::chain::NetworkId {
+        self.tx_builder.selected_net()
     }
 
     /// Mutable access to the Privacy Pools app so the coordinator can deliver
@@ -197,7 +255,20 @@ impl AppsPane {
                 // Load the identity + sync the first time it's opened.
                 self.pool.on_open().map(Outcome::Pool)
             }
+            Message::OpenTxBuilderApp => {
+                self.view = AppsView::TxBuilder;
+                None
+            }
             Message::Names(child) => self.names.update(child).map(Outcome::Name),
+            Message::TxBuilder(child) => match self.tx_builder.update(child) {
+                // The "← Apps" link steps back to the launcher rather than
+                // bubbling to the dashboard.
+                Some(tx_builder::Outcome::Close) => {
+                    self.view = AppsView::Launcher;
+                    None
+                }
+                other => other.map(Outcome::TxBuilder),
+            },
             Message::Pool(child) => match self.pool.update(child) {
                 // The pane's "← Apps" link steps back to the launcher rather
                 // than bubbling to the dashboard.
@@ -228,12 +299,27 @@ impl AppsPane {
                     key: keyboard::Key::Named(keyboard::key::Named::Escape),
                     ..
                 } = event
-                    && matches!(
-                        self.view,
-                        AppsView::Swap | AppsView::Names | AppsView::PrivacyPools
-                    )
                 {
-                    self.view = AppsView::Launcher;
+                    match self.view {
+                        // The Builder gets first refusal: with its JSON overlay
+                        // open, stepping back to the launcher throws the user
+                        // out *and* leaves `modal` set, so re-entering lands
+                        // back inside the overlay. It closes the modal and eats
+                        // the key, or bubbles `Close` when there's none.
+                        AppsView::TxBuilder => {
+                            return match self.tx_builder.update(tx_builder::Message::Escape) {
+                                Some(tx_builder::Outcome::Close) => {
+                                    self.view = AppsView::Launcher;
+                                    None
+                                }
+                                other => other.map(Outcome::TxBuilder),
+                            };
+                        }
+                        AppsView::Swap | AppsView::Names | AppsView::PrivacyPools => {
+                            self.view = AppsView::Launcher;
+                        }
+                        AppsView::Launcher => {}
+                    }
                 }
                 None
             }
@@ -257,6 +343,8 @@ impl AppsPane {
                 keyboard::listen().map(Message::Key),
                 self.pool.subscription().map(Message::Pool),
             ]),
+            // Esc closes the JSON overlay if one is open, else steps back.
+            AppsView::TxBuilder => keyboard::listen().map(Message::Key),
             AppsView::Launcher => Subscription::none(),
         }
     }
@@ -267,18 +355,40 @@ impl AppsPane {
         portfolio: &'a [LiveToken],
         orders: &[&'a TrackedOrder],
         names_available: bool,
+        swap_available: bool,
         recipients: super::send::ContactsView,
     ) -> Element<'a, Message> {
         let content = match self.view {
-            AppsView::Launcher => self.launcher_view(t, orders, names_available),
+            AppsView::Launcher => self.launcher_view(t, orders, names_available, swap_available),
+            // Swap is unavailable for a Safe with no CoW market (the launcher
+            // hides the card) — same fallback as Names, for the same reason.
+            AppsView::Swap if !swap_available => {
+                self.launcher_view(t, orders, names_available, swap_available)
+            }
             AppsView::Swap => self.swap_view(t, portfolio, orders),
             // Names is unavailable for a non-Mainnet Safe (the launcher hides the
             // card). Fall back to the launcher if we landed on the Names view
             // before switching to such an identity.
-            AppsView::Names if !names_available => self.launcher_view(t, orders, names_available),
+            AppsView::Names if !names_available => {
+                self.launcher_view(t, orders, names_available, swap_available)
+            }
             AppsView::Names => self.names.view(t).map(Message::Names),
             AppsView::PrivacyPools => self.pool.view(t, portfolio, recipients).map(Message::Pool),
+            AppsView::TxBuilder => self.tx_builder.view(t).map(Message::TxBuilder),
         };
+
+        // The Transaction Builder runs its own full-height, two-pane layout and
+        // scrolls each pane internally, so it needs a *bounded* height to fill.
+        // Wrapping it in the shared vertical scrollable would hand it an
+        // unbounded height and collapse the equal-height panes — so it takes the
+        // pane at full size and skips the page scroll.
+        if matches!(self.view, AppsView::TxBuilder) {
+            return container(content)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .padding(Padding::from([28, 32]))
+                .into();
+        }
 
         // Center the bounded (max-width 560) content within the full-width
         // scroll area. Centering has to live on the inner container: the
@@ -301,14 +411,21 @@ impl AppsPane {
     }
 
     /// The app launcher: a card per available app. The order list lives inside
-    /// the Swap app; the card shows a count of open orders. `names_available`
-    /// gates the Names card — names register/resolve against the active identity
-    /// (an EOA, or a Mainnet Safe), so it's hidden for a non-Mainnet Safe.
+    /// the Swap app; the card shows a count of open orders.
+    ///
+    /// Both gates here are about *reach*, never about keys. `names_available`
+    /// hides Names for a non-Mainnet Safe (names register/resolve against the
+    /// active identity — an EOA, or a Mainnet Safe); `swap_available` hides Swap
+    /// for a Safe with no CoW market or too few linked owners. A watch-only
+    /// account still sees every card it could reach: composing, quoting,
+    /// simulating and reading all work without a signer, and each app's write
+    /// action refuses on its own terms when the key isn't there.
     fn launcher_view<'a>(
         &self,
         t: KaoTheme,
         orders: &[&'a TrackedOrder],
         names_available: bool,
+        swap_available: bool,
     ) -> Element<'a, Message> {
         let open_count = orders.iter().filter(|o| !o.status.is_terminal()).count();
         let swap_sub = if open_count > 0 {
@@ -316,21 +433,31 @@ impl AppsPane {
         } else {
             "Trade tokens via CoW Protocol".to_string()
         };
-        let subtitle = if names_available {
-            "On-chain apps — swaps and name registration"
-        } else {
-            "On-chain apps — swaps"
+        // Names and Swap come and go with the identity; Privacy Pools and the
+        // Transaction Builder are always there, so the subtitle never claims
+        // less than the four cards below it.
+        let subtitle = match (swap_available, names_available) {
+            (true, true) => "On-chain apps — swaps, names, privacy and transactions",
+            (true, false) => "On-chain apps — swaps, privacy and transactions",
+            (false, true) => "On-chain apps — names, privacy and transactions",
+            (false, false) => "On-chain apps — privacy and transactions",
         };
 
-        let mut col = column![
-            screen_title(t, "Apps"),
-            Space::new().height(6),
-            screen_subtitle(t, subtitle),
-            Space::new().height(20),
-            app_card(t, "(⇌ω⇌)", "Swap", &swap_sub, Message::OpenSwapApp),
-        ];
+        // The cards carry their own `spacing`, so any card can be the first one
+        // without leaving a leading gap — the list used to hang each card off a
+        // preceding `Space`, which only worked while Swap was unconditional.
+        let mut cards = column![].spacing(10).width(Length::Fill);
+        if swap_available {
+            cards = cards.push(app_card(
+                t,
+                "(⇌ω⇌)",
+                "Swap",
+                &swap_sub,
+                Message::OpenSwapApp,
+            ));
+        }
         if names_available {
-            col = col.push(Space::new().height(10)).push(app_card(
+            cards = cards.push(app_card(
                 t,
                 "(✎ω✎)",
                 "Names",
@@ -340,14 +467,33 @@ impl AppsPane {
         }
         // Privacy Pools is its own EOA-independent identity with its own chain
         // selector (Ethereum + Optimism), so the card is always available.
-        col = col.push(Space::new().height(10)).push(app_card(
+        cards = cards.push(app_card(
             t,
             "(≖ᴗ≖)",
             "Privacy Pools",
             "Deposit & withdraw privately with ZK proofs",
             Message::OpenPrivacyPoolsApp,
         ));
-        col.width(Length::Fill).max_width(560).into()
+        // Transaction Builder works for both a plain EOA (single call) and a
+        // Safe (atomic MultiSend batch), so the card is always available.
+        cards = cards.push(app_card(
+            t,
+            "( •̀ω•́ )✧",
+            "Transaction Builder",
+            "Compose contract calls & batch them atomically",
+            Message::OpenTxBuilderApp,
+        ));
+
+        column![
+            screen_title(t, "Apps"),
+            Space::new().height(6),
+            screen_subtitle(t, subtitle),
+            Space::new().height(20),
+            cards,
+        ]
+        .width(Length::Fill)
+        .max_width(560)
+        .into()
     }
 
     /// The Swap app: a back link, the inline composer, and the live order list

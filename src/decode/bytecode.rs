@@ -19,11 +19,21 @@
 
 use alloy::dyn_abi::DynSolType;
 
+/// Solidity's four mutability classes, as evmole infers them from the
+/// dispatcher. Re-exported so callers don't take their own evmole dependency.
+pub use evmole::StateMutability;
+
 /// One public entry point recovered from the bytecode dispatcher.
 #[derive(Debug, Clone)]
 pub struct ExtractedFn {
     pub selector: [u8; 4],
     pub arg_types: Vec<DynSolType>,
+    /// Mutability, when evmole could infer it — `None` means it could not, and
+    /// callers must treat that as "unknown", not as `NonPayable`. Inference is
+    /// a heuristic over the dispatcher (does this path reach a `CALLVALUE`
+    /// guard, does it reach an `SSTORE`), so a wrong answer is possible; it
+    /// decides which menu a method appears in, never what gets signed.
+    pub mutability: Option<StateMutability>,
 }
 
 /// All public functions evmole could recover from `code`. Empty when
@@ -36,7 +46,8 @@ pub fn extract(code: &[u8]) -> Vec<ExtractedFn> {
     }
     let args = evmole::ContractInfoArgs::new(code)
         .with_selectors()
-        .with_arguments();
+        .with_arguments()
+        .with_state_mutability();
     let info = evmole::contract_info(args);
     info.functions
         .unwrap_or_default()
@@ -44,6 +55,7 @@ pub fn extract(code: &[u8]) -> Vec<ExtractedFn> {
         .map(|f| ExtractedFn {
             selector: f.selector,
             arg_types: f.arguments.unwrap_or_default(),
+            mutability: f.state_mutability,
         })
         .collect()
 }
@@ -58,30 +70,41 @@ pub fn lookup(code: &[u8], selector: [u8; 4]) -> Option<Vec<DynSolType>> {
         .map(|f| f.arg_types)
 }
 
+/// Minimal compiled `transfer(address,uint256)` dispatcher. Hand-
+/// crafted via solc against:
+///
+/// ```solidity
+/// contract T {
+///     function transfer(address to, uint256 amount) external {}
+/// }
+/// ```
+///
+/// We just need ANY valid runtime that exposes the standard ERC-20
+/// transfer selector for evmole to chew through. If this snippet
+/// breaks on an evmole upgrade, swap with `solc --bin-runtime`.
+/// Shared with the Transaction Builder's ABI tests, which need a contract
+/// whose selectors actually come back.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use alloy::hex;
+pub(crate) fn tiny_transfer_runtime() -> Vec<u8> {
+    let cleaned: String = TINY_TRANSFER_RUNTIME
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    alloy::hex::decode(&cleaned).expect("fixture bytecode hex is malformed")
+}
 
-    /// Minimal compiled `transfer(address,uint256)` dispatcher. Hand-
-    /// crafted via solc against:
-    ///
-    /// ```solidity
-    /// contract T {
-    ///     function transfer(address to, uint256 amount) external {}
-    /// }
-    /// ```
-    ///
-    /// We just need ANY valid runtime that exposes the standard ERC-20
-    /// transfer selector for evmole to chew through. If this snippet
-    /// breaks on an evmole upgrade, swap with `solc --bin-runtime`.
-    const TINY_TRANSFER_RUNTIME: &str = "608060405234801561001057600080fd5b50600436106100365760003560e01c\
+#[cfg(test)]
+const TINY_TRANSFER_RUNTIME: &str = "608060405234801561001057600080fd5b50600436106100365760003560e01c\
         8063a9059cbb1461003b575b600080fd5b610055600480360381019061005091906100a4565b610057565b005b505050565b6000\
         81359050610071816100f1565b92915050565b6000813590506100868161010856\
         5b92915050565b60008060408385031215610099576100986100ec565b5b60006100a785828601610062565b92505060206100b8\
         85828601610077565b9150509250929050565b6100ca816100d0565b82525050565b60006100db826100e2565b9050919050565b6000\
         819050919050565b600080fd5b6100f4816100d0565b81146100ff57600080fd5b50565b610111816100d6565b811461011c57\
         600080fd5b5056fea2646970667358221220";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
 
     #[test]
     fn empty_code_returns_empty() {
@@ -91,15 +114,7 @@ mod tests {
 
     #[test]
     fn extracts_transfer_selector() {
-        // Strip whitespace, decode hex; if odd length or invalid, the
-        // whole module's broken — surface the parse error.
-        let cleaned: String = TINY_TRANSFER_RUNTIME
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
-        let Ok(code) = hex::decode(&cleaned) else {
-            panic!("bench bytecode hex is malformed");
-        };
+        let code = tiny_transfer_runtime();
         let funcs = extract(&code);
         // Even if evmole's heuristic misses some, the transfer selector
         // is the only public entry point in this contract — it must
@@ -126,11 +141,7 @@ mod tests {
 
     #[test]
     fn lookup_finds_known_selector() {
-        let cleaned: String = TINY_TRANSFER_RUNTIME
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
-        let code = hex::decode(&cleaned).expect("bench bytecode hex");
+        let code = tiny_transfer_runtime();
         let types = lookup(&code, [0xa9, 0x05, 0x9c, 0xbb]);
         // evmole sometimes recovers the selector but not the arg types —
         // both "Some(empty)" and "Some([Address, Uint(256)])" mean the
@@ -140,11 +151,7 @@ mod tests {
 
     #[test]
     fn lookup_misses_unknown_selector() {
-        let cleaned: String = TINY_TRANSFER_RUNTIME
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
-        let code = hex::decode(&cleaned).expect("bench bytecode hex");
+        let code = tiny_transfer_runtime();
         // Selector that the contract doesn't expose. evmole should
         // simply not return it.
         assert!(lookup(&code, [0xde, 0xad, 0xbe, 0xef]).is_none());

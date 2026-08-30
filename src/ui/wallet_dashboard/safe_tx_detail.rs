@@ -243,6 +243,50 @@ impl SafeTxDetailPane {
             .unwrap_or(self.pending.operation)
     }
 
+    /// The calldata this transaction actually carries, preferring the loaded
+    /// `SafeTx` over the list snapshot for the same reason
+    /// [`Self::effective_operation`] does: the loaded record is the one the
+    /// hash was computed over.
+    fn effective_data(&self) -> &[u8] {
+        self.detail
+            .as_ref()
+            .map(|d| d.tx.data.as_ref())
+            .unwrap_or(self.pending.data.as_ref())
+    }
+
+    /// The sub-calls packed inside a MultiSend batch, when this transaction is
+    /// one.
+    ///
+    /// `None` when it isn't — an ordinary Safe transaction has nothing to
+    /// unpack. `Some(Err)` when it is addressed to a canonical MultiSend
+    /// library by `DELEGATECALL` and the blob will *not* parse, which is the
+    /// one case that must be said out loud: silently falling back to the hex
+    /// dump would present a batch this wallet cannot account for as though
+    /// there were nothing to account for.
+    ///
+    /// This is what a co-signer had instead of a batch: `to` = 0x9641…02e2,
+    /// `operation` = 1, and 742 bytes of `0x8d80ff0a…`. Everything needed to
+    /// unpack it was already in the tree — [`decode_multisend_calldata`] is the
+    /// inverse the Builder's own review has used since it started clear-signing
+    /// batches — and only the proposing side was ever calling it.
+    fn batch_contents(
+        &self,
+    ) -> Option<Result<Vec<crate::txbuilder::multisend::PackedCall>, String>> {
+        use crate::txbuilder::multisend::{
+            MULTISEND_CALL_ONLY_1_3_0, MULTISEND_CALL_ONLY_1_4_1, decode_multisend_calldata,
+        };
+        let to = self
+            .detail
+            .as_ref()
+            .map(|d| d.tx.to)
+            .unwrap_or(self.pending.to);
+        let is_multisend = matches!(to, MULTISEND_CALL_ONLY_1_3_0 | MULTISEND_CALL_ONLY_1_4_1);
+        if !is_multisend || self.effective_operation() != 1 {
+            return None;
+        }
+        Some(decode_multisend_calldata(self.effective_data()).map_err(|e| e.to_string()))
+    }
+
     /// Owner addresses that this wallet controls and that have **not** yet
     /// signed — the candidates for Confirm. Empty until detail loads.
     pub fn unsigned_signable(&self) -> Vec<Address> {
@@ -472,6 +516,51 @@ impl SafeTxDetailPane {
             format!("{} ETH", format_eth(self.pending.value)),
         ));
         fields = fields.push(section_card(t, "TRANSACTION", tx_col.into()));
+
+        // What the batch actually does. Directly under TRANSACTION, because the
+        // rows above it ("To: 0x9641…02e2", "Value: 0 ETH") describe the
+        // MultiSend library and say nothing about the calls being authorised.
+        if let Some(contents) = self.batch_contents() {
+            fields = fields.push(match contents {
+                Ok(calls) => {
+                    let n = calls.len();
+                    let mut col = column![
+                        text(format!(
+                            "{n} call{} executed atomically, in this order. If any one reverts, \
+                             the whole batch reverts.",
+                            if n == 1 { "" } else { "s" }
+                        ))
+                        .size(11)
+                        .color(t.sub),
+                    ]
+                    .spacing(8)
+                    .width(Length::Fill);
+                    for (i, c) in calls.iter().enumerate() {
+                        col = col.push(sub_call_row(t, i, n, c, self.safe));
+                    }
+                    section_card(t, "BATCH CONTENTS", col.into())
+                }
+                Err(e) => section_card(
+                    t,
+                    "BATCH CONTENTS",
+                    column![
+                        text("⚠ This is a MultiSend batch and its contents could not be decoded.")
+                            .size(12)
+                            .color(t.down)
+                            .font(bold()),
+                        Space::new().height(4),
+                        text(format!(
+                            "{e}. Do not confirm this transaction: the calls it would run cannot \
+                             be shown, so there is nothing here to review."
+                        ))
+                        .size(11)
+                        .color(t.text),
+                    ]
+                    .width(Length::Fill)
+                    .into(),
+                ),
+            });
+        }
 
         if let Some(detail) = &self.detail {
             let signed_fields = non_default_signed_fields(&detail.tx);
@@ -985,6 +1074,115 @@ fn non_default_signed_fields(tx: &SafeTx) -> Vec<SignedField> {
     fields
 }
 
+/// One packed sub-call of a MultiSend batch.
+///
+/// No ERC-7730 decode: this modal renders synchronously and the clear-sign
+/// pipeline is async, so the honest offer is the mechanical facts — who it
+/// calls, what it moves, which selector, how many bytes — rather than a
+/// half-decode dressed up as a description. The one thing that *is* derivable
+/// here without a network round trip is the case that matters most, and it is
+/// the reason a co-signer needs this section at all: a call addressed to the
+/// Safe itself runs as the Safe, and that is how the multisig's own owner set
+/// and threshold get changed.
+fn sub_call_row<'a>(
+    t: KaoTheme,
+    index: usize,
+    total: usize,
+    call: &crate::txbuilder::multisend::PackedCall,
+    safe: Address,
+) -> Element<'a, Message> {
+    let mut col = column![
+        text(format!("{} of {total}", index + 1))
+            .size(11)
+            .color(t.sub)
+            .font(bold()),
+    ]
+    .spacing(4)
+    .width(Length::Fill);
+
+    if call.to == safe {
+        let effect = match crate::safe::admin::authorized_effect(&call.data) {
+            Some(e) => format!("Runs as this Safe and {e}."),
+            None => "Addressed to this Safe, and this wallet does not recognise the call. Run \
+                     this way it acts as the Safe on itself."
+                .to_string(),
+        };
+        col = col.push(
+            container(
+                column![
+                    text("⚠ TARGETS THIS SAFE")
+                        .size(11)
+                        .color(t.down)
+                        .font(bold()),
+                    Space::new().height(2),
+                    text(effect).size(11).color(t.text),
+                ]
+                .width(Length::Fill),
+            )
+            .padding(8)
+            .width(Length::Fill)
+            .style(move |_: &iced::Theme| container::Style {
+                background: Some(t.card_alt.into()),
+                border: iced::Border {
+                    color: t.down,
+                    width: 1.0,
+                    radius: 8.0.into(),
+                },
+                ..Default::default()
+            }),
+        );
+    }
+
+    col = col.push(field(t, "To", colored_address(t, call.to)));
+    if !call.value.is_zero() {
+        col = col.push(simple_field(
+            t,
+            "Value",
+            format!("{} ETH", format_eth(call.value)),
+        ));
+    }
+    // Captured before the styling closure so it doesn't borrow `call`.
+    let targets_safe = call.to == safe;
+    // A nested delegatecall inside the blob is refused outright on the signing
+    // side; here it is only ever displayed, so name it rather than drop it.
+    if call.operation != 0 {
+        col = col.push(simple_field(
+            t,
+            "Operation",
+            format!("{} — NESTED DELEGATECALL", call.operation),
+        ));
+    }
+    if call.data.is_empty() {
+        col = col.push(simple_field(t, "Calldata", "none (plain transfer)".into()));
+    } else {
+        let selector = if call.data.len() >= 4 {
+            format!("0x{}", alloy::hex::encode(&call.data[..4]))
+        } else {
+            "malformed (under 4 bytes)".to_string()
+        };
+        col = col.push(simple_field(
+            t,
+            "Selector",
+            format!("{selector} · {} bytes", call.data.len()),
+        ));
+        col = col.push(wrapped_field(t, "data", format_calldata(&call.data)));
+    }
+
+    container(col)
+        .padding(10)
+        .width(Length::Fill)
+        .style(move |_: &iced::Theme| container::Style {
+            background: Some(t.card.into()),
+            border: iced::Border {
+                color: if targets_safe { t.down } else { t.border },
+                width: 1.0,
+                radius: 10.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
 fn format_operation(operation: u8) -> String {
     match operation {
         1 => "1 (delegatecall)".to_string(),
@@ -1233,6 +1431,120 @@ mod tests {
         pending_state: SafeTxState,
     ) -> SafeTxDetailPane {
         pane_with_trust(signable, has_exec, pending_state, SafeTrust::Canonical)
+    }
+
+    /// A MultiSend blob wrapping `calls`, as the Builder's propose path files
+    /// it — built with the real encoder so a change to either side shows up
+    /// here rather than in front of a co-signer.
+    fn multisend_blob(calls: &[(Address, u64, Vec<u8>)]) -> Bytes {
+        use crate::txbuilder::{QueuedCall, multisend};
+        let queued: Vec<QueuedCall> = calls
+            .iter()
+            .enumerate()
+            .map(|(i, (to, value, data))| QueuedCall {
+                id: i as u64,
+                to: *to,
+                value: alloy::primitives::U256::from(*value),
+                data: Bytes::from(data.clone()),
+                title: "t".into(),
+                detail: "d".into(),
+                signature: None,
+                decoded_args: Vec::new(),
+            })
+            .collect();
+        multisend::encode_multisend_calldata(&multisend::encode_packed(&queued))
+    }
+
+    fn pane_with_batch(safe: Address, to: Address, data: Bytes, operation: u8) -> SafeTxDetailPane {
+        let state = SafeTxState::AwaitingConfirmations {
+            have: 0,
+            required: 2,
+        };
+        let mut p = pane(vec![], false, state);
+        p.safe = safe;
+        let mut d = detail(state, vec![]);
+        d.tx.to = to;
+        d.tx.data = data;
+        d.tx.operation = operation;
+        p.set_detail(Ok(d));
+        p
+    }
+
+    #[test]
+    fn a_multisend_proposal_unpacks_into_its_sub_calls() {
+        // What a co-signer had instead: to = 0x9641…02e2, operation = 1, and a
+        // few hundred bytes of 0x8d80ff0a…
+        use crate::txbuilder::multisend::MULTISEND_CALL_ONLY_1_4_1;
+        let safe = owner(0x5A);
+        let blob = multisend_blob(&[
+            (owner(0xC1), 0, vec![0x01, 0x02, 0x03, 0x04]),
+            (owner(0xC2), 5, Vec::new()),
+        ]);
+        let p = pane_with_batch(safe, MULTISEND_CALL_ONLY_1_4_1, blob, 1);
+        let calls = p
+            .batch_contents()
+            .expect("recognised as a batch")
+            .expect("and decodes");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].to, owner(0xC1));
+        assert_eq!(calls[0].data.as_ref(), &[0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(calls[1].to, owner(0xC2));
+        assert_eq!(calls[1].value, alloy::primitives::U256::from(5u64));
+    }
+
+    #[test]
+    fn an_ordinary_safe_transaction_has_no_batch_section() {
+        // The section must not appear for a plain transfer, or it becomes
+        // furniture the reader stops seeing.
+        let p = pane_with_batch(owner(0x5A), owner(0xC1), Bytes::from(vec![0x01]), 0);
+        assert!(p.batch_contents().is_none());
+    }
+
+    #[test]
+    fn a_delegatecall_to_something_other_than_multisend_is_not_unpacked() {
+        // Claiming to unpack a delegatecall to an unknown library would be
+        // asserting a shape this wallet has no reason to believe.
+        let p = pane_with_batch(owner(0x5A), owner(0xDD), Bytes::from(vec![0x01]), 1);
+        assert!(p.batch_contents().is_none());
+    }
+
+    #[test]
+    fn a_multisend_blob_that_will_not_parse_is_reported_not_hidden() {
+        // The failure mode that matters: falling back to the hex dump would
+        // present a batch this wallet cannot account for as though there were
+        // nothing to account for.
+        use crate::txbuilder::multisend::MULTISEND_CALL_ONLY_1_3_0;
+        let junk = Bytes::from(vec![0x8d, 0x80, 0xff, 0x0a, 0xde, 0xad]);
+        let p = pane_with_batch(owner(0x5A), MULTISEND_CALL_ONLY_1_3_0, junk, 1);
+        assert!(
+            p.batch_contents().expect("recognised").is_err(),
+            "a blob that won't parse must surface as an error",
+        );
+    }
+
+    #[test]
+    fn a_sub_call_addressed_to_the_safe_is_recognised_as_governance() {
+        // Blockers 2 and 3 meet here: the co-signer is the person who most
+        // needs to be told that call 2 hands the multisig to someone else.
+        use crate::txbuilder::multisend::MULTISEND_CALL_ONLY_1_4_1;
+        let safe = owner(0x5A);
+        let mut add_owner =
+            alloy::primitives::keccak256(b"addOwnerWithThreshold(address,uint256)")[..4].to_vec();
+        add_owner.extend_from_slice(B256::left_padding_from(owner(0xBB).as_slice()).as_slice());
+        add_owner.extend_from_slice(&alloy::primitives::U256::from(1u64).to_be_bytes::<32>());
+        let blob = multisend_blob(&[
+            (owner(0xC1), 0, vec![0x01, 0x02, 0x03, 0x04]),
+            (safe, 0, add_owner),
+        ]);
+        let p = pane_with_batch(safe, MULTISEND_CALL_ONLY_1_4_1, blob, 1);
+        let calls = p.batch_contents().unwrap().unwrap();
+        assert_ne!(calls[0].to, safe);
+        assert_eq!(calls[1].to, safe, "the governance call targets the Safe");
+        assert!(
+            crate::safe::admin::authorized_effect(&calls[1].data)
+                .is_some_and(|e| e.contains("adds an owner")),
+            "and its effect is nameable without a network round trip",
+        );
     }
 
     #[test]

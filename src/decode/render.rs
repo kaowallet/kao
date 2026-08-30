@@ -6,7 +6,7 @@
 //!     ├─ proxy::resolve_implementation  → impl address (verified)
 //!     ├─ net.get_code(impl)             → bytecode (verified)
 //!     ├─ bytecode::extract              → selector → arg-type list
-//!     ├─ fourbyte::lookup(selector)     → human signatures
+//!     ├─ fourbyte::lookup(selector)     → human signatures (snapshot)
 //!     ├─ matcher::resolve               → Resolved::{Unique|Ambiguous|TypesOnly|Unknown}
 //!     ├─ alloy::dyn_abi::abi_decode     → DynSolValue per arg
 //!     └─ humanize:
@@ -144,6 +144,18 @@ pub enum Warning {
     /// what the contract actually implements. A possible spoof; the UI
     /// flags it louder than plain ambiguity. Carries the rejected names.
     BytecodeMismatch { candidates: Vec<String> },
+    /// The arguments on screen do not account for every byte of the calldata.
+    ///
+    /// Alloy's decoder is non-consuming: it reads the arguments it was asked
+    /// for and ignores whatever follows. So a call can render a clean, complete
+    /// argument list and still carry bytes that reach the contract — an
+    /// ERC-2771 forwarder takes the spoofed sender from exactly this tail. The
+    /// decoded view is the whole basis on which a call is vetted, so bytes it
+    /// cannot explain have to be said out loud rather than dropped.
+    ///
+    /// Carries the length the decoded arguments account for and the total
+    /// calldata body (both excluding the 4-byte selector).
+    UnaccountedCalldata { decoded: usize, total: usize },
 }
 
 // ---------------------------------------------------------------------------
@@ -204,7 +216,7 @@ pub async fn decode_call(
         bytecode::lookup(&code, selector)
     };
 
-    // Phase 2+5: 4byte lookup, signature matcher.
+    // Phase 2+5: 4byte lookup (compile-time snapshot), signature matcher.
     let candidates = fourbyte::lookup(selector);
     let resolved_sig = matcher::resolve(&candidates, bytecode_types.as_deref());
 
@@ -247,6 +259,10 @@ pub async fn decode_call(
 
     // Decode arguments via alloy.
     let raw_args = decode_args_inner(&arg_types, &calldata[4..]);
+    if let Some((decoded, total)) = unaccounted_calldata(&raw_args, &calldata[4..]) {
+        out.warnings
+            .push(Warning::UnaccountedCalldata { decoded, total });
+    }
 
     // Probe the call target (NOT the implementation — `to` is what the
     // user thinks they're interacting with) for symbol() / decimals().
@@ -297,7 +313,26 @@ pub async fn decode_call(
 /// Decode the argument bytes against `arg_types`. Returns one
 /// `DynSolValue` per type, or empty if alloy refuses to decode (e.g.
 /// truncated calldata).
-fn decode_args_inner(arg_types: &[DynSolType], data: &[u8]) -> Vec<DynSolValue> {
+/// `Some((decoded_len, total_len))` when re-encoding the decoded arguments does
+/// not reproduce `data` — i.e. the argument list on screen leaves part of the
+/// calldata unexplained. `None` when every byte is accounted for.
+///
+/// Unlike `txbuilder::encode::decode_args`, which *refuses* such a call
+/// outright because it is composing the bytes that get signed, this path is
+/// describing bytes that already exist. Dropping the decode entirely would
+/// leave the review with less to show, not more, so the mismatch is surfaced as
+/// a warning beside a decode that is still worth reading.
+pub(super) fn unaccounted_calldata(values: &[DynSolValue], data: &[u8]) -> Option<(usize, usize)> {
+    if values.is_empty() {
+        // Nothing decoded, so nothing is claiming to account for anything —
+        // the raw-calldata view is what the user reads here.
+        return None;
+    }
+    let reencoded = DynSolValue::Tuple(values.to_vec()).abi_encode_params();
+    (reencoded.as_slice() != data).then_some((reencoded.len(), data.len()))
+}
+
+pub(super) fn decode_args_inner(arg_types: &[DynSolType], data: &[u8]) -> Vec<DynSolValue> {
     if arg_types.is_empty() {
         return Vec::new();
     }
@@ -514,6 +549,39 @@ mod tests {
     fn decode_empty_args() {
         let values = decode_args_inner(&[], &[]);
         assert!(values.is_empty());
+    }
+
+    /// The decoder stops once it has the arguments it was asked for, so a
+    /// clean-looking `transfer` can carry a tail the panel never renders.
+    #[test]
+    fn a_calldata_tail_the_arguments_do_not_explain_is_reported() {
+        let mut cd = Vec::with_capacity(68);
+        cd.extend_from_slice(&[0xa9, 0x05, 0x9c, 0xbb]);
+        cd.extend_from_slice(&[0u8; 12]);
+        cd.extend_from_slice(address!("000000000000000000000000000000000000dEaD").as_slice());
+        cd.extend_from_slice(&U256::from(1_000_000u64).to_be_bytes::<32>());
+
+        let arg_types = vec![DynSolType::Address, DynSolType::Uint(256)];
+        let clean = decode_args_inner(&arg_types, &cd[4..]);
+        assert_eq!(
+            unaccounted_calldata(&clean, &cd[4..]),
+            None,
+            "an exactly-accounted-for call warns about nothing"
+        );
+
+        let mut padded = cd.clone();
+        padded.extend_from_slice(&[0x11u8; 20]);
+        let values = decode_args_inner(&arg_types, &padded[4..]);
+        assert_eq!(
+            values.len(),
+            2,
+            "the tail does not stop the arguments decoding — that is the problem"
+        );
+        assert_eq!(
+            unaccounted_calldata(&values, &padded[4..]),
+            Some((64, 84)),
+            "20 unexplained bytes must be reported"
+        );
     }
 
     #[test]

@@ -22,7 +22,7 @@
 //! because that requires a multi-thread tokio runtime — and iced's tokio
 //! integration doesn't guarantee one.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -31,9 +31,11 @@ use revm::context::result::{ExecutionResult, Output};
 use revm::context::{BlockEnv, CfgEnv, TxEnv};
 use revm::context_interface::block::BlobExcessGasAndPrice;
 use revm::database_interface::DBErrorMarker;
-use revm::primitives::{KECCAK_EMPTY, hardfork::SpecId};
-use revm::state::{AccountInfo, Bytecode};
-use revm::{Context, Database, ExecuteEvm, MainBuilder, MainContext};
+use revm::primitives::{HashMap as RevmHashMap, KECCAK_EMPTY, hardfork::SpecId};
+use revm::state::{Account, AccountInfo, Bytecode};
+use revm::{
+    Context, Database, DatabaseCommit, ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext,
+};
 use tokio::runtime::Handle;
 use tracing::{debug, info, warn};
 
@@ -196,6 +198,11 @@ struct HeliosDb {
     handle: Handle,
     accounts: HashMap<Address, AccountInfo>,
     storage: HashMap<(Address, U256), U256>,
+    /// Addresses whose storage was locally cleared by a committed tx
+    /// (CREATE or SELFDESTRUCT). A storage miss on one of these reads as
+    /// zero rather than re-fetching stale on-chain state — only relevant
+    /// on the batch path, where state is committed between sub-calls.
+    cleared: HashSet<Address>,
     /// `true` while every read so far went through Helios's verified
     /// path. Flipped to `false` the first time a read returns
     /// `VerifiedRead { verified: false, .. }`. The simulator surfaces
@@ -213,6 +220,7 @@ impl HeliosDb {
             handle,
             accounts: HashMap::new(),
             storage: HashMap::new(),
+            cleared: HashSet::new(),
             all_verified: true,
         }
     }
@@ -270,6 +278,11 @@ impl Database for HeliosDb {
         if let Some(value) = self.storage.get(&(address, slot)) {
             return Ok(*value);
         }
+        // A locally created/destructed account starts with empty storage;
+        // an unset slot is zero, not whatever the chain held before.
+        if self.cleared.contains(&address) {
+            return Ok(U256::ZERO);
+        }
         let net = self.network.clone();
         let chain = self.chain;
         let read = self
@@ -285,14 +298,49 @@ impl Database for HeliosDb {
     }
 
     fn block_hash(&mut self, number: u64) -> Result<B256, DbError> {
-        // No send-flow tx (native ETH, ERC-20 transfer) reads
-        // BLOCKHASH. A general-purpose simulation path would need to
-        // service this via a verified `eth_getBlockByNumber`; in v1 we
-        // surface the gap rather than silently returning zero (which
-        // would be a wrong execution, not a missing one).
+        // Servicing this needs a verified `eth_getBlockByNumber`, which
+        // `BalanceFetcher` does not expose. Surfacing the gap is deliberate:
+        // returning zero would be a *wrong* execution rather than a missing
+        // one, and a preflight that quietly computes the wrong answer is worse
+        // than one that declines. The caller renders this string, so it is
+        // written for the person reading it — the batch composer, who can hit
+        // it through any callee that reads BLOCKHASH.
         Err(DbError(format!(
-            "block_hash({number}) unsupported — no send-flow tx reads BLOCKHASH"
+            "this batch reads the hash of block {number}, which Kao's preflight can't supply — \
+             the simulation can't run, but the batch itself may be fine"
         )))
+    }
+}
+
+/// Commit an executed tx's state changes back into the cache so a later
+/// sub-call in the same batch observes them (e.g. `approve` then a
+/// `supply` that spends the allowance). Mirrors revm's own in-memory
+/// commit: skip untouched accounts, reset self-destructed / freshly-created
+/// accounts to empty storage, and write through each changed slot's present
+/// value. Only exercised by [`simulate_batch`]; the single-call path uses
+/// `replay()` and never commits.
+impl DatabaseCommit for HeliosDb {
+    fn commit(&mut self, changes: RevmHashMap<Address, Account>) {
+        for (address, account) in changes {
+            if !account.is_touched() {
+                continue;
+            }
+            if account.is_selfdestructed() {
+                self.accounts.insert(address, AccountInfo::default());
+                self.storage.retain(|(a, _), _| *a != address);
+                self.cleared.insert(address);
+                continue;
+            }
+            if account.is_created() {
+                // New account: its prior on-chain storage (if any) is gone.
+                self.storage.retain(|(a, _), _| *a != address);
+                self.cleared.insert(address);
+            }
+            self.accounts.insert(address, account.info);
+            for (slot, value) in account.storage {
+                self.storage.insert((address, slot), value.present_value());
+            }
+        }
     }
 }
 
@@ -410,6 +458,352 @@ pub async fn simulate_call(
         verified = result.verified,
         reverted = result.is_revert(),
         "sim: done",
+    );
+    Ok(result)
+}
+
+// ============================================================================
+// Batch simulation (Transaction Builder)
+// ============================================================================
+
+/// One sub-call of a batch. Mirrors the inner semantics of a MultiSend
+/// delegatecall: each sub-call runs with `msg.sender == from` (the Safe)
+/// against state carried over from the previous sub-call.
+#[derive(Debug, Clone)]
+pub struct BatchStep {
+    pub to: Address,
+    pub value: U256,
+    pub input: Bytes,
+}
+
+/// Aggregate outcome of simulating a whole batch.
+#[derive(Debug, Clone)]
+pub enum BatchOutcome {
+    /// Every sub-call executed successfully.
+    Success,
+    /// Sub-call `step` (0-based) reverted; the real batch reverts atomically.
+    Revert { step: usize, reason: String },
+    /// Sub-call `step` halted (out of gas / invalid opcode / …).
+    Halt { step: usize, reason: String },
+    /// The simulator could not produce a verdict, and here is why.
+    ///
+    /// Distinct from [`Self::Unavailable`], which says only "no answer". The
+    /// error string used to be dropped on the floor by the caller, so a Helios
+    /// outage, a `BLOCKHASH` read the db can't service, and a batch whose value
+    /// exceeds the sender's balance all rendered as the same shrug — followed
+    /// by advice to re-run a preflight that, for most of those, can never
+    /// succeed.
+    Error(String),
+    /// Simulation couldn't run (unsupported chain / upstream error).
+    Unavailable,
+}
+
+/// Where a batch's metered gas lands against the block it would have to be
+/// mined in.
+///
+/// [`simulate_batch`] runs each sub-call as its own revm transaction under
+/// [`SIM_GAS_LIMIT`], with `disable_block_gas_limit = true` on the `CfgEnv` —
+/// which is what keeps a legitimate gas-heavy call from bouncing during
+/// preflight, and is also why five 25M-gas steps metered 125M and reported a
+/// clean pass for a transaction no block on any chain Kao supports could ever
+/// include. The per-step limit stays; this is what stops the aggregate lying.
+///
+/// The ceiling is the live `LatestBlock::gas_limit` the simulation already ran
+/// against, not a per-chain constant: free, correct on Mainnet, Base and
+/// Optimism alike, and it doesn't rot at the next limit bump.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GasFit {
+    /// No block gas limit was read (the simulation never ran) — nothing to say.
+    Unknown,
+    /// Comfortably inside the block: under half the limit.
+    Fits,
+    /// Inside the limit but occupying more than half a block. Includable only
+    /// when the rest of the block is nearly empty — and the metered figure
+    /// under-counts the real transaction (it omits the MultiSend loop, the
+    /// `execTransaction` wrapper, calldata cost and per-owner signature
+    /// verification), so past half a block there is no honest margin left.
+    Crowded { gas_used: u64, block_gas_limit: u64 },
+    /// At or over the block gas limit. This transaction cannot be mined at all:
+    /// no builder can pack it, and it is not a fee problem. It has to be split.
+    Exceeds { gas_used: u64, block_gas_limit: u64 },
+}
+
+#[derive(Debug, Clone)]
+pub struct BatchSimResult {
+    pub outcome: BatchOutcome,
+    /// Sum of gas metered by the executed sub-calls.
+    ///
+    /// Advisory, and in both directions. It over-counts by `(N − 1) × 21000`
+    /// (each step pays its own intrinsic cost; the real transaction pays one)
+    /// and under-counts the MultiSend loop, the `execTransaction` wrapper,
+    /// calldata cost and per-owner signature verification. Treat it as an
+    /// order of magnitude, not a quote.
+    ///
+    /// This used to claim "the review pairs it with a real `eth_estimateGas`
+    /// at execute time". It does not: no `SignStep` on the Builder path
+    /// carries a gas field, and the only `estimate_gas` in the flow runs
+    /// inside the broadcast helpers, after every signature is collected. The
+    /// one place this figure is load-bearing rather than decorative is
+    /// [`BatchSimResult::gas_fit`], which compares it against the block gas
+    /// limit. The two errors don't cancel and their net sign isn't known, so
+    /// that check deliberately treats "over half a block" as already too
+    /// close to call rather than trusting the number near the boundary.
+    pub gas_used: u64,
+    /// Every ERC-20/721 `Transfer` event emitted across all sub-calls, in
+    /// execution order. **Not netted** — this is the concatenation of each
+    /// step's logs, so one swap contributes the hop into the pool and the hop
+    /// out of it, and a router contributes its own legs in between. A consumer
+    /// presenting these as balance changes has to net them itself (see
+    /// `wallet_dashboard::build_batch_economics`, which sums per token against
+    /// the sending account).
+    ///
+    /// Only meaningful on `Success` — a reverting batch performs no transfer,
+    /// so it's cleared.
+    pub transfers: Vec<TokenTransfer>,
+    pub verified: bool,
+    pub base_fee_per_gas: u64,
+    /// The block this ran against. A verdict is only a statement about the
+    /// state at one height; without the height, a "Simulation passed" from
+    /// twenty minutes and a hundred blocks ago is indistinguishable from one
+    /// taken a second before the review opened.
+    pub block: u64,
+    /// The gas limit of the block this ran against — the ceiling the assembled
+    /// transaction has to fit under. Live and per-chain (the same value fed to
+    /// revm's `BlockEnv`), so there is no hardcoded limit to keep in sync. Zero
+    /// means no block was read, which reads as "unknown" and suppresses the
+    /// check rather than failing it.
+    pub block_gas_limit: u64,
+}
+
+impl BatchSimResult {
+    pub fn unavailable() -> Self {
+        Self {
+            outcome: BatchOutcome::Unavailable,
+            gas_used: 0,
+            transfers: Vec::new(),
+            verified: false,
+            base_fee_per_gas: 0,
+            block: 0,
+            block_gas_limit: 0,
+        }
+    }
+
+    /// A **lower bound** on the gas the assembled transaction will need, given
+    /// the batch ran as `n_calls` steps — or `None` when no honest bound is
+    /// available.
+    ///
+    /// [`Self::gas_used`] is the sum of per-step metering, and the one error in
+    /// it whose sign and size are both known is the intrinsic cost: each step
+    /// pays its own 21,000, where the real transaction pays that once. Removing
+    /// `(n − 1) × 21,000` therefore yields a figure the real transaction cannot
+    /// come in **under** — every remaining un-modelled term (the MultiSend
+    /// dispatch loop, the `execTransaction` wrapper, per-owner signature
+    /// verification, the per-call MultiSend headers) only adds to the true
+    /// figure.
+    ///
+    /// That direction is the whole point: it makes the bound safe to *refuse*
+    /// on. `gas_fit`'s bands are calibrated for a warning and compare the raw
+    /// sum, which over-counts — fine for "this looks too big", not fine for a
+    /// wall a user cannot get past.
+    ///
+    /// `None` unless the run actually succeeded (a partial run's metering
+    /// describes a transaction that doesn't exist), a block was read, and that
+    /// read was **verified**. The last is deliberate: `block_gas_limit` comes
+    /// off a header that can fall back to a raw exec RPC, and an unverified
+    /// scalar must not be able to veto a signature — everywhere else in this
+    /// wallet an unverified read softens a verdict rather than hardening one.
+    pub fn gas_floor(&self, n_calls: usize) -> Option<u64> {
+        if !matches!(self.outcome, BatchOutcome::Success)
+            || !self.verified
+            || self.block_gas_limit == 0
+        {
+            return None;
+        }
+        let intrinsic_overcount = (n_calls.saturating_sub(1) as u64).saturating_mul(21_000);
+        Some(self.gas_used.saturating_sub(intrinsic_overcount))
+    }
+
+    /// `Some((floor, block_gas_limit))` when this batch **cannot be mined at
+    /// all**: even the lower bound of [`Self::gas_floor`] is at or over the
+    /// limit of the block it ran against.
+    ///
+    /// Distinct from `GasFit::Exceeds`, and deliberately stricter. `Exceeds`
+    /// says "the estimate is over the limit" and is advisory — the estimate
+    /// over-counts, so it can say that about a batch that would have fit. This
+    /// says "no reading of the meter puts it under", which is categorical, and
+    /// is the only form of the claim strong enough to refuse a signature over.
+    pub fn unmineable(&self, n_calls: usize) -> Option<(u64, u64)> {
+        let floor = self.gas_floor(n_calls)?;
+        (floor >= self.block_gas_limit).then_some((floor, self.block_gas_limit))
+    }
+
+    /// How this batch's metered gas sits against the block it would be mined
+    /// in. See [`GasFit`] for why the bands are where they are.
+    pub fn gas_fit(&self) -> GasFit {
+        let limit = self.block_gas_limit;
+        if limit == 0 {
+            return GasFit::Unknown;
+        }
+        if self.gas_used >= limit {
+            GasFit::Exceeds {
+                gas_used: self.gas_used,
+                block_gas_limit: limit,
+            }
+        } else if self.gas_used.saturating_mul(2) >= limit {
+            GasFit::Crowded {
+                gas_used: self.gas_used,
+                block_gas_limit: limit,
+            }
+        } else {
+            GasFit::Fits
+        }
+    }
+
+    /// The simulator failed outright — `reason` is what to tell the user.
+    pub fn errored(reason: impl Into<String>) -> Self {
+        Self {
+            outcome: BatchOutcome::Error(reason.into()),
+            ..Self::unavailable()
+        }
+    }
+
+    pub fn is_success(&self) -> bool {
+        matches!(self.outcome, BatchOutcome::Success)
+    }
+
+    pub fn is_revert(&self) -> bool {
+        matches!(
+            self.outcome,
+            BatchOutcome::Revert { .. } | BatchOutcome::Halt { .. }
+        )
+    }
+}
+
+/// Simulate a batch of sub-calls as one atomic unit.
+///
+/// Each step runs from `from` (the Safe) against *shared, committed* state,
+/// so a `supply` sees the allowance a preceding `approve` granted. Execution
+/// stops at the first revert/halt — exactly where the on-chain MultiSend
+/// would revert the whole batch — and reports which step failed and why.
+///
+/// This models the *inner* effect of the MultiSend delegatecall (each
+/// sub-call as the Safe), not the full `execTransaction` wrapper. Like the
+/// single-call preflight it is advisory: a stale-state false negative must
+/// never hard-block a legitimate batch.
+pub async fn simulate_batch(
+    network: Arc<dyn BalanceFetcher>,
+    chain: Chain,
+    from: Address,
+    steps: Vec<BatchStep>,
+) -> Result<BatchSimResult, SimError> {
+    if steps.is_empty() {
+        return Err(SimError::Evm("empty batch".into()));
+    }
+    info!(
+        chain = %chain.label(),
+        from = %from,
+        steps = steps.len(),
+        "batch sim: starting",
+    );
+
+    let latest = network.latest_block(chain).await.map_err(SimError::State)?;
+    let block_verified = latest.verified;
+    let block = latest.value;
+    let chain_id = chain.chain_id();
+    let base_fee_per_gas = block.base_fee_per_gas;
+    let block_number = block.number;
+    // Captured before `block` moves into the blocking closure: the ceiling the
+    // assembled transaction has to fit under, so the caller can tell a batch
+    // that passed from one that passed and cannot be mined.
+    let block_gas_limit = block.gas_limit;
+    let handle = Handle::current();
+
+    let result = tokio::task::spawn_blocking(move || -> Result<BatchSimResult, SimError> {
+        let mut db = HeliosDb::new(network, chain, handle);
+        if !block_verified {
+            db.all_verified = false;
+        }
+        let block_env = build_block_env(&block);
+        let cfg = build_cfg(chain_id);
+        let ctx = Context::mainnet().with_block(block_env).with_cfg(cfg);
+        let mut evm = ctx.with_db(&mut db).build_mainnet();
+
+        let mut gas_used: u64 = 0;
+        let mut transfers: Vec<TokenTransfer> = Vec::new();
+        let mut outcome = BatchOutcome::Success;
+        for (i, step) in steps.iter().enumerate() {
+            let tx_env = build_tx_env(from, step.to, step.value, step.input.clone(), 0, chain_id);
+            let res = match evm.transact_commit(tx_env) {
+                Ok(r) => r,
+                // revm refuses a step whose `value` exceeds the sender's
+                // balance in its upfront check, before the EVM runs, and
+                // reports it as an *error* rather than a Revert. It is a real
+                // prediction about this batch — the chain would do the same —
+                // so it belongs in the outcome, not in the error channel where
+                // it degrades to "simulation unavailable". Mirrors the same
+                // translation in `safe::sim::simulate_safe_inner`.
+                Err(e) => {
+                    let msg = format!("{e:?}");
+                    if msg.contains("LackOfFund") {
+                        outcome = BatchOutcome::Revert {
+                            step: i,
+                            reason: "sender's balance is below this call's value".to_string(),
+                        };
+                        break;
+                    }
+                    return Err(SimError::Evm(msg));
+                }
+            };
+            gas_used = gas_used.saturating_add(res.gas_used());
+            match res {
+                ExecutionResult::Success { logs, .. } => {
+                    transfers.extend(extract_transfers(&logs));
+                }
+                ExecutionResult::Revert { output, .. } => {
+                    let reason = decode_revert_reason(&output).unwrap_or_else(|| {
+                        if output.is_empty() {
+                            "reverted without reason".to_string()
+                        } else {
+                            format!("0x{}", alloy::hex::encode(output.as_ref()))
+                        }
+                    });
+                    outcome = BatchOutcome::Revert { step: i, reason };
+                    break;
+                }
+                ExecutionResult::Halt { reason, .. } => {
+                    outcome = BatchOutcome::Halt {
+                        step: i,
+                        reason: format!("{reason:?}"),
+                    };
+                    break;
+                }
+            }
+        }
+        // A reverting batch performs no net transfer — don't show one.
+        if !matches!(outcome, BatchOutcome::Success) {
+            transfers.clear();
+        }
+        let verified = db.all_verified;
+        Ok(BatchSimResult {
+            outcome,
+            gas_used,
+            transfers,
+            verified,
+            base_fee_per_gas,
+            block: block_number,
+            block_gas_limit,
+        })
+    })
+    .await
+    .map_err(|e| SimError::Join(e.to_string()))??;
+
+    info!(
+        chain = %chain.label(),
+        gas_used = result.gas_used,
+        transfers = result.transfers.len(),
+        verified = result.verified,
+        reverted = result.is_revert(),
+        "batch sim: done",
     );
     Ok(result)
 }
@@ -668,6 +1062,125 @@ fn address_from_topic(topic: &B256) -> Address {
 mod tests {
     use super::*;
     use alloy::primitives::{LogData, address, b256, bytes};
+
+    /// A `Success` result metering `gas_used` against `block_gas_limit`.
+    fn metered(gas_used: u64, block_gas_limit: u64) -> BatchSimResult {
+        BatchSimResult {
+            outcome: BatchOutcome::Success,
+            gas_used,
+            transfers: Vec::new(),
+            verified: true,
+            base_fee_per_gas: 1,
+            block: 21_000_000,
+            block_gas_limit,
+        }
+    }
+
+    #[test]
+    fn batch_gas_fit_flags_a_batch_that_cannot_fit_in_a_block() {
+        // Five 25M-gas steps: each is fine on its own under the per-step limit,
+        // and revm is run with `disable_block_gas_limit`, so the sum used to
+        // come back as a clean pass for a transaction no block can include.
+        let over = metered(125_000_000, 45_000_000);
+        assert_eq!(
+            over.gas_fit(),
+            GasFit::Exceeds {
+                gas_used: 125_000_000,
+                block_gas_limit: 45_000_000,
+            }
+        );
+        // The boundary is unminable, not borderline: a transaction has to fit
+        // *under* the limit, alongside nothing else.
+        assert!(matches!(
+            metered(45_000_000, 45_000_000).gas_fit(),
+            GasFit::Exceeds { .. }
+        ));
+    }
+
+    /// The floor removes the one error whose sign and size are both known, so
+    /// the figure it yields is one the real transaction cannot come in under.
+    #[test]
+    fn gas_floor_removes_the_intrinsic_over_count() {
+        // 10 steps: nine of the ten 21,000 intrinsics are an artefact of
+        // simulating each call as its own transaction.
+        let r = metered(5_000_000, 45_000_000);
+        assert_eq!(r.gas_floor(10), Some(5_000_000 - 9 * 21_000));
+        // A single call pays exactly one intrinsic in both worlds.
+        assert_eq!(r.gas_floor(1), Some(5_000_000));
+        assert_eq!(r.gas_floor(0), Some(5_000_000));
+    }
+
+    /// The distinction that lets one of these refuse a signature and the other
+    /// only warn: `Exceeds` compares the raw over-counting sum, `unmineable`
+    /// compares the floor.
+    #[test]
+    fn a_batch_exceeds_can_still_be_mineable() {
+        // 200 calls carry 199 × 21,000 = 4.179M of intrinsic over-count, so a
+        // metered 45M is really no more than ~40.8M — over the warning band,
+        // under the limit. The warning fires; the wall must not.
+        let r = metered(45_000_000, 45_000_000);
+        assert!(matches!(r.gas_fit(), GasFit::Exceeds { .. }));
+        assert_eq!(
+            r.unmineable(200),
+            None,
+            "a batch that could still be mined must never be refused",
+        );
+        // The same meter reading with few enough calls to have no such slack
+        // is unmineable on any reading.
+        assert_eq!(r.unmineable(1), Some((45_000_000, 45_000_000)));
+    }
+
+    #[test]
+    fn unmineable_needs_a_successful_verified_run_against_a_real_block() {
+        let base = metered(125_000_000, 45_000_000);
+        assert_eq!(
+            base.unmineable(5),
+            Some((125_000_000 - 4 * 21_000, 45_000_000))
+        );
+
+        // A partial run's metering describes a transaction that doesn't exist.
+        let reverted = BatchSimResult {
+            outcome: BatchOutcome::Revert {
+                step: 1,
+                reason: "nope".into(),
+            },
+            ..base.clone()
+        };
+        assert_eq!(reverted.unmineable(5), None);
+
+        // `block_gas_limit` can come off a raw exec RPC. An unverified scalar
+        // must not be able to veto a signature — one small `gasLimit` field
+        // would otherwise refuse every batch this wallet ever signs.
+        let unverified = BatchSimResult {
+            verified: false,
+            ..base.clone()
+        };
+        assert_eq!(unverified.unmineable(5), None);
+
+        // No block read ⇒ no ceiling to compare against.
+        let no_block = BatchSimResult {
+            block_gas_limit: 0,
+            ..base
+        };
+        assert_eq!(no_block.unmineable(5), None);
+    }
+
+    #[test]
+    fn batch_gas_fit_warns_past_half_a_block_and_stays_quiet_below() {
+        assert!(matches!(
+            metered(30_000_000, 45_000_000).gas_fit(),
+            GasFit::Crowded { .. }
+        ));
+        assert_eq!(metered(1_000_000, 45_000_000).gas_fit(), GasFit::Fits);
+    }
+
+    #[test]
+    fn batch_gas_fit_says_nothing_when_no_block_was_read() {
+        // `unavailable()` never ran, so it has no ceiling to measure against —
+        // and a stale-state false negative must never hard-block a batch.
+        assert_eq!(BatchSimResult::unavailable().gas_fit(), GasFit::Unknown);
+        assert_eq!(metered(125_000_000, 0).gas_fit(), GasFit::Unknown);
+    }
 
     #[test]
     fn decode_error_string_revert() {
@@ -1214,6 +1727,46 @@ mod tests {
     /// `verified = false` must survive `is_revert` / `is_unavailable`
     /// inspection without being misclassified — the UI sources its
     /// trust badge directly from this field.
+    #[tokio::test]
+    async fn simulate_batch_native_transfers_sum_gas() {
+        // Two native sends from a codeless caller succeed and meter
+        // 21000 gas each — the batch reports their sum.
+        use crate::net::MockFetcher;
+        use alloy::primitives::address;
+
+        let network: Arc<dyn BalanceFetcher> = Arc::new(MockFetcher::new());
+        let safe = address!("0x0000000000000000000000000000000000005AFE");
+        let steps = vec![
+            BatchStep {
+                to: address!("0x000000000000000000000000000000000000dEaD"),
+                value: U256::ZERO,
+                input: Bytes::new(),
+            },
+            BatchStep {
+                to: address!("0x000000000000000000000000000000000000bEEF"),
+                value: U256::ZERO,
+                input: Bytes::new(),
+            },
+        ];
+        let res = simulate_batch(network, Chain::Mainnet, safe, steps)
+            .await
+            .expect("batch sim runs");
+        assert!(res.is_success(), "got {:?}", res.outcome);
+        assert_eq!(res.gas_used, 42000);
+        assert!(res.transfers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn simulate_batch_empty_errors() {
+        use crate::net::MockFetcher;
+        let network: Arc<dyn BalanceFetcher> = Arc::new(MockFetcher::new());
+        assert!(
+            simulate_batch(network, Chain::Mainnet, Address::ZERO, Vec::new())
+                .await
+                .is_err()
+        );
+    }
+
     #[test]
     fn unverified_success_still_reports_success() {
         let r = SimulationResult {

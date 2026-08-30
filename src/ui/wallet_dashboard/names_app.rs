@@ -836,6 +836,13 @@ impl NamesApp {
         self.trace_delta(&before);
     }
 
+    /// The manage-tab notice as the user would see it — `(is_error, text)`.
+    /// For the coordinator's tests, mirroring `TxBuilderApp::settled_state`.
+    #[cfg(test)]
+    pub fn manage_notice(&self) -> Option<&(bool, String)> {
+        self.manage_notice.as_ref()
+    }
+
     pub fn on_commit(&mut self, result: Result<RegisterPlan, String>) {
         let before = self.trace_snapshot();
         let Some(r) = &mut self.reg else { return };

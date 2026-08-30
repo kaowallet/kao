@@ -570,7 +570,9 @@ impl ContactsPane {
             AddressResolution::Empty
         } else if let Ok(addr) = Address::from_str(trimmed) {
             AddressResolution::Hex(addr)
-        } else if crate::names::looks_like_known_name(trimmed) {
+        } else if crate::names::looks_like_known_name(trimmed)
+            || crate::names::looks_like_xns_name(trimmed)
+        {
             AddressResolution::Resolving {
                 name: trimmed.to_string(),
             }
@@ -966,12 +968,22 @@ fn list_card<'a>(
     // 2-column grid regardless of which contacts have which fields
     // populated. The earlier "render only when present" approach made
     // the row shorter when a card lacked a name, which left the grid
-    // looking ragged. The label reflects which service vouches for the
-    // name (ENS / GNS / WNS), keyed off its TLD.
+    // looking ragged.
+    //
+    // The prefix names the service that vouches for the name, and is dropped
+    // when the name alone can't say which one — an XNS namespace is
+    // permissionless, so `dave.crops` could be XNS and `frank.org` could be
+    // either XNS or ENS. The registry is known at resolve time but isn't
+    // carried in `ContactEns` (a postcard record: appending a field would fail
+    // every existing row's decode), so a saved contact renders the bare name
+    // rather than a guess.
     let ens_text = c
         .ens
         .as_ref()
-        .map(|e| format!("{}: {}", crate::names::namespace_label(&e.name), e.name))
+        .map(|e| match crate::names::namespace_label(&e.name) {
+            Some(ns) => format!("{ns}: {}", e.name),
+            None => e.name.clone(),
+        })
         .unwrap_or_default();
     let notes_text = c.notes.clone();
 
@@ -1195,4 +1207,51 @@ fn pick_random_kaomoji(current: &str) -> String {
         }
     }
     KAOMOJI_POOL[0].to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pane() -> ContactsPane {
+        ContactsPane::new(Arc::new(RwLock::new(ContactsBook::new())))
+    }
+
+    /// XNS namespaces are permissionless, so the gate can't be a TLD list. It
+    /// used to be one, which meant `dave.crops` was refused as "not a valid
+    /// 0x… address or name" and could never become a contact at all.
+    #[test]
+    fn an_arbitrary_xns_namespace_is_accepted_as_a_name() {
+        for name in ["dave.crops", "erin.cheese", "carol.xns", "vitalik.eth"] {
+            let mut p = pane();
+            p.set_address(name.into());
+            assert!(
+                matches!(&p.resolution, AddressResolution::Resolving { name: n } if n == name),
+                "{name} should start a lookup, got {:?}",
+                p.resolution,
+            );
+        }
+    }
+
+    /// The other half of the same gate: things no registry could hold are still
+    /// refused without a network call.
+    #[test]
+    fn junk_is_still_refused() {
+        for bad in ["docs.uniswap.org", "notaname", "definitely not an address"] {
+            let mut p = pane();
+            p.set_address(bad.into());
+            assert!(
+                matches!(p.resolution, AddressResolution::Invalid),
+                "{bad} should be refused, got {:?}",
+                p.resolution,
+            );
+        }
+    }
+
+    #[test]
+    fn a_hex_address_still_needs_no_lookup() {
+        let mut p = pane();
+        p.set_address("0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045".into());
+        assert!(matches!(p.resolution, AddressResolution::Hex(_)));
+    }
 }

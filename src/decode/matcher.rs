@@ -119,7 +119,12 @@ fn function_name(sig: &str) -> &str {
 /// Strategy: extract `(...)` substring, parse via `DynSolType::parse`
 /// (which natively handles nested tuples like
 /// `((address,uint256)[],bool)`), unwrap the resulting `Tuple`.
-fn parse_signature_args(sig: &str) -> Option<Vec<DynSolType>> {
+///
+/// Visible to the rest of `decode` because the clear-signing path needs the
+/// same signature → types step: an ERC-7730 `display.formats` key *is* a
+/// function signature, and the descriptor gives no other way to learn the
+/// argument shape it rendered.
+pub(super) fn parse_signature_args(sig: &str) -> Option<Vec<DynSolType>> {
     let open = sig.find('(')?;
     let close = sig.rfind(')')?;
     if close <= open {

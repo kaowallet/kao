@@ -39,14 +39,23 @@ use super::{
     SafeTx, decode_ret, domainSeparatorCall, execTransactionCall, getTransactionHashCall, nonceCall,
 };
 
-/// Safe-spec operation byte. Only `Call` is exposed in v1 —
-/// DelegateCall runs arbitrary code under the Safe's identity and is
-/// reserved for the future MultiSendCallOnly / module flow.
+/// Safe-spec operation byte.
+///
+/// `DelegateCall` runs the target's code under the Safe's own identity and
+/// storage — a foot-gun in general, since a delegatecall to an attacker
+/// contract can rewrite the Safe's owners. It is therefore NEVER offered as
+/// a free-form choice in any UI. The single sanctioned use is the
+/// Transaction Builder's atomic-batch path, which delegatecalls *only* the
+/// canonical, audited `MultiSendCallOnly` library (a fixed known address,
+/// verified to have code on-chain before signing) — see
+/// [`crate::txbuilder::multisend`]. `MultiSendCallOnly` restricts its own
+/// inner operations to plain `Call`, so the Safe's storage is never
+/// mutated by the delegatecall itself.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operation {
     Call = 0,
-    // DelegateCall = 1,  // intentionally not constructible in v1
+    DelegateCall = 1,
 }
 
 /// Ergonomic input for [`build_safe_tx_with_nonce`] — the

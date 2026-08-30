@@ -2038,108 +2038,117 @@ pub(crate) fn render_send_review<'a, M: 'a + Clone + CopyKick>(
     };
 
     // ── Decoded call data (collapsible) ──
-    let calldata_block: Element<'_, M> =
-        if function_panel::view::<M>(t, Some(r.decoded.as_ref()), false).is_some() {
-            let fn_name: Option<String> = match r.decoded.as_ref() {
-                DecodeResult::ClearSigned { model, .. } | DecodeResult::Fallback { model, .. } => {
-                    Some(model.intent.clone())
-                }
-                DecodeResult::Heuristic(decoded) => decoded.function_name.clone(),
-                DecodeResult::Empty => None,
-            };
-            let pill_label: Option<String> = fn_name.map(|name| {
-                // Truncate by *chars*, not bytes: a decoded intent/function name
-                // can carry attacker-controlled token metadata (e.g. a multibyte
-                // symbol), and a byte slice landing mid-codepoint would panic the
-                // review render.
-                if name.chars().count() > 30 {
-                    format!("{}…", name.chars().take(28).collect::<String>())
-                } else {
-                    name
-                }
-            });
-            let caret = if show_calldata { "▾" } else { "▸" };
-            let mut toggle_row = row![
-                text(caret).size(12).color(t.sub).font(mono()),
-                Space::new().width(6),
-                text("Decoded call data")
-                    .size(13)
-                    .color(t.text)
-                    .font(bold()),
-            ]
-            .align_y(Alignment::Center)
-            .spacing(0);
-            if let Some(label) = pill_label {
-                toggle_row = toggle_row.push(Space::new().width(8));
-                toggle_row = toggle_row.push(
-                    container(text(format!("{label}()")).size(10).color(t.a1).font(mono()))
-                        .padding(Padding::from([2, 7]))
-                        .style(move |_| container::Style {
-                            border: Border {
-                                color: with_alpha(t.a1, 0.22),
-                                width: 1.0,
-                                radius: Radius::from(6),
-                            },
-                            ..container::Style::default()
-                        }),
-                );
-            }
-            toggle_row = toggle_row.push(Space::new().width(Length::Fill));
-            toggle_row = toggle_row.push(
-                text(if show_calldata {
-                    "hide"
-                } else {
-                    "for the paranoid"
-                })
-                .size(11)
-                .color(t.sub)
-                .font(mono()),
-            );
-            let toggle_btn: Element<'_, M> = button(toggle_row.width(Length::Fill))
-                .width(Length::Fill)
-                .padding(Padding::from([13, 16]))
-                .on_press(toggle_msg)
-                .style(move |_theme, _status| button::Style {
-                    background: Some(Background::Color(Color::TRANSPARENT)),
-                    text_color: t.text,
-                    ..button::Style::default()
-                })
-                .into();
-            let expanded: Element<'_, M> = if show_calldata {
-                match function_panel::view::<M>(t, Some(r.decoded.as_ref()), false) {
-                    Some(panel) => container(panel)
-                        .padding(Padding::from([0, 13]).bottom(13.0))
-                        .width(Length::Fill)
-                        .style(move |_| container::Style {
-                            background: Some(Background::Color(t.bg)),
-                            border: Border {
-                                color: t.border,
-                                width: 1.0,
-                                radius: Radius::from(11),
-                            },
-                            ..container::Style::default()
-                        })
-                        .into(),
-                    None => Space::new().height(0).into(),
-                }
+    // The pill is the headline at a glance; the shared `headline()` is the one
+    // source for it, so a call can't headline differently here and on the
+    // sign-review overlay. The block also renders when the panel itself is
+    // empty (a resolved no-argument call is all headline, no rows).
+    let headline = r.decoded.headline();
+    let calldata_block: Element<'_, M> = if headline.is_some()
+        || function_panel::view::<M>(t, Some(r.decoded.as_ref()), false).is_some()
+    {
+        let pill_label: Option<String> = headline.as_ref().map(|h| {
+            // Truncate by *chars*, not bytes: a decoded intent/function name
+            // can carry attacker-controlled token metadata (e.g. a multibyte
+            // symbol), and a byte slice landing mid-codepoint would panic the
+            // review render.
+            let name = h.text.clone();
+            if name.chars().count() > 30 {
+                format!("{}…", name.chars().take(28).collect::<String>())
             } else {
-                Space::new().height(0).into()
-            };
-            container(column![toggle_btn, expanded].spacing(0).width(Length::Fill))
-                .width(Length::Fill)
-                .style(move |_| container::Style {
-                    background: Some(Background::Color(t.card_alt)),
-                    border: Border {
-                        color: t.border,
-                        width: 1.0,
-                        radius: Radius::from(15),
-                    },
-                    ..container::Style::default()
-                })
-                .into()
+                name
+            }
+        });
+        let caret = if show_calldata { "▾" } else { "▸" };
+        let mut toggle_row = row![
+            text(caret).size(12).color(t.sub).font(mono()),
+            Space::new().width(6),
+            text("Decoded call data")
+                .size(13)
+                .color(t.text)
+                .font(bold()),
+        ]
+        .align_y(Alignment::Center)
+        .spacing(0);
+        if let Some(label) = pill_label {
+            toggle_row = toggle_row.push(Space::new().width(8));
+            toggle_row = toggle_row.push(
+                container(text(format!("{label}()")).size(10).color(t.a1).font(mono()))
+                    .padding(Padding::from([2, 7]))
+                    .style(move |_| container::Style {
+                        border: Border {
+                            color: with_alpha(t.a1, 0.22),
+                            width: 1.0,
+                            radius: Radius::from(6),
+                        },
+                        ..container::Style::default()
+                    }),
+            );
+        }
+        toggle_row = toggle_row.push(Space::new().width(Length::Fill));
+        toggle_row = toggle_row.push(
+            text(if show_calldata {
+                "hide"
+            } else {
+                "for the paranoid"
+            })
+            .size(11)
+            .color(t.sub)
+            .font(mono()),
+        );
+        let toggle_btn: Element<'_, M> = button(toggle_row.width(Length::Fill))
+            .width(Length::Fill)
+            .padding(Padding::from([13, 16]))
+            .on_press(toggle_msg)
+            .style(move |_theme, _status| button::Style {
+                background: Some(Background::Color(Color::TRANSPARENT)),
+                text_color: t.text,
+                ..button::Style::default()
+            })
+            .into();
+        let expanded: Element<'_, M> = if show_calldata {
+            // Fall back to the headline card when the decode has no rows of
+            // its own (a resolved no-argument call), so expanding is never
+            // a dead end.
+            let body =
+                function_panel::view::<M>(t, Some(r.decoded.as_ref()), false).or_else(|| {
+                    headline
+                        .as_ref()
+                        .map(|h| function_panel::headline_view(t, h))
+                });
+            match body {
+                Some(panel) => container(panel)
+                    .padding(Padding::from([0, 13]).bottom(13.0))
+                    .width(Length::Fill)
+                    .style(move |_| container::Style {
+                        background: Some(Background::Color(t.bg)),
+                        border: Border {
+                            color: t.border,
+                            width: 1.0,
+                            radius: Radius::from(11),
+                        },
+                        ..container::Style::default()
+                    })
+                    .into(),
+                None => Space::new().height(0).into(),
+            }
         } else {
             Space::new().height(0).into()
         };
+        container(column![toggle_btn, expanded].spacing(0).width(Length::Fill))
+            .width(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(Background::Color(t.card_alt)),
+                border: Border {
+                    color: t.border,
+                    width: 1.0,
+                    radius: Radius::from(15),
+                },
+                ..container::Style::default()
+            })
+            .into()
+    } else {
+        Space::new().height(0).into()
+    };
 
     // ── Verification badges ──
     let good_badge = |label: &'a str| -> Element<'a, M> {

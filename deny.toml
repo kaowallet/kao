@@ -31,6 +31,7 @@ ignore = [
     { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.101.7 URI name-constraint bypass. Requires a misissued cert to exploit. Worst case: an attacker MITMs RPC responses; the light client rejects them as inconsistent with the verified header chain — liveness loss, not confidentiality." },
     { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.101.7 wildcard name-constraint bypass. Same misissuance precondition and same blast-radius cap as -0098." },
     { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.101.7 CRL-parse panic, reachable pre-verification. rustls doesn't fetch CRLs by default and we never pass any in; worst-case failure mode is a helios task panic, not key compromise." },
+    { id = "RUSTSEC-2026-0258", reason = "h2 unbounded empty DATA frames (memory DoS / panic). h2 0.3.27 is pinned by jsonrpsee 0.19 → hyper 0.14 (no 0.3 patch); h2 0.4.13 is pulled by helios's reqwest 0.12 and alloy's reqwest. Low severity, HTTP/2 frame-queue DoS on RPC connections — an attacker can stall helios, not reach keys. Revisit when helios moves off jsonrpsee 0.19, and when h2 ≥0.4.16 is cargo-vet audited so the 0.4 line can bump." },
 
     # ── helios libp2p subtree (helios-opstack → libp2p 0.51 and friends) ─
     # libp2p here is op-stack peer transport. Its noise/identity keys are

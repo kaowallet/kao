@@ -21,7 +21,10 @@
 //! Because the delegation designator persists on-chain, a subsequent batch
 //! from an account **already** delegated to the EF contract needs no fresh
 //! authorization (see [`delegated_to`]) — it is broadcast as an ordinary
-//! EIP-1559 call to `executeBatch`.
+//! EIP-1559 call to `executeBatch`. The Builder also offers a revocation
+//! (see [`build_revocation`]): a type-`0x04` transaction that carries an
+//! authorization to the zero address and no calls, which clears the
+//! designator and restores a plain EOA.
 
 use alloy::dyn_abi::DynSolValue;
 use alloy::eips::eip7702::Authorization;
@@ -147,22 +150,6 @@ pub fn build_authorization(chain_id: u64, auth_nonce: u64) -> Authorization {
 /// `auth_nonce` follows the same rule as [`build_authorization`]: the
 /// revocation is self-sponsored, so the outer transaction consumes the
 /// account's nonce first and the tuple commits to that value **+ 1**.
-///
-/// # Not yet reachable
-///
-/// Nothing outside this module calls this, and the same goes for
-/// [`PER_AUTH_GAS`] / [`REVOKE_GAS_LIMIT`], which exist to size the transaction
-/// that would carry it. Kao can *install* a delegation (the Builder's 7702
-/// batch path) but offers no way to remove one, so an account that has batched
-/// once keeps its designator until some other wallet clears it.
-///
-/// Kept rather than deleted because the hard part is done and pinned: the
-/// zero-address semantics, the self-sponsored nonce rule, and the EIP-3529
-/// refund-cap reasoning behind the gas limit are all settled and covered by the
-/// tests below. What is missing is only the wiring — a UI affordance, and a
-/// send path that signs one authorization and no calls. The send flow already
-/// builds and signs `TxEip7702` for the batch case.
-#[allow(dead_code)]
 pub fn build_revocation(chain_id: u64, auth_nonce: u64) -> Authorization {
     Authorization {
         chain_id: U256::from(chain_id),
@@ -182,18 +169,12 @@ pub fn build_revocation(chain_id: u64, auth_nonce: u64) -> Authorization {
 /// total refund at `gas_used / 5`, so a revocation using ~36,800 gas gets at
 /// most ~7,400 back, and a gas limit set to the post-refund figure fails
 /// intrinsic validation before it executes. Budget the full cost.
-///
-/// Unreachable for now — see [`build_revocation`].
-#[allow(dead_code)]
 pub const PER_AUTH_GAS: u64 = 25_000;
 
 /// A safe gas limit for a bare revocation transaction: the 21,000 intrinsic
 /// plus one authorization, with headroom. The transaction has no calldata and
 /// executes no code — by the time the frame runs, the authorization has
 /// already cleared the account — so nothing here scales with user input.
-///
-/// Unreachable for now — see [`build_revocation`].
-#[allow(dead_code)]
 pub const REVOKE_GAS_LIMIT: u64 = 21_000 + PER_AUTH_GAS + 10_000;
 
 /// If `code` is an EIP-7702 delegation designator (`0xef0100 ‖ address`),

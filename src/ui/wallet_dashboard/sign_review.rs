@@ -188,6 +188,12 @@ impl DelegationReview {
     pub fn replacing(&self) -> Option<Address> {
         self.incumbent.filter(|d| *d != self.delegate)
     }
+
+    /// True when this card is a revocation: the authorization targets the
+    /// zero address, which EIP-7702 interprets as "clear the designator".
+    pub fn is_revocation(&self) -> bool {
+        self.delegate.is_zero()
+    }
 }
 
 /// The CoW GPv2 order the user signs as EIP-712 typed data. Every field here is a
@@ -531,6 +537,11 @@ pub enum SigningKind {
     /// signature" in both cases, so a second prompt appeared with nothing on
     /// the host having predicted it.
     Eip7702Batch { fresh_authorization: bool },
+    /// An EIP-7702 revocation: one authorization to the zero address, then
+    /// the empty type-`0x04` transaction that carries it. Always two
+    /// signatures — there is no "already cleared" shortcut, because if the
+    /// account were already a plain EOA the review would have refused.
+    Eip7702Revoke,
     /// Signed and broadcast; waiting for the receipt that says whether it
     /// actually worked. The overlay stays up through this because a broadcast
     /// hash is not an outcome — a reverted transaction is broadcast exactly as
@@ -632,10 +643,13 @@ impl BatchEconomics {
         super::sim_view::format_gas_fee_eth(self.gas_used, self.base_fee_per_gas)
     }
 
-    /// Nothing to say at all — no movements and no fee. The card is skipped
-    /// entirely rather than rendering an empty box.
+    /// Nothing to say at all — no movements, no fee, and no caveats. The card
+    /// is skipped entirely rather than rendering an empty box. A caveat-only
+    /// card is still a card: an EIP-7702 revocation moves no tokens and has
+    /// no simulated gas, but the caveat is the only place the review says
+    /// the gas budget is a constant rather than an estimate.
     pub fn is_empty(&self) -> bool {
-        self.moves.is_empty() && self.fee_eth().is_none()
+        self.moves.is_empty() && self.fee_eth().is_none() && self.fee_caveats.is_empty()
     }
 }
 
@@ -1030,6 +1044,19 @@ fn waiting_card<'a>(
                     "One signature: your account already runs the batch executor's code, so \
                      no new delegation is authorized."
                 })
+                .size(12)
+                .color(t.sub)
+                .font(mono()),
+            );
+        }
+        Some(SigningKind::Eip7702Revoke) => {
+            col = col.push(Space::new().height(4));
+            col = col.push(
+                text(
+                    "Two signatures: first the authorization that clears the delegation, then \
+                     the empty transaction that carries it. On a hardware wallet that is two \
+                     separate prompts.",
+                )
                 .size(12)
                 .color(t.sub)
                 .font(mono()),
@@ -1453,10 +1480,14 @@ fn delegation_panel<'a>(t: KaoTheme, d: &'a DelegationReview) -> Element<'a, Mes
     .width(Length::Fill);
     col = col.push(Space::new().height(2));
     col = col.push(
-        text(match (d.already_active, d.replacing().is_some()) {
-            (true, _) => "Your account already runs this code",
-            (false, true) => "Your account will be re-pointed to different code",
-            (false, false) => "Your account will start running contract code",
+        text(if d.is_revocation() {
+            "Your account will stop running contract code"
+        } else {
+            match (d.already_active, d.replacing().is_some()) {
+                (true, _) => "Your account already runs this code",
+                (false, true) => "Your account will be re-pointed to different code",
+                (false, false) => "Your account will start running contract code",
+            }
         })
         .size(13)
         .color(t.text)
@@ -1464,13 +1495,20 @@ fn delegation_panel<'a>(t: KaoTheme, d: &'a DelegationReview) -> Element<'a, Mes
     );
     col = col.push(Space::new().height(8));
     col = col.push(addr_kv(t, "Your account", d.authority));
-    // Naming the incumbent first makes the swap legible as a swap: without it,
-    // an account already delegated elsewhere reads identically to a fresh one.
-    if let Some(prev) = d.replacing() {
-        col = col.push(addr_kv(t, "Currently delegated to", prev));
+    if d.is_revocation() {
+        if let Some(prev) = d.incumbent {
+            col = col.push(addr_kv(t, "Currently delegated to", prev));
+        }
+        col = col.push(kv(t, "Delegates to", "none — restore a plain EOA"));
+    } else {
+        // Naming the incumbent first makes the swap legible as a swap: without it,
+        // an account already delegated elsewhere reads identically to a fresh one.
+        if let Some(prev) = d.replacing() {
+            col = col.push(addr_kv(t, "Currently delegated to", prev));
+        }
+        col = col.push(addr_kv(t, "Delegates to", d.delegate));
+        col = col.push(kv(t, "Delegate", d.delegate_label.clone()));
     }
-    col = col.push(addr_kv(t, "Delegates to", d.delegate));
-    col = col.push(kv(t, "Delegate", d.delegate_label.clone()));
     col = col.push(kv(
         t,
         "Scoped to",
@@ -1487,23 +1525,29 @@ fn delegation_panel<'a>(t: KaoTheme, d: &'a DelegationReview) -> Element<'a, Mes
     // The persistence is the part a user can't infer from the transaction
     // panel below, so it is stated rather than implied.
     col = col.push(
-        text(match (d.already_active, d.replacing().is_some()) {
-            (true, _) => {
-                "This delegation is already in place, so no new authorization is signed — \
-                 the transaction below is an ordinary call into the code your account \
-                 already runs."
-            }
-            (false, true) => {
-                "Your account is ALREADY delegated to the contract above, and signing this \
-                 replaces it — anything reachable only through that contract stops being \
-                 reachable. You sign this separately from the transaction below (on a \
-                 hardware wallet, that's two prompts), and it does NOT expire with the \
-                 transaction."
-            }
-            (false, false) => {
-                "You sign this authorization separately from the transaction below (on a \
-                 hardware wallet, that's two prompts). It does NOT expire with the \
-                 transaction — your account keeps running this code until you replace it."
+        text(if d.is_revocation() {
+            "You sign this authorization separately from the empty transaction that carries \
+             it (on a hardware wallet, that's two prompts). After it mines, this account is \
+             a plain EOA again — it no longer runs any contract code."
+        } else {
+            match (d.already_active, d.replacing().is_some()) {
+                (true, _) => {
+                    "This delegation is already in place, so no new authorization is signed — \
+                     the transaction below is an ordinary call into the code your account \
+                     already runs."
+                }
+                (false, true) => {
+                    "Your account is ALREADY delegated to the contract above, and signing this \
+                     replaces it — anything reachable only through that contract stops being \
+                     reachable. You sign this separately from the transaction below (on a \
+                     hardware wallet, that's two prompts), and it does NOT expire with the \
+                     transaction."
+                }
+                (false, false) => {
+                    "You sign this authorization separately from the transaction below (on a \
+                     hardware wallet, that's two prompts). It does NOT expire with the \
+                     transaction — your account keeps running this code until you remove it."
+                }
             }
         })
         .size(11)

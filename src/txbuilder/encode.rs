@@ -80,9 +80,7 @@ fn addresses_are_unambiguous(ty: &DynSolType) -> bool {
             DynSolType::Address => *addr = true,
             // Free-hex leaves: a 40-hex run can be their canonical spelling,
             // so a token scan cannot attribute such a run to the address leaf.
-            DynSolType::Bytes
-            | DynSolType::FixedBytes(_)
-            | DynSolType::Function => *hexish = true,
+            DynSolType::Bytes | DynSolType::FixedBytes(_) | DynSolType::Function => *hexish = true,
             DynSolType::Array(inner) => walk(inner, addr, hexish),
             DynSolType::FixedArray(inner, _) => walk(inner, addr, hexish),
             DynSolType::Tuple(items) => items.iter().for_each(|t| walk(t, addr, hexish)),
@@ -594,7 +592,6 @@ mod tests {
         // whole reason the checksum has to be checked separately.
         assert!(CORRUPTED.parse::<Address>().is_ok());
     }
-
 
     /// `(address,string)` was the shape the gate went dark on: a `string`
     /// leaf used to disarm the whole tree-level scan, so a corrupted

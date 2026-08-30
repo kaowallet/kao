@@ -101,6 +101,12 @@ pub(super) fn root(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
             .push(signing_block_banner(t, &why));
     }
 
+    if app.current_delegation().is_some() {
+        header = header
+            .push(Space::new().height(10))
+            .push(delegation_banner(app, t));
+    }
+
     let mut col = column![header, Space::new().height(16), panes]
         .width(Length::Fill)
         .height(Length::Fill);
@@ -1707,7 +1713,9 @@ fn settled_strip<'a>(t: KaoTheme, settled: &super::Settled) -> Element<'a, Messa
     // the same class of lie as reporting a broadcast hash as a win.
     let good = matches!(
         settled,
-        super::Settled::Executed { .. } | super::Settled::Proposed { .. }
+        super::Settled::Executed { .. }
+            | super::Settled::Proposed { .. }
+            | super::Settled::Revoked { .. }
     );
     let accent = if good { t.up } else { t.down };
     let copy = || -> Option<Element<'a, Message>> {
@@ -1717,6 +1725,11 @@ fn settled_strip<'a>(t: KaoTheme, settled: &super::Settled) -> Element<'a, Messa
         super::Settled::Executed { hash } => {
             ("Batch executed".to_string(), format!("{hash:#x}"), copy())
         }
+        super::Settled::Revoked { hash } => (
+            "Delegation removed".to_string(),
+            format!("{hash:#x}\nThis account is a plain EOA again."),
+            copy(),
+        ),
         super::Settled::Proposed { nonce } => (
             "Batch queued for co-signers".to_string(),
             format!(
@@ -2955,6 +2968,61 @@ fn not_found_box(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
             background: Some(Background::Color(with_alpha(t.down, 0.08))),
             border: Border {
                 color: with_alpha(t.down, 0.4),
+                width: 1.0,
+                radius: Radius::from(12),
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+/// Standing notice that this EOA currently runs contract code via EIP-7702.
+/// Offers a revoke when the signer can authorize one; otherwise names why not.
+fn delegation_banner<'a>(app: &'a TxBuilderApp, t: KaoTheme) -> Element<'a, Message> {
+    let delegate = app.current_delegation().expect("banner is gated on Some");
+    let ef = crate::txbuilder::eip7702::EF_SIMPLE_7702_ACCOUNT;
+    let body = if delegate == ef {
+        "This account runs the batch executor (EIP-7702). Atomic batches stay available until you remove it — the delegation does not expire with the transaction that installed it.".to_string()
+    } else {
+        format!(
+            "This account is delegated to {} — contract code another wallet installed. Kao did not set this. Removing it restores a plain EOA.",
+            crate::wallet::short_address(delegate),
+        )
+    };
+    let mut col = column![
+        text("Account is delegated")
+            .size(12)
+            .color(t.a2)
+            .font(bold()),
+        Space::new().height(4),
+        text(body)
+            .size(11)
+            .color(t.sub)
+            .wrapping(Wrapping::WordOrGlyph),
+    ]
+    .width(Length::Fill);
+
+    if app.can_revoke_delegation() {
+        col = col.push(Space::new().height(10)).push(ghost_secondary(
+            t,
+            "Remove delegation",
+            Some(Message::RevokeDelegation),
+        ));
+    } else if let Some(why) = app.revoke_block_reason() {
+        col = col.push(Space::new().height(6)).push(
+            text(why)
+                .size(11)
+                .color(t.sub)
+                .wrapping(Wrapping::WordOrGlyph),
+        );
+    }
+
+    container(col.padding(Padding::from([10, 14])))
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(with_alpha(t.a2, 0.08))),
+            border: Border {
+                color: with_alpha(t.a2, 0.35),
                 width: 1.0,
                 radius: Radius::from(12),
             },

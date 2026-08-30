@@ -78,6 +78,10 @@ pub enum Settled {
     /// execute it twice if the first one lands. The strip says so and keeps the
     /// hash, which used to be dropped the moment the overlay was dismissed.
     Unconfirmed { hash: B256 },
+    /// An EIP-7702 revocation mined with `status == 1`. The account is a
+    /// plain EOA again. Kept distinct from [`Self::Executed`] so the strip
+    /// doesn't call a code-clearing transaction a batch.
+    Revoked { hash: B256 },
 }
 
 /// A settled outcome together with the account and network it happened on.
@@ -108,9 +112,10 @@ impl Settled {
     /// not: nothing has been broadcast.
     pub fn hash(&self) -> Option<B256> {
         match self {
-            Self::Executed { hash } | Self::Reverted { hash } | Self::Unconfirmed { hash } => {
-                Some(*hash)
-            }
+            Self::Executed { hash }
+            | Self::Reverted { hash }
+            | Self::Unconfirmed { hash }
+            | Self::Revoked { hash } => Some(*hash),
             Self::Proposed { .. } => None,
         }
     }
@@ -167,6 +172,8 @@ struct TraceState {
     sim: bool,
     errored: bool,
     settled: bool,
+    /// Whether the acting EOA currently carries an EIP-7702 designator.
+    delegated: bool,
     /// The name-resolution states in play, as `slot=Variant`, joined and
     /// sorted. A summary rather than the map itself: what a trace reader needs
     /// is that a field went `Resolving → Resolved`, and the name and address
@@ -250,6 +257,13 @@ impl TraceState {
         }
         if self.settled != to.settled {
             log("settled", self.settled.to_string(), to.settled.to_string());
+        }
+        if self.delegated != to.delegated {
+            log(
+                "delegated",
+                self.delegated.to_string(),
+                to.delegated.to_string(),
+            );
         }
         if self.names != to.names {
             log("names", self.names.clone(), to.names.clone());
@@ -354,6 +368,8 @@ pub enum Message {
     // settled batch
     CopySettledHash,
     DismissSettled,
+    /// Remove the EIP-7702 delegation currently installed on this account.
+    RevokeDelegation,
     // misc
     /// Esc was pressed while the Builder is open.
     Escape,
@@ -414,6 +430,7 @@ impl Message {
             Message::ImportJson => "ImportJson",
             Message::CopySettledHash => "CopySettledHash",
             Message::DismissSettled => "DismissSettled",
+            Message::RevokeDelegation => "RevokeDelegation",
             Message::Escape => "Escape",
             Message::DismissError => "DismissError",
         }
@@ -498,6 +515,10 @@ pub enum Preflight {
     /// a warning in its own right: the review's own copy already says the
     /// chain can't be light-client-verified.
     Unsupported,
+    /// No simulation applies: this transaction executes no calls (an EIP-7702
+    /// revocation). Distinct from [`Self::Unsupported`] (the chain can't
+    /// simulate) and [`Self::Missing`] (it can, and we didn't).
+    NotApplicable,
 }
 
 /// How long a preflight verdict stands before it stops being a claim about the
@@ -631,7 +652,7 @@ impl Preflight {
             // that fell through to unverified RPC, is not the clean pass the
             // routine label promises.
             Self::Passed { stale, verified } => *stale || !*verified,
-            Self::Unsupported => false,
+            Self::Unsupported | Self::NotApplicable => false,
         }
     }
 
@@ -639,7 +660,7 @@ impl Preflight {
     /// should weigh before signing. `None` when there's nothing to add.
     pub fn warning(&self) -> Option<String> {
         match self {
-            Self::Unsupported => None,
+            Self::Unsupported | Self::NotApplicable => None,
             Self::Passed {
                 stale: false,
                 verified: true,
@@ -785,6 +806,10 @@ pub enum Outcome {
     /// clipboard WITHOUT the auto-clear — it's not sensitive and the user
     /// wants it to survive until they paste it.
     CopyPlain(String),
+    /// Open the sign-review overlay for an EIP-7702 revocation: one
+    /// authorization to the zero address and no calls. The coordinator
+    /// reads the pane's identity / network the same way it does for a batch.
+    RevokeDelegation,
 }
 
 impl Outcome {
@@ -800,6 +825,7 @@ impl Outcome {
             Outcome::PersistTemplates { .. } => "PersistTemplates",
             Outcome::CopyText(_) => "CopyText",
             Outcome::CopyPlain(_) => "CopyPlain",
+            Outcome::RevokeDelegation => "RevokeDelegation",
         }
     }
 }
@@ -895,6 +921,21 @@ pub struct TxBuilderApp {
     /// Generation guard for [`Outcome::ProbeCode`]: a reply for an address the
     /// user has since retyped must not land on the new one.
     probe_seq: u64,
+    /// The EIP-7702 delegate this account currently runs, if any. `None` while
+    /// unknown (not yet probed, in flight, or a Safe / custom network that
+    /// never probes). The banner and the revoke CTA read this.
+    delegated_to: Option<Address>,
+    /// Generation guard for the identity-code probe. Bumped whenever the
+    /// acting account or network moves, so a reply for the previous identity
+    /// cannot badge this one.
+    del_seq: u64,
+    /// `(identity, net)` the current [`Self::delegated_to`] (or in-flight
+    /// probe) belongs to. Dedupes the probe across the coordinator's
+    /// per-message `set_context` refresh.
+    del_key: Option<(Address, NetworkId)>,
+    /// Set when a probe should be dispatched; consumed by
+    /// [`Self::take_pending_delegation_probe`].
+    pending_delegation_probe: bool,
     /// Set when the address is a beacon proxy — a shape the walker recognises
     /// but does not follow (resolving it needs an `eth_call` on the beacon, not
     /// a storage read). Held apart from `proxy_unverified` because it is a
@@ -996,6 +1037,10 @@ impl TxBuilderApp {
             nothing_deployed: false,
             raw_nothing_deployed: false,
             probe_seq: 0,
+            delegated_to: None,
+            del_seq: 0,
+            del_key: None,
+            pending_delegation_probe: false,
             proxy_beacon: false,
             paste_open: false,
             abi_paste: String::new(),
@@ -1060,6 +1105,121 @@ impl TxBuilderApp {
     /// against.
     pub fn selected_net(&self) -> NetworkId {
         self.net
+    }
+
+    /// The EIP-7702 delegate this account currently runs, if a probe has
+    /// found one. `None` for an undelegated EOA, a Safe, a custom network,
+    /// or a probe that hasn't landed.
+    pub fn current_delegation(&self) -> Option<Address> {
+        self.delegated_to
+    }
+
+    /// Whether this identity can sign an EIP-7702 revocation. Same gate as
+    /// atomic batching: Local / Ledger on a built-in chain, not a Safe.
+    pub fn can_revoke_delegation(&self) -> bool {
+        self.delegated_to.is_some()
+            && !self.ctx.is_safe
+            && self.ctx.eoa_can_batch
+            && self.ctx.can_sign
+            && self.net.builtin().is_some()
+    }
+
+    /// Why the revoke button is hidden or would refuse, when a delegation is
+    /// showing. `None` when [`Self::can_revoke_delegation`] is true, or when
+    /// there is nothing to revoke.
+    pub fn revoke_block_reason(&self) -> Option<String> {
+        self.delegated_to?;
+        if self.ctx.is_safe {
+            return None;
+        }
+        if !self.ctx.can_sign {
+            return Some(format!(
+                "{} is watch-only — Kao holds no key for it, so the delegation can't be \
+                 removed from here. Switch to an account with a key.",
+                crate::wallet::short_address(self.owner),
+            ));
+        }
+        if !self.ctx.eoa_can_batch {
+            return Some(
+                "Removing a delegation needs a software key or a Ledger — Trezor cannot \
+                 sign an EIP-7702 authorization."
+                    .into(),
+            );
+        }
+        if self.net.builtin().is_none() {
+            return Some(
+                "Removing a delegation isn't available on a custom network — switch to \
+                 Ethereum, Base or Optimism."
+                    .into(),
+            );
+        }
+        None
+    }
+
+    /// Dispatch the identity-code probe if one is pending. The coordinator
+    /// calls this after `set_context` and after a mined batch, so a reply
+    /// always describes the account currently on screen.
+    pub fn take_pending_delegation_probe(&mut self) -> Option<(u64, Chain, Address)> {
+        if !self.pending_delegation_probe {
+            return None;
+        }
+        let chain = self.net.builtin()?;
+        self.pending_delegation_probe = false;
+        Some((self.del_seq, chain, self.owner))
+    }
+
+    /// The coordinator fetched this account's code (or failed).
+    pub fn on_delegation_probed(&mut self, seq: u64, result: Result<Option<Address>, String>) {
+        self.traced("on_delegation_probed", move |s| {
+            if seq != s.del_seq {
+                return;
+            }
+            s.delegated_to = result.ok().flatten();
+        });
+    }
+
+    /// Ask the chain whether this identity currently carries a 7702
+    /// designator. No-ops when the `(identity, net)` has not moved and a
+    /// probe is already in flight or answered; no-ops for a Safe and for a
+    /// custom network, which have no 7702 path.
+    fn schedule_delegation_probe(&mut self) {
+        if self.ctx.is_safe || self.net.builtin().is_none() {
+            if self.delegated_to.is_some()
+                || self.pending_delegation_probe
+                || self.del_key.is_some()
+            {
+                self.del_seq += 1;
+                self.delegated_to = None;
+                self.del_key = None;
+                self.pending_delegation_probe = false;
+            }
+            return;
+        }
+        let key = (self.owner, self.net);
+        if self.del_key == Some(key) {
+            return;
+        }
+        self.del_key = Some(key);
+        self.delegated_to = None;
+        self.del_seq += 1;
+        self.pending_delegation_probe = true;
+    }
+
+    fn begin_revoke(&mut self) -> Option<Outcome> {
+        if let Some(why) = self.revoke_block_reason() {
+            self.error = Some(why);
+            return None;
+        }
+        if self.delegated_to.is_none() {
+            self.error = Some("this account has no EIP-7702 delegation to remove".into());
+            return None;
+        }
+        if let Some(why) = self.no_signer_reason() {
+            self.error = Some(why);
+            return None;
+        }
+        self.error = None;
+        Some(Outcome::RevokeDelegation)
     }
 
     /// Coordinator refreshes chain / Safe context before dispatching a
@@ -1128,6 +1288,7 @@ impl TxBuilderApp {
                     s.repin_network(from, explained);
                 }
             }
+            s.schedule_delegation_probe();
         })
     }
 
@@ -1547,6 +1708,24 @@ impl TxBuilderApp {
             s.error = None;
             let stamped = s.stamp(Settled::Executed { hash });
             s.settled = Some(stamped);
+            // A successful batch may have *installed* a delegation; a
+            // successful revocation has cleared one. Either way the banner
+            // has to re-read the account's code.
+            s.del_key = None;
+            s.schedule_delegation_probe();
+        })
+    }
+
+    /// An EIP-7702 revocation mined with `status == 1`. Same housekeeping as
+    /// [`Self::on_executed`], with a strip that names what actually happened.
+    pub fn on_revoked(&mut self, hash: B256) {
+        self.traced("on_revoked", move |s| {
+            s.error = None;
+            let stamped = s.stamp(Settled::Revoked { hash });
+            s.settled = Some(stamped);
+            s.delegated_to = None;
+            s.del_key = None;
+            s.schedule_delegation_probe();
         })
     }
 
@@ -1659,6 +1838,7 @@ impl TxBuilderApp {
             sim: self.sim.is_some(),
             errored: self.error.is_some(),
             settled: self.settled.is_some(),
+            delegated: self.delegated_to.is_some(),
             names: {
                 // Sorted so the string is a function of the state and not of
                 // the hash map's iteration order — otherwise every snapshot
@@ -2026,6 +2206,7 @@ impl TxBuilderApp {
                 }
             }
             Message::DismissSettled => self.settled = None,
+            Message::RevokeDelegation => return self.begin_revoke(),
             Message::DismissError => self.error = None,
         }
         None
@@ -2320,6 +2501,7 @@ impl TxBuilderApp {
                 self.net.display_name(),
             ));
         }
+        self.schedule_delegation_probe();
     }
 
     /// Drop the queue because the account it was composed for changed.
@@ -3277,15 +3459,25 @@ pub struct PreparedDelegation {
 }
 
 impl EoaBatchRequest {
+    /// True when this request is an EIP-7702 revocation: no calls, one
+    /// authorization to the zero address. Distinct from a single-call send
+    /// (`len == 1`) and from an atomic batch (`len > 1`).
+    pub fn is_revoke(&self) -> bool {
+        self.calls.is_empty()
+    }
+
     /// True when this batch runs via `executeBatch` (more than one call). A
     /// single call keeps its original `to`/`value`/`data` and needs no
-    /// delegation.
+    /// delegation. A revocation (`is_revoke`) is neither.
     pub fn is_batch(&self) -> bool {
         self.calls.len() > 1
     }
 
     /// A short human title for the review header.
     pub fn title(&self) -> String {
+        if self.is_revoke() {
+            return "Remove account delegation".into();
+        }
         match self.calls.split_first() {
             Some((first, [])) => first.title.clone(),
             _ => format!("Batch · {} calls", self.calls.len()),
@@ -4482,6 +4674,127 @@ mod tests {
         app.update(Message::AddToBatch);
         assert_eq!(app.batch.len(), 2, "7702-capable EOA batches N calls");
         assert!(app.error.is_none());
+    }
+
+    #[test]
+    fn an_eoa_on_a_builtin_chain_asks_whether_it_is_delegated() {
+        let mut app = eoa_app();
+        let probe = app
+            .take_pending_delegation_probe()
+            .expect("first context refresh schedules a probe");
+        assert_eq!(probe.1, Chain::Mainnet);
+        assert_eq!(probe.2, EOA);
+        assert!(
+            app.take_pending_delegation_probe().is_none(),
+            "the coordinator consumes it once"
+        );
+        // A no-op refresh of the same identity must not re-fire.
+        app.set_context(
+            EOA,
+            Chain::Mainnet,
+            false,
+            None,
+            true,
+            true,
+            vec![(11155111, "Sepolia".into())],
+        );
+        assert!(app.take_pending_delegation_probe().is_none());
+    }
+
+    #[test]
+    fn a_safe_never_probes_for_a_delegation() {
+        let mut app = safe_app();
+        assert!(
+            app.take_pending_delegation_probe().is_none(),
+            "a Safe is not an EIP-7702 account"
+        );
+    }
+
+    #[test]
+    fn a_delegation_probe_answer_is_retired_when_the_identity_moves() {
+        let mut app = eoa_app();
+        let (seq, ..) = app.take_pending_delegation_probe().unwrap();
+        let other = address!("0x2222222222222222222222222222222222222222");
+        app.set_context(other, Chain::Mainnet, false, None, true, true, Vec::new());
+        app.on_delegation_probed(
+            seq,
+            Ok(Some(crate::txbuilder::eip7702::EF_SIMPLE_7702_ACCOUNT)),
+        );
+        assert!(
+            app.current_delegation().is_none(),
+            "a reply for the previous account must not badge this one"
+        );
+    }
+
+    #[test]
+    fn revoke_is_refused_until_a_probe_finds_a_designator() {
+        let mut app = eoa_app();
+        assert!(app.update(Message::RevokeDelegation).is_none());
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|e| e.contains("no EIP-7702")),
+            "got {:?}",
+            app.error
+        );
+    }
+
+    #[test]
+    fn revoke_emits_once_a_designator_is_known() {
+        let mut app = eoa_app();
+        let (seq, ..) = app.take_pending_delegation_probe().unwrap();
+        app.on_delegation_probed(
+            seq,
+            Ok(Some(crate::txbuilder::eip7702::EF_SIMPLE_7702_ACCOUNT)),
+        );
+        assert_eq!(
+            app.current_delegation(),
+            Some(crate::txbuilder::eip7702::EF_SIMPLE_7702_ACCOUNT)
+        );
+        assert!(app.can_revoke_delegation());
+        assert!(matches!(
+            app.update(Message::RevokeDelegation),
+            Some(Outcome::RevokeDelegation)
+        ));
+    }
+
+    #[test]
+    fn a_watch_only_account_shows_the_delegation_and_cannot_revoke_it() {
+        let mut app = view_only_app();
+        let (seq, ..) = app
+            .take_pending_delegation_probe()
+            .expect("watch-only still probes");
+        app.on_delegation_probed(
+            seq,
+            Ok(Some(crate::txbuilder::eip7702::EF_SIMPLE_7702_ACCOUNT)),
+        );
+        assert!(app.current_delegation().is_some());
+        assert!(!app.can_revoke_delegation());
+        assert!(
+            app.revoke_block_reason()
+                .is_some_and(|r| r.contains("watch-only")),
+            "{:?}",
+            app.revoke_block_reason()
+        );
+        assert!(app.update(Message::RevokeDelegation).is_none());
+    }
+
+    #[test]
+    fn a_trezor_account_cannot_sign_the_revocation() {
+        let mut app = TxBuilderApp::new(EOA);
+        app.set_context(EOA, Chain::Mainnet, false, None, false, true, Vec::new());
+        let (seq, ..) = app.take_pending_delegation_probe().unwrap();
+        app.on_delegation_probed(
+            seq,
+            Ok(Some(crate::txbuilder::eip7702::EF_SIMPLE_7702_ACCOUNT)),
+        );
+        assert!(
+            app.revoke_block_reason()
+                .is_some_and(|r| r.contains("Trezor") || r.contains("Ledger")),
+            "{:?}",
+            app.revoke_block_reason()
+        );
+        assert!(app.update(Message::RevokeDelegation).is_none());
     }
 
     #[test]

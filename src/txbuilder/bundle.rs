@@ -59,7 +59,6 @@ fn is_zero_u64(v: &u64) -> bool {
     *v == 0
 }
 
-
 /// `operation` arrives from Safe{Wallet}-world as either a JSON number or a
 /// quoted digit — the same field both ways across versions of the official
 /// builder, exactly as `value` and `chainId` are strings everywhere there.
@@ -177,7 +176,11 @@ pub struct BundleTx {
     /// therefore refuses a non-CALL row rather than queueing it as something
     /// it isn't; `export` never writes one, so nothing this wallet emits
     /// carries a field its own round-trip would refuse.
-    #[serde(default, skip_serializing_if = "is_zero_u64", deserialize_with = "de_operation")]
+    #[serde(
+        default,
+        skip_serializing_if = "is_zero_u64",
+        deserialize_with = "de_operation"
+    )]
     pub operation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<String>,
@@ -869,7 +872,10 @@ mod tests {
             "expected the delegatecall refusal, got {msg}"
         );
         // The first row is the offender; the id it was assigned names it.
-        assert!(msg.contains("transaction 1"), "names the offending row: {msg}");
+        assert!(
+            msg.contains("transaction 1"),
+            "names the offending row: {msg}"
+        );
     }
 
     /// `0` is the format's plain CALL and the only operation this wallet

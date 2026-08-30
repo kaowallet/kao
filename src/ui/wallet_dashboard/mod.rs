@@ -458,6 +458,12 @@ pub enum Message {
         address: Address,
         result: Result<bool, String>,
     },
+    /// Whether the acting EOA currently carries an EIP-7702 designator.
+    /// `seq` drops a reply for an identity the pane has since left.
+    TxBuilderDelegationProbed {
+        seq: u64,
+        result: Result<Option<Address>, String>,
+    },
     /// A Transaction Builder address field's name resolved. `slot` says which
     /// field asked and `name` which name was looked up; the pane matches both
     /// against what that slot is still waiting for, so an answer the user has
@@ -2200,6 +2206,15 @@ impl WalletScreen {
             .set_txbuilder_context(addr, chain, is_safe, version, can_batch, can_sign, customs);
     }
 
+    fn drain_txbuilder_delegation_probe(&mut self) -> Task<Message> {
+        match self.apps.txbuilder_pane().take_pending_delegation_probe() {
+            Some((seq, chain, address)) => {
+                spawn_txbuilder_delegation_probe(self.network.clone(), seq, chain, address)
+            }
+            None => Task::none(),
+        }
+    }
+
     fn handle_txbuilder_outcome(&mut self, o: tx_builder::Outcome) -> Task<Message> {
         use tx_builder::Outcome as O;
         match o {
@@ -2261,6 +2276,7 @@ impl WalletScreen {
                 }
                 Task::none()
             }
+            O::RevokeDelegation => self.open_txbuilder_revoke_review(),
         }
     }
 
@@ -2336,6 +2352,76 @@ impl WalletScreen {
         if matches!(req, tx_builder::BatchSignRequest::Eoa(_)) && preflight.softens_confirm() {
             review.confirm_label = Some("Sign anyway ⚠".to_string());
         }
+        self.sign_review = Some(review);
+        let local_names = build_local_names(&self.accounts, &self.safes, &self.contacts);
+        spawn_txbuilder_prepare(self.network.clone(), seq, req, local_names)
+    }
+
+    /// Open the sign-review overlay for an EIP-7702 revocation: one
+    /// authorization to the zero address and no calls.
+    fn open_txbuilder_revoke_review(&mut self) -> Task<Message> {
+        if self.sign_review.is_some() {
+            return Task::none();
+        }
+        if self.active_safe_descriptor().is_some() {
+            self.apps.txbuilder_pane().set_error(
+                "a Safe is not an EIP-7702 account — there is no delegation to remove".into(),
+            );
+            return Task::none();
+        }
+        if let Err(e) = self.build_eoa_context() {
+            self.apps.txbuilder_pane().set_error(e);
+            return Task::none();
+        }
+        if !self.signer.supports_7702() {
+            self.apps.txbuilder_pane().set_error(
+                "Removing a delegation needs a software key or a Ledger (EIP-7702)".into(),
+            );
+            return Task::none();
+        }
+        let net = self.apps.txbuilder_selected_net();
+        if net.is_custom() {
+            self.apps
+                .txbuilder_pane()
+                .set_error("Removing a delegation isn't available on a custom network".into());
+            return Task::none();
+        }
+        let req = tx_builder::BatchSignRequest::Eoa(tx_builder::EoaBatchRequest {
+            net,
+            from: self.address,
+            calls: Vec::new(),
+            queue_map: tx_builder::QueueMap {
+                prepends: 0,
+                queued: 0,
+            },
+            prepared: None,
+        });
+        self.sign_review_seq += 1;
+        let seq = self.sign_review_seq;
+        let allowances = crate::txbuilder::flash_approval::allowance_verdict(&[]);
+        let (title, subtitle, note, can_execute) = txbuilder_review_copy(&req, &allowances);
+        let action = sign_review::SignAction::TxBuilder {
+            req: req.clone(),
+            can_execute,
+            preflight: tx_builder::Preflight::NotApplicable,
+        };
+        let economics = build_batch_economics(
+            &[],
+            None,
+            false,
+            self.address,
+            net,
+            &self.portfolio,
+            vec![
+                "This transaction only clears the account's EIP-7702 delegation — it moves no \
+                 tokens. Gas is a fixed budget (the authorization's intrinsic cost), not an \
+                 estimate of executed code."
+                    .into(),
+            ],
+        );
+        let mut review =
+            sign_review::SignReview::pending(title, subtitle, Vec::new(), note, seq, action);
+        review.economics = Some(economics);
         self.sign_review = Some(review);
         let local_names = build_local_names(&self.accounts, &self.safes, &self.contacts);
         spawn_txbuilder_prepare(self.network.clone(), seq, req, local_names)
@@ -2569,7 +2655,13 @@ fn txbuilder_review_copy(
                 short_address(e.from),
                 e.net.display_name()
             )),
-            Some(if e.is_batch() {
+            Some(if e.is_revoke() {
+                "This signs an EIP-7702 authorization to the zero address, which clears the \
+                 account's code. After it mines, this account is a plain EOA again. Read the \
+                 authorization shown first: unlike the empty transaction that carries it, the \
+                 authorization is what actually changes the account."
+                    .to_string()
+            } else if e.is_batch() {
                 // Deliberately does NOT state how many signatures this costs.
                 // That depends on whether the account is already delegated,
                 // which isn't known until the async prepare reads its code —
@@ -2854,7 +2946,7 @@ impl WalletScreen {
                 // Same gate the Safe arm applies to its pinned hash: a batch
                 // that delegates must not dispatch before the review has told
                 // us which delegation decision the user actually saw.
-                if ereq.is_batch() && ereq.prepared.is_none() {
+                if (ereq.is_batch() || ereq.is_revoke()) && ereq.prepared.is_none() {
                     warn!("tx-builder: EOA batch dispatch dropped — delegation not prepared");
                     if let Some(r) = self.sign_review.as_mut() {
                         r.error =
@@ -2884,11 +2976,14 @@ impl WalletScreen {
                 // A fresh delegation costs two prompts. The waiting card said
                 // "waiting for a signature" either way, so the second one
                 // arrived with nothing on the host having predicted it.
-                let kind = ereq
-                    .is_batch()
-                    .then(|| sign_review::SigningKind::Eip7702Batch {
-                        fresh_authorization: !ereq.prepared.is_some_and(|p| p.already_active),
-                    });
+                let kind = if ereq.is_revoke() {
+                    Some(sign_review::SigningKind::Eip7702Revoke)
+                } else {
+                    ereq.is_batch()
+                        .then(|| sign_review::SigningKind::Eip7702Batch {
+                            fresh_authorization: !ereq.prepared.is_some_and(|p| p.already_active),
+                        })
+                };
                 if let Some(r) = self.sign_review.as_mut() {
                     r.signing_since = Some(Instant::now());
                     r.signing_progress = kind;
@@ -4195,13 +4290,15 @@ impl WalletScreen {
                 // range. The write path still refuses correctly; this is so the
                 // screen says so before the user composes a batch for it.
                 self.refresh_txbuilder_context();
-                // The pending queue's lifecycle states were derived against the
-                // *old* descriptors (threshold/owners). Rebuild it against the
-                // refreshed ones so a changed threshold can't leave a stale
-                // have/required badge on a queued tx.
                 let pending = self.fetch_safe_pending_task();
                 self.safe_pending_loading = pending.is_some();
-                return (pending.unwrap_or_else(Task::none), None);
+                return (
+                    Task::batch([
+                        pending.unwrap_or_else(Task::none),
+                        self.drain_txbuilder_delegation_probe(),
+                    ]),
+                    None,
+                );
             }
             Message::PortfolioFetched {
                 address,
@@ -5081,7 +5178,10 @@ impl WalletScreen {
                     Some(apps::Outcome::TxBuilder(o)) => (self.handle_txbuilder_outcome(o), None),
                     None => (Task::none(), None),
                 };
-                return (Task::batch([resolve_task, task]), out);
+                return (
+                    Task::batch([resolve_task, task, self.drain_txbuilder_delegation_probe()]),
+                    out,
+                );
             }
             Message::TxBuilderResolved { seq, result } => {
                 self.apps.txbuilder_pane().on_contract_resolved(seq, result);
@@ -5095,6 +5195,10 @@ impl WalletScreen {
                 self.apps
                     .txbuilder_pane()
                     .on_code_probed(seq, net, address, result);
+                return (Task::none(), None);
+            }
+            Message::TxBuilderDelegationProbed { seq, result } => {
+                self.apps.txbuilder_pane().on_delegation_probed(seq, result);
                 return (Task::none(), None);
             }
             Message::TxBuilderNameResolved {
@@ -5138,12 +5242,26 @@ impl WalletScreen {
                 }
                 if matches!(fate, tx_builder::BatchFate::Mined) {
                     info!(hash = %format!("{hash:#x}"), "tx-builder: batch mined");
+                    let is_revoke = self.sign_review.as_ref().is_some_and(|r| {
+                        matches!(
+                            &r.action,
+                            sign_review::SignAction::TxBuilder {
+                                req: tx_builder::BatchSignRequest::Eoa(e),
+                                ..
+                            } if e.is_revoke()
+                        )
+                    });
                     self.sign_review = None;
-                    self.apps.txbuilder_pane().on_executed(hash);
+                    if is_revoke {
+                        self.apps.txbuilder_pane().on_revoked(hash);
+                    } else {
+                        self.apps.txbuilder_pane().on_executed(hash);
+                    }
                     return (
                         Task::batch([
                             self.refresh_verification_task(),
                             self.fetch_portfolio_task(),
+                            self.drain_txbuilder_delegation_probe(),
                         ]),
                         None,
                     );
@@ -5897,6 +6015,7 @@ impl WalletScreen {
                         // rebuild the dashboard, so nothing else would tell the
                         // Builder its identity moved.
                         self.refresh_txbuilder_context();
+                        let probe = self.drain_txbuilder_delegation_probe();
                         if was_safe {
                             // Drop the Safe's history so the EOA's
                             // history lazy-loads on the next Activity
@@ -5914,7 +6033,7 @@ impl WalletScreen {
                             // Different account: the App rebuilds the
                             // dashboard and kicks the multi-chain
                             // portfolio fetch for the new EOA there.
-                            return (task, Some(Outcome::Switch(idx)));
+                            return (Task::batch([task, probe]), Some(Outcome::Switch(idx)));
                         }
                         // Same underlying EOA — the App does NOT rebuild,
                         // so nothing else will refresh the portfolio. If
@@ -5931,9 +6050,9 @@ impl WalletScreen {
                                 self.refresh_verification_task(),
                                 self.fetch_portfolio_task(),
                             ]);
-                            return (Task::batch([task, refresh]), None);
+                            return (Task::batch([task, refresh, probe]), None);
                         }
-                        return (task, None);
+                        return (Task::batch([task, probe]), None);
                     }
                     Some(account_dropdown::Outcome::SelectSafe(idx)) => {
                         self.modal = Modal::None;
@@ -5942,6 +6061,7 @@ impl WalletScreen {
                             // Activating a Safe never rebuilds the dashboard,
                             // so the Builder learns the new identity here.
                             self.refresh_txbuilder_context();
+                            let probe = self.drain_txbuilder_delegation_probe();
                             // Seed the Safe portfolio from cache if
                             // we've viewed it before; kick a fresh
                             // fetch either way so on-chain state
@@ -5965,6 +6085,7 @@ impl WalletScreen {
                                 self.refresh_verification_task(),
                                 self.fetch_portfolio_task(),
                                 pending.unwrap_or_else(Task::none),
+                                probe,
                             ]);
                             return (Task::batch([task, refresh]), None);
                         }
@@ -7265,6 +7386,24 @@ fn spawn_txbuilder_code_probe(
     )
 }
 
+/// Read the acting EOA's code and recover an EIP-7702 designator, if any.
+fn spawn_txbuilder_delegation_probe(
+    network: Arc<dyn BalanceFetcher>,
+    seq: u64,
+    chain: Chain,
+    address: Address,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            network
+                .get_code(address, chain)
+                .await
+                .map(|r| crate::txbuilder::eip7702::delegated_to(&r.value))
+        },
+        move |result| Message::TxBuilderDelegationProbed { seq, result },
+    )
+}
+
 fn spawn_txbuilder_read(
     network: Arc<dyn BalanceFetcher>,
     seq: u64,
@@ -7380,7 +7519,7 @@ fn spawn_txbuilder_prepare(
             // then falls back to the verified head exactly as before, and the
             // send-side check still stands behind it.
             let pending_nonce = match &req {
-                tx_builder::BatchSignRequest::Eoa(e) if e.is_batch() => {
+                tx_builder::BatchSignRequest::Eoa(e) if e.is_batch() || e.is_revoke() => {
                     resolve_pending_nonce(&network, e.net, e.from).await
                 }
                 _ => None,
@@ -7703,7 +7842,46 @@ async fn build_txbuilder_steps(
         }
         tx_builder::BatchSignRequest::Eoa(e) => {
             use crate::txbuilder::eip7702;
-            if e.calls.len() > 1 {
+            if e.is_revoke() {
+                let chain = e.net.builtin().ok_or_else(|| {
+                    "removing a delegation is only available on built-in chains".to_string()
+                })?;
+                let code = network.get_code(e.from, chain).await?.value;
+                let current = eip7702::delegated_to(&code).ok_or_else(|| {
+                    "this account has no EIP-7702 delegation to remove".to_string()
+                })?;
+                let tx_nonce = match pending_nonce {
+                    Some(n) => n,
+                    None => network.get_transaction_count(e.from, chain).await?.value,
+                };
+                let n = tx_nonce + 1;
+                let auth = eip7702::build_revocation(chain.chain_id(), n);
+                let delegation = sign_review::DelegationReview {
+                    delegate: Address::ZERO,
+                    delegate_label: "none — restore a plain EOA".into(),
+                    authority: e.from,
+                    chain_id: chain.chain_id(),
+                    net: e.net,
+                    already_active: false,
+                    incumbent: Some(current),
+                    auth_nonce: Some(n),
+                    auth_digest: Some(auth.signature_hash()),
+                };
+                let leg = sign_review::ReviewLeg {
+                    title: "Clear account code".into(),
+                    to: e.from,
+                    value: U256::ZERO,
+                    net: e.net,
+                    calldata: Bytes::new(),
+                    decoded: Box::new(crate::decode::clear_sign::DecodeResult::Empty),
+                    sub_legs: Vec::new(),
+                    self_admin: None,
+                };
+                Ok(vec![
+                    sign_review::SignStep::Delegation(delegation),
+                    sign_review::SignStep::RawTx(leg),
+                ])
+            } else if e.calls.len() > 1 {
                 // Atomic batch → executeBatch on the (to-be-)delegated
                 // account. Only built-in chains verify + delegate; the
                 // UI never queues >1 call on a custom network, but guard
@@ -8187,7 +8365,9 @@ fn spawn_txbuilder_eoa_send(
             // outlives the transaction that carries it. Custom networks have no
             // verified state to simulate against and are skipped, matching the
             // `Preflight::Unsupported` the review shows for them.
-            if let Some(chain) = ereq.net.builtin() {
+            if let Some(chain) = ereq.net.builtin()
+                && !ereq.is_revoke()
+            {
                 preflight_before_signing(&network, chain, ereq.from, &ereq.calls, ereq.queue_map)
                     .await?;
             }
@@ -8288,8 +8468,13 @@ async fn check_gas_funding(
         .calls
         .iter()
         .fold(U256::ZERO, |acc, c| acc.saturating_add(c.value));
+    let gas_floor = if req.is_revoke() {
+        crate::txbuilder::eip7702::REVOKE_GAS_LIMIT
+    } else {
+        INTRINSIC_GAS
+    };
     let floor = moved
-        .saturating_add(U256::from(INTRINSIC_GAS).saturating_mul(U256::from(fees.max_fee_per_gas)));
+        .saturating_add(U256::from(gas_floor).saturating_mul(U256::from(fees.max_fee_per_gas)));
     if balance < floor {
         return Err(format!(
             "{} holds {} ETH, and this transaction needs at least {} ETH to cover the value it \
@@ -8352,7 +8537,7 @@ async fn send_eoa_batch(
     // needed. Only a multi-call batch delegates; a single call keeps its
     // original target/value/data.
     let mut signed_auth: Option<alloy::eips::eip7702::SignedAuthorization> = None;
-    let (to, value, data) = if req.calls.len() > 1 {
+    let (to, value, data) = if req.is_revoke() || req.calls.len() > 1 {
         // The delegation decision was made and shown at review time. Do not
         // make it again — re-read the account's code and check the answer
         // against the pin, then act on the *reviewed* decision.
@@ -8419,7 +8604,11 @@ async fn send_eoa_batch(
                         .to_string(),
                 );
             }
-            let auth = eip7702::build_authorization(chain_id, nonce + 1);
+            let auth = if pinned.delegate.is_zero() {
+                eip7702::build_revocation(chain_id, nonce + 1)
+            } else {
+                eip7702::build_authorization(chain_id, nonce + 1)
+            };
             let s = signer
                 .sign_authorization(&auth)
                 .await
@@ -8433,27 +8622,46 @@ async fn send_eoa_batch(
         // `executeBatch` into a code-less account — and that failure is worth
         // stopping precisely because it doesn't revert: a call to an address
         // with no code succeeds having executed nothing.
-        // Self-call into the (to-be-)delegated account.
-        (from, U256::ZERO, eip7702::encode_execute_batch(&req.calls))
+        // Self-call into the (to-be-)delegated account, or — for a revocation —
+        // an empty self-call that executes after the authorization has already
+        // cleared the code.
+        if req.is_revoke() {
+            if !pinned.delegate.is_zero() {
+                return Err(
+                    "reviewed revocation does not target the zero address — refusing to sign"
+                        .into(),
+                );
+            }
+            if pinned.already_active {
+                return Err("this revocation would sign nothing — go back and review again".into());
+            }
+            (from, U256::ZERO, Bytes::new())
+        } else {
+            (from, U256::ZERO, eip7702::encode_execute_batch(&req.calls))
+        }
     } else {
         let c = req.calls.first().ok_or_else(|| "empty batch".to_string())?;
         (c.to, c.value, c.data.clone())
     };
 
-    // Estimate gas against the exact shape being signed — include the
-    // authorization so the estimate accounts for the delegation set-up cost.
-    let mut est = TransactionRequest::default()
-        .from(from)
-        .to(to)
-        .value(value)
-        .input(TransactionInput::new(data.clone()));
-    if let Some(a) = &signed_auth {
-        est.authorization_list = Some(vec![a.clone()]);
-    }
-    let gas_limit = provider
-        .estimate_gas(est)
-        .await
-        .map_err(|e| format!("estimate_gas: {}", crate::net::redact_urls(&e.to_string())))?;
+    let gas_limit = if req.is_revoke() {
+        // `estimate_gas` sees the post-authorization empty account and the
+        // EIP-3529 refund cap; the constant is the budget that survives both.
+        eip7702::REVOKE_GAS_LIMIT
+    } else {
+        let mut est = TransactionRequest::default()
+            .from(from)
+            .to(to)
+            .value(value)
+            .input(TransactionInput::new(data.clone()));
+        if let Some(a) = &signed_auth {
+            est.authorization_list = Some(vec![a.clone()]);
+        }
+        provider
+            .estimate_gas(est)
+            .await
+            .map_err(|e| format!("estimate_gas: {}", crate::net::redact_urls(&e.to_string())))?
+    };
     let fees = provider.estimate_eip1559_fees().await.map_err(|e| {
         format!(
             "estimate_eip1559_fees: {}",
@@ -14679,6 +14887,26 @@ mod tests {
     }
 
     #[test]
+    fn a_caveat_alone_is_enough_to_keep_the_economics_card() {
+        // An EIP-7702 revocation moves no tokens and has no simulated gas, so
+        // the caveat is the only thing the card has to say. Skipping it would
+        // hide the one place the review explains that the gas budget is a
+        // constant rather than an estimate of executed code.
+        let e = build_batch_economics(
+            &[],
+            None,
+            false,
+            addr(0xAA),
+            Chain::Mainnet.into(),
+            &[],
+            vec!["Gas is a fixed budget.".into()],
+        );
+        assert!(e.moves.is_empty());
+        assert!(e.fee_eth().is_none());
+        assert!(!e.is_empty(), "the caveat is something to say");
+    }
+
+    #[test]
     fn economics_quote_a_base_fee_estimate_over_the_simulated_gas() {
         let e = build_batch_economics(
             &[queued(1, addr(0xC1), 0, vec![0x01])],
@@ -15615,6 +15843,90 @@ mod tests {
         assert!(err.contains("only available on built-in chains"), "{err}");
     }
 
+    /// A revocation is an authorization to the zero address, not a batch.
+    /// The overlay has to show that tuple — and the incumbent it displaces —
+    /// before the empty transaction that merely carries it.
+    #[tokio::test]
+    async fn txbuilder_7702_prepare_revokes_to_the_zero_address() {
+        let req = eoa_batch_req(crate::chain::NetworkId::Builtin(Chain::Mainnet), Vec::new());
+        let from = req.from;
+        let mock = CallMock::new();
+        let mut code = vec![0xef, 0x01, 0x00];
+        code.extend_from_slice(eip7702::EF_SIMPLE_7702_ACCOUNT.as_slice());
+        mock.set_code(from, Bytes::from(code), true);
+        let steps = prepared_steps(&mock, tx_builder::BatchSignRequest::Eoa(req))
+            .await
+            .unwrap();
+        let [
+            sign_review::SignStep::Delegation(d),
+            sign_review::SignStep::RawTx(leg),
+        ] = steps.as_slice()
+        else {
+            panic!("expected a delegation card then the empty tx, got {steps:?}");
+        };
+        assert!(d.is_revocation());
+        assert_eq!(d.delegate, Address::ZERO);
+        assert_eq!(d.incumbent, Some(eip7702::EF_SIMPLE_7702_ACCOUNT));
+        assert!(
+            !d.already_active,
+            "a revocation always signs an authorization"
+        );
+        assert_eq!(d.authority, from);
+        assert_eq!(d.auth_nonce, Some(1));
+        let expected = eip7702::build_revocation(Chain::Mainnet.chain_id(), 1).signature_hash();
+        assert_eq!(d.auth_digest, Some(expected));
+        assert_eq!(
+            sign_review::erc8213_rows(&steps[0]),
+            vec![("Authorization Digest (EIP-7702)".to_string(), expected)],
+        );
+        assert_eq!(leg.title, "Clear account code");
+        assert_eq!(leg.to, from);
+        assert!(leg.calldata.is_empty());
+        assert_eq!(leg.value, U256::ZERO);
+    }
+
+    /// The signed tuple is always zero. A foreign incumbent is named so the
+    /// user can see what they are clearing, but it is never what they sign.
+    #[tokio::test]
+    async fn txbuilder_7702_revoke_names_a_foreign_incumbent_but_signs_zero() {
+        let req = eoa_batch_req(crate::chain::NetworkId::Builtin(Chain::Mainnet), Vec::new());
+        let incumbent = addr(0x77);
+        let mock = CallMock::new();
+        let mut code = vec![0xef, 0x01, 0x00];
+        code.extend_from_slice(incumbent.as_slice());
+        mock.set_code(req.from, Bytes::from(code), true);
+        let steps = prepared_steps(&mock, tx_builder::BatchSignRequest::Eoa(req))
+            .await
+            .unwrap();
+        let [sign_review::SignStep::Delegation(d), _] = steps.as_slice() else {
+            panic!("expected a delegation card then the empty tx, got {steps:?}");
+        };
+        assert_eq!(d.delegate, Address::ZERO);
+        assert_eq!(d.incumbent, Some(incumbent));
+        assert_eq!(
+            d.auth_digest,
+            Some(eip7702::build_revocation(Chain::Mainnet.chain_id(), 1).signature_hash()),
+        );
+    }
+
+    #[tokio::test]
+    async fn txbuilder_7702_prepare_refuses_to_revoke_an_undelegated_account() {
+        let req = eoa_batch_req(crate::chain::NetworkId::Builtin(Chain::Mainnet), Vec::new());
+        let err = prepared_steps(&CallMock::new(), tx_builder::BatchSignRequest::Eoa(req))
+            .await
+            .unwrap_err();
+        assert!(err.contains("no EIP-7702 delegation"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn txbuilder_7702_prepare_refuses_to_revoke_on_a_custom_network() {
+        let req = eoa_batch_req(crate::chain::NetworkId::Custom(1337), Vec::new());
+        let err = prepared_steps(&CallMock::new(), tx_builder::BatchSignRequest::Eoa(req))
+            .await
+            .unwrap_err();
+        assert!(err.contains("only available on built-in chains"), "{err}");
+    }
+
     // ── the copy the user reads before signing ───────────────────────
 
     #[test]
@@ -15684,6 +15996,24 @@ mod tests {
     }
 
     #[test]
+    fn eoa_revoke_copy_names_the_zero_address_authorization() {
+        let req = tx_builder::BatchSignRequest::Eoa(eoa_batch_req(
+            crate::chain::NetworkId::Builtin(Chain::Mainnet),
+            Vec::new(),
+        ));
+        let (title, _, note, can_execute) = txbuilder_review_copy(&req, &Default::default());
+        assert_eq!(title, "Remove account delegation");
+        assert!(can_execute);
+        let note = note.unwrap();
+        assert!(note.contains("zero address"), "{note}");
+        assert!(note.contains("plain EOA"), "{note}");
+        assert!(
+            note.contains("authorization"),
+            "the authorization is the load-bearing signature: {note}"
+        );
+    }
+
+    #[test]
     fn safe_review_copy_refuses_to_promise_a_propose_with_no_owner_key() {
         // Below the threshold *and* holding nothing: proposing still costs one
         // owner signature, so the copy must not offer the queue-for-co-signers
@@ -15719,6 +16049,20 @@ mod tests {
             None,
             Vec::new(),
         );
+        assert!(s.sign_review.is_none(), "no overlay opened");
+        let err = s
+            .apps
+            .txbuilder_pane()
+            .error_text()
+            .expect("the pane says why")
+            .to_string();
+        assert!(err.contains("watch-only"), "{err}");
+    }
+
+    #[test]
+    fn txbuilder_revoke_review_refuses_a_watch_only_account() {
+        let mut s = screen_for(addr(0xAA), new_cache());
+        let _ = s.open_txbuilder_revoke_review();
         assert!(s.sign_review.is_none(), "no overlay opened");
         let err = s
             .apps

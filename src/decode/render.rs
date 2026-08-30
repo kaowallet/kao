@@ -6,7 +6,7 @@
 //!     ├─ proxy::resolve_implementation  → impl address (verified)
 //!     ├─ net.get_code(impl)             → bytecode (verified)
 //!     ├─ bytecode::extract              → selector → arg-type list
-//!     ├─ fourbyte::lookup(selector)     → human signatures
+//!     ├─ fourbyte::lookup(selector)     → human signatures (snapshot)
 //!     ├─ matcher::resolve               → Resolved::{Unique|Ambiguous|TypesOnly|Unknown}
 //!     ├─ alloy::dyn_abi::abi_decode     → DynSolValue per arg
 //!     └─ humanize:
@@ -216,7 +216,7 @@ pub async fn decode_call(
         bytecode::lookup(&code, selector)
     };
 
-    // Phase 2+5: 4byte lookup, signature matcher.
+    // Phase 2+5: 4byte lookup (compile-time snapshot), signature matcher.
     let candidates = fourbyte::lookup(selector);
     let resolved_sig = matcher::resolve(&candidates, bytecode_types.as_deref());
 

@@ -459,12 +459,9 @@ fn contract_head(app: &TxBuilderApp, t: KaoTheme) -> Column<'_, Message> {
                 .push(Space::new().height(8))
                 .push(proxy_unverified_note(t));
         }
-        // A loaded ABI used to be final: a wrong bytecode recovery, or a
-        // curated entry missing the method you want, had no way back except
-        // retyping the address or dropping to Raw hex.
         col = col
             .push(Space::new().height(10))
-            .push(abi_paste_block(app, t, "Replace ABI…"));
+            .push(fetch_abi_button(app, t));
     } else if let Some(e) = &app.addr_error {
         col = col.push(Space::new().height(14)).push(addr_error_box(t, e));
     } else if let Some(e) = &app.resolve_error {
@@ -477,7 +474,7 @@ fn contract_head(app: &TxBuilderApp, t: KaoTheme) -> Column<'_, Message> {
             .push(not_found_box(app, t));
     } else if app.addr_input.trim().is_empty() {
         let hint = if app.is_custom() {
-            "Paste a contract address, then its ABI — Kao can't fetch a verified ABI on a custom network."
+            "Paste a contract address, then fetch its ABI from Sourcify — Kao can't prove bytecode on a custom network."
         } else {
             "Paste a verified contract address to load its ABI."
         };
@@ -2688,6 +2685,8 @@ fn info_box<'a>(t: KaoTheme, msg: &str, accent: Color) -> Element<'a, Message> {
 fn contract_banner<'a>(t: KaoTheme, c: &'a super::LoadedContract) -> Element<'a, Message> {
     let badge = match c.source {
         AbiSource::Known => pill(t, "✓ verified", t.up),
+        AbiSource::Sourcify => pill(t, "✓ Sourcify", t.up),
+        AbiSource::Etherscan => pill(t, "✓ Etherscan", t.up),
         AbiSource::Pasted => pill(t, "pasted ABI", t.a2),
         // Guard first: a menu authored during a light-client cooldown came off
         // an untrusted endpoint, and used to be badged identically to one the
@@ -2820,6 +2819,8 @@ fn resolve_error_box<'a>(app: &'a TxBuilderApp, t: KaoTheme, err: &'a str) -> El
         Space::new().height(10),
         ghost_secondary(t, "↻ Retry", Some(Message::RetryResolve)),
         Space::new().height(8),
+        fetch_abi_button(app, t),
+        Space::new().height(8),
         abi_paste_block(app, t, "Paste ABI JSON"),
     ]
     .width(Length::Fill);
@@ -2887,6 +2888,20 @@ fn nothing_deployed_note<'a>(
         .into()
 }
 
+/// The paste-box used to be the only way to overwrite a wrong bytecode
+/// recovery. Sourcify / Etherscan is that overwrite now; the box stays as
+/// the fallback when neither registry has the contract (or on a custom
+/// network Sourcify doesn't know).
+fn fetch_abi_button<'a>(app: &'a TxBuilderApp, t: KaoTheme) -> Element<'a, Message> {
+    let label = if app.abi_fetching {
+        "Fetching…"
+    } else {
+        "Fetch from Sourcify / Etherscan"
+    };
+    let ready = !app.abi_fetching && encode::parse_address(&app.addr_input).is_ok();
+    ghost_secondary(t, label, ready.then_some(Message::FetchVerifiedAbi)).into()
+}
+
 /// The "Paste ABI JSON" button and, once armed, the box it opens.
 ///
 /// One block rather than three copies, because the button used to be offered in
@@ -2926,7 +2941,7 @@ fn not_found_box(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
             .color(t.down)
             .font(bold()),
         Space::new().height(3),
-        text("Paste the ABI as JSON, or switch to Raw hex to send custom calldata.")
+        text("Fetch a verified ABI from Sourcify or Etherscan, paste JSON, or switch to Raw hex to send custom calldata.")
             .size(12)
             .color(t.sub),
     ]
@@ -2960,6 +2975,8 @@ fn not_found_box(app: &TxBuilderApp, t: KaoTheme) -> Element<'_, Message> {
 
     col = col
         .push(Space::new().height(10))
+        .push(fetch_abi_button(app, t))
+        .push(Space::new().height(8))
         .push(abi_paste_block(app, t, "Paste ABI JSON"));
 
     container(col.padding(Padding::from([13, 16])))

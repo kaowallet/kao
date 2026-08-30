@@ -167,6 +167,7 @@ struct TraceState {
     modal: Modal,
     loaded: bool,
     resolving: bool,
+    abi_fetching: bool,
     read_busy: bool,
     sim_busy: bool,
     sim: bool,
@@ -233,6 +234,13 @@ impl TraceState {
                 "resolving",
                 self.resolving.to_string(),
                 to.resolving.to_string(),
+            );
+        }
+        if self.abi_fetching != to.abi_fetching {
+            log(
+                "abi_fetching",
+                self.abi_fetching.to_string(),
+                to.abi_fetching.to_string(),
             );
         }
         if self.read_busy != to.read_busy {
@@ -316,6 +324,7 @@ pub enum Message {
     // contract-call composer
     AddrChanged(String),
     RetryResolve,
+    FetchVerifiedAbi,
     ShowAbiPaste,
     AbiPasteChanged(String),
     LoadPastedAbi,
@@ -385,6 +394,7 @@ impl Message {
             Message::SetNetwork(_) => "SetNetwork",
             Message::AddrChanged(_) => "AddrChanged",
             Message::RetryResolve => "RetryResolve",
+            Message::FetchVerifiedAbi => "FetchVerifiedAbi",
             Message::ShowAbiPaste => "ShowAbiPaste",
             Message::AbiPasteChanged(_) => "AbiPasteChanged",
             Message::LoadPastedAbi => "LoadPastedAbi",
@@ -719,6 +729,17 @@ pub enum Outcome {
         chain: Chain,
         address: Address,
     },
+    /// Fetch a published ABI from Sourcify / Etherscan for `address`.
+    /// Answered via [`TxBuilderApp::on_verified_abi`]. Does not need a
+    /// bytecode read — this is the escape hatch when the light-client
+    /// path failed, and the replace-ABI control when a wrong recovery
+    /// is already on screen.
+    FetchVerifiedAbi {
+        seq: u64,
+        chain_id: u64,
+        address: Address,
+        walked: Option<Address>,
+    },
     /// Run a Read-tab `eth_call` on `net` and hand the raw return data back via
     /// [`TxBuilderApp::on_read`].
     Read {
@@ -817,6 +838,7 @@ impl Outcome {
         match self {
             Outcome::Close => "Close",
             Outcome::ResolveContract { .. } => "ResolveContract",
+            Outcome::FetchVerifiedAbi { .. } => "FetchVerifiedAbi",
             Outcome::Read { .. } => "Read",
             Outcome::ProbeCode { .. } => "ProbeCode",
             Outcome::ResolveName { .. } => "ResolveName",
@@ -889,6 +911,11 @@ pub struct TxBuilderApp {
     addr_input: String,
     loaded: Option<LoadedContract>,
     resolving: bool,
+    /// In-flight Sourcify / Etherscan ABI fetch from the explicit button.
+    /// Separate from [`Self::resolving`]: that one hides the composer behind
+    /// a light-client spinner, this one only disables the fetch button so a
+    /// loaded menu stays usable while the replace is in flight.
+    abi_fetching: bool,
     /// Set when a resolve found no ABI — prompts the paste-ABI fallback.
     not_found: bool,
     /// Set when the last resolve *failed* rather than came back empty.
@@ -947,6 +974,7 @@ pub struct TxBuilderApp {
     /// The address currently being resolved / loaded (dedup guard).
     resolve_target: Option<Address>,
     resolve_seq: u64,
+    abi_fetch_seq: u64,
     method_idx: usize,
     method_menu_open: bool,
     args: Vec<String>,
@@ -1030,6 +1058,7 @@ impl TxBuilderApp {
             addr_input: String::new(),
             loaded: None,
             resolving: false,
+            abi_fetching: false,
             not_found: false,
             resolve_error: None,
             addr_error: None,
@@ -1046,6 +1075,7 @@ impl TxBuilderApp {
             abi_paste: String::new(),
             resolve_target: None,
             resolve_seq: 0,
+            abi_fetch_seq: 0,
             method_idx: 0,
             method_menu_open: false,
             args: Vec::new(),
@@ -1327,12 +1357,13 @@ impl TxBuilderApp {
                     // being augmented must keep whatever the chain just said
                     // about whether anything is deployed there.
                     let nothing_deployed = r.nothing_deployed;
-                    match abi::from_bytecode_behind_proxy(
+                    let recovered = abi::from_bytecode_behind_proxy(
                         &r.code,
                         addr,
                         r.implementation,
                         r.code_verified,
-                    ) {
+                    );
+                    match recovered {
                         // A curated entry is already on screen: fold the
                         // recovered selectors into it rather than replacing it,
                         // so the hand-written names win where they overlap and
@@ -1343,9 +1374,6 @@ impl TxBuilderApp {
                             }
                             _ => s.set_loaded(recovered),
                         },
-                        // Nothing recoverable. A curated entry already loaded
-                        // stands on its own — the augmenting fetch failing to
-                        // add anything is not a reason to drop it.
                         None => {
                             if s.loaded.is_none() {
                                 s.not_found = true;
@@ -1358,6 +1386,54 @@ impl TxBuilderApp {
                 // a recoverable ABI, so it must not be reported as "no verified
                 // ABI".
                 Err(e) => s.resolve_error = Some(e),
+            }
+        })
+    }
+
+    /// The coordinator fetched a Sourcify / Etherscan ABI (or didn't find
+    /// one). Replaces a pasted / previous explorer ABI; folds into a
+    /// bytecode recovery so extra selectors stay reachable.
+    pub fn on_verified_abi(
+        &mut self,
+        seq: u64,
+        result: Result<Option<crate::txbuilder::explorer::VerifiedAbi>, String>,
+    ) {
+        self.traced("on_verified_abi", move |s| {
+            if seq != s.abi_fetch_seq {
+                return;
+            }
+            s.abi_fetching = false;
+            let addr = match crate::txbuilder::encode::parse_address(&s.addr_input) {
+                Ok(a) => a,
+                Err(_) => match s.resolve_target {
+                    Some(a) => a,
+                    None => return,
+                },
+            };
+            match result {
+                Ok(Some(v)) => match abi::from_explorer_abi(&v, addr) {
+                    Ok(fetched) => {
+                        let write_sel = s.selected_method().map(|m| m.selector);
+                        let read_sel = s.selected_read_method().map(|m| m.selector);
+                        let args = s.args.clone();
+                        let read_args = s.read_args.clone();
+                        let value = s.value_input.clone();
+                        let loaded = match s.loaded.take() {
+                            Some(prev) if prev.source == AbiSource::Bytecode => {
+                                abi::merge_recovered(fetched, prev)
+                            }
+                            _ => fetched,
+                        };
+                        s.set_loaded(loaded);
+                        s.reselect_method(write_sel, &args, &value);
+                        s.reselect_read(read_sel, &read_args);
+                    }
+                    Err(e) => s.error = Some(e.to_string()),
+                },
+                Ok(None) => {
+                    s.error = Some("no verified ABI on Sourcify or Etherscan".into());
+                }
+                Err(e) => s.error = Some(e),
             }
         })
     }
@@ -1833,6 +1909,7 @@ impl TxBuilderApp {
             modal: self.modal.clone(),
             loaded: self.loaded.is_some(),
             resolving: self.resolving,
+            abi_fetching: self.abi_fetching,
             read_busy: self.read_busy,
             sim_busy: self.sim_busy,
             sim: self.sim.is_some(),
@@ -1880,6 +1957,7 @@ impl TxBuilderApp {
             }
             Message::AddrChanged(v) => return self.on_addr_changed(v),
             Message::RetryResolve => return self.retry_resolve(),
+            Message::FetchVerifiedAbi => return self.fetch_verified_abi(),
             Message::ShowAbiPaste => {
                 self.paste_open = true;
             }
@@ -2273,8 +2351,9 @@ impl TxBuilderApp {
         self.reset_composer_keep_addr();
         self.resolve_target = Some(addr);
         match self.net.builtin() {
-            // Built-in chain: curated registry first, else fetch the
-            // verified bytecode and recover the ABI.
+            // Built-in chain: curated registry first, else recover the ABI
+            // from verified bytecode. Sourcify / Etherscan is opt-in via
+            // the fetch button — it is not part of this resolve.
             Some(chain) => {
                 // A curated hit shows immediately — its names are
                 // authoritative and it needs no round trip — and then
@@ -2324,6 +2403,26 @@ impl TxBuilderApp {
         })
     }
 
+    fn fetch_verified_abi(&mut self) -> Option<Outcome> {
+        let addr = match crate::txbuilder::encode::parse_address(&self.addr_input) {
+            Ok(a) => a,
+            Err(_) => {
+                self.error = Some("enter the contract address first".into());
+                return None;
+            }
+        };
+        let walked = self.loaded.as_ref().and_then(|c| c.proxy_impl);
+        self.error = None;
+        self.invalidate_abi_fetch();
+        self.abi_fetching = true;
+        Some(Outcome::FetchVerifiedAbi {
+            seq: self.abi_fetch_seq,
+            chain_id: self.net.chain_id(),
+            address: addr,
+            walked,
+        })
+    }
+
     fn set_loaded(&mut self, loaded: LoadedContract) {
         // Installing a contract retires any resolve still in flight. Without
         // this, a curated-registry hit or a pasted ABI (neither of which issues
@@ -2334,9 +2433,10 @@ impl TxBuilderApp {
         self.resolving = false;
         self.not_found = false;
         self.resolve_error = None;
-        // A curated or pasted ABI is authoritative for the address regardless
-        // of what the proxy walk could or couldn't read, so the caution retires
-        // with it; a bytecode load keeps it (that ABI *is* the stub's).
+        // A curated, explorer, or pasted ABI is authoritative for the address
+        // regardless of what the proxy walk could or couldn't read, so the
+        // caution retires with it; a bytecode load keeps it (that ABI *is*
+        // the stub's).
         if loaded.source != AbiSource::Bytecode {
             self.proxy_unverified = false;
             self.proxy_beacon = false;
@@ -2351,6 +2451,47 @@ impl TxBuilderApp {
         self.loaded = Some(loaded);
         self.reset_args();
         self.reset_read_args();
+    }
+
+    /// Keep the method the user had picked across an ABI replace, matching
+    /// on selector so a Sourcify hit that merely *names* the same function
+    /// does not yank the composer back to the first row (and wipe the
+    /// arguments they already typed).
+    fn reselect_method(&mut self, selector: Option<[u8; 4]>, args: &[String], value: &str) {
+        let Some(sel) = selector else {
+            return;
+        };
+        let Some(i) = self
+            .loaded
+            .as_ref()
+            .and_then(|c| c.methods.iter().position(|m| m.selector == sel))
+        else {
+            return;
+        };
+        self.method_idx = i;
+        self.reset_args();
+        if self.args.len() == args.len() {
+            self.args = args.to_vec();
+        }
+        self.value_input = value.to_string();
+    }
+
+    fn reselect_read(&mut self, selector: Option<[u8; 4]>, args: &[String]) {
+        let Some(sel) = selector else {
+            return;
+        };
+        let Some(i) = self
+            .loaded
+            .as_ref()
+            .and_then(|c| c.read_methods.iter().position(|m| m.selector == sel))
+        else {
+            return;
+        };
+        self.read_idx = i;
+        self.reset_read_args();
+        if self.read_args.len() == args.len() {
+            self.read_args = args.to_vec();
+        }
     }
 
     fn reset_args(&mut self) {
@@ -2421,8 +2562,10 @@ impl TxBuilderApp {
 
     fn reset_composer_keep_addr(&mut self) {
         self.invalidate_resolve();
+        self.invalidate_abi_fetch();
         self.loaded = None;
         self.resolving = false;
+        self.abi_fetching = false;
         self.not_found = false;
         self.resolve_error = None;
         self.addr_error = None;
@@ -2457,6 +2600,11 @@ impl TxBuilderApp {
     /// switch — has to bump the sequence or the answer gets misapplied.
     fn invalidate_resolve(&mut self) {
         self.resolve_seq += 1;
+    }
+
+    fn invalidate_abi_fetch(&mut self) {
+        self.abi_fetch_seq += 1;
+        self.abi_fetching = false;
     }
 
     /// Retire any read still in flight, plus its displayed result. Same shape
@@ -5111,6 +5259,215 @@ mod tests {
         assert_eq!(loaded.address, proxy);
         assert_eq!(loaded.proxy_impl, Some(impl_addr));
         assert!(!app.proxy_unverified);
+    }
+
+    #[test]
+    fn etherscan_abi_loads_declared_param_names_even_without_bytecode() {
+        // A proxy stub's own code has no selectors. The fetch button is what
+        // names `to`/`amount` the way the explorer page does.
+        let mut app = eoa_app();
+        let proxy = address!("0x00000000000000000000000000000000C0FFEE00");
+        let impl_addr = address!("0x00000000000000000000000000000000BEEF0000");
+        app.update(Message::AddrChanged(proxy.to_string()));
+        app.update(Message::FetchVerifiedAbi);
+        let seq = app.abi_fetch_seq;
+        app.on_verified_abi(
+            seq,
+            Ok(Some(crate::txbuilder::explorer::VerifiedAbi {
+                json: r#"[{"type":"function","name":"transfer","stateMutability":"nonpayable",
+                     "inputs":[{"name":"to","type":"address"},{"name":"amount","type":"uint256"}]}]"#
+                    .into(),
+                contract_name: "UsdC".into(),
+                implementation: Some(impl_addr),
+                origin: crate::txbuilder::explorer::AbiOrigin::Etherscan,
+            })),
+        );
+        let loaded = app.loaded.as_ref().expect("explorer ABI loaded");
+        assert_eq!(loaded.source, AbiSource::Etherscan);
+        assert_eq!(loaded.address, proxy);
+        assert_eq!(loaded.name, "UsdC");
+        assert_eq!(loaded.proxy_impl, Some(impl_addr));
+        let t = loaded
+            .methods
+            .iter()
+            .find(|m| m.name == "transfer")
+            .unwrap();
+        assert_eq!(t.inputs[0].name, "to");
+        assert_eq!(t.inputs[1].name, "amount");
+        assert!(!app.not_found);
+    }
+
+    #[test]
+    fn etherscan_abi_keeps_declared_names_when_bytecode_also_arrives() {
+        let mut app = eoa_app();
+        let addr = address!("0x00000000000000000000000000000000C0FFEE00");
+        app.update(Message::AddrChanged(addr.to_string()));
+        app.on_contract_resolved(
+            app.resolve_seq,
+            Ok(plain_code(
+                addr,
+                &crate::decode::bytecode::tiny_transfer_runtime(),
+            )),
+        );
+        app.update(Message::FetchVerifiedAbi);
+        let seq = app.abi_fetch_seq;
+        app.on_verified_abi(
+            seq,
+            Ok(Some(crate::txbuilder::explorer::VerifiedAbi {
+                json: r#"[{"type":"function","name":"transfer","stateMutability":"nonpayable",
+                     "inputs":[{"name":"to","type":"address"},{"name":"amount","type":"uint256"}]}]"#
+                    .into(),
+                contract_name: "Token".into(),
+                implementation: None,
+                origin: crate::txbuilder::explorer::AbiOrigin::Etherscan,
+            })),
+        );
+        let loaded = app.loaded.as_ref().expect("merged");
+        assert_eq!(loaded.source, AbiSource::Etherscan);
+        let t = loaded
+            .methods
+            .iter()
+            .find(|m| m.name == "transfer")
+            .unwrap();
+        assert_eq!(t.inputs[0].name, "to");
+        assert_eq!(
+            t.provenance,
+            crate::txbuilder::abi::MethodProvenance::Declared
+        );
+    }
+
+    #[test]
+    fn a_fetch_keeps_the_method_already_chosen() {
+        let mut app = eoa_app();
+        let addr = address!("0x00000000000000000000000000000000C0FFEE00");
+        app.update(Message::AddrChanged(addr.to_string()));
+        app.update(Message::ShowAbiPaste);
+        app.update(Message::AbiPasteChanged(
+            r#"[{"type":"function","name":"approve","stateMutability":"nonpayable",
+                "inputs":[{"name":"spender","type":"address"},{"name":"amount","type":"uint256"}]},
+               {"type":"function","name":"transfer","stateMutability":"nonpayable",
+                "inputs":[{"name":"dst","type":"address"},{"name":"wad","type":"uint256"}]}]"#
+                .into(),
+        ));
+        app.update(Message::LoadPastedAbi);
+        let transfer_idx = app
+            .loaded
+            .as_ref()
+            .unwrap()
+            .methods
+            .iter()
+            .position(|m| m.name == "transfer")
+            .unwrap();
+        assert_ne!(transfer_idx, 0, "the bug is a reset to the first row");
+        app.update(Message::PickMethod(transfer_idx));
+        app.update(Message::ArgChanged(
+            0,
+            "0x0000000000000000000000000000000000000001".into(),
+        ));
+        app.update(Message::ArgChanged(1, "42".into()));
+        let sel = app.selected_method().unwrap().selector;
+
+        app.update(Message::FetchVerifiedAbi);
+        let seq = app.abi_fetch_seq;
+        app.on_verified_abi(
+            seq,
+            Ok(Some(crate::txbuilder::explorer::VerifiedAbi {
+                json: r#"[{"type":"function","name":"transfer","stateMutability":"nonpayable",
+                     "inputs":[{"name":"to","type":"address"},{"name":"amount","type":"uint256"}]},
+                    {"type":"function","name":"approve","stateMutability":"nonpayable",
+                     "inputs":[{"name":"spender","type":"address"},{"name":"amount","type":"uint256"}]}]"#
+                    .into(),
+                contract_name: "Token".into(),
+                implementation: None,
+                origin: crate::txbuilder::explorer::AbiOrigin::Sourcify,
+            })),
+        );
+        let chosen = app.selected_method().expect("still a method");
+        assert_eq!(
+            chosen.selector, sel,
+            "fetch must not change the chosen call"
+        );
+        assert_eq!(chosen.name, "transfer");
+        assert_eq!(chosen.inputs[0].name, "to");
+        assert_eq!(
+            app.args,
+            vec![
+                "0x0000000000000000000000000000000000000001".to_string(),
+                "42".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn fetch_verified_abi_requires_an_address() {
+        let mut app = eoa_app();
+        let out = app.update(Message::FetchVerifiedAbi);
+        assert!(out.is_none());
+        assert!(app.error.as_deref().unwrap().contains("address"));
+        assert!(!app.abi_fetching);
+    }
+
+    #[test]
+    fn fetch_verified_abi_bubbles_the_lookup() {
+        let mut app = eoa_app();
+        let addr = address!("0x00000000000000000000000000000000C0FFEE00");
+        app.update(Message::AddrChanged(addr.to_string()));
+        let Some(Outcome::FetchVerifiedAbi {
+            chain_id,
+            address,
+            walked,
+            ..
+        }) = app.update(Message::FetchVerifiedAbi)
+        else {
+            panic!("expected FetchVerifiedAbi");
+        };
+        assert_eq!(chain_id, Chain::Mainnet.chain_id());
+        assert_eq!(address, addr);
+        assert!(walked.is_none());
+        assert!(app.abi_fetching);
+    }
+
+    #[test]
+    fn on_verified_abi_replaces_a_bytecode_menu() {
+        let mut app = eoa_app();
+        let addr = address!("0x00000000000000000000000000000000C0FFEE00");
+        app.update(Message::AddrChanged(addr.to_string()));
+        let code = crate::decode::bytecode::tiny_transfer_runtime();
+        app.on_contract_resolved(app.resolve_seq, Ok(plain_code(addr, &code)));
+        assert_eq!(app.loaded.as_ref().unwrap().source, AbiSource::Bytecode);
+
+        app.update(Message::FetchVerifiedAbi);
+        let seq = app.abi_fetch_seq;
+        app.on_verified_abi(
+            seq,
+            Ok(Some(crate::txbuilder::explorer::VerifiedAbi {
+                json: r#"[{"type":"function","name":"transfer","stateMutability":"nonpayable",
+                     "inputs":[{"name":"to","type":"address"},{"name":"amount","type":"uint256"}]}]"#
+                    .into(),
+                contract_name: "Token".into(),
+                implementation: None,
+                origin: crate::txbuilder::explorer::AbiOrigin::Sourcify,
+            })),
+        );
+        let loaded = app.loaded.as_ref().expect("replaced");
+        assert_eq!(loaded.source, AbiSource::Sourcify);
+        assert_eq!(loaded.methods[0].inputs[0].name, "to");
+        assert!(!app.abi_fetching);
+    }
+
+    #[test]
+    fn a_missed_verified_abi_keeps_what_was_on_screen() {
+        let mut app = eoa_app();
+        let addr = address!("0x00000000000000000000000000000000C0FFEE00");
+        app.update(Message::AddrChanged(addr.to_string()));
+        let code = crate::decode::bytecode::tiny_transfer_runtime();
+        app.on_contract_resolved(app.resolve_seq, Ok(plain_code(addr, &code)));
+        app.update(Message::FetchVerifiedAbi);
+        let seq = app.abi_fetch_seq;
+        app.on_verified_abi(seq, Ok(None));
+        assert_eq!(app.loaded.as_ref().unwrap().source, AbiSource::Bytecode);
+        assert!(app.error.as_deref().unwrap().contains("Sourcify"));
+        assert!(!app.abi_fetching);
     }
 
     #[test]

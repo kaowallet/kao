@@ -28,6 +28,7 @@ pub mod abi;
 pub mod bundle;
 pub mod eip7702;
 pub mod encode;
+pub mod explorer;
 pub mod flash_approval;
 pub mod multisend;
 pub mod sim;

@@ -1,27 +1,30 @@
 //! ABI model for the Transaction Builder's composer: what "write methods"
 //! a contract exposes, and how each was discovered.
 //!
-//! Three loading tiers, in descending fidelity (v1 — no block-explorer
-//! fetch):
+//! Four loading tiers, in descending fidelity:
 //!
 //! 1. **Known contracts** — a small curated registry of common Mainnet
 //!    contracts with hand-verified method signatures and (importantly)
 //!    parameter *names*. Selected via the quick-picker.
-//! 2. **Pasted JSON ABI** — the user pastes a standard Solidity ABI array;
+//! 2. **Verified explorer ABI** — opt-in, via the composer's fetch button.
+//!    Sourcify first (no key), then Etherscan `getsourcecode` when a free
+//!    API key is set. Full declared names and parameter names for the typed
+//!    address (and its implementation, when the explorer tags a proxy).
+//! 3. **Pasted JSON ABI** — the user pastes a standard Solidity ABI array;
 //!    we keep the state-mutating functions and parse each param type.
 //!    Full param names, no network dependency.
-//! 3. **Bytecode heuristic** — for any other address, `evmole` recovers
+//! 4. **Bytecode heuristic** — for any other address, `evmole` recovers
 //!    the public selectors, argument *types* and state mutability from the
-//!    on-chain runtime code, and the embedded 4byte database supplies human
-//!    names where it can. Never yields parameter names (positional `arg0…`),
-//!    and its mutability is inferred rather than declared — but always
-//!    available. When the address
-//!    is an EIP-1967 / ZeppelinOS proxy, the introspected code is the
-//!    implementation's (see [`from_bytecode_behind_proxy`]); a proxy stub's
-//!    own code exposes almost no selectors.
+//!    on-chain runtime code. Names come from the embedded 4byte snapshot.
+//!    Never yields parameter names (positional `arg0…`), and its
+//!    mutability is inferred rather than declared — but always available.
+//!    When the address is an EIP-1967 / ZeppelinOS proxy, the introspected
+//!    code is the implementation's (see [`from_bytecode_behind_proxy`]); a
+//!    proxy stub's own code exposes almost no selectors.
 //!
-//! All three converge on [`LoadedContract`] → `Vec<AbiMethod>`, which the
-//! composer renders identically.
+//! A declared ABI (known / explorer / pasted) is merged with a bytecode
+//! recovery so extra selectors still show up. Collisions keep the declared
+//! names. All four converge on [`LoadedContract`] → `Vec<AbiMethod>`.
 
 use std::sync::OnceLock;
 
@@ -69,7 +72,7 @@ impl AbiParam {
 /// carries the same fact back to the menu the method is chosen from.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum MethodProvenance {
-    /// The ABI declared this name: a curated entry, or a pasted JSON ABI.
+    /// The ABI declared this name: a curated entry, an explorer ABI, or a pasted JSON ABI.
     #[default]
     Declared,
     /// One 4byte signature, consistent with the bytecode — name and code agree.
@@ -228,6 +231,10 @@ impl AbiMethod {
 pub enum AbiSource {
     /// Curated, hand-verified registry entry.
     Known,
+    /// JSON ABI from Sourcify for this address.
+    Sourcify,
+    /// JSON ABI from Etherscan `getsourcecode` for this address.
+    Etherscan,
     /// User-pasted standard JSON ABI.
     Pasted,
     /// Recovered from on-chain bytecode + the 4byte database. Argument names
@@ -262,8 +269,8 @@ pub struct LoadedContract {
     pub proxy_impl: Option<Address>,
     /// False when this ABI rests on a code read that fell through to unverified
     /// RPC — during a light-client cooldown, the whole method list can be
-    /// authored by an untrusted endpoint. Always true for a curated or pasted
-    /// ABI, neither of which reads code at all.
+    /// authored by an untrusted endpoint. Always true for a curated, explorer,
+    /// or pasted ABI, none of which read code at all.
     pub code_verified: bool,
 }
 
@@ -910,16 +917,40 @@ pub fn parse_abi_json(json: &str, address: Address) -> Result<LoadedContract, Tx
     })
 }
 
+/// A verified explorer ABI, addressed at the contract the user typed.
+///
+/// Parameter names and mutability come from the published JSON, same as a
+/// paste — the source badge is what distinguishes them. `implementation`
+/// is recorded when the explorer (or our walk) said this address is a
+/// proxy; calls still go to `address`.
+pub fn from_explorer_abi(
+    verified: &super::explorer::VerifiedAbi,
+    address: Address,
+) -> Result<LoadedContract, TxBuilderError> {
+    let mut loaded = parse_abi_json(&verified.json, address)?;
+    loaded.source = match verified.origin {
+        super::explorer::AbiOrigin::Sourcify => AbiSource::Sourcify,
+        super::explorer::AbiOrigin::Etherscan => AbiSource::Etherscan,
+    };
+    loaded.label = match verified.origin {
+        super::explorer::AbiOrigin::Sourcify => "Sourcify verified ABI",
+        super::explorer::AbiOrigin::Etherscan => "Etherscan verified ABI",
+    }
+    .into();
+    let name = crate::sanitize::sanitize_display(&verified.contract_name, MAX_FN_NAME_CHARS);
+    if !name.is_empty() {
+        loaded.name = name.into_owned();
+    }
+    if let Some(impl_addr) = verified.implementation.filter(|i| *i != address) {
+        loaded.proxy_impl = Some(impl_addr);
+    }
+    Ok(loaded)
+}
+
 // ============================================================================
 // Bytecode heuristic
 // ============================================================================
 
-/// Recover a contract's methods from its runtime `code` using `evmole` (arg
-/// types and state mutability) reconciled with the embedded 4byte database
-/// (function names). Never yields parameter names, and its `view`/`pure` split
-/// is inferred from the dispatcher rather than declared — but works on any
-/// deployed contract without a pasted ABI. Returns `None` if the code exposes
-/// no recoverable functions (EOA, empty account, minimal proxy).
 /// A selector evmole believes only reads state.
 ///
 /// Kept composable — the inference bails silently on a big dispatcher and
@@ -933,6 +964,12 @@ fn reads_only(m: &AbiMethod) -> bool {
     )
 }
 
+/// Recover a contract's methods from its runtime `code` using `evmole` (arg
+/// types and state mutability) reconciled with the embedded 4byte database
+/// (function names). Never yields parameter names, and its `view`/`pure` split
+/// is inferred from the dispatcher rather than declared — but works on any
+/// deployed contract without a pasted ABI. Returns `None` if the code exposes
+/// no recoverable functions (EOA, empty account, minimal proxy).
 pub fn from_bytecode(code: &[u8], address: Address, code_verified: bool) -> Option<LoadedContract> {
     let extracted = bytecode::extract(code);
     if extracted.is_empty() {
@@ -1418,6 +1455,73 @@ mod tests {
         assert_eq!(m.provenance, MethodProvenance::Matched);
         assert!(m.provenance.caution().is_none());
         assert!(!m.provenance.is_spoof_signal());
+    }
+
+    #[test]
+    fn from_explorer_abi_keeps_declared_param_names() {
+        let verified = crate::txbuilder::explorer::VerifiedAbi {
+            json: r#"[{"type":"function","name":"transfer","stateMutability":"nonpayable",
+                 "inputs":[{"name":"to","type":"address"},{"name":"amount","type":"uint256"}]}]"#
+                .into(),
+            contract_name: "UsdC".into(),
+            implementation: None,
+            origin: crate::txbuilder::explorer::AbiOrigin::Etherscan,
+        };
+        let addr = Address::repeat_byte(0xA0);
+        let c = from_explorer_abi(&verified, addr).unwrap();
+        assert_eq!(c.source, AbiSource::Etherscan);
+        assert_eq!(c.address, addr);
+        assert_eq!(c.name, "UsdC");
+        assert_eq!(c.label, "Etherscan verified ABI");
+        let t = c.methods.iter().find(|m| m.name == "transfer").unwrap();
+        assert_eq!(t.inputs[0].name, "to");
+        assert_eq!(t.inputs[1].name, "amount");
+        assert_eq!(t.provenance, MethodProvenance::Declared);
+        assert!(c.proxy_impl.is_none());
+    }
+
+    #[test]
+    fn from_explorer_abi_records_a_proxy_implementation() {
+        let impl_addr = Address::repeat_byte(0x22);
+        let verified = crate::txbuilder::explorer::VerifiedAbi {
+            json: r#"[{"type":"function","name":"transfer","stateMutability":"nonpayable",
+                 "inputs":[{"name":"to","type":"address"},{"name":"amount","type":"uint256"}]}]"#
+                .into(),
+            contract_name: "FiatTokenV2".into(),
+            implementation: Some(impl_addr),
+            origin: crate::txbuilder::explorer::AbiOrigin::Etherscan,
+        };
+        let proxy = Address::repeat_byte(0x11);
+        let c = from_explorer_abi(&verified, proxy).unwrap();
+        assert_eq!(c.address, proxy);
+        assert_eq!(c.proxy_impl, Some(impl_addr));
+    }
+
+    #[test]
+    fn explorer_abi_wins_names_and_bytecode_fills_extra_selectors() {
+        let verified = crate::txbuilder::explorer::VerifiedAbi {
+            json: r#"[{"type":"function","name":"transfer","stateMutability":"nonpayable",
+                 "inputs":[{"name":"to","type":"address"},{"name":"amount","type":"uint256"}]}]"#
+                .into(),
+            contract_name: "Token".into(),
+            implementation: None,
+            origin: crate::txbuilder::explorer::AbiOrigin::Etherscan,
+        };
+        let declared = from_explorer_abi(&verified, Address::ZERO).unwrap();
+        let code = crate::decode::bytecode::tiny_transfer_runtime();
+        let recovered = from_bytecode(&code, Address::ZERO, true).unwrap();
+        let merged = merge_recovered(declared, recovered);
+        assert_eq!(merged.source, AbiSource::Etherscan);
+        let t = merged
+            .methods
+            .iter()
+            .find(|m| m.name == "transfer")
+            .unwrap();
+        assert_eq!(
+            t.inputs[0].name, "to",
+            "declared names must not be stripped"
+        );
+        assert_eq!(t.provenance, MethodProvenance::Declared);
     }
 
     #[test]

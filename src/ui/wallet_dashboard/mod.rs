@@ -428,6 +428,11 @@ pub enum Message {
         seq: u64,
         result: Result<tx_builder::ResolvedCode, String>,
     },
+    /// Transaction Builder: Sourcify / Etherscan ABI lookup finished.
+    TxBuilderVerifiedAbi {
+        seq: u64,
+        result: Result<Option<crate::txbuilder::explorer::VerifiedAbi>, String>,
+    },
     /// Transaction Builder: a Read-tab `eth_call` returned `(bytes, verified)`.
     TxBuilderRead {
         seq: u64,
@@ -2226,6 +2231,12 @@ impl WalletScreen {
                 chain,
                 address,
             } => spawn_txbuilder_resolve(self.network.clone(), seq, chain, address),
+            O::FetchVerifiedAbi {
+                seq,
+                chain_id,
+                address,
+                walked,
+            } => spawn_txbuilder_verified_abi(seq, chain_id, address, walked),
             O::Read { seq, net, to, data } => {
                 spawn_txbuilder_read(self.network.clone(), seq, net, to, data)
             }
@@ -5186,6 +5197,9 @@ impl WalletScreen {
             Message::TxBuilderResolved { seq, result } => {
                 self.apps.txbuilder_pane().on_contract_resolved(seq, result);
             }
+            Message::TxBuilderVerifiedAbi { seq, result } => {
+                self.apps.txbuilder_pane().on_verified_abi(seq, result);
+            }
             Message::TxBuilderCodeProbed {
                 seq,
                 net,
@@ -7227,6 +7241,18 @@ fn spawn_txbuilder_resolve(
     Task::perform(
         async move { resolve_contract_code(network.as_ref(), chain, address).await },
         move |result| Message::TxBuilderResolved { seq, result },
+    )
+}
+
+fn spawn_txbuilder_verified_abi(
+    seq: u64,
+    chain_id: u64,
+    address: Address,
+    walked: Option<Address>,
+) -> Task<Message> {
+    Task::perform(
+        async move { crate::txbuilder::explorer::fetch_verified_abi(chain_id, address, walked).await },
+        move |result| Message::TxBuilderVerifiedAbi { seq, result },
     )
 }
 

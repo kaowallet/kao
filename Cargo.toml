@@ -14,7 +14,7 @@ strip = true
 codegen-units = 1
 
 [dependencies]
-alloy = { version = "2.0.1", features = ["full", "signer-mnemonic", "signer-ledger", "signer-trezor"] }
+alloy = { version = "2.4.2", features = ["full", "signer-mnemonic", "signer-ledger", "signer-trezor"] }
 # EIP-712 support, deliberately NOT via alloy's `eip712` meta-feature. That
 # meta-feature weak-references the cloud signers (`alloy-signer-aws?/eip712`,
 # -gcp, -turnkey), and cargo's version resolver locks weak-referenced optional
@@ -30,13 +30,13 @@ alloy = { version = "2.0.1", features = ["full", "signer-mnemonic", "signer-ledg
 #     by software keys and Trezor (which has no eip712 feature of its own).
 #   - alloy-signer-local/eip712, alloy-signer-ledger/eip712 → the cfg-gated
 #     native impls (Ledger's on-device domain-hash + struct-hash flow).
-# Versions pin to the same builds alloy 2.0.1 already resolves to, so no new
+# Versions pin to the same builds alloy 2.4.2 already resolves to, so no new
 # packages enter the tree. Drop these four (back to the meta-feature) if
 # cargo#10801 is ever fixed.
-alloy-core = { version = "1.5.7", features = ["eip712"] }
-alloy-signer = { version = "2.0.1", features = ["eip712"] }
-alloy-signer-local = { version = "2.0.1", features = ["eip712"] }
-alloy-signer-ledger = { version = "2.0.1", features = ["eip712", "eip7702"] }
+alloy-core = { version = "1.7.3", features = ["eip712"] }
+alloy-signer = { version = "2.4.2", features = ["eip712"] }
+alloy-signer-local = { version = "2.4.2", features = ["eip712"] }
+alloy-signer-ledger = { version = "2.4.2", features = ["eip712", "eip7702"] }
 clear-signing = { git = "https://github.com/kaowallet/clear-signing", features = ["bundled-registry"] }
 # rusb reaches us transitively via alloy-signer-ledger -> hidapi-rusb -> rusb.
 # Its default build dynamically links the host's libusb, baking an absolute
@@ -86,9 +86,9 @@ ens-normalize-rs = "0.1.1"
 # narrow ambiguous 4byte matches by intersecting with what the contract
 # actually implements, and to fall back to "selector + arg types only"
 # when 4byte has no entry. MIT-licensed; uses alloy-dyn-abi internally.
-evmole = "0.8"
+evmole = "0.9"
 futures = "0.3"
-getrandom = "0.4.2"
+getrandom = "0.4.3"
 # Pinned to commit on tag 0.11.1. Bump deliberately rather than tracking a branch.
 helios-ethereum = { git = "https://github.com/a16z/helios", rev = "204c998a927348e1c000a664f08d5b37b1b0d924" }
 # Same git rev as helios-ethereum: both crates ship from the a16z/helios
@@ -105,15 +105,16 @@ helios-opstack = { git = "https://github.com/a16z/helios", rev = "204c998a927348
 # `colored_address`'s hover-grey + click-to-copy widget in src/ui/kao_widgets.rs.
 iced = { version = "0.14.0", features = ["tokio", "image", "qr_code", "svg", "advanced"] }
 # Privacy Pools (0xbow) proving + wallet SDK, pure Rust. `wallet` = onchain +
-# account (alloy 2.0.1 bindings + BIP-44 HD derivation + the flow/sync helpers);
+# account (alloy 2.x bindings + BIP-44 HD derivation + the flow/sync helpers);
 # the default `bundled` feature embeds the ~19 MB Groth16 circuit artifacts so
-# proving needs no wasm/node/circom at runtime. The crate pins & re-exports
-# alloy 2.0.1 — import alloy through `privacy_pools::alloy` where boundary types
-# (Address/U256/Provider) cross — and pulls arkworks 0.5 + circom-witnesscalc
-# (new ark-*/witnesscalc crates need supply-chain exemptions).
+# proving needs no wasm/node/circom at runtime. The crate declares
+# `alloy = "2.0.1"` (caret, so 2.4.2 unifies) — import alloy through
+# `privacy_pools::alloy` where boundary types (Address/U256/Provider) cross —
+# and pulls arkworks 0.5 + circom-witnesscalc (new ark-*/witnesscalc crates
+# need supply-chain exemptions).
 privacy-pools = { git = "https://github.com/kaowallet/privacy-pools", features = ["wallet"] }
 rand = "0.8"
-redb = "4.1.0"
+redb = "4.2.0"
 # Local EVM for transaction preflight. Pinned to the same version helios
 # pulls in (cargo unifies them into one build of revm 29.0.1 instead of
 # duplicating). The three `optional_*` features disable basefee / nonce /
@@ -141,11 +142,11 @@ secrecy = "0.10.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "sync"] }
-toml = "0.8"
+toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
-zeroize = { version = "1.8.2", features = ["derive"] }
+zeroize = { version = "1.9", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"

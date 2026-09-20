@@ -14,4 +14,4 @@ serde_json = { version = "1", features = ["preserve_order"] }
 sha3 = "0.10"
 tar = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
-usvg = "0.47"
+usvg = "0.48"

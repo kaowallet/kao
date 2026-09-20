@@ -31,7 +31,7 @@ ignore = [
     { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.101.7 URI name-constraint bypass. Requires a misissued cert to exploit. Worst case: an attacker MITMs RPC responses; the light client rejects them as inconsistent with the verified header chain — liveness loss, not confidentiality." },
     { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.101.7 wildcard name-constraint bypass. Same misissuance precondition and same blast-radius cap as -0098." },
     { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.101.7 CRL-parse panic, reachable pre-verification. rustls doesn't fetch CRLs by default and we never pass any in; worst-case failure mode is a helios task panic, not key compromise." },
-    { id = "RUSTSEC-2026-0258", reason = "h2 unbounded empty DATA frames (memory DoS / panic). h2 0.3.27 is pinned by jsonrpsee 0.19 → hyper 0.14 (no 0.3 patch); h2 0.4.13 is pulled by helios's reqwest 0.12 and alloy's reqwest. Low severity, HTTP/2 frame-queue DoS on RPC connections — an attacker can stall helios, not reach keys. Revisit when helios moves off jsonrpsee 0.19, and when h2 ≥0.4.16 is cargo-vet audited so the 0.4 line can bump." },
+    { id = "RUSTSEC-2026-0258", reason = "h2 unbounded empty DATA frames (memory DoS / panic). Patched in h2 ≥0.4.16; the 0.4 line is on 0.4.19. h2 0.3.27 remains, pinned by jsonrpsee 0.19 → hyper 0.14 (no 0.3 patch). Low severity, HTTP/2 frame-queue DoS on RPC connections — an attacker can stall helios, not reach keys. Revisit when helios moves off jsonrpsee 0.19." },
 
     # ── helios libp2p subtree (helios-opstack → libp2p 0.51 and friends) ─
     # libp2p here is op-stack peer transport. Its noise/identity keys are
@@ -51,7 +51,6 @@ ignore = [
 
     # ── alloy/build-time ──────────────────────────────────────────────────
     { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 unmaintained. Build-time proc-macro used by alloy-primitives via alloy-chains. No known vuln, no runtime surface." },
-    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 2.0.1 unmaintained (fork of proc-macro-error, see RUSTSEC-2024-0370 above). Build-time proc-macro diagnostics used by alloy-sol-macro. No known vuln, no runtime surface. Revisit when alloy-sol-macro migrates off it upstream." },
 
     # ── iced GUI font/glyph subtree (cosmic-text + usvg → fontdb → ttf-parser,
     #    resvg → usvg → rustybuzz) ──────────────────────────────────────────
@@ -61,22 +60,7 @@ ignore = [
     # storage, signed payloads, or verified chain state, and the fonts/SVG assets
     # they read ship with the app.
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser 0.25.1 unmaintained (author won't ship further fixes; no known vuln). Reaches the tree via iced's text/SVG rendering (cosmic-text + usvg → fontdb). Glyph/font parsing for rendering only — disjoint from signing, storage, and chain verification. Revisit when iced/cosmic-text/usvg migrate to skrifa." },
-    { id = "RUSTSEC-2026-0206", reason = "rustybuzz 0.20.1 unmaintained (maintainer points at harfrust; no known vuln). Enters via iced's SVG rendering (iced_tiny_skia/iced_wgpu → resvg 0.45 → usvg). Text shaping for the bundled app icons only — same rendering-path isolation as ttf-parser above. No consumer-side upgrade: iced pins resvg ^0.45 and even usvg 0.47 still requires rustybuzz ^0.20.1. Revisit when usvg migrates to harfrust and iced bumps resvg." },
-
-    # ── iced Wayland subtree (winit → smithay-client-toolkit →
-    #    wayland-scanner → quick-xml 0.39) ───────────────────────────────────
-    # Linux/Wayland-only and BUILD-TIME only: wayland-scanner is a proc-macro
-    # that parses the Wayland protocol XML files bundled with the crate to
-    # generate bindings at compile time. quick-xml never runs at runtime and
-    # never sees attacker-controlled input — the XML it parses ships with
-    # wayland-protocols. Both advisories are DoS on maliciously-crafted XML
-    # (quadratic attribute scan / unbounded namespace allocation), which
-    # requires hostile input that cannot reach this path. wayland-scanner
-    # 0.31.10 pins quick-xml `^0.39`, so ≥0.41 needs iced's whole winit/
-    # smithay stack to bump — no consumer-side upgrade exists. Revisit when
-    # iced upgrades winit past the smithay-client-toolkit that caps it.
-    { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.39 quadratic duplicate-attribute scan (DoS on malicious XML). Enters via wayland-scanner, a build-time-only, Linux/Wayland-only proc-macro that parses the trusted bundled Wayland protocol XML — no runtime surface and no attacker-controlled input. Capped at ^0.39 by wayland-scanner; no consumer-side upgrade path. Revisit when iced bumps its winit/smithay stack." },
-    { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.39 unbounded namespace-declaration allocation in NsReader (memory-exhaustion DoS on malicious XML). Same build-time-only, Linux/Wayland-only wayland-scanner path parsing trusted bundled protocol XML — no runtime surface, no hostile input. Same ^0.39 cap and revisit condition as -0194." },
+    { id = "RUSTSEC-2026-0206", reason = "rustybuzz 0.20.1 unmaintained (maintainer points at harfrust; no known vuln). xtask's usvg 0.48 moved to harfrust, but iced still pins resvg ^0.45 → usvg 0.45 → rustybuzz for in-app SVG icons. Text shaping for bundled assets only — same rendering-path isolation as ttf-parser above. Revisit when iced bumps resvg." },
 
     # ── privacy-pools proving subtree (arkworks 0.5 → ark-relations →
     #    tracing-subscriber 0.2.25) ─────────────────────────────────────────
@@ -116,6 +100,9 @@ allow = [
     "NCSA",
     # Mozilla's bundled root-cert list (webpki-roots, webpki-root-certs).
     "CDLA-Permissive-2.0",
+    # evmole 0.9 → minicbor (CBOR metadata in bytecode). OSI-approved
+    # permissive license, MIT-equivalent grant with a notice obligation.
+    "BlueOak-1.0.0",
 ]
 exceptions = []
 

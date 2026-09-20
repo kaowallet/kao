@@ -534,7 +534,7 @@ pub enum Message {
         result: Result<crate::pool::relayer::QuoteResponse, String>,
     },
     /// Forward name resolution for the Privacy Pools withdrawal target finished
-    /// (`.eth` / `.gwei` / `.wei` / `.xns`, or a picked contact's pinned name).
+    /// (`.eth` / `.gwei` / `.wei` / `label@namespace`, or a picked contact's pinned name).
     /// `seq` drops stale lookups; `name` disambiguates when the input changed.
     PoolTargetResolved {
         seq: u64,
@@ -7354,9 +7354,9 @@ async fn resolve_contract_code(
 /// ABI argument, so it has to fail closed.
 ///
 /// Through the **tagged** resolver, so the pane can badge the name with the
-/// registry that actually vouched for it. For an XNS name the TLD can't say:
-/// namespaces are permissionless, so `alice.crops` has no TLD to route on and
-/// `alice.org` could be answered by either XNS or ENS.
+/// registry that actually vouched for it. v2's `@` vs `.` split means the
+/// syntax already says which service to ask: `alice@crops` is XNS,
+/// `alice.eth` is ENS.
 fn spawn_txbuilder_name_resolve(
     network: Arc<dyn BalanceFetcher>,
     seq: u64,
@@ -9094,7 +9094,7 @@ fn name_review_labels(sign: &sign_review::NameSign) -> (String, Option<String>, 
             blind,
         ),
         sign_review::NameSign::RegisterXns { namespace, label } => {
-            (format!("Register {label}.{namespace}"), None, blind)
+            (format!("Register {label}@{namespace}"), None, blind)
         }
         sign_review::NameSign::Renew {
             namespace,
@@ -9250,7 +9250,7 @@ async fn build_name_call(
         }
         sign_review::NameSign::RegisterXns { namespace, label } => {
             let (to, value, cd) = manage::register_xns_call_for(net, namespace, label).await?;
-            Ok((to, value, cd, format!("Register {label}.{namespace}")))
+            Ok((to, value, cd, format!("Register {label}@{namespace}")))
         }
         sign_review::NameSign::Renew {
             namespace,

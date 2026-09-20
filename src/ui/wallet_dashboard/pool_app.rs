@@ -115,7 +115,7 @@ pub struct WithdrawRequest {
 }
 
 /// Resolution state of the withdrawal target field — the same address-or-name
-/// state machine the Send flow uses, so a `.eth` / `.gwei` / `.wei` / `.xns`
+/// state machine the Send flow uses, so a `.eth` / `.gwei` / `.wei` / `@xns`
 /// name (or a picked contact) resolves to a verified address before it can be
 /// baked into a withdrawal proof. The coordinator drives the async half through
 /// [`PoolApp::take_pending_resolve`] / [`PoolApp::set_target_resolution`].
@@ -1593,7 +1593,7 @@ impl PoolApp {
             vspace(18),
             text("Target address").size(11).color(t.sub).font(mono_bold()),
             vspace(4),
-            text_input("0x… address or a name (.eth / .gwei / .wei / .xns)", &self.withdraw_target)
+            text_input("0x… address or a name (.eth / .gwei / .wei / @xns)", &self.withdraw_target)
                 .on_input(Message::WithdrawTarget)
                 .padding(12)
                 .font(mono())
@@ -2446,7 +2446,12 @@ mod tests {
             matches!(&app.withdraw_resolution, TargetResolution::Resolving { name } if name == "vitalik.eth")
         );
 
-        // Not hex and not name-shaped (no dot).
+        app.set_target("alice@xns".into());
+        assert!(
+            matches!(&app.withdraw_resolution, TargetResolution::Resolving { name } if name == "alice@xns")
+        );
+
+        // Not hex and not name-shaped (no `.` and no `@`).
         app.set_target("hello".into());
         assert!(matches!(app.withdraw_resolution, TargetResolution::Invalid));
     }

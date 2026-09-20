@@ -570,9 +570,7 @@ impl ContactsPane {
             AddressResolution::Empty
         } else if let Ok(addr) = Address::from_str(trimmed) {
             AddressResolution::Hex(addr)
-        } else if crate::names::looks_like_known_name(trimmed)
-            || crate::names::looks_like_xns_name(trimmed)
-        {
+        } else if crate::names::looks_like_known_name(trimmed) {
             AddressResolution::Resolving {
                 name: trimmed.to_string(),
             }
@@ -836,7 +834,7 @@ impl ContactsPane {
         let addr_field = labeled_input(
             t,
             "ADDRESS OR NAME",
-            "0x… or a name (.eth / .gwei / .wei)",
+            "0x… or a name (.eth / .gwei / .wei / @xns)",
             &self.draft.address_input,
             Message::AddressChanged,
         );
@@ -970,13 +968,11 @@ fn list_card<'a>(
     // the row shorter when a card lacked a name, which left the grid
     // looking ragged.
     //
-    // The prefix names the service that vouches for the name, and is dropped
-    // when the name alone can't say which one — an XNS namespace is
-    // permissionless, so `dave.crops` could be XNS and `frank.org` could be
-    // either XNS or ENS. The registry is known at resolve time but isn't
-    // carried in `ContactEns` (a postcard record: appending a field would fail
-    // every existing row's decode), so a saved contact renders the bare name
-    // rather than a guess.
+    // The prefix names the service that vouches for the name. v2's `@` vs `.`
+    // split is unambiguous (`dave@crops` is XNS, `vitalik.eth` is ENS), so
+    // [`namespace_label`] always has an answer. The registry is still derived
+    // from the saved name rather than stored on `ContactEns` (a postcard
+    // record: appending a field would fail every existing row's decode).
     let ens_text = c
         .ens
         .as_ref()
@@ -1217,12 +1213,17 @@ mod tests {
         ContactsPane::new(Arc::new(RwLock::new(ContactsBook::new())))
     }
 
-    /// XNS namespaces are permissionless, so the gate can't be a TLD list. It
-    /// used to be one, which meant `dave.crops` was refused as "not a valid
-    /// 0x… address or name" and could never become a contact at all.
+    /// XNS namespaces are permissionless, so the gate is the contract's
+    /// `label@namespace` grammar rather than a TLD list.
     #[test]
     fn an_arbitrary_xns_namespace_is_accepted_as_a_name() {
-        for name in ["dave.crops", "erin.cheese", "carol.xns", "vitalik.eth"] {
+        for name in [
+            "dave@crops",
+            "erin@cheese",
+            "carol@xns",
+            "alice@eth",
+            "vitalik.eth",
+        ] {
             let mut p = pane();
             p.set_address(name.into());
             assert!(
@@ -1237,7 +1238,14 @@ mod tests {
     /// refused without a network call.
     #[test]
     fn junk_is_still_refused() {
-        for bad in ["docs.uniswap.org", "notaname", "definitely not an address"] {
+        for bad in [
+            "docs.uniswap.org",
+            "dave.crops",
+            "alice.xns",
+            "user@gmail.com",
+            "notaname",
+            "definitely not an address",
+        ] {
             let mut p = pane();
             p.set_address(bad.into());
             assert!(

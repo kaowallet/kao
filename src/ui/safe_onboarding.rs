@@ -506,7 +506,7 @@ impl SafeOnboardingScreen {
             return self.kick_off_ens(trimmed);
         }
         self.set_address_error(
-            "Not a valid Ethereum address or name. Expected `0x…` (40 hex chars) or a `.eth` / `.gwei` / `.wei` name.",
+            "Not a valid Ethereum address or name. Expected `0x…` (40 hex chars) or a `.eth` / `.gwei` / `.wei` / `@xns` name.",
         );
         (Task::none(), None)
     }
@@ -1160,7 +1160,7 @@ fn view_address_input<'a>(
     error: Option<&'a str>,
     resolving: bool,
 ) -> Element<'a, Message> {
-    let addr_input = text_input("0x… or a name (.eth / .gwei / .wei)", input)
+    let addr_input = text_input("0x… or a name (.eth / .gwei / .wei / @xns)", input)
         .id(ADDRESS_INPUT_ID)
         .on_input(Message::AddressInput)
         .on_submit(Message::AddressSubmit)

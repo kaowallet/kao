@@ -1068,12 +1068,15 @@ impl SendPane {
         } else {
             bold()
         });
-        let input = text_input("0x… address or a name (.eth / .gwei / .wei)", &self.to)
-            .on_input(Message::SetTo)
-            .padding(Padding::from([12, 14]))
-            .size(15)
-            .font(mono())
-            .style(move |_, status| text_input_style(t, status));
+        let input = text_input(
+            "0x… address or a name (.eth / .gwei / .wei / @xns)",
+            &self.to,
+        )
+        .on_input(Message::SetTo)
+        .padding(Padding::from([12, 14]))
+        .size(15)
+        .font(mono())
+        .style(move |_, status| text_input_style(t, status));
 
         let parse_hint: Element<'_, Message> = match &self.resolution {
             Resolution::Empty => Space::new().height(0).into(),
@@ -3418,6 +3421,31 @@ mod tests {
             result: Ok(Some(stale)),
         });
         assert!(matches!(pane.resolution, Resolution::Resolving { .. }));
+    }
+
+    #[test]
+    fn an_xns_at_name_starts_resolution() {
+        let mut pane = SendPane::new_safe(&safe_only(1, vec![0]), &[local_account_simple(1)]);
+        pane.set_to("alice@xns".to_string());
+        assert!(
+            matches!(&pane.resolution, Resolution::Resolving { name } if name == "alice@xns"),
+            "alice@xns must start a lookup, got {:?}",
+            pane.resolution,
+        );
+        pane.set_to("wehi@crops".to_string());
+        assert!(matches!(
+            &pane.resolution,
+            Resolution::Resolving { name } if name == "wehi@crops"
+        ));
+        pane.set_to("alice@eth".to_string());
+        assert!(matches!(
+            &pane.resolution,
+            Resolution::Resolving { name } if name == "alice@eth"
+        ));
+        // v1 dotted shape is not XNS; Send still treats any dotted string as a
+        // name (ENS), which is fine — but a bare word is not.
+        pane.set_to("alice".to_string());
+        assert!(matches!(pane.resolution, Resolution::Invalid));
     }
 
     #[test]

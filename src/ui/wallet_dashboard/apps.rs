@@ -461,7 +461,7 @@ impl AppsPane {
                 t,
                 "(✎ω✎)",
                 "Names",
-                "Search & register .eth / .gwei / .wei / .xns names",
+                "Search & register .eth / .gwei / .wei / @xns names",
                 Message::OpenNamesApp,
             ));
         }

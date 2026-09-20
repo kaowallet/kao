@@ -1,6 +1,7 @@
 //! Name-service app — a search-first surface for registering and managing names
-//! across ENS (`.eth`), GNS (`.gwei`), WNS (`.wei`) and XNS (`.xns`, `.crops`
-//! and any permissionless namespace), surfaced as a tile in the Apps launcher.
+//! across ENS (`.eth`), GNS (`.gwei`), WNS (`.wei`) and XNS (`@xns`, `@eth`,
+//! `@crops` and any permissionless namespace), surfaced as a tile in the Apps
+//! launcher.
 //!
 //! This pane is a self-contained Elm widget: it owns ephemeral UI state and emits
 //! [`Outcome`]s for the coordinator to turn into verified reads / signed
@@ -984,7 +985,7 @@ impl NamesApp {
             column![
                 screen_title(t, "Names"),
                 Space::new().height(4),
-                screen_subtitle(t, "Search & register across .eth / .gwei / .wei / .xns"),
+                screen_subtitle(t, "Search & register across .eth / .gwei / .wei / @xns"),
             ]
             .width(Length::Fill),
             text(KAO_MASCOT).size(22).color(t.a3).font(bold()),
@@ -996,7 +997,7 @@ impl NamesApp {
         // is a compact pill so the bar gets the room.
         let search = row![
             text_input(
-                "search a name — kitty, vitalik.eth, cow.crops…",
+                "search a name — kitty, vitalik.eth, cow@crops…",
                 &self.query
             )
             .on_input(Message::QueryChanged)
@@ -1820,7 +1821,7 @@ mod tests {
                 label, registries, ..
             }) => {
                 assert_eq!(label, "rat");
-                assert_eq!(registries.len(), 5);
+                assert_eq!(registries.len(), 6);
             }
             _ => panic!("expected Search, got {out:?}"),
         }
@@ -1830,7 +1831,7 @@ mod tests {
     #[test]
     fn explicit_xns_query_searches_one_namespace() {
         let mut a = app();
-        a.update(Message::QueryChanged("cow.cheese".into()));
+        a.update(Message::QueryChanged("cow@cheese".into()));
         let out = a.update(Message::Search);
         match out {
             Some(Outcome::Search {
@@ -1846,6 +1847,39 @@ mod tests {
             }
             _ => panic!("expected Search, got {out:?}"),
         }
+        assert!(a.searching);
+    }
+
+    #[test]
+    fn at_eth_searches_xns_dot_eth_searches_ens() {
+        let mut a = app();
+        a.update(Message::QueryChanged("alice@eth".into()));
+        match a.update(Message::Search) {
+            Some(Outcome::Search {
+                label, registries, ..
+            }) => {
+                assert_eq!(label, "alice");
+                assert_eq!(
+                    registries,
+                    vec![Registry::Xns {
+                        namespace: "eth".to_string()
+                    }]
+                );
+            }
+            other => panic!("expected XNS Search, got {other:?}"),
+        }
+
+        let mut a = app();
+        a.update(Message::QueryChanged("alice.eth".into()));
+        match a.update(Message::Search) {
+            Some(Outcome::Search {
+                label, registries, ..
+            }) => {
+                assert_eq!(label, "alice");
+                assert_eq!(registries, vec![Registry::Ens]);
+            }
+            other => panic!("expected ENS Search, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1856,7 +1890,7 @@ mod tests {
                 namespace: "crops".to_string(),
             },
             label: "cow".to_string(),
-            full: "cow.crops".to_string(),
+            full: "cow@crops".to_string(),
             status: HitStatus::Available { quote: None },
         }];
         a.update(Message::PickResult(0));
@@ -2259,7 +2293,7 @@ mod tests {
                 namespace: "crops".to_string(),
             },
             label: "cow".to_string(),
-            full: "cow.crops".to_string(),
+            full: "cow@crops".to_string(),
             status: HitStatus::Available { quote: None },
         }];
         a.update(Message::PickResult(0));
@@ -2274,7 +2308,7 @@ mod tests {
         }
         // …and it appears under "Your names" (permanent XNS → no expiry).
         assert_eq!(a.owned.len(), 1);
-        assert_eq!(a.owned[0].full, "cow.crops");
+        assert_eq!(a.owned[0].full, "cow@crops");
         assert!(a.owned[0].owned_by(a.owner));
         assert_eq!(a.owned[0].expires_at, None);
         assert_eq!(a.owned[0].state(), NameState::Permanent);

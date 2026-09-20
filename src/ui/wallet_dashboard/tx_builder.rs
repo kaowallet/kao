@@ -1510,22 +1510,17 @@ impl TxBuilderApp {
     /// "that isn't an address" complaint they would otherwise raise.
     ///
     /// The gate is "a registry could actually hold this": a first-class TLD
-    /// (`.eth` / `.gwei` / `.wei`) or an XNS-shaped `label.namespace`. Not the
+    /// (`.eth` / `.gwei` / `.wei`) or an XNS-shaped `label@namespace`. Not the
     /// loose `looks_like_name` the Send recipient uses, which fires on any
     /// dotted string — the Builder's boxes are paste targets for explorer
     /// output and calldata, and a lookup per pasted URL is noise.
     ///
-    /// XNS namespaces are permissionless, so the second half of that gate is a
-    /// grammar check rather than a TLD list, and it necessarily admits some
-    /// things that are not names (`uniswap.org` is XNS-shaped). That is the
-    /// unavoidable cost of supporting namespaces nobody has to register with
-    /// this wallet first; what it buys is that `alice.crops` resolves at all.
-    /// Multi-dot strings and every `0x…` are still rejected without a call.
+    /// v2's `@` separator is unambiguous, so `uniswap.org` is no longer
+    /// XNS-shaped and does not fire a lookup. Multi-dot strings, undotted
+    /// junk, and every `0x…` are still rejected without a call.
     fn route_name_input(&mut self, slot: NameSlot, text: &str) -> (bool, Option<Outcome>) {
         let trimmed = text.trim();
-        if crate::names::looks_like_known_name(trimmed)
-            || crate::names::looks_like_xns_name(trimmed)
-        {
+        if crate::names::looks_like_known_name(trimmed) {
             // Already resolved / resolving this exact name for this slot — the
             // keystroke that produced this text changed something else.
             let same = self.names.get(&slot).is_some_and(|s| match s {
@@ -1567,10 +1562,9 @@ impl TxBuilderApp {
                 _ => return None,
             }
             let next = match result {
-                // The badge comes from whichever registry answered, not from
-                // the TLD: an XNS namespace is permissionless, so `alice.crops`
-                // has no TLD-derived answer and `alice.org` could have come
-                // from either side.
+                // The badge comes from whichever registry answered. v2's `@`
+                // vs `.` split already says for XNS vs ENS, but the lookup
+                // is still the source of truth.
                 Ok(Some((addr, registry))) => NameState::Resolved {
                     ns: registry.label(),
                     name: name.clone(),
@@ -4412,9 +4406,8 @@ mod tests {
         ));
     }
 
-    /// The badge names whichever registry answered. For ENS/GNS/WNS the TLD
-    /// determines that; for XNS it cannot, because namespaces are
-    /// permissionless — so the registry rides back with the address.
+    /// The badge names whichever registry answered. v2's `@` vs `.` split
+    /// already says XNS vs ENS; GNS/WNS still ride on their TLDs.
     #[test]
     fn a_resolved_name_is_badged_by_the_registry_that_answered() {
         use crate::names::Registry;
@@ -4422,12 +4415,10 @@ mod tests {
             ("vitalik.eth", Registry::Ens, "ENS"),
             ("alice.gwei", Registry::Gns, "GNS"),
             ("bob.wei", Registry::Wns, "WNS"),
-            ("carol.xns", Registry::Xns, "XNS"),
-            // Arbitrary XNS namespaces — nothing in the string says XNS.
-            ("dave.crops", Registry::Xns, "XNS"),
-            ("erin.cheese", Registry::Xns, "XNS"),
-            // Shaped like an XNS name, but ENS is what held it.
-            ("frank.org", Registry::Ens, "ENS"),
+            ("carol@xns", Registry::Xns, "XNS"),
+            ("dave@crops", Registry::Xns, "XNS"),
+            ("erin@cheese", Registry::Xns, "XNS"),
+            ("alice@eth", Registry::Xns, "XNS"),
         ] {
             let mut app = safe_app();
             app.update(Message::AddrChanged(name.into()));
@@ -4439,11 +4430,17 @@ mod tests {
         }
     }
 
-    /// The gate has to admit permissionless namespaces, or `alice.crops` never
-    /// gets asked about at all — which is what used to happen.
+    /// The gate has to admit permissionless `@` namespaces, or `alice@crops`
+    /// never gets asked about at all.
     #[test]
     fn an_arbitrary_xns_namespace_starts_a_lookup() {
-        for name in ["dave.crops", "erin.cheese", "a.b", "team-1.my-ns"] {
+        for name in [
+            "dave@crops",
+            "erin@cheese",
+            "a@b",
+            "team-1@my-ns",
+            "alice@eth",
+        ] {
             let mut app = safe_app();
             let out = app.update(Message::AddrChanged(name.into()));
             assert!(
@@ -4607,20 +4604,22 @@ mod tests {
         );
     }
 
-    /// What the gate still refuses. Permissionless namespaces mean the gate is
-    /// a grammar check, so it cannot reject `uniswap.org` — nothing about that
-    /// string distinguishes it from an XNS name until the contract is asked.
-    /// What it does reject, without a network call: anything multi-dot (a URL
-    /// with a subdomain, which no XNS label can contain), anything undotted,
-    /// and every address.
+    /// What the gate still refuses. v2's `@` separator means `uniswap.org` is
+    /// no longer XNS-shaped. What it rejects without a network call: any
+    /// dotted string that isn't `.eth`/`.gwei`/`.wei`, anything undotted that
+    /// isn't `label@namespace`, and every address.
     #[test]
     fn junk_that_no_registry_could_hold_fires_no_lookup() {
         for text in [
             "docs.uniswap.org",
             "app.aave.com",
+            "uniswap.org",
+            "alice.xns",
+            "dave.crops",
             "notanaddress",
             "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
-            "toolongalabelfortheXNScontract.ns",
+            "toolongalabelfortheXNScontract@ns",
+            "user@gmail.com",
         ] {
             let mut app = safe_app();
             let out = app.update(Message::AddrChanged(text.into()));

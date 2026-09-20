@@ -181,7 +181,7 @@ impl ImportAddressScreen {
             return (task, None);
         }
         self.error = Some(
-            "Not a valid Ethereum address or name. Expected `0x…` (40 hex chars) or a `.eth` / `.gwei` / `.wei` name.".into(),
+            "Not a valid Ethereum address or name. Expected `0x…` (40 hex chars) or a `.eth` / `.gwei` / `.wei` / `@xns` name.".into(),
         );
         (Task::none(), None)
     }
@@ -193,14 +193,17 @@ impl ImportAddressScreen {
     pub fn view(&self) -> Element<'_, Message> {
         let t = KaoTheme::for_kind(settings::theme());
 
-        let address_input = text_input("0x… or a name (.eth / .gwei / .wei)", &self.address_input)
-            .id(ADDRESS_INPUT_ID)
-            .on_input(Message::AddressInput)
-            .on_submit(Message::AddPressed)
-            .padding(Padding::from([12, 14]))
-            .size(14)
-            .font(mono())
-            .style(move |_theme, status| text_input_style(t, status));
+        let address_input = text_input(
+            "0x… or a name (.eth / .gwei / .wei / @xns)",
+            &self.address_input,
+        )
+        .id(ADDRESS_INPUT_ID)
+        .on_input(Message::AddressInput)
+        .on_submit(Message::AddPressed)
+        .padding(Padding::from([12, 14]))
+        .size(14)
+        .font(mono())
+        .style(move |_theme, status| text_input_style(t, status));
 
         let resolving_now = self.resolving.is_some();
         let btn_label = if resolving_now {

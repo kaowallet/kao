@@ -18,7 +18,7 @@
 //!   settable recipient (`setAddr`).
 //! - **XNS** ([`super::xns`]): a single payable `registerName`, permanent +
 //!   immutable + non-transferable names (no renew, no re-point), one name per
-//!   address, and permissionless `label.namespace` namespaces.
+//!   address, and permissionless `label@namespace` namespaces.
 //!
 //! [`Registry`] is the unified handle the UI and coordinator pass around;
 //! [`Registry::legacy`] bridges to [`registrar::Namespace`] for the commit-reveal
@@ -80,8 +80,8 @@ pub enum Registry {
     Ens,
     Gns,
     Wns,
-    /// XNS `label.namespace`; the string is the (already lowercase, validated)
-    /// XNS namespace, e.g. `"xns"` / `"crops"` / `"cheese"`.
+    /// XNS `label@namespace`; the string is the (already lowercase, validated)
+    /// XNS namespace, e.g. `"eth"` / `"xns"` / `"crops"`.
     Xns {
         namespace: String,
     },
@@ -90,8 +90,8 @@ pub enum Registry {
 impl Registry {
     /// The XNS namespaces shown by default in the cross-namespace search,
     /// alongside `.eth` / `.gwei` / `.wei`. Custom namespaces still work — they're
-    /// reached by typing an explicit `label.namespace`.
-    pub const XNS_DEFAULTS: [&'static str; 2] = ["xns", "crops"];
+    /// reached by typing an explicit `label@namespace`.
+    pub const XNS_DEFAULTS: [&'static str; 3] = ["eth", "xns", "crops"];
 
     /// The default search targets for a bare label: ENS, GNS, WNS and the
     /// shown XNS namespaces.
@@ -144,18 +144,18 @@ impl Registry {
         }
     }
 
-    /// The dotted TLD suffix: `.eth` / `.gwei` / `.wei` for the registrars, or
-    /// `.{namespace}` for XNS.
+    /// The suffix: `.eth` / `.gwei` / `.wei` for the registrars, or
+    /// `@{namespace}` for XNS.
     pub fn tld(&self) -> String {
         match self {
             Registry::Ens => ".eth".to_string(),
             Registry::Gns => ".gwei".to_string(),
             Registry::Wns => ".wei".to_string(),
-            Registry::Xns { namespace } => format!(".{namespace}"),
+            Registry::Xns { namespace } => format!("@{namespace}"),
         }
     }
 
-    /// `label` + this registry's TLD, e.g. `"vitalik.eth"` / `"rat.cheese"`.
+    /// `label` + this registry's suffix, e.g. `"vitalik.eth"` / `"rat@cheese"`.
     pub fn full_name(&self, label: &str) -> String {
         format!("{label}{}", self.tld())
     }
@@ -204,18 +204,39 @@ impl Registry {
 pub enum Query {
     /// A bare label (no TLD) → search the [`Registry::defaults`] with it.
     Bare(String),
-    /// An explicit `label.tld` → search just this one registry.
+    /// An explicit `label.tld` or `label@namespace` → search just this one registry.
     One { registry: Registry, label: String },
 }
 
 /// Parse free search-bar input. A bare word becomes a cross-namespace
 /// [`Query::Bare`]; `name.eth` / `name.gwei` / `name.wei` route to the matching
-/// registrar; anything else (`cow.domain`) is treated as an XNS namespace whose
-/// existence is checked on-chain during the search.
+/// registrar; `name@namespace` routes to that XNS namespace (existence is
+/// checked on-chain during the search). A dotted unknown TLD is rejected —
+/// v2 XNS identifiers use `@`, not `.`.
 pub fn parse_query(input: &str) -> Result<Query, String> {
     let t = input.trim();
     if t.is_empty() {
         return Err("type a name to search".to_string());
+    }
+    if t.contains('@') {
+        let (label, namespace) = t.split_once('@').expect("contains @");
+        if namespace.contains('@') {
+            return Err("enter a single name, e.g. alice@xns".to_string());
+        }
+        if label.is_empty() {
+            return Err("type a label before the @".to_string());
+        }
+        if namespace.is_empty() {
+            return Err("type a namespace after the @".to_string());
+        }
+        let lc_ns = namespace.to_ascii_lowercase();
+        if !xns::is_valid_label(&lc_ns) {
+            return Err("that doesn't look like a valid namespace".to_string());
+        }
+        return Ok(Query::One {
+            registry: Registry::Xns { namespace: lc_ns },
+            label: label.to_string(),
+        });
     }
     match t.rsplit_once('.') {
         None => Ok(Query::Bare(t.to_string())),
@@ -231,13 +252,8 @@ pub fn parse_query(input: &str) -> Result<Query, String> {
                 "eth" => Registry::Ens,
                 "gwei" => Registry::Gns,
                 "wei" => Registry::Wns,
-                other => {
-                    if !xns::is_valid_label(other) {
-                        return Err("that doesn't look like a valid namespace".to_string());
-                    }
-                    Registry::Xns {
-                        namespace: other.to_string(),
-                    }
+                _ => {
+                    return Err("XNS names use @, e.g. alice@xns".to_string());
                 }
             };
             Ok(Query::One {
@@ -253,7 +269,7 @@ pub fn parse_query(input: &str) -> Result<Query, String> {
 pub fn parse_one_name(input: &str) -> Result<(Registry, String), String> {
     match parse_query(input)? {
         Query::One { registry, label } => Ok((registry, label)),
-        Query::Bare(_) => Err("include a TLD, e.g. vitalik.eth or alice.xns".to_string()),
+        Query::Bare(_) => Err("include a namespace, e.g. vitalik.eth or alice@xns".to_string()),
     }
 }
 
@@ -376,7 +392,7 @@ pub struct NameStatus {
     pub registry: Registry,
     /// Bare, normalized label (no TLD).
     pub label: String,
-    /// Beautified full name for display, e.g. `vitalik.eth` / `rat.crops`.
+    /// Beautified full name for display, e.g. `vitalik.eth` / `rat@crops`.
     pub full: String,
     /// Expiry timestamp (unix seconds); `None` for permanent (XNS) names, 0 if
     /// unregistered.
@@ -480,7 +496,7 @@ async fn xns_name_status(
             namespace: namespace.to_string(),
         },
         label: label.to_string(),
-        full: format!("{label}.{namespace}"),
+        full: format!("{label}@{namespace}"),
         expires_at: None,
         now,
         owner,
@@ -510,7 +526,7 @@ pub struct SearchHit {
     pub registry: Registry,
     /// Normalized label (as it would be registered/resolved).
     pub label: String,
-    /// Full display name, e.g. `rat.crops`.
+    /// Full display name, e.g. `rat@crops`.
     pub full: String,
     pub status: HitStatus,
 }
@@ -582,13 +598,13 @@ async fn xns_search(net: &dyn BalanceFetcher, namespace: &str, label: &str) -> H
             Some(i) => i,
             None => {
                 return HitStatus::Unavailable {
-                    reason: format!("no “.{namespace}” namespace"),
+                    reason: format!("no “@{namespace}” namespace"),
                 };
             }
         },
         Err(_) => {
             return HitStatus::Unavailable {
-                reason: format!("no “.{namespace}” namespace"),
+                reason: format!("no “@{namespace}” namespace"),
             };
         }
     };
@@ -673,9 +689,9 @@ pub async fn reverse_owned_names(
     {
         targets.push((Registry::Wns, label));
     }
-    // XNS: `label.namespace`, already lowercase/validated by the reverse helper.
+    // XNS: `label@namespace`, already lowercase/validated by the reverse helper.
     if let Ok(Some(name)) = &xns_r
-        && let Some((label, namespace)) = name.rsplit_once('.')
+        && let Some((label, namespace)) = name.split_once('@')
     {
         targets.push((
             Registry::Xns {
@@ -895,7 +911,7 @@ mod tests {
         Bytes::from(buf)
     }
 
-    /// The real on-chain XNS name `wehi.crops` and the address it resolves to.
+    /// The real on-chain XNS name `wehi@crops` and the address it resolves to.
     /// Pinned so the forward / reverse / discovery paths are exercised against a
     /// concrete, registered name rather than only synthetic fixtures.
     const WEHI: Address = address!("0xa1491eFf7CaC231440C8C0E6FaC043D8965C451f");
@@ -924,9 +940,9 @@ mod tests {
                 label: "apoorv".to_string()
             }
         );
-        // Arbitrary TLD → XNS custom namespace.
+        // Arbitrary XNS namespace via `@`.
         assert_eq!(
-            parse_query("rat.cheese").unwrap(),
+            parse_query("rat@cheese").unwrap(),
             Query::One {
                 registry: Registry::Xns {
                     namespace: "cheese".to_string()
@@ -934,17 +950,33 @@ mod tests {
                 label: "rat".to_string()
             }
         );
+        assert_eq!(
+            parse_query("alice@eth").unwrap(),
+            Query::One {
+                registry: Registry::Xns {
+                    namespace: "eth".to_string()
+                },
+                label: "alice".to_string()
+            }
+        );
         assert!(parse_query("").is_err());
         assert!(parse_query(".eth").is_err());
         assert!(parse_query("a.b.eth").is_err(), "multi-dot label");
+        assert!(
+            parse_query("cow.crops").unwrap_err().contains('@'),
+            "v1 dotted XNS shape must point at the new @"
+        );
         assert!(parse_query("cow.NOT_A_NAMESPACE!").is_err());
+        assert!(parse_query("@xns").is_err());
+        assert!(parse_query("alice@").is_err());
+        assert!(parse_query("a@b@c").is_err());
     }
 
     #[test]
-    fn parse_one_name_requires_a_tld() {
+    fn parse_one_name_requires_a_namespace() {
         assert!(parse_one_name("rat").is_err(), "bare label rejected");
         assert_eq!(
-            parse_one_name("alice.xns").unwrap(),
+            parse_one_name("alice@xns").unwrap(),
             (
                 Registry::Xns {
                     namespace: "xns".to_string()
@@ -966,18 +998,21 @@ mod tests {
         };
         assert!(!xns.is_commit_reveal());
         assert!(!xns.supports_renew());
-        assert_eq!(xns.tld(), ".crops");
-        assert_eq!(xns.full_name("cow"), "cow.crops");
+        assert_eq!(xns.tld(), "@crops");
+        assert_eq!(xns.full_name("cow"), "cow@crops");
         assert_eq!(xns.badge(), "XNS");
         assert_eq!(xns.legacy(), None);
         assert_eq!(Registry::from_legacy(Namespace::Wns), Registry::Wns);
     }
 
     #[test]
-    fn defaults_cover_five_namespaces() {
+    fn defaults_cover_six_namespaces() {
         let d = Registry::defaults();
-        assert_eq!(d.len(), 5);
+        assert_eq!(d.len(), 6);
         assert!(d.contains(&Registry::Ens));
+        assert!(d.contains(&Registry::Xns {
+            namespace: "eth".to_string()
+        }));
         assert!(d.contains(&Registry::Xns {
             namespace: "xns".to_string()
         }));
@@ -1015,7 +1050,7 @@ mod tests {
                 namespace: "xns".to_string(),
             },
             label: "alice".to_string(),
-            full: "alice.xns".to_string(),
+            full: "alice@xns".to_string(),
             expires_at: None,
             now: now_secs(),
             owner: Some(address!("0x000000000000000000000000000000000000bEEF")),
@@ -1062,7 +1097,7 @@ mod tests {
         assert_eq!(s.owner, Some(owner));
         assert_eq!(s.recipient, Some(owner), "XNS recipient == owner");
         assert_eq!(s.state(), NameState::Permanent);
-        assert_eq!(s.full, "alice.crops");
+        assert_eq!(s.full, "alice@crops");
     }
 
     #[tokio::test]
@@ -1152,7 +1187,7 @@ mod tests {
         assert_eq!(q.total, U256::from(7u64));
     }
 
-    // ── the real wehi.crops ↔ 0xa149…451f mapping, both directions ───────────
+    // ── the real wehi@crops ↔ 0xa149…451f mapping, both directions ───────────
 
     #[tokio::test]
     async fn wehi_crops_status_is_owned_and_permanent() {
@@ -1162,7 +1197,7 @@ mod tests {
         let (to, cd) = xns::get_address_call("wehi", "crops");
         net.set_call(to, cd, addr_word(WEHI), true);
         let s = name_status(&net, &crops(), "wehi").await.unwrap();
-        assert_eq!(s.full, "wehi.crops");
+        assert_eq!(s.full, "wehi@crops");
         assert_eq!(s.owner, Some(WEHI));
         assert_eq!(s.recipient, Some(WEHI));
         assert_eq!(s.state(), NameState::Permanent);
@@ -1171,18 +1206,18 @@ mod tests {
     #[tokio::test]
     async fn reverse_lookup_discovers_wehi_crops() {
         // …and vice versa — the full reverse-discovery round-trip: addr →
-        // getName → "wehi.crops", forward-verified, then re-checked via
+        // getName → "wehi@crops", forward-verified, then re-checked via
         // name_status. ENS/GNS/WNS reverse legs are unmocked (no record), so XNS
         // is the only hit.
         let net = CallMock::new();
         let (gto, gcd) = xns::get_name_call(WEHI);
-        net.set_call(gto, gcd, abi_string("wehi.crops"), true);
+        net.set_call(gto, gcd, abi_string("wehi@crops"), true);
         let (fto, fcd) = xns::get_address_call("wehi", "crops");
         net.set_call(fto, fcd, addr_word(WEHI), true);
 
         let names = reverse_owned_names(&net, WEHI).await.unwrap();
         assert_eq!(names.len(), 1, "only the XNS name resolves back to WEHI");
-        assert_eq!(names[0].full, "wehi.crops");
+        assert_eq!(names[0].full, "wehi@crops");
         assert_eq!(names[0].registry, crops());
         assert_eq!(names[0].owner, Some(WEHI));
         assert!(names[0].owned_by(WEHI));

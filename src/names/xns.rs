@@ -1,5 +1,5 @@
-//! XNS (<https://github.com/Walodja1987/xns>) — the permissionless `label.namespace`
-//! name service.
+//! XNS v2 (<https://github.com/Walodja1987/xns>) — the permissionless
+//! `label@namespace` name service.
 //!
 //! This is the **pure** layer for XNS: the mainnet contract address, the ABI
 //! (via `sol!`, so byte layouts are correct by construction), calldata builders,
@@ -17,12 +17,17 @@
 //!   resolves to is fixed at registration.
 //! - **One name per address.** `registerName` reverts if the caller already holds
 //!   a name, so an account can own at most one XNS name (across every namespace).
-//! - **Permissionless namespaces.** A name is `label.namespace` where `namespace`
-//!   is an arbitrary registered string (`xns`, `crops`, `cheese`, …) — every
+//! - **Permissionless namespaces.** A name is `label@namespace` where `namespace`
+//!   is an arbitrary registered string (`eth`, `xns`, `crops`, …) — every
 //!   namespace lives in the *same* contract. `getNamespaceInfo` is the gate: it
 //!   reverts for a namespace that doesn't exist, and otherwise returns its price,
 //!   owner, creation time (for the 7-day exclusivity window) and public/private
 //!   flag.
+//!
+//! v2 dropped the v1 `label.namespace` / bare-name special cases so XNS no
+//! longer collides with domain-style systems: `alice.eth` is ENS, `alice@eth`
+//! is XNS. The v1 registry remains on-chain as history; this wallet talks only
+//! to v2.
 //!
 //! All reads ride the same Helios-verified mainnet path and fail closed as the
 //! rest of [`crate::names`]; a `getNamespaceInfo` revert (nonexistent namespace)
@@ -32,10 +37,10 @@
 use alloy::primitives::{Address, Bytes, U256, address};
 use alloy::sol_types::SolCall;
 
-/// XNS registry + resolver, Ethereum mainnet. Registers, resolves and reverse-
-/// resolves every namespace.
-/// <https://etherscan.io/address/0x648E4F05aF2b7eB85109A8dc8AE81D8E006457D8>
-pub(crate) const XNS_REGISTRY: Address = address!("0x648E4F05aF2b7eB85109A8dc8AE81D8E006457D8");
+/// XNS v2 registry + resolver, Ethereum mainnet (same address on Sepolia).
+/// Registers, resolves and reverse-resolves every namespace.
+/// <https://etherscan.io/address/0x6e797ba2d3103aF167918e71a7E01DE40D45f74b>
+pub(crate) const XNS_REGISTRY: Address = address!("0x6e797ba2d3103aF167918e71a7E01DE40D45f74b");
 
 /// Exclusivity window (7 days) after a public namespace is created, during which
 /// only the namespace owner may register a name in it. `registerName` reverts
@@ -48,6 +53,10 @@ pub const XNS_MAX_LEN: usize = 20;
 /// XNS contract ABI. Only the calls this wallet makes; `getNamespaceInfo` carries
 /// price + owner + createdAt + isPrivate, so a single read covers existence,
 /// pricing, the exclusivity window and the public/private gate.
+///
+/// v2 also exposes `getAddress(string fullName)` (`label@namespace`) and
+/// `registerNameForOwnedContract`; we keep using the two-arg forms so label and
+/// namespace stay validated on our side before any read or write.
 pub(crate) mod abi {
     use alloy::sol;
     sol! {
@@ -63,7 +72,7 @@ pub(crate) mod abi {
     }
 }
 
-/// `(to, calldata)` for forward resolution of `label.namespace`. Decode with
+/// `(to, calldata)` for forward resolution of `label@namespace`. Decode with
 /// [`super::registrar::decode_address`]; the zero address means "not registered"
 /// (and, since names are permanent + immutable, therefore available).
 pub fn get_address_call(label: &str, namespace: &str) -> (Address, Bytes) {
@@ -80,8 +89,8 @@ pub fn get_address_call(label: &str, namespace: &str) -> (Address, Bytes) {
 }
 
 /// `(to, calldata)` for the reverse lookup of `addr`'s primary (and only) name.
-/// Decode with [`crate::names::ens::decode_string`]; an empty string means no name. A
-/// bare name (the special `x` namespace) comes back as just the label.
+/// Decode with [`crate::names::ens::decode_string`]; an empty string means no
+/// name. v2 always returns `label@namespace` (no bare names).
 pub fn get_name_call(addr: Address) -> (Address, Bytes) {
     (
         XNS_REGISTRY,
@@ -226,6 +235,14 @@ mod tests {
     }
 
     #[test]
+    fn v2_registry_is_the_live_contract() {
+        assert_eq!(
+            XNS_REGISTRY,
+            address!("0x6e797ba2d3103aF167918e71a7E01DE40D45f74b")
+        );
+    }
+
+    #[test]
     fn get_address_call_roundtrips_label_and_namespace() {
         let (to, data) = get_address_call("rat", "cheese");
         assert_eq!(to, XNS_REGISTRY);
@@ -294,6 +311,7 @@ mod tests {
         assert!(is_valid_label("cow-boy"));
         assert!(is_valid_label("a1b2c3"));
         assert!(is_valid_label("x")); // 1 char ok
+        assert!(is_valid_label("eth")); // unblocked in v2
         assert!(is_valid_label(&"a".repeat(20))); // 20 ok
         assert!(!is_valid_label(&"a".repeat(21)), "21 too long");
         assert!(!is_valid_label(""), "empty");
@@ -304,6 +322,7 @@ mod tests {
         assert!(!is_valid_label("rät"), "non-ascii");
         assert!(!is_valid_label("ra_t"), "underscore");
         assert!(!is_valid_label("ra.t"), "dot");
+        assert!(!is_valid_label("ra@t"), "at");
     }
 
     #[test]

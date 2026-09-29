@@ -19,6 +19,7 @@ use crate::cow::composer::{self, SwapComposer, SwapDraft};
 use crate::cow::tracked::{OrderStatus, TrackedOrder};
 use crate::portfolio::{LiveToken, format_token_balance};
 
+use super::approvals_app::{self, ApprovalsApp};
 use super::names_app::{self, NamesApp};
 use super::pool_app::{self, PoolApp};
 use super::tx_builder::{self, TxBuilderApp};
@@ -41,6 +42,10 @@ pub enum Message {
     OpenPrivacyPoolsApp,
     /// Open the Transaction Builder app from the launcher.
     OpenTxBuilderApp,
+    /// Open the Approvals app from the launcher.
+    OpenApprovalsApp,
+    /// Messages for the embedded Approvals app.
+    Approvals(approvals_app::Message),
     /// Messages for the embedded Names app.
     Names(names_app::Message),
     /// Messages for the embedded Privacy Pools app.
@@ -68,6 +73,7 @@ enum AppsView {
     Names,
     PrivacyPools,
     TxBuilder,
+    Approvals,
 }
 
 impl AppsView {
@@ -79,6 +85,7 @@ impl AppsView {
             AppsView::Names => "Names",
             AppsView::PrivacyPools => "PrivacyPools",
             AppsView::TxBuilder => "TxBuilder",
+            AppsView::Approvals => "Approvals",
         }
     }
 }
@@ -114,12 +121,16 @@ pub enum Outcome {
     /// it); the coordinator services it and feeds results back via
     /// [`AppsPane::txbuilder_pane`].
     TxBuilder(tx_builder::Outcome),
+    /// A scan step bubbled up from the embedded Approvals app; the coordinator
+    /// services it and feeds the result back via [`AppsPane::approvals_pane`].
+    Approvals(approvals_app::Outcome),
 }
 
 impl Outcome {
     /// Variant name for the GUI state trace — never the payload.
     fn name(&self) -> &'static str {
         match self {
+            Outcome::Approvals(_) => "Approvals",
             Outcome::RequestQuote(_) => "RequestQuote",
             Outcome::RequestPlace { .. } => "RequestPlace",
             Outcome::RequestCancel { .. } => "RequestCancel",
@@ -138,6 +149,7 @@ pub struct AppsPane {
     names: NamesApp,
     pool: PoolApp,
     tx_builder: TxBuilderApp,
+    approvals: ApprovalsApp,
     view: AppsView,
 }
 
@@ -152,7 +164,33 @@ impl AppsPane {
             names: NamesApp::new(owner),
             pool: PoolApp::new(),
             tx_builder,
+            approvals: ApprovalsApp::new(owner),
             view: AppsView::Launcher,
+        }
+    }
+
+    /// Mutable access to the Approvals app so the coordinator can deliver each
+    /// scan step's result.
+    pub fn approvals_pane(&mut self) -> &mut ApprovalsApp {
+        &mut self.approvals
+    }
+
+    /// Refresh the identity the Approvals app reads for. `pinned` is a Safe's
+    /// chain; an EOA picks its own.
+    pub fn set_approvals_identity(&mut self, owner: Address, pinned: Option<crate::chain::Chain>) {
+        self.approvals.set_identity(owner, pinned);
+    }
+
+    /// Queue revokes in the Transaction Builder and switch to it, or leave
+    /// the refusal on the Approvals screen.
+    fn load_revokes(
+        &mut self,
+        chain: crate::chain::Chain,
+        calls: Vec<crate::txbuilder::QueuedCall>,
+    ) {
+        match self.tx_builder.load_calls(chain, calls) {
+            Ok(()) => self.view = AppsView::TxBuilder,
+            Err(e) => self.approvals.set_error(e),
         }
     }
 
@@ -259,6 +297,22 @@ impl AppsPane {
                 self.view = AppsView::TxBuilder;
                 None
             }
+            Message::OpenApprovalsApp => {
+                self.view = AppsView::Approvals;
+                // Scan with the default lookback the first time it's opened.
+                self.approvals.on_open().map(Outcome::Approvals)
+            }
+            Message::Approvals(child) => match self.approvals.update(child) {
+                Some(approvals_app::Outcome::Close) => {
+                    self.view = AppsView::Launcher;
+                    None
+                }
+                Some(approvals_app::Outcome::Revoke { chain, calls }) => {
+                    self.load_revokes(chain, calls);
+                    None
+                }
+                other => other.map(Outcome::Approvals),
+            },
             Message::Names(child) => self.names.update(child).map(Outcome::Name),
             Message::TxBuilder(child) => match self.tx_builder.update(child) {
                 // The "← Apps" link steps back to the launcher rather than
@@ -315,7 +369,10 @@ impl AppsPane {
                                 other => other.map(Outcome::TxBuilder),
                             };
                         }
-                        AppsView::Swap | AppsView::Names | AppsView::PrivacyPools => {
+                        AppsView::Swap
+                        | AppsView::Names
+                        | AppsView::PrivacyPools
+                        | AppsView::Approvals => {
                             self.view = AppsView::Launcher;
                         }
                         AppsView::Launcher => {}
@@ -344,7 +401,7 @@ impl AppsPane {
                 self.pool.subscription().map(Message::Pool),
             ]),
             // Esc closes the JSON overlay if one is open, else steps back.
-            AppsView::TxBuilder => keyboard::listen().map(Message::Key),
+            AppsView::TxBuilder | AppsView::Approvals => keyboard::listen().map(Message::Key),
             AppsView::Launcher => Subscription::none(),
         }
     }
@@ -375,6 +432,7 @@ impl AppsPane {
             AppsView::Names => self.names.view(t).map(Message::Names),
             AppsView::PrivacyPools => self.pool.view(t, portfolio, recipients).map(Message::Pool),
             AppsView::TxBuilder => self.tx_builder.view(t).map(Message::TxBuilder),
+            AppsView::Approvals => self.approvals.view(t).map(Message::Approvals),
         };
 
         // The Transaction Builder runs its own full-height, two-pane layout and
@@ -433,14 +491,14 @@ impl AppsPane {
         } else {
             "Trade tokens via CoW Protocol".to_string()
         };
-        // Names and Swap come and go with the identity; Privacy Pools and the
-        // Transaction Builder are always there, so the subtitle never claims
-        // less than the four cards below it.
+        // Names and Swap come and go with the identity; Privacy Pools, the
+        // Transaction Builder and Approvals are always there, so the subtitle
+        // never claims less than the cards below it.
         let subtitle = match (swap_available, names_available) {
-            (true, true) => "On-chain apps — swaps, names, privacy and transactions",
-            (true, false) => "On-chain apps — swaps, privacy and transactions",
-            (false, true) => "On-chain apps — names, privacy and transactions",
-            (false, false) => "On-chain apps — privacy and transactions",
+            (true, true) => "On-chain apps — swaps, names, privacy, approvals and transactions",
+            (true, false) => "On-chain apps — swaps, privacy, approvals and transactions",
+            (false, true) => "On-chain apps — names, privacy, approvals and transactions",
+            (false, false) => "On-chain apps — privacy, approvals and transactions",
         };
 
         // The cards carry their own `spacing`, so any card can be the first one
@@ -482,6 +540,15 @@ impl AppsPane {
             "Transaction Builder",
             "Compose contract calls & batch them atomically",
             Message::OpenTxBuilderApp,
+        ));
+        // Reads only, and the revokes run through the Builder's own gates, so
+        // every identity gets it — a Safe scans the chain it lives on.
+        cards = cards.push(app_card(
+            t,
+            approvals_app::KAO_MASCOT,
+            "Approvals",
+            "Find the allowances you've granted & revoke them",
+            Message::OpenApprovalsApp,
         ));
 
         column![
@@ -801,6 +868,70 @@ mod tests {
             "stepping back is internal, no outcome bubbles up"
         );
         assert_eq!(pane.view, AppsView::Launcher);
+    }
+
+    fn revokes(n: u8) -> Vec<crate::txbuilder::QueuedCall> {
+        let rows: Vec<crate::approvals::Approval> = (1..=n)
+            .map(|i| crate::approvals::Approval {
+                kind: crate::approvals::Kind::Erc20,
+                asset: Address::repeat_byte(i),
+                symbol: "TKN".into(),
+                known_asset: false,
+                decimals: Some(18),
+                spender: Address::repeat_byte(0xEE),
+                spender_label: None,
+                amount: Some(alloy::primitives::U256::MAX),
+                expires: None,
+                spender_has_code: Some(true),
+                verified: true,
+            })
+            .collect();
+        crate::approvals::revoke_calls(&rows.iter().collect::<Vec<_>>())
+    }
+
+    /// Revoking hands the batch to the Builder, on the chain the approvals
+    /// were read on, and shows it.
+    #[test]
+    fn revokes_open_in_the_builder_on_their_chain() {
+        let mut pane = AppsPane::new(Address::ZERO);
+        pane.set_txbuilder_context(
+            Address::ZERO,
+            crate::chain::Chain::Mainnet,
+            false,
+            None,
+            true,
+            true,
+            Vec::new(),
+        );
+        pane.update(Message::OpenApprovalsApp);
+        assert_eq!(pane.view, AppsView::Approvals);
+        pane.load_revokes(crate::chain::Chain::Base, revokes(2));
+        assert_eq!(pane.view, AppsView::TxBuilder);
+        assert_eq!(
+            pane.txbuilder_selected_net(),
+            crate::chain::NetworkId::Builtin(crate::chain::Chain::Base)
+        );
+    }
+
+    /// An account that sends one call at a time can't take a two-call batch;
+    /// the user stays on the Approvals screen with the reason.
+    #[test]
+    fn a_refused_revoke_stays_on_approvals() {
+        let mut pane = AppsPane::new(Address::ZERO);
+        pane.set_txbuilder_context(
+            Address::ZERO,
+            crate::chain::Chain::Mainnet,
+            false,
+            None,
+            false,
+            true,
+            Vec::new(),
+        );
+        pane.update(Message::OpenApprovalsApp);
+        pane.load_revokes(crate::chain::Chain::Mainnet, revokes(2));
+        assert_eq!(pane.view, AppsView::Approvals);
+        pane.load_revokes(crate::chain::Chain::Mainnet, revokes(1));
+        assert_eq!(pane.view, AppsView::TxBuilder, "one call at a time is fine");
     }
 
     #[test]

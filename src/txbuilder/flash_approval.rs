@@ -154,6 +154,10 @@ pub struct AllowanceVerdict {
     /// absolute guarantee: the batch grants something the verdict cannot
     /// promise was reset.
     pub unmodelled: Vec<(Address, &'static str)>,
+    /// Whether any call raises an allowance at all. A batch that only ever
+    /// zeroes is a revoke, and the review says so instead of calling it a
+    /// flash approval.
+    pub grants: bool,
 }
 
 impl AllowanceVerdict {
@@ -209,6 +213,15 @@ impl AllowanceVerdict {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
+        if self.standing.is_empty() && !self.grants {
+            return Some(format!(
+                "Revokes {} token allowance{} (sets {} to 0): {}.",
+                self.reset.len(),
+                if self.reset.len() == 1 { "" } else { "s" },
+                if self.reset.len() == 1 { "it" } else { "them" },
+                names(&self.reset),
+            ));
+        }
         if self.standing.is_empty() {
             return Some(format!(
                 "Resets {} approval{} to 0 in the same transaction (flash approval — every \
@@ -278,6 +291,7 @@ pub fn allowance_verdict(calls: &[QueuedCall]) -> AllowanceVerdict {
         let Some((spender, nonzero)) = allowance_effect(&c.data) else {
             continue;
         };
+        v.grants |= nonzero;
         let pair = (c.to, spender);
         match seen.iter_mut().find(|(p, _)| *p == pair) {
             Some((_, state)) => *state = nonzero,
@@ -297,8 +311,19 @@ pub fn allowance_verdict(calls: &[QueuedCall]) -> AllowanceVerdict {
 /// The name of the approval-granting call `data` makes, when it is one this
 /// scan recognises but cannot score. `None` for everything else — including
 /// ordinary non-approval calls, which are simply not approvals.
+///
+/// `setApprovalForAll(operator, false)` is the one listed selector with a
+/// shape that can only take rights away, so a well-formed call with a zero
+/// `approved` word is a revoke, not a grant. A short one stays listed: an
+/// argument this can't read is not evidence of anything.
 fn unmodelled_grant(data: &[u8]) -> Option<&'static str> {
     let sel: [u8; 4] = data.get(..4)?.try_into().ok()?;
+    if sel == UNMODELLED_GRANTS[0].0
+        && data.len() >= 4 + 64
+        && U256::from_be_slice(&data[4 + 32..4 + 64]).is_zero()
+    {
+        return None;
+    }
     UNMODELLED_GRANTS
         .iter()
         .find(|(s, _)| *s == sel)
@@ -631,6 +656,48 @@ mod tests {
                 "and the absolute guarantee is never made over it: {d}"
             );
         }
+    }
+
+    /// `setApprovalForAll(operator, false)` switches an operator off. Listing
+    /// it as a grant told the review a revoke batch granted something the
+    /// wallet couldn't account for.
+    #[test]
+    fn switching_an_operator_off_is_not_a_grant() {
+        let nft = address!("0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D");
+        let call = |approved: u64| {
+            let mut c = approve("0");
+            c.to = nft;
+            let mut data = Vec::from(UNMODELLED_GRANTS[0].0);
+            data.extend_from_slice(&[0u8; 12]);
+            data.extend_from_slice(SPENDER.as_slice());
+            data.extend_from_slice(&U256::from(approved).to_be_bytes::<32>());
+            c.data = Bytes::from(data);
+            c
+        };
+        assert!(allowance_verdict(&[call(0)]).unmodelled.is_empty());
+        assert_eq!(
+            allowance_verdict(&[call(1)]).unmodelled,
+            vec![(nft, "setApprovalForAll")]
+        );
+        // Truncated: the flag can't be read, so it stays listed.
+        let mut short = call(0);
+        short.data = Bytes::from(short.data[..40].to_vec());
+        assert_eq!(allowance_verdict(&[short]).unmodelled.len(), 1);
+    }
+
+    /// A batch that only zeroes allowances is a revoke. It still names what it
+    /// resets, but not as a "flash approval" of grants it never made.
+    #[test]
+    fn a_batch_that_only_zeroes_reads_as_a_revoke() {
+        let v = allowance_verdict(&[approve("0")]);
+        assert!(!v.grants);
+        let d = v.disclosure().unwrap();
+        assert!(d.starts_with("Revokes 1 token allowance"), "got {d}");
+        assert!(!d.contains("flash approval"), "got {d}");
+
+        let v = allowance_verdict(&wrap_with_flash_approval(&[approve("1")], 1));
+        assert!(v.grants);
+        assert!(v.disclosure().unwrap().contains("flash approval"));
     }
 
     #[test]

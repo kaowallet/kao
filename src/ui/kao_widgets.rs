@@ -369,13 +369,13 @@ pub fn kao_checkbox<'a, M: 'a>(t: KaoTheme, is_checked: bool) -> iced::widget::C
 
 pub fn primary_button<'a, M: Clone + 'a>(
     t: KaoTheme,
-    label: &'a str,
+    label: impl Into<String>,
     enabled: bool,
 ) -> button::Button<'a, M> {
     let bg = if enabled { t.a1 } else { t.border };
     let fg = Color::WHITE;
     button(
-        container(text(label.to_string()).size(16).color(fg).font(black()))
+        container(text(label.into()).size(16).color(fg).font(black()))
             .width(Length::Fill)
             .center_x(Length::Fill)
             .padding(Padding::from([13, 0])),

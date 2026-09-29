@@ -105,7 +105,7 @@ where
 /// Used to batch every per-refresh `eth_call` (native ETH balance,
 /// ERC-20 `balanceOf`s, Uniswap V3 `slot0()` reads) into one round trip
 /// per batch.
-const MULTICALL3: Address = address!("0xcA11bde05977b3631167028862bE2a173976CA11");
+pub(crate) const MULTICALL3: Address = address!("0xcA11bde05977b3631167028862bE2a173976CA11");
 
 sol! {
     struct Call3 {

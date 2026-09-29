@@ -160,7 +160,7 @@ pub async fn fetch_onchain_history(
 /// Recursively `eth_getLogs` over `[from, to]`, halving the range when
 /// the RPC reports a cap error (block-range or result-count limit).
 /// Wrapped in `with_rate_limit_retry` so 429s back off.
-async fn get_logs_chunked(
+pub(crate) async fn get_logs_chunked(
     provider: &RootProvider<Ethereum>,
     filter: &Filter,
     from: u64,
@@ -296,13 +296,13 @@ fn parse_log_rows(logs: &[Log], owner: Address, chain: Chain) -> Vec<IndexedTx> 
     out
 }
 
-fn address_to_topic(addr: Address) -> B256 {
+pub(crate) fn address_to_topic(addr: Address) -> B256 {
     let mut buf = [0u8; 32];
     buf[12..].copy_from_slice(addr.as_slice());
     B256::from(buf)
 }
 
-fn address_from_topic(topic: &B256) -> Address {
+pub(crate) fn address_from_topic(topic: &B256) -> Address {
     let mut buf = [0u8; 20];
     buf.copy_from_slice(&topic.0[12..]);
     Address::from(buf)
@@ -530,7 +530,7 @@ async fn enrich_token_metadata(provider: &RootProvider<Ethereum>, rows: &mut [In
 
 /// Decode a `string` ABI return. ERC-20s like MKR return `bytes32`
 /// instead — fall back to a UTF-8-trimmed bytes32 read for those.
-fn decode_symbol(data: &Bytes) -> String {
+pub(crate) fn decode_symbol(data: &Bytes) -> String {
     if data.len() < 32 {
         return String::new();
     }
@@ -571,7 +571,7 @@ fn decode_symbol(data: &Bytes) -> String {
     String::new()
 }
 
-fn decode_decimals(data: &Bytes) -> Option<u8> {
+pub(crate) fn decode_decimals(data: &Bytes) -> Option<u8> {
     if data.len() < 32 {
         return None;
     }

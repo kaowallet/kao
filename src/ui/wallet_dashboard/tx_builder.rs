@@ -3373,23 +3373,8 @@ impl TxBuilderApp {
     /// Replacing a non-empty queue is also called out rather than done
     /// silently, since there is no undo for it.
     fn adopt_batch(&mut self, calls: Vec<QueuedCall>) -> Result<(), String> {
-        if calls.is_empty() {
-            return Err("that batch has no calls in it".to_string());
-        }
-        if calls.len() > 1 && !self.can_batch() {
-            return Err(format!(
-                "This batch has {} calls, and this account sends one at a time — atomic \
-                 batching needs a software key or a Ledger (EIP-7702), or a Safe.",
-                calls.len(),
-            ));
-        }
-        // After the one-at-a-time reason, so the more specific refusal wins for
-        // an account that could never have run this batch at any length.
-        if calls.len() > MAX_BATCH_CALLS {
-            return Err(format!(
-                "That batch has {} calls, and this wallet queues at most {MAX_BATCH_CALLS}.",
-                calls.len(),
-            ));
+        if let Some(why) = self.batch_refusal(calls.len()) {
+            return Err(why);
         }
         let replaced = self.batch.len();
         self.next_id += calls.len() as u64;
@@ -3403,6 +3388,67 @@ impl TxBuilderApp {
             )
         });
         Ok(())
+    }
+
+    /// Why a wholesale batch of `len` calls can't be adopted, if it can't.
+    fn batch_refusal(&self, len: usize) -> Option<String> {
+        if len == 0 {
+            return Some("that batch has no calls in it".to_string());
+        }
+        if len > 1 && !self.can_batch() {
+            return Some(format!(
+                "This batch has {len} calls, and this account sends one at a time — atomic \
+                 batching needs a software key or a Ledger (EIP-7702), or a Safe.",
+            ));
+        }
+        // After the one-at-a-time reason, so the more specific refusal wins for
+        // an account that could never have run this batch at any length.
+        if len > MAX_BATCH_CALLS {
+            return Some(format!(
+                "That batch has {len} calls, and this wallet queues at most {MAX_BATCH_CALLS}.",
+            ));
+        }
+        None
+    }
+
+    /// Adopt calls composed by another app (the Approvals app's revokes) for
+    /// `chain`, moving the network selector there first.
+    ///
+    /// Refuses before touching anything: a refusal after the network switch
+    /// would already have cleared whatever the user had queued. A Safe is
+    /// pinned to its own chain and refuses any other.
+    pub fn load_calls(&mut self, chain: Chain, mut calls: Vec<QueuedCall>) -> Result<(), String> {
+        let target = NetworkId::Builtin(chain);
+        if self.ctx.is_safe && self.net != target {
+            return Err(format!(
+                "This Safe is on {}, so it can't run calls composed for {}.",
+                self.net.display_name(),
+                chain.display_name(),
+            ));
+        }
+        if let Some(why) = self.batch_refusal(calls.len()) {
+            return Err(why);
+        }
+        self.traced("load_calls", move |s| {
+            // The switch explains any queue it drops; keep that notice through
+            // the adoption, which would otherwise overwrite it.
+            let mut notice = None;
+            if s.net != target {
+                let from = s.net;
+                s.net = target;
+                s.on_network_reset(from);
+                notice = s.error.take();
+            }
+            for (i, c) in calls.iter_mut().enumerate() {
+                c.id = s.next_id + i as u64;
+            }
+            s.adopt_batch(calls)?;
+            s.error = match (notice, s.error.take()) {
+                (Some(a), Some(b)) => Some(format!("{a} {b}")),
+                (a, b) => a.or(b),
+            };
+            Ok(())
+        })
     }
 
     /// Commit an in-flight inline rename: trim, apply, persist. A blank name is
@@ -5785,6 +5831,51 @@ mod tests {
             vec![(11155111, "Sepolia".into())],
         );
         app
+    }
+
+    /// The Approvals app hands its revokes over with a chain. The builder
+    /// follows it there, renumbers the calls into its own id space, and still
+    /// says what the switch dropped.
+    #[test]
+    fn loaded_calls_move_the_network_and_keep_the_drop_notice() {
+        let mut app = eoa_app();
+        app.batch = sample_batch(&mut app.next_id, app.owner);
+        let first_id = app.next_id;
+        let calls = sample_batch(&mut 0, app.owner);
+        app.load_calls(Chain::Base, calls).unwrap();
+        assert_eq!(app.selected_net(), NetworkId::Builtin(Chain::Base));
+        assert_eq!(app.batch.len(), 2);
+        assert_eq!(app.batch[0].id, first_id);
+        assert_eq!(app.batch[1].id, first_id + 1);
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|e| e.contains("Batch cleared")),
+            "the dropped Mainnet queue is explained: {:?}",
+            app.error
+        );
+    }
+
+    /// A refusal must leave the builder untouched — in particular, it must not
+    /// switch networks and clear a queue on the way to refusing.
+    #[test]
+    fn a_refused_load_changes_nothing() {
+        let mut app = view_only_app();
+        app.batch = vec![sample_batch(&mut app.next_id, app.owner).remove(0)];
+        let before = app.batch.clone();
+        let err = app
+            .load_calls(Chain::Optimism, sample_batch(&mut 0, app.owner))
+            .unwrap_err();
+        assert!(err.contains("one at a time"), "got {err}");
+        assert_eq!(app.selected_net(), NetworkId::Builtin(Chain::Mainnet));
+        assert_eq!(app.batch, before);
+
+        let mut safe = safe_app();
+        let err = safe
+            .load_calls(Chain::Base, sample_batch(&mut 0, safe.owner))
+            .unwrap_err();
+        assert!(err.contains("This Safe is on"), "got {err}");
+        assert!(safe.batch.is_empty());
     }
 
     #[test]

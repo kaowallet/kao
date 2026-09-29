@@ -19,6 +19,7 @@ use tracing::{debug, error, info, warn};
 mod account_dropdown;
 mod activity;
 mod appearance;
+mod approvals_app;
 mod apps;
 mod contacts_settings;
 mod function_panel;
@@ -478,6 +479,24 @@ pub enum Message {
         slot: tx_builder::NameSlot,
         name: String,
         result: Result<Option<(Address, crate::names::Registry)>, String>,
+    },
+    /// Approvals app: the chain head its log scan walks down from.
+    ApprovalsHead {
+        seq: u64,
+        result: Result<u64, String>,
+    },
+    /// Approvals app: one `[from, to]` log window's candidates. The bounds
+    /// round-trip so the pane can record exactly which blocks were searched.
+    ApprovalsLogs {
+        seq: u64,
+        from: u64,
+        to: u64,
+        result: Result<Vec<crate::approvals::Candidate>, String>,
+    },
+    /// Approvals app: every candidate read back through Helios.
+    ApprovalsVerified {
+        seq: u64,
+        result: Result<crate::approvals::Verified, String>,
     },
     /// Names app: reverse-lookup discovery finished. `owner` is the account the
     /// scan was spawned for — the handler drops it if the active account changed.
@@ -2209,6 +2228,70 @@ impl WalletScreen {
             .collect();
         self.apps
             .set_txbuilder_context(addr, chain, is_safe, version, can_batch, can_sign, customs);
+        self.apps
+            .set_approvals_identity(addr, is_safe.then_some(chain));
+    }
+
+    fn handle_approvals_step(&mut self, next: Option<approvals_app::Outcome>) -> Task<Message> {
+        next.map_or_else(Task::none, |o| self.handle_approvals_outcome(o))
+    }
+
+    fn handle_approvals_outcome(&mut self, o: approvals_app::Outcome) -> Task<Message> {
+        use approvals_app::Outcome as O;
+        crate::trace::outcome("approvals", o.name());
+        let network = self.network.clone();
+        match o {
+            // Both handled inside the Apps pane; neither reaches here.
+            O::Close | O::Revoke { .. } => Task::none(),
+            O::Head { seq, chain } => Task::perform(
+                async move { crate::approvals::head(&*network, chain).await },
+                move |result| Message::ApprovalsHead { seq, result },
+            ),
+            O::Logs {
+                seq,
+                chain,
+                owner,
+                from,
+                to,
+            } => Task::perform(
+                async move { crate::approvals::scan_window(&*network, chain, owner, from, to).await },
+                move |result| Message::ApprovalsLogs {
+                    seq,
+                    from,
+                    to,
+                    result,
+                },
+            ),
+            O::Verify {
+                seq,
+                chain,
+                owner,
+                mut candidates,
+            } => {
+                // The portfolio is the active identity's, so its held tokens
+                // on this chain are the ones worth checking without a log.
+                let held: Vec<Address> = self
+                    .portfolio
+                    .iter()
+                    .filter(|t| {
+                        t.chain == crate::chain::NetworkId::Builtin(chain)
+                            && !t.balance_raw.is_zero()
+                    })
+                    .filter_map(|t| t.contract)
+                    .collect();
+                candidates.extend(crate::approvals::seed_candidates(chain, &held));
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                Task::perform(
+                    async move {
+                        crate::approvals::verify(&*network, chain, owner, candidates, now).await
+                    },
+                    move |result| Message::ApprovalsVerified { seq, result },
+                )
+            }
+        }
     }
 
     fn drain_txbuilder_delegation_probe(&mut self) -> Task<Message> {
@@ -5187,6 +5270,7 @@ impl WalletScreen {
                     Some(apps::Outcome::Name(o)) => (self.handle_name_outcome(o), None),
                     Some(apps::Outcome::Pool(o)) => self.handle_pool_outcome(o),
                     Some(apps::Outcome::TxBuilder(o)) => (self.handle_txbuilder_outcome(o), None),
+                    Some(apps::Outcome::Approvals(o)) => (self.handle_approvals_outcome(o), None),
                     None => (Task::none(), None),
                 };
                 return (
@@ -5577,6 +5661,22 @@ impl WalletScreen {
                         }
                     }
                 }
+            }
+            Message::ApprovalsHead { seq, result } => {
+                let next = self.apps.approvals_pane().on_head(seq, result);
+                return (self.handle_approvals_step(next), None);
+            }
+            Message::ApprovalsLogs {
+                seq,
+                from,
+                to,
+                result,
+            } => {
+                let next = self.apps.approvals_pane().on_logs(seq, from, to, result);
+                return (self.handle_approvals_step(next), None);
+            }
+            Message::ApprovalsVerified { seq, result } => {
+                self.apps.approvals_pane().on_verified(seq, result);
             }
             Message::NameReverseScanned { owner, result } => {
                 if owner == self.order_owner() {

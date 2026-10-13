@@ -5,7 +5,7 @@ use iced::widget::operation::focus as focus_widget;
 use iced::widget::{Space, column, container, mouse_area, row, stack, text};
 use iced::{Alignment, Background, Border, Element, Length, Padding, Subscription};
 use secrecy::SecretString;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::net::{BalanceFetcher, NetworkClient};
 use crate::portfolio::{self, PortfolioCache};
@@ -56,7 +56,9 @@ use crate::ui::verify_seed::{
 use crate::ui::wallet_dashboard::{
     Message as WalletDashboardMessage, Outcome as WalletDashboardOutcome, WalletScreen,
 };
-use crate::wallet::{self, AccountDescriptor, Contact, ContactsBook, KaoSigner, WalletDescriptor};
+use crate::wallet::{
+    self, AccountDescriptor, Contact, ContactsBook, KaoSigner, SafeUpsert, WalletDescriptor,
+};
 use alloy::signers::local::PrivateKeySigner;
 
 // ── Messages ─────────────────────────────────────────────────────────────────
@@ -79,29 +81,36 @@ pub enum Message {
     Unlock(UnlockMessage),
     VerifySeed(VerifySeedMessage),
     WalletDashboard(WalletDashboardMessage),
-    /// Result of an off-thread `wallet::save_descriptor`. Emitted only to
-    /// surface errors — successful saves are silent.
+    /// Result of an off-thread `wallet::save_descriptor`. Frees the wallet
+    /// file for whatever queued behind it (see `DbGate`); an error surfaces
+    /// as a toast.
     WalletSaved(Result<(), String>),
     /// Result of the post-unlock Safe refresh batch. Carries one entry
-    /// per Safe in the order they live in `wallet.safes`. Each entry
-    /// is `Ok((new_descriptor, diff))` on a successful refresh, or
+    /// per Safe in the unlock-time snapshot. Each entry is
+    /// `Ok((new_descriptor, diff))` on a successful refresh, or
     /// `Err(reason)` for that Safe alone (other Safes may have
-    /// succeeded). Fires at most once per unlock.
+    /// succeeded). Lands by `(address, chain_id)`, never by position.
+    /// Fires at most once per unlock.
     SafesRefreshed(crate::safe::RefreshBatch),
     /// Result of an off-thread `wallet::load_contacts`. Carries the
     /// loaded vec on success; errors are logged and the in-memory book
-    /// stays empty.
+    /// stays empty. Frees the wallet file like `WalletSaved`.
     ContactsLoaded(Result<Vec<Contact>, String>),
     /// Result of an off-thread `wallet::save_contacts`. Errors only —
     /// the in-memory book was already updated synchronously when the
-    /// save was dispatched.
+    /// save was dispatched. Frees the wallet file like `WalletSaved`.
     ContactsSaved(Result<(), String>),
+    /// Something went wrong: red ⚠ toast, logged at `error!`.
     WalletError(String),
-    /// Auto-dismiss tick for the wallet-error toast. Carries the
-    /// generation counter the timer was spawned with — a newer error
-    /// supersedes by bumping the counter, which makes the older
-    /// timer's dismissal a no-op when it fires.
-    DismissError {
+    /// Something the user should know that went fine ("Removed Account 2",
+    /// "Treasury on Base is already in your wallet"): neutral toast, logged
+    /// at `info!`. Same slot and lifetime as `WalletError`.
+    Notice(String),
+    /// Auto-dismiss tick for the toast. Carries the generation counter
+    /// the timer was spawned with — a newer toast supersedes by bumping
+    /// the counter, which makes the older timer's dismissal a no-op when
+    /// it fires.
+    DismissToast {
         generation: u64,
     },
 }
@@ -238,11 +247,11 @@ pub struct App {
     /// never saved anyone. Adding or deleting one contact then wrote that empty
     /// book over every row. No error was shown at any point.
     contacts_loaded: bool,
-    /// Latest wallet-error toast, or `None` when nothing is on screen.
-    /// Cleared by the auto-dismiss `Task::perform` spawned when the
-    /// toast lands, or replaced by a newer error mid-lifetime.
+    /// Latest toast (error or notice), or `None` when nothing is on
+    /// screen. Cleared by the auto-dismiss `Task::perform` spawned when
+    /// the toast lands, or replaced by a newer one mid-lifetime.
     toast: Option<ToastState>,
-    /// Monotonic counter bumped on every fresh error so an older
+    /// Monotonic counter bumped on every fresh toast so an older
     /// dismissal task firing late can no-op against a newer toast.
     toast_gen: u64,
     /// Set when the user triggered a hardware reconnect from the dashboard
@@ -262,20 +271,120 @@ pub struct App {
     /// is required because the nested-Safe sub-flow opens another
     /// SafeOnboardingScreen on top of the parent.
     pending_add_signer: Vec<PendingAddSigner>,
+    /// Who has `wallet.redb` open off-thread, and what waits for it.
+    db: DbGate,
+    /// The unlock-time legacy repair (`repair_sibling_signer_links_once`)
+    /// changed the wallet in memory — its links and/or its marker — but
+    /// nothing has saved it yet. Saved by the Safe-refresh completion, or
+    /// by any earlier `persist_wallet`.
+    safes_dirty: bool,
 }
 
-/// Single-toast state. We don't queue — a fresher error replaces the
+/// Off-thread work on `wallet.redb`, one op at a time.
+///
+/// redb locks the file exclusively and doesn't wait: opening it while
+/// another open is alive fails at once with `DatabaseAlreadyOpen`. Three
+/// kinds of App work open it off the UI thread — wallet saves, the
+/// unlock-time contacts load and contacts saves — so they take turns here.
+/// Whatever is requested while the file is busy is queued, never dropped,
+/// and goes out when the running op lands (`App::db_op_landed`):
+///
+/// * wallet saves coalesce into ONE save of the then-latest `App::wallet`;
+/// * contacts saves coalesce into one save of the latest book;
+/// * a contacts load requested while busy simply waits its turn.
+///
+/// Every completion (`WalletSaved`, `ContactsLoaded`, `ContactsSaved`)
+/// frees the gate, error or not, so no failure leaves it stuck.
+///
+/// Not gated, because they run synchronously on the UI thread — no gated
+/// op can *start* while one of them runs, but one already running can
+/// collide with them:
+///
+/// * the Privacy Pools seed. `load_pp_seed` runs once, at the first
+///   dashboard entry, in the same `update` that dispatches unlock's
+///   contacts load and before it starts, so the file is free then.
+///   `save_pp_seed` (create / restore identity) refuses while the gate is
+///   busy (`App::pool_seed_write_blocked`) rather than racing it.
+/// * the pool note cache (`save_pp_notes` and friends, in the dashboard).
+///   It is advisory — a failed write only costs a re-scan — and a
+///   collision there just logs.
+#[derive(Debug, Default)]
+struct DbGate {
+    /// The op holding the file right now.
+    running: Option<DbOp>,
+    /// A wallet save waits; it writes the wallet as it is when it starts.
+    wallet_save_queued: bool,
+    /// The unlock-time contacts load waits.
+    contacts_load_queued: bool,
+    /// A contacts save waits, with the latest book to write.
+    contacts_save_queued: Option<Vec<Contact>>,
+}
+
+/// One kind of gated `wallet.redb` op (see `DbGate`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DbOp {
+    WalletSave,
+    ContactsLoad,
+    ContactsSave,
+}
+
+impl DbOp {
+    /// Stable short name for the GUI state trace (see `crate::trace`).
+    fn name(self) -> &'static str {
+        match self {
+            DbOp::WalletSave => "saving",
+            DbOp::ContactsLoad => "loading_contacts",
+            DbOp::ContactsSave => "saving_contacts",
+        }
+    }
+}
+
+impl DbGate {
+    /// Coarse state for the GUI trace: the running op (or `idle`) plus a
+    /// suffix per queued op — e.g. `saving`, `saving+queued` (a wallet
+    /// save waits), `loading_contacts+queued`, `saving+contacts_queued`.
+    fn name(&self) -> String {
+        let mut name = self.running.map_or("idle", DbOp::name).to_string();
+        if self.wallet_save_queued {
+            name.push_str("+queued");
+        }
+        if self.contacts_load_queued {
+            name.push_str("+contacts_load_queued");
+        }
+        if self.contacts_save_queued.is_some() {
+            name.push_str("+contacts_queued");
+        }
+        name
+    }
+
+    /// A wallet save is running or waiting — it will report for every edit
+    /// made so far.
+    fn wallet_save_pending(&self) -> bool {
+        self.wallet_save_queued || self.running == Some(DbOp::WalletSave)
+    }
+}
+
+/// Single-toast state. We don't queue — a fresher toast replaces the
 /// previous message rather than stacking, so the user always reads the
 /// most relevant signal.
 #[derive(Debug)]
 struct ToastState {
     msg: String,
     generation: u64,
+    kind: ToastKind,
 }
 
-/// Auto-dismiss timeout for the wallet-error toast. Long enough to read
-/// a sentence comfortably, short enough that a missed glance gets a
-/// second chance via the dismiss button.
+/// How a toast reads: a failure (`Message::WalletError`) or an
+/// informational notice (`Message::Notice`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToastKind {
+    Error,
+    Notice,
+}
+
+/// Auto-dismiss timeout for the toast. Long enough to read a sentence
+/// comfortably, short enough that a missed glance gets a second chance via
+/// the dismiss button.
 const TOAST_LIFETIME_SECS: u64 = 5;
 
 impl App {
@@ -313,6 +422,8 @@ impl App {
                 send_reconnect: None,
                 reconnect_open_send: false,
                 pending_add_signer: Vec::new(),
+                db: DbGate::default(),
+                safes_dirty: false,
             };
             let task = focus_widget(crate::ui::unlock::PASSWORD_INPUT_ID).map(Message::Unlock);
             (app, task)
@@ -338,6 +449,8 @@ impl App {
                 send_reconnect: None,
                 reconnect_open_send: false,
                 pending_add_signer: Vec::new(),
+                db: DbGate::default(),
+                safes_dirty: false,
             };
             let task = focus_widget(crate::ui::create_password::PASSWORD_INPUT_ID)
                 .map(Message::CreatePassword);
@@ -357,12 +470,12 @@ impl App {
         account: AccountDescriptor,
         signer: KaoSigner,
     ) -> iced::Task<Message> {
-        let Some(passphrase) = self.passphrase.as_ref() else {
+        if self.passphrase.is_none() {
             return iced::Task::perform(
                 async { "missing passphrase; cannot save wallet".to_string() },
                 Message::WalletError,
             );
-        };
+        }
 
         let descriptor = match self.setup_context {
             Some(SetupContext::AddAccount) => {
@@ -397,11 +510,142 @@ impl App {
             active = descriptor.active_index,
             "save_account_and_enter_dashboard",
         );
-        let save = save_descriptor_task(descriptor.clone(), passphrase.clone());
         self.setup_context = None;
         self.pending_signer = None;
         self.wallet = Some(descriptor);
+        let save = self.persist_wallet("add account");
         iced::Task::batch(vec![save, self.enter_dashboard(signer, None)])
+    }
+
+    /// Persist `self.wallet`. Every save of the loaded wallet goes through
+    /// here.
+    ///
+    /// Saves go through the `DbGate`: redb holds an exclusive file lock for
+    /// the whole save (two Argon2 passes included), so a save opened while
+    /// another save or a contacts load/save holds the file fails with
+    /// `DatabaseAlreadyOpen` and its edit is gone after a restart. While the
+    /// file is busy, further calls just note that a save is needed; when the
+    /// running op lands, ONE save of the *latest* `self.wallet` goes out and
+    /// covers every edit made in between.
+    ///
+    /// Callers must return (or batch) the task: dropping it would leave the
+    /// gate marked busy and park every later save. `why` only labels the
+    /// log line.
+    fn persist_wallet(&mut self, why: &'static str) -> iced::Task<Message> {
+        let (Some(wallet), Some(passphrase)) = (self.wallet.as_ref(), self.passphrase.as_ref())
+        else {
+            warn!(
+                why,
+                "persist: no wallet or passphrase held; skipping disk write"
+            );
+            return iced::Task::none();
+        };
+        if let Some(running) = self.db.running {
+            debug!(
+                why,
+                running = running.name(),
+                "persist: wallet file busy; queued a save"
+            );
+            self.db.wallet_save_queued = true;
+            // The queued save writes the then-current wallet, repair included.
+            self.safes_dirty = false;
+            return iced::Task::none();
+        }
+        debug!(why, "persist: dispatching wallet save");
+        let save = save_descriptor_task(wallet.clone(), passphrase.clone());
+        self.db.running = Some(DbOp::WalletSave);
+        self.safes_dirty = false;
+        save
+    }
+
+    /// Write the contacts book, through the `DbGate` like `persist_wallet`.
+    /// The caller has already put `contacts` in the in-memory book; while
+    /// the file is busy, the latest book waits and is written when it
+    /// frees up.
+    fn persist_contacts(&mut self, contacts: Vec<Contact>) -> iced::Task<Message> {
+        let Some(passphrase) = self.passphrase.as_ref() else {
+            warn!("save contacts: no passphrase held; skipping disk write");
+            return iced::Task::none();
+        };
+        if let Some(running) = self.db.running {
+            debug!(
+                running = running.name(),
+                "save contacts: wallet file busy; queued"
+            );
+            self.db.contacts_save_queued = Some(contacts);
+            return iced::Task::none();
+        }
+        self.db.running = Some(DbOp::ContactsSave);
+        save_contacts_task(contacts, passphrase.clone())
+    }
+
+    /// Read the contacts book off-thread (once per unlock), through the
+    /// `DbGate`. Lands as `Message::ContactsLoaded`.
+    fn start_contacts_load(&mut self) -> iced::Task<Message> {
+        let Some(passphrase) = self.passphrase.as_ref() else {
+            warn!("load contacts: no passphrase held; skipping");
+            return iced::Task::none();
+        };
+        if let Some(running) = self.db.running {
+            debug!(
+                running = running.name(),
+                "load contacts: wallet file busy; queued"
+            );
+            self.db.contacts_load_queued = true;
+            return iced::Task::none();
+        }
+        self.db.running = Some(DbOp::ContactsLoad);
+        load_contacts_task(passphrase.clone())
+    }
+
+    /// `finished` landed (successfully or not) and let go of the wallet
+    /// file: free the gate and start whatever queued behind it — one op;
+    /// the rest wait for that one. The other kind goes first (contacts
+    /// after a wallet save, the wallet after a contacts op), so a burst of
+    /// one kind can't starve the other.
+    fn db_op_landed(&mut self, finished: DbOp) -> iced::Task<Message> {
+        if self.db.running != Some(finished) {
+            // Nothing of this kind was running (a stray completion): leave
+            // whatever is running alone — it frees the gate when it lands.
+            warn!(
+                finished = finished.name(),
+                running = self.db.running.map_or("idle", DbOp::name),
+                "wallet file: completion for an op that wasn't running",
+            );
+            return iced::Task::none();
+        }
+        self.db.running = None;
+        let order = if finished == DbOp::WalletSave {
+            [DbOp::ContactsLoad, DbOp::ContactsSave, DbOp::WalletSave]
+        } else {
+            [DbOp::WalletSave, DbOp::ContactsLoad, DbOp::ContactsSave]
+        };
+        for op in order {
+            let task = match op {
+                DbOp::WalletSave if std::mem::take(&mut self.db.wallet_save_queued) => {
+                    self.persist_wallet("queued")
+                }
+                DbOp::ContactsLoad if std::mem::take(&mut self.db.contacts_load_queued) => {
+                    self.start_contacts_load()
+                }
+                DbOp::ContactsSave => match self.db.contacts_save_queued.take() {
+                    Some(contacts) => self.persist_contacts(contacts),
+                    None => continue,
+                },
+                _ => continue,
+            };
+            if self.db.running.is_some() {
+                return task;
+            }
+            // It couldn't start (no wallet or passphrase held, already
+            // logged); the next queued op still may.
+        }
+        iced::Task::none()
+    }
+
+    /// Coarse state of the wallet-file gate for the GUI trace (`DbGate::name`).
+    fn save_state_name(&self) -> String {
+        self.db.name()
     }
 
     /// Build the dashboard for the currently-loaded wallet and the given
@@ -459,6 +703,11 @@ impl App {
     // dashboard. Load is Argon2-gated, so it runs at most once per session.
 
     /// Load the pool seed (once) and push the derived account into the dashboard.
+    ///
+    /// Opens `wallet.redb` synchronously, outside the `DbGate`. The one load
+    /// happens at the first dashboard entry, inside the `update` that
+    /// dispatches unlock's contacts load (or a fresh wallet's first save),
+    /// before that task starts — so the file is free then.
     fn load_pp_identity(&mut self) {
         if !self.pp_loaded {
             if let Some(pw) = self.passphrase.as_ref() {
@@ -511,12 +760,29 @@ impl App {
         }
     }
 
+    /// Why `save_pp_seed` must not run right now, if it mustn't: it opens
+    /// `wallet.redb` synchronously, outside the `DbGate`, and would fail on
+    /// the lock of a gated op still running. Asking again once it lands
+    /// works (nothing gated can start while the synchronous save runs).
+    fn pool_seed_write_blocked(&self) -> Option<String> {
+        let running = self.db.running?;
+        debug!(
+            running = running.name(),
+            "privacy pools: seed write deferred — wallet file busy"
+        );
+        Some("Kao is still writing your wallet file — try again in a moment.".to_string())
+    }
+
     /// Generate a fresh pool identity, persist it, and show its backup phrase.
     fn pool_create_identity(&mut self) -> iced::Task<Message> {
         let Some(pw) = self.passphrase.clone() else {
             self.pool_error("wallet is locked".into());
             return iced::Task::none();
         };
+        if let Some(why) = self.pool_seed_write_blocked() {
+            self.pool_error(why);
+            return iced::Task::none();
+        }
         let phrase = match wallet::generate_pp_mnemonic() {
             Ok(p) => p,
             Err(e) => {
@@ -538,6 +804,10 @@ impl App {
             self.pool_error("wallet is locked".into());
             return iced::Task::none();
         };
+        if let Some(why) = self.pool_seed_write_blocked() {
+            self.pool_error(why);
+            return iced::Task::none();
+        }
         if let Err(e) = wallet::save_pp_seed(&phrase, &pw) {
             self.pool_error(e.to_string());
             return iced::Task::none();
@@ -679,55 +949,60 @@ impl App {
     /// Drop back to the dashboard without going through setup again, using
     /// the signer the user had before they entered the add-account flow.
     /// Used when the user backs out of the SetupMethod / its sub-screens.
-    /// Append `primary` plus any `siblings` to `wallet.safes`, persist
-    /// the wallet, and route back to the dashboard.
+    /// Add `primary` plus any `siblings` to `wallet.safes`, persist the
+    /// wallet, and route back to the dashboard.
     ///
     /// v1 (stage 3a) requires an existing wallet — Safes must be added
     /// in `AddAccount` context. Calling this with no loaded wallet
     /// surfaces a toast and bails (the storage layer would refuse
     /// anyway since a wallet with safes but no accounts can't be
-    /// loaded back). Dedup is (address, chain_id) per `contains_safe`.
+    /// loaded back).
+    ///
+    /// A Safe already saved under the same `(address, chain_id)` is merged,
+    /// not skipped (`WalletDescriptor::upsert_safe`): its new signer links
+    /// are added, so adding a watch-only Safe again with your key links it.
+    /// The Safe keeps one name on every chain (see `upsert_safes`). A
+    /// notice says which entries were already there.
     fn save_safe_and_return_to_dashboard(
         &mut self,
         primary: crate::wallet::SafeDescriptor,
         siblings: Vec<crate::wallet::SafeDescriptor>,
     ) -> iced::Task<Message> {
-        let Some(passphrase) = self.passphrase.as_ref() else {
+        if self.passphrase.is_none() {
             return iced::Task::perform(
                 async { "missing passphrase; cannot save Safe".to_string() },
                 Message::WalletError,
             );
-        };
-        let Some(mut wallet) = self.wallet.take() else {
+        }
+        let Some(wallet) = self.wallet.as_mut() else {
             return iced::Task::perform(
                 async { "no wallet loaded; add an account before adding a Safe".to_string() },
                 Message::WalletError,
             );
         };
-        let mut added = 0usize;
-        let mut skipped = 0usize;
-        for s in std::iter::once(primary).chain(siblings) {
-            let addr = alloy::primitives::Address::from(s.address);
-            if wallet.contains_safe(addr, s.chain_id) {
-                skipped += 1;
-            } else {
-                wallet.safes.push(s);
-                added += 1;
-            }
-        }
-        debug!(added, skipped, total = wallet.safes.len(), "Safe(s) saved");
-        let save = save_descriptor_task(wallet.clone(), passphrase.clone());
-        self.wallet = Some(wallet);
-        iced::Task::batch(vec![save, self.cancel_add_account()])
+        let notice = upsert_safes(wallet, std::iter::once(primary).chain(siblings));
+        let save = self.persist_wallet("add Safe");
+        let mut tasks = vec![save, self.cancel_add_account()];
+        tasks.extend(notice.map(|msg| iced::Task::done(Message::Notice(msg))));
+        iced::Task::batch(tasks)
     }
 
-    /// Process the post-unlock Safe-refresh batch. For each successful
-    /// refresh: replace `wallet.safes[idx]` with the new descriptor;
-    /// collect any user-facing change summaries. After the batch:
-    /// - if any diff was non-empty, save the wallet once for the whole batch
+    /// Process the post-unlock Safe-refresh batch. Each successful
+    /// refresh lands on the live entry with the same `(address,
+    /// chain_id)` and updates only its cached on-chain fields; any
+    /// user-facing change summaries are collected. After the batch:
+    /// - if any diff was non-empty (or the unlock repair left the Safes
+    ///   dirty), save the wallet once for the whole batch
     /// - if any user-facing alerts collected, surface them as a toast
     /// - push the updated safes vec into the WalletScreen so its
     ///   dropdown stops rendering stale labels
+    ///
+    /// Never by position, never the whole descriptor: the batch was
+    /// spawned from a snapshot taken at unlock, and a Helios first sync
+    /// can keep it in flight for a while. A Safe removed, renamed,
+    /// relinked or re-pointed meanwhile must stay that way — a positional
+    /// whole-slot write would resurrect a removed Safe onto its
+    /// neighbour's slot and revert names, links and service URLs.
     ///
     /// Refresh errors are logged but never toasted — a single
     /// unreachable RPC shouldn't interrupt the user every unlock.
@@ -743,44 +1018,45 @@ impl App {
         };
         let mut any_changed = false;
         let mut alerts: Vec<String> = Vec::new();
-        // Pre-resolve linked-signer addresses per safe so summarize can
-        // tell apart "your owner removed" from "someone else's owner
-        // removed". Use the existing accounts vec.
-        for (idx, result) in results {
-            match result {
+        for (spawn_idx, result) in results {
+            let (fresh, diff) = match result {
+                Ok(refreshed) => refreshed,
                 Err(e) => {
-                    warn!(safe_idx = idx, error = %e, "Safe refresh failed");
+                    warn!(safe_idx = spawn_idx, error = %e, "Safe refresh failed");
+                    continue;
                 }
-                Ok((new_desc, diff)) => {
-                    if let Some(slot) = wallet.safes.get_mut(idx) {
-                        let linked_addrs: Vec<alloy::primitives::Address> = slot
-                            .linked_signer_indices
-                            .iter()
-                            .filter_map(|i| wallet.accounts.get(*i as usize))
-                            .filter_map(wallet::account_address)
-                            .collect();
-                        let mut summarized =
-                            crate::safe::summarize_user_facing_changes(&diff, &linked_addrs);
-                        if !summarized.is_empty() {
-                            // Prefix each alert with the Safe's name so a
-                            // user with multiple Safes can tell which one
-                            // changed.
-                            let safe_name = new_desc.display_name(idx);
-                            for s in summarized.drain(..) {
-                                alerts.push(format!("{safe_name}: {s}"));
-                            }
-                        }
-                        if !diff.is_empty() {
-                            any_changed = true;
-                        }
-                        *slot = new_desc;
-                    } else {
-                        // Safe was removed between spawn and result —
-                        // discard silently.
-                        warn!(safe_idx = idx, "Safe refresh result has no slot to land in");
-                    }
+            };
+            let Some(live_idx) = wallet.safe_index(fresh.address, fresh.chain_id) else {
+                // Removed between spawn and result — nothing to land on.
+                debug!(
+                    safe_idx = spawn_idx,
+                    "Safe refresh result dropped: Safe no longer in the wallet",
+                );
+                continue;
+            };
+            let slot = &wallet.safes[live_idx];
+            // Resolve linked-signer addresses from the LIVE entry so
+            // summarize can tell apart "your owner removed" from "someone
+            // else's owner removed" even if the links moved since unlock.
+            let linked_addrs: Vec<alloy::primitives::Address> = slot
+                .linked_signer_indices
+                .iter()
+                .filter_map(|i| wallet.accounts.get(*i as usize))
+                .filter_map(wallet::account_address)
+                .collect();
+            let mut summarized = crate::safe::summarize_user_facing_changes(&diff, &linked_addrs);
+            if !summarized.is_empty() {
+                // Prefix each alert with the Safe's current name so a
+                // user with multiple Safes can tell which one changed.
+                let safe_name = slot.display_name(live_idx);
+                for s in summarized.drain(..) {
+                    alerts.push(format!("{safe_name}: {s}"));
                 }
             }
+            if !diff.is_empty() {
+                any_changed = true;
+            }
+            wallet.safes[live_idx].refresh_onchain_from(&fresh);
         }
 
         // Build the follow-up tasks: push the updated safes into the
@@ -791,8 +1067,8 @@ impl App {
             crate::ui::wallet_dashboard::Message::SafesUpdated(updated_safes),
         ));
         let mut tasks = vec![push_to_dashboard];
-        if any_changed && let Some(passphrase) = self.passphrase.as_ref() {
-            tasks.push(save_descriptor_task(wallet.clone(), passphrase.clone()));
+        if any_changed || self.safes_dirty {
+            tasks.push(self.persist_wallet("safe refresh"));
         }
         if !alerts.is_empty() {
             let msg = alerts.join(" · ");
@@ -806,27 +1082,201 @@ impl App {
     /// dispatch the disk write off-thread, and push the updated list
     /// into the dashboard so its copy (and the open Settings → Safes
     /// pane) reseeds from what actually persisted.
-    fn set_safe_service_url(&mut self, index: usize, url: Option<String>) -> iced::Task<Message> {
+    fn set_safe_service_url(
+        &mut self,
+        address: [u8; 20],
+        chain_id: u64,
+        url: Option<String>,
+    ) -> iced::Task<Message> {
         let Some(wallet) = self.wallet.as_mut() else {
             warn!("set_safe_service_url: no wallet loaded");
             return iced::Task::none();
         };
-        let Some(slot) = wallet.safes.get_mut(index) else {
-            warn!(index, "set_safe_service_url: no Safe at index");
+        let Some(index) = wallet.safe_index(address, chain_id) else {
+            warn!(chain_id, "set_safe_service_url: Safe not in wallet");
             return iced::Task::none();
         };
-        slot.tx_service_url = url;
+        wallet.safes[index].tx_service_url = url;
+        self.push_safes_and_persist("safe service url")
+    }
+
+    /// Rename the Safe at `address` on every chain it's saved on (header
+    /// pencil in Safe mode, or Settings → Safes). Same shape as
+    /// `set_safe_service_url`; the dashboard already mirrored the name, and
+    /// the push re-syncs it with what will persist.
+    fn rename_safe(&mut self, address: [u8; 20], name: Option<String>) -> iced::Task<Message> {
+        let Some(wallet) = self.wallet.as_mut() else {
+            warn!("rename_safe: no wallet loaded");
+            return iced::Task::none();
+        };
+        if wallet.rename_safe(address, name) == 0 {
+            warn!("rename_safe: Safe not in wallet");
+            return iced::Task::none();
+        }
+        self.push_safes_and_persist("rename safe")
+    }
+
+    /// Forget the Safe keyed `(address, chain_id)` — that chain only
+    /// (Settings → Safes, after its inline confirm). Nothing happens
+    /// on-chain. The pushed list makes the dashboard drop it, leaving Safe
+    /// mode if it was the active one; the dashboard refuses to ask for that
+    /// while a signature is in flight with it.
+    fn remove_safe(&mut self, address: [u8; 20], chain_id: u64) -> iced::Task<Message> {
+        let Some(wallet) = self.wallet.as_mut() else {
+            warn!("remove_safe: no wallet loaded");
+            return iced::Task::none();
+        };
+        let Some(removed) = wallet.remove_safe(address, chain_id) else {
+            warn!(chain_id, "remove_safe: Safe not in wallet");
+            return iced::Task::none();
+        };
+        info!(
+            safe = %crate::wallet::short_address(removed.address()),
+            chain_id,
+            "removed Safe from wallet"
+        );
+        self.push_safes_and_persist("remove safe")
+    }
+
+    /// After a Safe edit to `self.wallet`: push the full list into the
+    /// dashboard (`SafesUpdated` re-resolves its active Safe by key and
+    /// reseeds an open Settings → Safes pane) and persist.
+    fn push_safes_and_persist(&mut self, why: &'static str) -> iced::Task<Message> {
+        let Some(wallet) = self.wallet.as_ref() else {
+            return iced::Task::none();
+        };
         let push = iced::Task::done(Message::WalletDashboard(
             WalletDashboardMessage::SafesUpdated(wallet.safes.clone()),
         ));
-        let save = match self.passphrase.as_ref() {
-            Some(pw) => save_descriptor_task(wallet.clone(), pw.clone()),
-            None => {
-                warn!("set_safe_service_url: no passphrase held; skipping disk write");
-                iced::Task::none()
+        let save = self.persist_wallet(why);
+        iced::Task::batch(vec![push, save])
+    }
+
+    /// Rename any account (Settings → Accounts). `address` is the account
+    /// the pane showed at `index`; if this list disagrees (it moved since),
+    /// nothing is renamed rather than whichever account slid into the slot.
+    /// The dashboard already mirrored the name, so nothing is pushed back.
+    fn rename_account(
+        &mut self,
+        index: usize,
+        address: alloy::primitives::Address,
+        name: Option<String>,
+    ) -> iced::Task<Message> {
+        let Some(wallet) = self.wallet.as_mut() else {
+            warn!("rename account: no wallet loaded");
+            return iced::Task::none();
+        };
+        let Some(account) = wallet
+            .accounts
+            .get_mut(index)
+            .filter(|a| wallet::account_address(a) == Some(address))
+        else {
+            warn!(
+                index,
+                "rename account: that position no longer holds that account"
+            );
+            return iced::Task::none();
+        };
+        account.set_name(name);
+        self.persist_wallet("rename account")
+    }
+
+    /// Forget the account at `index` (Settings → Accounts, after its inline
+    /// confirm). Nothing happens on-chain; a `Local` account's key is
+    /// forgotten (its old ciphertext may linger in redb's freed pages).
+    ///
+    /// Refused — with a toast, changing nothing — while a signature is in
+    /// flight or under review (the dashboard refuses first; this is the
+    /// backstop), when `index` no longer holds `address`, and for the
+    /// wallet's last account. Otherwise `WalletDescriptor::remove_account`
+    /// remaps every index-based reference in one edit, the wallet persists,
+    /// and the dashboard catches up:
+    ///
+    /// * the active account went → rebuild the dashboard for the account
+    ///   that took its place (`enter_active_from_wallet`, keeping the nav)
+    ///   and reopen Settings → Accounts, where the user was;
+    /// * any other account went → update the live dashboard in place via
+    ///   `AccountsUpdated`. Same signer, so a connected Ledger/Trezor stays
+    ///   connected and the open pane stays open.
+    fn remove_account(
+        &mut self,
+        index: usize,
+        address: alloy::primitives::Address,
+    ) -> iced::Task<Message> {
+        if let Screen::Wallet(screen) = &self.screen
+            && screen.is_signing_or_reviewing()
+        {
+            warn!("remove account refused: signing op in flight");
+            return iced::Task::done(Message::WalletError(
+                "Kao is signing right now — finish or cancel that first, then remove the account."
+                    .to_string(),
+            ));
+        }
+        let Some(wallet) = self.wallet.as_mut() else {
+            warn!("remove account: no wallet loaded");
+            return iced::Task::none();
+        };
+        if wallet.accounts.get(index).and_then(wallet::account_address) != Some(address) {
+            warn!(
+                index,
+                "remove account refused: that position no longer holds that account"
+            );
+            return iced::Task::done(Message::WalletError(
+                "Your account list changed before that went through — nothing was removed. \
+                 Try again."
+                    .to_string(),
+            ));
+        }
+        // `active()`'s clamp, so a stale stored index can't misroute this.
+        let was_active = wallet.active_index.min(wallet.accounts.len() - 1) == index;
+        let removed = match wallet.remove_account(index) {
+            Ok(removed) => removed,
+            Err(e) => {
+                warn!(error = %e, "remove account refused");
+                return iced::Task::done(Message::WalletError(e.to_string()));
             }
         };
-        iced::Task::batch(vec![push, save])
+        info!(
+            index,
+            account = ?removed.address.map(wallet::short_address),
+            unlinked_safes = removed.unlinked_safes.len(),
+            left_without_signing_key = removed.left_without_signing_key.len(),
+            was_active,
+            "removed account from wallet",
+        );
+        let notice = removal_notice(wallet, &removed);
+        self.pending_signer = None;
+        let save = self.persist_wallet("remove account");
+        let dashboard = if was_active {
+            let nav = match &self.screen {
+                Screen::Wallet(screen) => Some(screen.current_nav()),
+                _ => None,
+            };
+            let enter = self.enter_active_from_wallet(nav);
+            if let Screen::Wallet(screen) = &mut self.screen {
+                screen.open_accounts_settings();
+            }
+            enter
+        } else if let (Screen::Wallet(screen), Some(wallet)) =
+            (&mut self.screen, self.wallet.as_ref())
+        {
+            // Applied now rather than via `Task::done`, so no message can
+            // reach the App while the dashboard still holds the old
+            // positions. `AccountsUpdated` never yields an outcome.
+            let (task, _) = screen.update(WalletDashboardMessage::AccountsUpdated {
+                accounts: wallet.accounts.clone(),
+                safes: wallet.safes.clone(),
+                active_index: wallet.active_index,
+            });
+            task.map(Message::WalletDashboard)
+        } else {
+            iced::Task::none()
+        };
+        iced::Task::batch(vec![
+            save,
+            dashboard,
+            iced::Task::done(Message::Notice(notice)),
+        ])
     }
 
     fn cancel_add_account(&mut self) -> iced::Task<Message> {
@@ -872,7 +1322,8 @@ impl App {
             }
             SignerMethod::NestedSafe => {
                 let existing = self.existing_accounts_snapshot();
-                let screen = SafeOnboardingScreen::new(self.network.clone(), existing);
+                let screen = SafeOnboardingScreen::new(self.network.clone(), existing)
+                    .with_existing_safes(self.existing_safes_snapshot());
                 self.screen = Screen::SafeOnboarding(screen);
                 focus_widget(crate::ui::safe_onboarding::ADDRESS_INPUT_ID)
                     .map(Message::SafeOnboarding)
@@ -881,7 +1332,7 @@ impl App {
     }
 
     /// Snapshot of the wallet's accounts in the shape SafeOnboarding's
-    /// RoleSelection step needs. Returns an empty Vec when no wallet is
+    /// Review step needs. Returns an empty Vec when no wallet is
     /// loaded (fresh-setup add-Safe path).
     fn existing_accounts_snapshot(&self) -> Vec<crate::ui::safe_onboarding::ExistingAccount> {
         self.wallet
@@ -896,12 +1347,25 @@ impl App {
                                 account_idx: idx as u32,
                                 address: addr,
                                 label: acc.display_name(idx),
+                                view_only: matches!(acc, AccountDescriptor::ViewOnly { .. }),
                             }
                         })
                     })
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Snapshot of the wallet's saved Safes (name and links per `(address,
+    /// chain_id)`) for SafeOnboarding's Review. Empty when no wallet is
+    /// loaded.
+    fn existing_safes_snapshot(&self) -> Vec<crate::ui::safe_onboarding::ExistingSafe> {
+        self.wallet.as_ref().map_or_else(Vec::new, |w| {
+            w.safes
+                .iter()
+                .map(crate::ui::safe_onboarding::ExistingSafe::from)
+                .collect()
+        })
     }
 
     /// If an add-signer sub-flow is active, restore the parked
@@ -989,33 +1453,21 @@ impl App {
             return iced::Task::none();
         }
 
-        let Some(mut wallet) = self.wallet.take() else {
+        let Some(wallet) = self.wallet.as_mut() else {
             warn!("finish_add_nested_safe: no wallet loaded");
             stash.apply_signer_import_error("No wallet loaded — try again.".to_string());
             self.screen = Screen::SafeOnboarding(*stash);
             return iced::Task::none();
         };
-        let mut added = 0usize;
-        for s in std::iter::once(primary).chain(siblings) {
-            let addr = alloy::primitives::Address::from(s.address);
-            if !wallet.contains_safe(addr, s.chain_id) {
-                wallet.safes.push(s);
-                added += 1;
-            }
-        }
-        debug!(added, "nested Safe(s) saved");
-        let save = match self.passphrase.as_ref() {
-            Some(passphrase) => save_descriptor_task(wallet.clone(), passphrase.clone()),
-            None => {
-                warn!("finish_add_nested_safe: no passphrase held; skipping save");
-                iced::Task::none()
-            }
-        };
-        self.wallet = Some(wallet);
+        // Same merge-not-skip as the top-level add.
+        let notice = upsert_safes(wallet, std::iter::once(primary).chain(siblings));
+        let save = self.persist_wallet("add nested Safe");
 
         stash.apply_added_nested_safe(primary_addr);
         self.screen = Screen::SafeOnboarding(*stash);
-        save
+        let mut tasks = vec![save];
+        tasks.extend(notice.map(|msg| iced::Task::done(Message::Notice(msg))));
+        iced::Task::batch(tasks)
     }
 
     fn finish_add_signer(
@@ -1063,20 +1515,32 @@ impl App {
         // Signer addition is permanent regardless of whether the user
         // later confirms the Safe — they may have already keyed in a
         // mnemonic they don't want to retype.
-        let save = match self.passphrase.as_ref() {
-            Some(passphrase) => save_descriptor_task(wallet.clone(), passphrase.clone()),
-            None => {
-                warn!("finish_add_signer: no passphrase held; skipping save");
-                iced::Task::none()
-            }
-        };
         self.wallet = Some(wallet);
+        let save = self.persist_wallet("add Safe signer");
 
-        stash.apply_added_signer(crate::ui::safe_onboarding::ExistingAccount {
+        let added = crate::ui::safe_onboarding::ExistingAccount {
             account_idx: new_idx,
             address,
             label,
-        });
+            // Only key-bearing imports reach the add-signer sub-flow.
+            view_only: false,
+        };
+        // Inside a nested-Safe sub-flow the parent screen(s) are still
+        // parked below this one, holding account snapshots from before the
+        // import. Tell each, so a parent whose Safe the new key also owns
+        // lists and ticks it instead of reading watch-only and offering
+        // the key as unclaimed (whose import would then be refused as a
+        // duplicate).
+        if !self.pending_add_signer.is_empty() {
+            for parked in &mut self.pending_add_signer {
+                parked.stash.note_account(added.clone());
+            }
+            debug!(
+                parked = self.pending_add_signer.len(),
+                "add Safe signer: parent screens told about the new account"
+            );
+        }
+        stash.apply_added_signer(added);
         self.screen = Screen::SafeOnboarding(*stash);
         save
     }
@@ -1106,13 +1570,7 @@ impl App {
         wallet.active_index = idx;
         debug!(prev, next = idx, "switch account");
         let switch_started = std::time::Instant::now();
-        let save = match self.passphrase.as_ref() {
-            Some(passphrase) => save_descriptor_task(wallet.clone(), passphrase.clone()),
-            None => {
-                warn!("switch: no passphrase held; skipping save");
-                iced::Task::none()
-            }
-        };
+        let save = self.persist_wallet("switch account");
         self.pending_signer = None;
         // Preserve the active dashboard tab across the rebuild — switching
         // accounts while reading the Activity feed shouldn't yank the
@@ -1175,13 +1633,64 @@ impl App {
             return iced::Task::none();
         };
         acc.set_name(name);
-        match self.passphrase.as_ref() {
-            Some(passphrase) => save_descriptor_task(wallet.clone(), passphrase.clone()),
-            None => {
-                warn!("rename: no passphrase held; skipping save");
-                iced::Task::none()
+        self.persist_wallet("rename account")
+    }
+
+    /// Take over a freshly unlocked wallet: hold the passphrase for the
+    /// session, repair Safes saved before sibling chains inherited signer
+    /// links, enter the dashboard, and kick off the contacts load and the
+    /// Safe refresh.
+    fn adopt_unlocked_wallet(
+        &mut self,
+        passphrase: SecretString,
+        mut descriptor: WalletDescriptor,
+    ) -> iced::Task<Message> {
+        // Hold the passphrase for the unlocked session so we
+        // can re-save the wallet file on add/switch account.
+        self.passphrase = Some(passphrase);
+        // Repair BEFORE the refresh below snapshots the Safes, so the
+        // snapshot (and the dashboard) already carry the links. Only a
+        // wallet saved before the repair shipped gets it, once: the marker
+        // flips with it, links repaired or not, and must reach disk.
+        // Not saved here — the contacts load takes the file first. The
+        // refresh completion saves it (`safes_dirty`), or any earlier
+        // `persist_wallet`; if neither happens this session, the repair
+        // just runs again next unlock.
+        self.safes_dirty = match descriptor.repair_sibling_signer_links_once() {
+            None => false,
+            Some(repaired) => {
+                info!(
+                    count = repaired.len(),
+                    positions = ?repaired,
+                    "unlock: one-time repair of sibling-chain Safes saved watch-only",
+                );
+                true
             }
-        }
+        };
+        self.wallet = Some(descriptor);
+        // Enter first: its one synchronous pool-seed read must run before
+        // the gated contacts load below opens the file.
+        let enter = self.enter_active_from_wallet(None);
+        let load_contacts = self.start_contacts_load();
+        // Refresh-on-app-open: kick off a parallel
+        // re-inspect for every Safe so the dashboard
+        // renders against verified-fresh owner sets and
+        // any chain-side changes since last open get
+        // surfaced (owner removals affecting the user,
+        // unknown modules added, etc.). Skipped when the
+        // wallet has zero Safes — no work, no toast risk.
+        let refresh_safes = match self.wallet.as_ref() {
+            Some(w) if !w.safes.is_empty() => {
+                let net = self.network.clone();
+                let safes = w.safes.clone();
+                iced::Task::perform(
+                    crate::safe::refresh_all_safes(net, safes),
+                    Message::SafesRefreshed,
+                )
+            }
+            _ => iced::Task::none(),
+        };
+        iced::Task::batch(vec![enter, load_contacts, refresh_safes])
     }
 
     pub fn update(&mut self, message: Message) -> iced::Task<Message> {
@@ -1192,6 +1701,8 @@ impl App {
         let toast_before = self.toast.is_some();
         let active_before = self.wallet.as_ref().map(|w| w.active_index);
         let accounts_before = self.wallet.as_ref().map(|w| w.accounts.len());
+        let safes_before = self.wallet.as_ref().map(|w| w.safes.len());
+        let save_before = self.save_state_name();
 
         let task = self.update_inner(message);
 
@@ -1221,6 +1732,14 @@ impl App {
                 fmt_opt(accounts_before),
                 fmt_opt(accounts_after),
             );
+        }
+        let safes_after = self.wallet.as_ref().map(|w| w.safes.len());
+        if safes_before != safes_after {
+            crate::trace::state("app", "safes", fmt_opt(safes_before), fmt_opt(safes_after));
+        }
+        let save_after = self.save_state_name();
+        if save_before != save_after {
+            crate::trace::state("app", "wallet_db", save_before, save_after);
         }
         task
     }
@@ -1254,38 +1773,7 @@ impl App {
                     descriptor,
                 }) = outcome
                 {
-                    // Hold the passphrase for the unlocked session so we
-                    // can re-save the wallet file on add/switch account.
-                    // Clone the passphrase into the session slot and move the
-                    // original into the contacts task — avoids re-fetching from
-                    // `self.passphrase` with an `.expect()` that would panic the
-                    // whole app if the invariant ever changed under refactoring.
-                    self.passphrase = Some(passphrase.clone());
-                    self.wallet = Some(descriptor);
-                    let load_contacts = load_contacts_task(passphrase);
-                    // Refresh-on-app-open: kick off a parallel
-                    // re-inspect for every Safe so the dashboard
-                    // renders against verified-fresh owner sets and
-                    // any chain-side changes since last open get
-                    // surfaced (owner removals affecting the user,
-                    // unknown modules added, etc.). Skipped when the
-                    // wallet has zero Safes — no work, no toast risk.
-                    let refresh_safes = match self.wallet.as_ref() {
-                        Some(w) if !w.safes.is_empty() => {
-                            let net = self.network.clone();
-                            let safes = w.safes.clone();
-                            iced::Task::perform(
-                                crate::safe::refresh_all_safes(net, safes),
-                                Message::SafesRefreshed,
-                            )
-                        }
-                        _ => iced::Task::none(),
-                    };
-                    return iced::Task::batch(vec![
-                        self.enter_active_from_wallet(None),
-                        load_contacts,
-                        refresh_safes,
-                    ]);
+                    return self.adopt_unlocked_wallet(passphrase, descriptor);
                 }
                 cmd.map(Message::Unlock)
             }
@@ -1362,14 +1850,14 @@ impl App {
                         }
                         SetupMethod::AddSafe => {
                             // Wallet is `None` during fresh setup — the
-                            // empty snapshot means RoleSelection shows
-                            // "no matched owners" and the user proceeds
-                            // watch-only or backs out.
+                            // empty snapshot means Review shows "none of
+                            // your accounts own this Safe" and the user
+                            // proceeds watch-only or backs out.
                             let existing = self.existing_accounts_snapshot();
-                            self.screen = Screen::SafeOnboarding(SafeOnboardingScreen::new(
-                                self.network.clone(),
-                                existing,
-                            ));
+                            self.screen = Screen::SafeOnboarding(
+                                SafeOnboardingScreen::new(self.network.clone(), existing)
+                                    .with_existing_safes(self.existing_safes_snapshot()),
+                            );
                             focus_widget(crate::ui::safe_onboarding::ADDRESS_INPUT_ID)
                                 .map(Message::SafeOnboarding)
                         }
@@ -1725,18 +2213,36 @@ impl App {
                         } else {
                             warn!("contacts lock poisoned; skipping in-memory update");
                         }
-                        let save = match self.passphrase.as_ref() {
-                            Some(pw) => save_contacts_task(new_contacts, pw.clone()),
-                            None => {
-                                warn!("save contacts: no passphrase held; skipping disk write");
-                                iced::Task::none()
-                            }
-                        };
+                        let save = self.persist_contacts(new_contacts);
                         iced::Task::batch(vec![cmd.map(Message::WalletDashboard), save])
                     }
-                    Some(WalletDashboardOutcome::SetSafeServiceUrl { index, url }) => {
-                        let save = self.set_safe_service_url(index, url);
+                    Some(WalletDashboardOutcome::SetSafeServiceUrl {
+                        address,
+                        chain_id,
+                        url,
+                    }) => {
+                        let save = self.set_safe_service_url(address, chain_id, url);
                         iced::Task::batch(vec![cmd.map(Message::WalletDashboard), save])
+                    }
+                    Some(WalletDashboardOutcome::RenameSafe { address, name }) => {
+                        let save = self.rename_safe(address, name);
+                        iced::Task::batch(vec![cmd.map(Message::WalletDashboard), save])
+                    }
+                    Some(WalletDashboardOutcome::RemoveSafe { address, chain_id }) => {
+                        let save = self.remove_safe(address, chain_id);
+                        iced::Task::batch(vec![cmd.map(Message::WalletDashboard), save])
+                    }
+                    Some(WalletDashboardOutcome::RenameAccount {
+                        index,
+                        address,
+                        name,
+                    }) => {
+                        let save = self.rename_account(index, address, name);
+                        iced::Task::batch(vec![cmd.map(Message::WalletDashboard), save])
+                    }
+                    Some(WalletDashboardOutcome::RemoveAccount { index, address }) => {
+                        let removal = self.remove_account(index, address);
+                        iced::Task::batch(vec![cmd.map(Message::WalletDashboard), removal])
                     }
                     Some(WalletDashboardOutcome::PoolCreateIdentity) => {
                         let t = self.pool_create_identity();
@@ -1756,10 +2262,27 @@ impl App {
 
             // ── Background wallet save ──────────────────────────────
             Message::WalletSaved(result) => {
-                if let Err(e) = result {
-                    error!(error = %e, "wallet save error");
+                // Whatever queued meanwhile goes out now — for wallet edits
+                // made while that save ran, one save of the latest wallet
+                // covers them all.
+                let next = self.db_op_landed(DbOp::WalletSave);
+                let Err(e) = result else {
+                    return next;
+                };
+                error!(error = %e, "wallet save error");
+                if self.db.wallet_save_pending() {
+                    // A follow-up writes everything this one held, so it
+                    // gets to report; one transient failure isn't worth a
+                    // toast if the retry lands.
+                    return next;
                 }
-                iced::Task::none()
+                iced::Task::batch(vec![
+                    next,
+                    iced::Task::done(Message::WalletError(format!(
+                        "Kao couldn't save your wallet ({e}). Your latest change works for \
+                         now but may be gone after a restart."
+                    ))),
+                ])
             }
 
             // ── Post-unlock Safe refresh batch ──────────────────────
@@ -1767,6 +2290,7 @@ impl App {
 
             // ── Contacts background load/save ───────────────────────
             Message::ContactsLoaded(result) => {
+                let next = self.db_op_landed(DbOp::ContactsLoad);
                 match result {
                     Ok(vec) => {
                         if let Ok(mut book) = self.contacts.write() {
@@ -1781,41 +2305,35 @@ impl App {
                     // be written back over the rows it is missing.
                     Err(e) => {
                         error!(error = %e, "contacts load failed — saving is disabled this session");
-                        return iced::Task::done(Message::WalletError(format!(
-                            "Couldn't read your contacts ({e}). They're still on disk — Kao won't \
-                             save over them this session. Restart to try again."
-                        )));
+                        return iced::Task::batch(vec![
+                            next,
+                            iced::Task::done(Message::WalletError(format!(
+                                "Couldn't read your contacts ({e}). They're still on disk — Kao \
+                                 won't save over them this session. Restart to try again."
+                            ))),
+                        ]);
                     }
                 }
-                iced::Task::none()
+                next
             }
             Message::ContactsSaved(result) => {
+                let next = self.db_op_landed(DbOp::ContactsSave);
                 if let Err(e) = result {
                     error!(error = %e, "contacts save error");
                 }
-                iced::Task::none()
+                next
             }
 
             // ── Error handling ──────────────────────────────────────
             Message::WalletError(e) => {
                 error!(error = %e, "wallet error");
-                self.toast_gen = self.toast_gen.wrapping_add(1);
-                let generation = self.toast_gen;
-                self.toast = Some(ToastState { msg: e, generation });
-                // Schedule the auto-dismiss tick. Generation-tagged so a
-                // late firing can't clear a newer toast: replacement
-                // bumps the counter, and the stale `DismissError`
-                // arrives with `g != self.toast_gen` and no-ops.
-                iced::Task::perform(
-                    async move {
-                        tokio::time::sleep(std::time::Duration::from_secs(TOAST_LIFETIME_SECS))
-                            .await;
-                        generation
-                    },
-                    |generation| Message::DismissError { generation },
-                )
+                self.show_toast(ToastKind::Error, e)
             }
-            Message::DismissError { generation } => {
+            Message::Notice(msg) => {
+                info!(notice = %msg, "notice");
+                self.show_toast(ToastKind::Notice, msg)
+            }
+            Message::DismissToast { generation } => {
                 if self
                     .toast
                     .as_ref()
@@ -1826,6 +2344,28 @@ impl App {
                 iced::Task::none()
             }
         }
+    }
+
+    /// Put `msg` in the toast slot (replacing whatever is there) and
+    /// schedule its auto-dismiss.
+    fn show_toast(&mut self, kind: ToastKind, msg: String) -> iced::Task<Message> {
+        self.toast_gen = self.toast_gen.wrapping_add(1);
+        let generation = self.toast_gen;
+        self.toast = Some(ToastState {
+            msg,
+            generation,
+            kind,
+        });
+        // Generation-tagged so a late firing can't clear a newer toast:
+        // replacement bumps the counter, and the stale `DismissToast`
+        // arrives with `g != self.toast_gen` and no-ops.
+        iced::Task::perform(
+            async move {
+                tokio::time::sleep(std::time::Duration::from_secs(TOAST_LIFETIME_SECS)).await;
+                generation
+            },
+            |generation| Message::DismissToast { generation },
+        )
     }
 
     pub fn view(&self) -> Element<'_, Message> {
@@ -1853,7 +2393,7 @@ impl App {
             None => screen,
             Some(state) => {
                 let t = KaoTheme::for_kind(settings::theme());
-                stack![screen, error_toast(t, state)].into()
+                stack![screen, toast_view(t, state)].into()
             }
         }
     }
@@ -1885,24 +2425,37 @@ impl App {
     }
 }
 
-/// Bottom-center toast for the latest wallet error. Auto-dismisses
+/// Bottom-center toast for the latest error or notice. Auto-dismisses
 /// after `TOAST_LIFETIME_SECS`; the ✕ chip on the right lets the user
 /// clear it sooner. The container width is capped (`max_width(480)`) so
 /// the toast looks like a chip on wide windows but still wraps cleanly
 /// on narrow ones, and the rest of the overlay is `Space` so pointer
 /// events on the screen below pass through.
-fn error_toast<'a>(t: KaoTheme, state: &'a ToastState) -> Element<'a, Message> {
+///
+/// An error is red with a ⚠; a notice reports something that went fine,
+/// so it gets the positive accent, a ✓ and body-colored text instead.
+fn toast_view<'a>(t: KaoTheme, state: &'a ToastState) -> Element<'a, Message> {
     let generation = state.generation;
+    let (accent, glyph, msg_color) = match state.kind {
+        ToastKind::Error => (t.down, "⚠", t.down),
+        ToastKind::Notice => (t.up, "✓", t.text),
+    };
     let dismiss = mouse_area(
-        container(text("✕").size(13).color(t.down).font(bold())).padding(Padding::from([2, 6])),
+        container(text("✕").size(13).color(accent).font(bold())).padding(Padding::from([2, 6])),
     )
-    .on_press(Message::DismissError { generation })
+    .on_press(Message::DismissToast { generation })
     .interaction(iced::mouse::Interaction::Pointer);
 
     let body = row![
-        text("⚠").size(14).color(t.down).font(bold()),
+        text(glyph).size(14).color(accent).font(bold()),
         Space::new().width(8),
-        container(text(state.msg.as_str()).size(12).color(t.down).font(bold())).width(Length::Fill),
+        container(
+            text(state.msg.as_str())
+                .size(12)
+                .color(msg_color)
+                .font(bold())
+        )
+        .width(Length::Fill),
         Space::new().width(10),
         dismiss,
     ]
@@ -1914,13 +2467,13 @@ fn error_toast<'a>(t: KaoTheme, state: &'a ToastState) -> Element<'a, Message> {
         .width(Length::Fill)
         .max_width(480.0)
         .style(move |_| container::Style {
-            background: Some(Background::Color(with_alpha(t.down, 0.18))),
+            background: Some(Background::Color(with_alpha(accent, 0.18))),
             border: Border {
-                color: with_alpha(t.down, 0.5),
+                color: with_alpha(accent, 0.5),
                 width: 1.0,
                 radius: Radius::from(12),
             },
-            text_color: Some(t.down),
+            text_color: Some(msg_color),
             ..container::Style::default()
         });
 
@@ -1977,6 +2530,98 @@ fn save_descriptor_task(
         },
         Message::WalletSaved,
     )
+}
+
+/// Fold onboarded Safe descriptors into `wallet` (`upsert_safe` each) and
+/// return the notice for the ones that were already saved — `None` when
+/// every one was new.
+///
+/// One Safe address keeps one name on every chain. A chain added without a
+/// name takes the saved one (`upsert_safe`); a name the user gave in Review
+/// that differs from a saved entry's is their explicit choice, so it
+/// renames the Safe everywhere (`rename_safe`). Review prefills the saved
+/// name, so leaving it untouched renames nothing.
+fn upsert_safes(
+    wallet: &mut WalletDescriptor,
+    incoming: impl IntoIterator<Item = wallet::SafeDescriptor>,
+) -> Option<String> {
+    let mut added = 0usize;
+    // (position, newly linked) for each entry that was already saved;
+    // worded after the renames so the notice uses the final name.
+    let mut already: Vec<(usize, usize)> = Vec::new();
+    let mut renames: Vec<([u8; 20], String)> = Vec::new();
+    for safe in incoming {
+        if let Some(name) = safe.name()
+            && !renames.iter().any(|(address, _)| *address == safe.address)
+            && wallet
+                .safes
+                .iter()
+                .any(|s| s.address == safe.address && s.name() != Some(name))
+        {
+            renames.push((safe.address, name.to_owned()));
+        }
+        match wallet.upsert_safe(safe) {
+            SafeUpsert::Added => added += 1,
+            SafeUpsert::Merged {
+                index,
+                newly_linked,
+            } => already.push((index, newly_linked)),
+            SafeUpsert::Unchanged(index) => already.push((index, 0)),
+        }
+    }
+    for (address, name) in renames {
+        let renamed = wallet.rename_safe(address, Some(name));
+        debug!(renamed, "add Safe: Review name applied to every chain");
+    }
+    let notes: Vec<String> = already
+        .into_iter()
+        .map(|(index, newly_linked)| match newly_linked {
+            0 => format!("{} is already in your wallet", safe_label(wallet, index)),
+            1 => format!(
+                "{} was already in your wallet — linked 1 signer",
+                safe_label(wallet, index)
+            ),
+            n => format!(
+                "{} was already in your wallet — linked {n} signers",
+                safe_label(wallet, index)
+            ),
+        })
+        .collect();
+    debug!(
+        added,
+        already_saved = notes.len(),
+        total = wallet.safes.len(),
+        "Safe(s) saved",
+    );
+    (!notes.is_empty()).then(|| notes.join(" · "))
+}
+
+/// "Treasury on Base" — how the add-Safe toasts name `wallet.safes[index]`.
+fn safe_label(wallet: &WalletDescriptor, index: usize) -> String {
+    let Some(safe) = wallet.safes.get(index) else {
+        return format!("Safe {}", index + 1);
+    };
+    let chain = crate::chain::Chain::from_chain_id(safe.chain_id)
+        .map(|c| c.display_name().to_string())
+        .unwrap_or_else(|| format!("chain {}", safe.chain_id));
+    format!("{} on {chain}", safe.display_name(index))
+}
+
+/// The toast after an account removal: "Removed Account 2", plus each Safe
+/// it left without a key Kao can sign with ("· Treasury on Base is
+/// watch-only now") — a leftover view-only or ex-owner link doesn't count.
+/// `wallet` is the wallet after the removal.
+fn removal_notice(wallet: &WalletDescriptor, removed: &wallet::RemovedAccount) -> String {
+    let mut notice = format!("Removed {}", removed.name);
+    for &(address, chain_id) in &removed.left_without_signing_key {
+        if let Some(index) = wallet.safe_index(address, chain_id) {
+            notice.push_str(&format!(
+                " · {} is watch-only now",
+                safe_label(wallet, index)
+            ));
+        }
+    }
+    notice
 }
 
 /// Off-thread `wallet::load_contacts`. The Argon2id KDF runs on the file's
@@ -2046,6 +2691,8 @@ mod tests {
             send_reconnect: None,
             reconnect_open_send: false,
             pending_add_signer: Vec::new(),
+            db: DbGate::default(),
+            safes_dirty: false,
         }
     }
 
@@ -2090,6 +2737,7 @@ mod tests {
             accounts: vec![a0, a1],
             safes: Vec::new(),
             active_index: 0,
+            sibling_links_repaired: true,
         });
         let _ = app.switch_account(1);
         assert_eq!(app.wallet.as_ref().unwrap().active_index, 1);
@@ -2115,6 +2763,8 @@ mod tests {
         let (parked_signer, _) = local_signer_and_account(1);
         app.pending_signer = Some(parked_signer);
         app.passphrase = Some(SecretString::new("pw".to_string().into_boxed_str()));
+        // Skip the pool-seed load, which would open the real wallet file.
+        app.pp_loaded = true;
         app.setup_context = Some(SetupContext::AddAccount);
 
         let _task = app.save_account_and_enter_dashboard(dup, signer);
@@ -2131,6 +2781,8 @@ mod tests {
         let (_, existing) = local_signer_and_account(1);
         app.wallet = Some(WalletDescriptor::single(existing));
         app.passphrase = Some(SecretString::new("pw".to_string().into_boxed_str()));
+        // Skip the pool-seed load, which would open the real wallet file.
+        app.pp_loaded = true;
         app.setup_context = Some(SetupContext::AddAccount);
 
         let (new_signer, new_account) = local_signer_and_account(2);
@@ -2147,6 +2799,8 @@ mod tests {
     fn save_account_in_fresh_wallet_mode_creates_single_account_descriptor() {
         let mut app = build_app(placeholder_screen());
         app.passphrase = Some(SecretString::new("pw".to_string().into_boxed_str()));
+        // Skip the pool-seed load, which would open the real wallet file.
+        app.pp_loaded = true;
         app.setup_context = Some(SetupContext::FreshWallet);
         let (signer, account) = local_signer_and_account(1);
         let _task = app.save_account_and_enter_dashboard(account, signer);
@@ -2155,6 +2809,11 @@ mod tests {
         assert_eq!(w.active_index, 0);
         assert!(app.setup_context.is_none());
         assert!(matches!(app.screen, Screen::Wallet(_)));
+        assert_eq!(
+            app.save_state_name(),
+            "saving",
+            "the first save creates the file"
+        );
     }
 
     #[test]
@@ -2163,5 +2822,1127 @@ mod tests {
         let _ = app.begin_add_account();
         assert!(matches!(app.setup_context, Some(SetupContext::AddAccount)));
         assert!(matches!(app.screen, Screen::SetupMethod(_)));
+    }
+
+    // ── Wallet persistence, Safe refresh, add-Safe merge ────────────────
+
+    fn test_pw() -> SecretString {
+        SecretString::new("pw".to_string().into_boxed_str())
+    }
+
+    /// Safe at `[byte; 20]` on `chain_id`, owned by `owners`, linking
+    /// `linked`.
+    fn safe_at(
+        byte: u8,
+        chain_id: u64,
+        owners: Vec<alloy::primitives::Address>,
+        linked: Vec<u32>,
+        sibling_chains: Vec<u64>,
+    ) -> wallet::SafeDescriptor {
+        wallet::SafeDescriptor {
+            name: None,
+            chain_id,
+            address: [byte; 20],
+            version: "1.4.1".into(),
+            trust: wallet::SafeTrust::Canonical,
+            threshold: 1,
+            owners: owners.into_iter().map(|a| a.into_array()).collect(),
+            modules: Vec::new(),
+            guard: None,
+            fallback_handler: None,
+            linked_signer_indices: linked,
+            sibling_chains,
+            cached_at: 10,
+            tx_service_url: None,
+        }
+    }
+
+    /// An unlocked App holding `wallet` and a passphrase. `pp_loaded` is
+    /// set so entering the dashboard never opens the real wallet file to
+    /// look for a pool seed.
+    fn unlocked_app(wallet: WalletDescriptor) -> App {
+        let mut app = build_app(placeholder_screen());
+        app.passphrase = Some(test_pw());
+        app.pp_loaded = true;
+        app.wallet = Some(wallet);
+        app
+    }
+
+    fn wallet_of(
+        accounts: Vec<AccountDescriptor>,
+        safes: Vec<wallet::SafeDescriptor>,
+    ) -> WalletDescriptor {
+        WalletDescriptor {
+            accounts,
+            safes,
+            active_index: 0,
+            sibling_links_repaired: true,
+        }
+    }
+
+    /// A refresh result for `snapshot` reporting a threshold change to
+    /// `threshold`, the way `refresh_one` builds it: user fields copied
+    /// from the snapshot, on-chain fields fresh.
+    fn refreshed(
+        snapshot: &wallet::SafeDescriptor,
+        threshold: u32,
+    ) -> Result<(wallet::SafeDescriptor, crate::safe::RefreshDiff), String> {
+        let mut fresh = snapshot.clone();
+        fresh.threshold = threshold;
+        fresh.cached_at = 99;
+        let diff = crate::safe::RefreshDiff {
+            changes: vec![crate::safe::SafeChange::ThresholdChanged {
+                from: snapshot.threshold,
+                to: threshold,
+            }],
+        };
+        Ok((fresh, diff))
+    }
+
+    #[test]
+    fn persist_wallet_coalesces_saves_while_one_is_in_flight() {
+        let (_, a0) = local_signer_and_account(1);
+        let mut app = unlocked_app(WalletDescriptor::single(a0));
+
+        let first = app.persist_wallet("test");
+        assert!(first.units() > 0, "the first save is dispatched");
+        assert_eq!(app.save_state_name(), "saving");
+
+        // Overlapping requests only mark a follow-up — a second open of the
+        // file would fail on redb's lock.
+        assert_eq!(app.persist_wallet("test").units(), 0);
+        assert_eq!(app.persist_wallet("test").units(), 0);
+        assert_eq!(app.save_state_name(), "saving+queued");
+
+        // The first save lands: exactly one follow-up goes out.
+        let follow_up = app.update(Message::WalletSaved(Ok(())));
+        assert!(follow_up.units() > 0);
+        assert_eq!(app.save_state_name(), "saving");
+
+        // The follow-up lands: nothing left to do.
+        let done = app.update(Message::WalletSaved(Ok(())));
+        assert_eq!(done.units(), 0);
+        assert_eq!(app.save_state_name(), "idle");
+    }
+
+    #[test]
+    fn persist_wallet_without_passphrase_dispatches_nothing() {
+        let (_, a0) = local_signer_and_account(1);
+        let mut app = build_app(placeholder_screen());
+        app.wallet = Some(WalletDescriptor::single(a0));
+        assert_eq!(app.persist_wallet("test").units(), 0);
+        assert_eq!(app.save_state_name(), "idle");
+    }
+
+    #[test]
+    fn rapid_account_switches_share_the_save_pipeline() {
+        let (_, a0) = local_signer_and_account(1);
+        let (_, a1) = local_signer_and_account(2);
+        let mut app = unlocked_app(wallet_of(vec![a0, a1], vec![]));
+        let _ = app.switch_account(1);
+        let _ = app.switch_account(0);
+        assert_eq!(
+            app.save_state_name(),
+            "saving+queued",
+            "the second switch must not open the file while the first save holds it",
+        );
+        assert_eq!(app.wallet.as_ref().unwrap().active_index, 0);
+    }
+
+    #[test]
+    fn wallet_save_error_toasts_unless_a_follow_up_retries() {
+        let (_, a0) = local_signer_and_account(1);
+        let mut app = unlocked_app(WalletDescriptor::single(a0));
+
+        // Lone failure: the only task left is the toast.
+        let _ = app.persist_wallet("test");
+        let toast = app.update(Message::WalletSaved(Err("Database already open".into())));
+        assert_eq!(app.save_state_name(), "idle");
+        assert_eq!(toast.units(), 1);
+
+        // Failure with a queued follow-up: the retry carries every edit
+        // and reports for both, so no toast yet.
+        let _ = app.persist_wallet("test");
+        let _ = app.persist_wallet("test");
+        let retry = app.update(Message::WalletSaved(Err("Database already open".into())));
+        assert_eq!(
+            app.save_state_name(),
+            "saving",
+            "the follow-up save went out"
+        );
+        assert_eq!(retry.units(), 1);
+    }
+
+    #[test]
+    fn safe_refresh_lands_by_key_after_a_mid_refresh_removal() {
+        let (_, a0) = local_signer_and_account(1);
+        // Snapshot taken at unlock: [A, B, C]. The user then removed A.
+        let snapshot = [
+            safe_at(0xa1, 1, vec![], vec![0], vec![]),
+            safe_at(0xb2, 1, vec![], vec![0], vec![]),
+            safe_at(0xc3, 8453, vec![], vec![], vec![]),
+        ];
+        let mut app = unlocked_app(wallet_of(vec![a0], snapshot[1..].to_vec()));
+
+        let batch = snapshot
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (i, refreshed(s, 2 + i as u32)))
+            .collect();
+        let _ = app.handle_safes_refreshed(batch);
+
+        let w = app.wallet.as_ref().unwrap();
+        let keys: Vec<_> = w.safes.iter().map(wallet::SafeDescriptor::key).collect();
+        assert_eq!(
+            keys,
+            vec![([0xb2; 20], 1), ([0xc3; 20], 8453)],
+            "the removed Safe must not come back, nor land on its neighbour's slot",
+        );
+        assert_eq!(w.safes[0].threshold, 3, "B got B's result");
+        assert_eq!(w.safes[1].threshold, 4, "C got C's result");
+        assert_eq!(w.safes[0].linked_signer_indices, vec![0]);
+        assert!(w.safes[1].linked_signer_indices.is_empty());
+        assert_eq!(app.save_state_name(), "saving", "diffs were non-empty");
+    }
+
+    #[test]
+    fn safe_refresh_keeps_edits_made_while_it_was_in_flight() {
+        let (_, a0) = local_signer_and_account(1);
+        let owner = wallet::account_address(&a0).unwrap();
+        let snapshot = safe_at(0x55, 1, vec![owner], vec![], vec![]);
+        // Meanwhile: renamed, linked, re-pointed, sibling noted.
+        let mut live = snapshot.clone();
+        live.set_name(Some("Vault".into()));
+        live.linked_signer_indices = vec![0];
+        live.tx_service_url = Some("https://txs.example.org".into());
+        live.sibling_chains = vec![8453];
+        let mut app = unlocked_app(wallet_of(vec![a0], vec![live]));
+
+        let (mut fresh, diff) = refreshed(&snapshot, 2).unwrap();
+        fresh.owners.push([0x77; 20]);
+        let _ = app.handle_safes_refreshed(vec![(0, Ok((fresh, diff)))]);
+
+        let s = &app.wallet.as_ref().unwrap().safes[0];
+        assert_eq!(s.name(), Some("Vault"));
+        assert_eq!(s.linked_signer_indices, vec![0]);
+        assert_eq!(s.tx_service_url.as_deref(), Some("https://txs.example.org"));
+        assert_eq!(s.sibling_chains, vec![8453]);
+        assert_eq!(s.threshold, 2, "on-chain fields still refresh");
+        assert_eq!(s.owners, vec![owner.into_array(), [0x77; 20]]);
+        assert_eq!(s.cached_at, 99);
+    }
+
+    #[test]
+    fn safe_refresh_saves_only_for_real_changes_or_a_pending_repair() {
+        let (_, a0) = local_signer_and_account(1);
+        let safe = safe_at(0x55, 1, vec![], vec![0], vec![]);
+
+        // Nothing changed on chain, nothing repaired: no save.
+        let mut app = unlocked_app(wallet_of(vec![a0.clone()], vec![safe.clone()]));
+        let quiet = (safe.clone(), crate::safe::RefreshDiff::default());
+        let _ = app.handle_safes_refreshed(vec![(0, Ok(quiet))]);
+        assert_eq!(app.save_state_name(), "idle");
+
+        // The unlock repair left the Safes dirty: the refresh completion
+        // saves them even though the batch itself changed nothing.
+        let mut app = unlocked_app(wallet_of(vec![a0], vec![safe]));
+        app.safes_dirty = true;
+        let _ = app.handle_safes_refreshed(vec![(0, Err("rpc down".into()))]);
+        assert_eq!(app.save_state_name(), "saving");
+        assert!(!app.safes_dirty);
+    }
+
+    /// A wallet as a build before the one-time repair saved it: no marker.
+    fn legacy(mut wallet: WalletDescriptor) -> WalletDescriptor {
+        wallet.sibling_links_repaired = false;
+        wallet
+    }
+
+    /// Unlock `wallet` into a fresh App, the way `Message::Unlock` does.
+    fn unlock(wallet: WalletDescriptor) -> App {
+        let mut app = build_app(placeholder_screen());
+        app.pp_loaded = true;
+        let _ = app.adopt_unlocked_wallet(test_pw(), wallet);
+        app
+    }
+
+    #[test]
+    fn unlock_repairs_a_legacy_wallet_before_the_refresh_snapshot() {
+        let (_, a0) = local_signer_and_account(1);
+        let owner = wallet::account_address(&a0).unwrap();
+        let mut app = unlock(legacy(wallet_of(
+            vec![a0],
+            vec![
+                safe_at(0x55, 1, vec![owner], vec![0], vec![8453]),
+                safe_at(0x55, 8453, vec![owner], vec![], vec![1]),
+            ],
+        )));
+
+        let w = app.wallet.as_ref().unwrap();
+        assert_eq!(w.safes[1].linked_signer_indices, vec![0], "Base repaired");
+        assert!(w.sibling_links_repaired, "and marked, to be saved with it");
+        assert!(app.safes_dirty);
+        assert_eq!(
+            app.save_state_name(),
+            "loading_contacts",
+            "no wallet save at unlock — the contacts load holds the file"
+        );
+        assert!(matches!(app.screen, Screen::Wallet(_)));
+
+        // The contacts load lands first; the refresh completion then
+        // persists the repair.
+        let _ = app.update(Message::ContactsLoaded(Ok(Vec::new())));
+        assert_eq!(app.save_state_name(), "idle");
+        let _ = app.handle_safes_refreshed(Vec::new());
+        assert_eq!(app.save_state_name(), "saving");
+        assert!(!app.safes_dirty);
+    }
+
+    #[test]
+    fn unlock_marks_a_legacy_wallet_repaired_even_with_nothing_to_repair() {
+        let (_, a0) = local_signer_and_account(1);
+        let app = unlock(legacy(wallet_of(
+            vec![a0],
+            vec![safe_at(0x55, 1, vec![], vec![0], vec![])],
+        )));
+        assert!(app.wallet.as_ref().unwrap().sibling_links_repaired);
+        assert!(app.safes_dirty, "the marker itself must reach disk");
+    }
+
+    #[test]
+    fn unlock_of_a_wallet_already_repaired_changes_nothing() {
+        let (_, a0) = local_signer_and_account(1);
+        let mut app = build_app(placeholder_screen());
+        app.pp_loaded = true;
+        app.safes_dirty = true; // stale flag from an earlier session
+        let descriptor = wallet_of(vec![a0], vec![safe_at(0x55, 1, vec![], vec![0], vec![])]);
+        let _ = app.adopt_unlocked_wallet(test_pw(), descriptor);
+        assert!(!app.safes_dirty);
+    }
+
+    #[test]
+    fn a_chain_left_watch_only_on_purpose_stays_so_across_unlocks() {
+        let (_, a0) = local_signer_and_account(1);
+        let owner = wallet::account_address(&a0).unwrap();
+        // Added on Mainnet + Base with the only key unticked: both
+        // watch-only, listing each other.
+        let mut app = unlocked_app(wallet_of(
+            vec![a0],
+            vec![
+                safe_at(0x55, 1, vec![owner], vec![], vec![8453]),
+                safe_at(0x55, 8453, vec![owner], vec![], vec![1]),
+            ],
+        ));
+        app.setup_context = Some(SetupContext::AddAccount);
+        // Added again with the key ticked and Base excluded: only Mainnet
+        // comes in, linked. The upsert keeps Mainnet's `sibling_chains`, so
+        // the pair now has exactly the legacy bug's shape.
+        let _ = app.save_safe_and_return_to_dashboard(
+            safe_at(0x55, 1, vec![owner], vec![0], vec![]),
+            vec![],
+        );
+        let saved = app.wallet.clone().unwrap();
+        assert_eq!(saved.safes[0].linked_signer_indices, vec![0]);
+        assert_eq!(saved.safes[0].sibling_chains, vec![8453]);
+
+        let next = unlock(saved);
+        let w = next.wallet.as_ref().unwrap();
+        assert!(
+            w.safes[1].linked_signer_indices.is_empty(),
+            "Base stays watch-only, as the user left it"
+        );
+        assert!(!next.safes_dirty);
+    }
+
+    // ── The wallet-file gate (`DbGate`) ──────────────────────────────
+
+    fn contact(byte: u8) -> Contact {
+        Contact {
+            name: format!("Friend {byte}"),
+            address: [byte; 20],
+            kaomoji: String::new(),
+            notes: String::new(),
+            ens: None,
+        }
+    }
+
+    #[test]
+    fn a_refresh_landing_during_the_contacts_load_queues_its_save() {
+        let (_, a0) = local_signer_and_account(1);
+        let owner = wallet::account_address(&a0).unwrap();
+        let wallet = legacy(wallet_of(
+            vec![a0],
+            vec![
+                safe_at(0x55, 1, vec![owner], vec![0], vec![8453]),
+                safe_at(0x55, 8453, vec![owner], vec![], vec![1]),
+            ],
+        ));
+
+        for loaded in [Ok(vec![contact(1)]), Err("bad row".to_string())] {
+            let failed = loaded.is_err();
+            let mut app = unlock(wallet.clone());
+            assert_eq!(app.save_state_name(), "loading_contacts");
+
+            // Offline: the refresh fails fast, while the contacts load
+            // still holds the file. Its repair save must wait, not race.
+            let _ = app.handle_safes_refreshed(vec![(0, Err("rpc down".into()))]);
+            assert_eq!(app.save_state_name(), "loading_contacts+queued");
+            assert!(!app.safes_dirty, "the queued save carries the repair");
+            assert!(app.toast.is_none(), "no 'couldn't save' toast");
+
+            // The load lands — even failing — and the save goes out.
+            let flushed = app.update(Message::ContactsLoaded(loaded));
+            assert_eq!(app.save_state_name(), "saving", "failed load: {failed}");
+            assert!(flushed.units() > 0);
+            let _ = app.update(Message::WalletSaved(Ok(())));
+            assert_eq!(app.save_state_name(), "idle");
+        }
+    }
+
+    #[test]
+    fn a_contacts_save_during_a_wallet_save_waits_for_it() {
+        let (_, a0) = local_signer_and_account(1);
+        let mut app = unlocked_app(WalletDescriptor::single(a0));
+
+        let _ = app.persist_wallet("test");
+        assert_eq!(app.persist_contacts(vec![contact(1)]).units(), 0);
+        assert_eq!(app.save_state_name(), "saving+contacts_queued");
+        // A newer book replaces the waiting one.
+        assert_eq!(
+            app.persist_contacts(vec![contact(1), contact(2)]).units(),
+            0
+        );
+        assert_eq!(app.db.contacts_save_queued.as_ref().map(Vec::len), Some(2));
+
+        let flushed = app.update(Message::WalletSaved(Ok(())));
+        assert!(flushed.units() > 0);
+        assert_eq!(app.save_state_name(), "saving_contacts");
+
+        // The other way round: a wallet save waits for the contacts save,
+        // and a failed contacts save still frees the file.
+        let _ = app.persist_wallet("test");
+        assert_eq!(app.save_state_name(), "saving_contacts+queued");
+        let _ = app.update(Message::ContactsSaved(Err("disk full".into())));
+        assert_eq!(app.save_state_name(), "saving");
+        let _ = app.update(Message::WalletSaved(Ok(())));
+        assert_eq!(app.save_state_name(), "idle");
+    }
+
+    #[test]
+    fn queued_ops_take_turns_so_neither_kind_starves() {
+        let (_, a0) = local_signer_and_account(1);
+        let mut app = unlocked_app(WalletDescriptor::single(a0));
+        let _ = app.persist_wallet("test");
+        let _ = app.persist_contacts(vec![contact(1)]);
+        let _ = app.persist_wallet("test");
+        assert_eq!(app.save_state_name(), "saving+queued+contacts_queued");
+
+        // After a wallet save, the waiting contacts go first…
+        let _ = app.update(Message::WalletSaved(Ok(())));
+        assert_eq!(app.save_state_name(), "saving_contacts+queued");
+        // …then the wallet.
+        let _ = app.update(Message::ContactsSaved(Ok(())));
+        assert_eq!(app.save_state_name(), "saving");
+        let _ = app.update(Message::WalletSaved(Ok(())));
+        assert_eq!(app.save_state_name(), "idle");
+    }
+
+    #[test]
+    fn a_stray_completion_leaves_the_running_op_alone() {
+        let (_, a0) = local_signer_and_account(1);
+        let mut app = unlocked_app(WalletDescriptor::single(a0));
+        let _ = app.start_contacts_load();
+        let _ = app.persist_wallet("test");
+        assert_eq!(app.save_state_name(), "loading_contacts+queued");
+        assert_eq!(app.update(Message::WalletSaved(Ok(()))).units(), 0);
+        assert_eq!(
+            app.save_state_name(),
+            "loading_contacts+queued",
+            "the load still holds the file"
+        );
+    }
+
+    #[test]
+    fn a_pool_seed_write_waits_for_the_wallet_file() {
+        let (_, a0) = local_signer_and_account(1);
+        let mut app = unlocked_app(WalletDescriptor::single(a0));
+        assert!(app.pool_seed_write_blocked().is_none());
+        let _ = app.persist_wallet("test");
+        assert!(app.pool_seed_write_blocked().is_some());
+        // Refused before it opens anything: no seed, no file touched.
+        let _ = app.pool_create_identity();
+        assert!(app.pp_seed.is_none());
+        let _ = app.update(Message::WalletSaved(Ok(())));
+        assert!(app.pool_seed_write_blocked().is_none());
+    }
+
+    // ── Toasts ───────────────────────────────────────────────────────
+
+    #[test]
+    fn notices_toast_without_the_error_styling() {
+        let mut app = build_app(placeholder_screen());
+        let dismiss = app.update(Message::Notice("Removed Account 2".into()));
+        assert_eq!(dismiss.units(), 1, "auto-dismiss scheduled");
+        let toast = app.toast.as_ref().expect("shown");
+        assert_eq!(toast.kind, ToastKind::Notice);
+        assert_eq!(toast.msg, "Removed Account 2");
+        let notice_gen = toast.generation;
+        let _ = app.view();
+
+        // An error replaces it, and the notice's late dismissal no-ops.
+        let _ = app.update(Message::WalletError("Kao couldn't save".into()));
+        assert_eq!(app.toast.as_ref().unwrap().kind, ToastKind::Error);
+        let _ = app.view();
+        let _ = app.update(Message::DismissToast {
+            generation: notice_gen,
+        });
+        assert!(app.toast.is_some());
+        let current = app.toast.as_ref().unwrap().generation;
+        let _ = app.update(Message::DismissToast {
+            generation: current,
+        });
+        assert!(app.toast.is_none());
+    }
+
+    #[test]
+    fn adding_a_saved_safe_again_merges_links_instead_of_skipping() {
+        let (_, a0) = local_signer_and_account(1);
+        let owner = wallet::account_address(&a0).unwrap();
+        // Base was saved watch-only by the old multi-chain bug.
+        let mut base = safe_at(0x55, 8453, vec![owner], vec![], vec![]);
+        base.set_name(Some("Treasury".into()));
+        let mut app = unlocked_app(wallet_of(vec![a0], vec![base]));
+        app.setup_context = Some(SetupContext::AddAccount);
+
+        let primary = safe_at(0x55, 1, vec![owner], vec![0], vec![8453]);
+        let sibling = safe_at(0x55, 8453, vec![owner], vec![0], vec![1]);
+        let _ = app.save_safe_and_return_to_dashboard(primary, vec![sibling]);
+
+        let w = app.wallet.as_ref().unwrap();
+        assert_eq!(w.safes.len(), 2, "Base merged in place, Mainnet appended");
+        assert_eq!(w.safes[0].linked_signer_indices, vec![0], "Base now signs");
+        assert_eq!(w.safes[0].name(), Some("Treasury"), "saved name kept");
+        assert_eq!(w.safes[1].key(), ([0x55; 20], 1));
+        assert_eq!(
+            w.safes[1].name(),
+            Some("Treasury"),
+            "the new chain takes the saved name"
+        );
+        assert_eq!(app.save_state_name(), "saving");
+        assert!(matches!(app.screen, Screen::Wallet(_)));
+    }
+
+    /// What adding Safe `0x55` on Mainnet + Base from Review emits: the
+    /// Review `name` on both, the key linked on both.
+    fn review_add(
+        owner: alloy::primitives::Address,
+        name: Option<&str>,
+    ) -> (wallet::SafeDescriptor, Vec<wallet::SafeDescriptor>) {
+        let mut primary = safe_at(0x55, 1, vec![owner], vec![0], vec![8453]);
+        let mut sibling = safe_at(0x55, 8453, vec![owner], vec![0], vec![1]);
+        primary.set_name(name.map(str::to_owned));
+        sibling.set_name(name.map(str::to_owned));
+        (primary, vec![sibling])
+    }
+
+    #[test]
+    fn adding_chains_of_a_saved_safe_keeps_one_name_per_address() {
+        let (_, a0) = local_signer_and_account(1);
+        let owner = wallet::account_address(&a0).unwrap();
+        let mut mainnet = named(safe_at(0x55, 1, vec![owner], vec![], vec![]), "Treasury");
+        mainnet.tx_service_url = Some("https://txs.example.org".into());
+        let start = wallet_of(
+            vec![a0],
+            vec![
+                named(safe_at(0x66, 1, vec![], vec![], vec![]), "Grants"),
+                mainnet,
+            ],
+        );
+        let names = |app: &App| -> Vec<Option<String>> {
+            let w = app.wallet.as_ref().unwrap();
+            w.safes
+                .iter()
+                .filter(|s| s.address == [0x55; 20])
+                .map(|s| s.name().map(str::to_owned))
+                .collect()
+        };
+
+        // Blank Review name: the saved name (and service URL) everywhere.
+        let mut app = unlocked_app(start.clone());
+        app.setup_context = Some(SetupContext::AddAccount);
+        let (primary, siblings) = review_add(owner, None);
+        let _ = app.save_safe_and_return_to_dashboard(primary, siblings);
+        assert_eq!(names(&app), vec![Some("Treasury".into()); 2]);
+        let base = &app.wallet.as_ref().unwrap().safes[2];
+        assert_eq!(base.key(), ([0x55; 20], 8453));
+        assert_eq!(
+            base.tx_service_url.as_deref(),
+            Some("https://txs.example.org")
+        );
+
+        // The saved name left as prefilled: nothing renamed.
+        let mut app = unlocked_app(start.clone());
+        app.setup_context = Some(SetupContext::AddAccount);
+        let (primary, siblings) = review_add(owner, Some("Treasury"));
+        let _ = app.save_safe_and_return_to_dashboard(primary, siblings);
+        assert_eq!(names(&app), vec![Some("Treasury".into()); 2]);
+
+        // A typed name renames the Safe on every chain, saved one included.
+        let mut app = unlocked_app(start);
+        app.setup_context = Some(SetupContext::AddAccount);
+        let (primary, siblings) = review_add(owner, Some("Vault"));
+        let _ = app.save_safe_and_return_to_dashboard(primary, siblings);
+        assert_eq!(names(&app), vec![Some("Vault".into()); 2]);
+        let w = app.wallet.as_ref().unwrap();
+        assert_eq!(w.safes[0].name(), Some("Grants"), "other Safes untouched");
+    }
+
+    #[test]
+    fn a_typed_name_heals_a_split_name_and_the_notice_uses_it() {
+        let (_, a0) = local_signer_and_account(1);
+        let owner = wallet::account_address(&a0).unwrap();
+        // Saved before this fix: two names for one address.
+        let mut w = wallet_of(
+            vec![a0],
+            vec![
+                named(safe_at(0x55, 1, vec![owner], vec![0], vec![]), "Treasury"),
+                safe_at(0x55, 8453, vec![owner], vec![], vec![]),
+            ],
+        );
+        let (primary, siblings) = review_add(owner, Some("Treasury"));
+        let notice = upsert_safes(&mut w, std::iter::once(primary).chain(siblings))
+            .expect("both chains were saved");
+        assert!(w.safes.iter().all(|s| s.name() == Some("Treasury")));
+        assert_eq!(
+            notice,
+            "Treasury on Ethereum Mainnet is already in your wallet · \
+             Treasury on Base was already in your wallet — linked 1 signer"
+        );
+    }
+
+    #[test]
+    fn upsert_toast_names_the_saved_entry_and_the_new_links() {
+        let (_, a0) = local_signer_and_account(1);
+        let (_, a1) = local_signer_and_account(2);
+        let mut base = safe_at(0x55, 8453, vec![], vec![], vec![]);
+        base.set_name(Some("Treasury".into()));
+        let mut w = wallet_of(
+            vec![a0, a1],
+            vec![base, safe_at(0x66, 1, vec![], vec![0], vec![])],
+        );
+
+        let fresh = safe_at(0x77, 10, vec![], vec![], vec![]);
+        assert_eq!(
+            upsert_safes(&mut w, vec![fresh]),
+            None,
+            "all new → no toast"
+        );
+
+        let notice = upsert_safes(
+            &mut w,
+            vec![
+                safe_at(0x55, 8453, vec![], vec![0, 1], vec![]),
+                safe_at(0x66, 1, vec![], vec![0], vec![]),
+            ],
+        )
+        .expect("both were already saved");
+        assert_eq!(
+            notice,
+            "Treasury on Base was already in your wallet — linked 2 signers · \
+             Safe 2 on Ethereum Mainnet is already in your wallet"
+        );
+        let single = upsert_safes(&mut w, vec![safe_at(0x77, 10, vec![], vec![1], vec![])]);
+        assert_eq!(
+            single.as_deref(),
+            Some("Safe 3 on OP Mainnet was already in your wallet — linked 1 signer")
+        );
+    }
+
+    #[test]
+    fn nested_safe_add_merges_into_a_saved_entry() {
+        let (_, a0) = local_signer_and_account(1);
+        let owner = wallet::account_address(&a0).unwrap();
+        let mut app = unlocked_app(wallet_of(
+            vec![a0],
+            vec![safe_at(0x99, 1, vec![owner], vec![], vec![])],
+        ));
+        let nested_addr = alloy::primitives::Address::repeat_byte(0x99);
+        app.pending_add_signer.push(PendingAddSigner {
+            allowed_owners: vec![nested_addr],
+            stash: Box::new(SafeOnboardingScreen::new(app.network.clone(), Vec::new())),
+        });
+
+        let _ = app.finish_add_nested_safe(safe_at(0x99, 1, vec![owner], vec![0], vec![]), vec![]);
+
+        let w = app.wallet.as_ref().unwrap();
+        assert_eq!(w.safes.len(), 1);
+        assert_eq!(w.safes[0].linked_signer_indices, vec![0]);
+        assert!(app.pending_add_signer.is_empty());
+        assert!(matches!(app.screen, Screen::SafeOnboarding(_)));
+        assert_eq!(app.save_state_name(), "saving");
+    }
+
+    /// Press Confirm on the onboarding screen on display and return what
+    /// it emits.
+    fn confirm_onboarding(app: &mut App) -> (wallet::SafeDescriptor, Vec<wallet::SafeDescriptor>) {
+        let Screen::SafeOnboarding(screen) = &mut app.screen else {
+            panic!("expected the Safe onboarding screen");
+        };
+        let (_, outcome) = screen.update(crate::ui::safe_onboarding::Message::Confirm);
+        let Some(SafeOnboardingOutcome::Done { primary, siblings }) = outcome else {
+            panic!("expected Done, got {outcome:?}");
+        };
+        (*primary, siblings)
+    }
+
+    #[test]
+    fn a_key_imported_inside_a_nested_safe_flow_reaches_the_parent() {
+        use crate::chain::Chain;
+        // Parent Safe P (0x55) is owned by key k and by Safe N (0x99); N
+        // is owned by k. The wallet holds an unrelated account 0, not k.
+        let (_, a0) = local_signer_and_account(1);
+        let (_, k) = local_signer_and_account(2);
+        let k_addr = wallet::account_address(&k).unwrap();
+        let p_addr = alloy::primitives::Address::repeat_byte(0x55);
+        let n_addr = alloy::primitives::Address::repeat_byte(0x99);
+        let mut app = unlocked_app(wallet_of(vec![a0], Vec::new()));
+        let snapshot = app.existing_accounts_snapshot();
+        let parent = SafeOnboardingScreen::new(app.network.clone(), snapshot.clone())
+            .scanned_for_test(p_addr, vec![(Chain::Mainnet, vec![k_addr, n_addr])]);
+        let nested = SafeOnboardingScreen::new(app.network.clone(), snapshot)
+            .scanned_for_test(n_addr, vec![(Chain::Mainnet, vec![k_addr])]);
+        // P picked "Nested Safe", then N picked "Private key": two deep.
+        app.pending_add_signer.push(PendingAddSigner {
+            allowed_owners: vec![k_addr, n_addr],
+            stash: Box::new(parent),
+        });
+        app.pending_add_signer.push(PendingAddSigner {
+            allowed_owners: vec![k_addr],
+            stash: Box::new(nested),
+        });
+
+        let _ = app.finish_add_signer(k, k_addr);
+
+        // N is back on screen with k (account 1) ticked…
+        let Screen::SafeOnboarding(n) = &app.screen else {
+            panic!("the nested Review is restored");
+        };
+        assert!(n.ticks_signer(1));
+        // …and P, still parked below it, knows k and ticks it too.
+        assert_eq!(app.pending_add_signer.len(), 1);
+        let p = &app.pending_add_signer[0].stash;
+        assert!(p.knows_account(1));
+        assert!(p.ticks_signer(1));
+
+        // Confirming N saves it and resumes P, which links k.
+        let (n_primary, n_siblings) = confirm_onboarding(&mut app);
+        assert_eq!(n_primary.linked_signer_indices, vec![1]);
+        let _ = app.finish_add_nested_safe(n_primary, n_siblings);
+        assert!(app.pending_add_signer.is_empty());
+        let (p_primary, _) = confirm_onboarding(&mut app);
+        assert_eq!(p_primary.address, [0x55; 20]);
+        assert_eq!(p_primary.linked_signer_indices, vec![1]);
+    }
+
+    #[test]
+    fn re_adding_a_saved_safe_by_hex_keeps_its_name_and_links() {
+        use crate::chain::Chain;
+        // Treasury (0x55) is saved on Mainnet linking account 0. The user
+        // pastes its hex address again to pick up Base.
+        let (_, a0) = local_signer_and_account(1);
+        let owner = wallet::account_address(&a0).unwrap();
+        let mut app = unlocked_app(wallet_of(
+            vec![a0],
+            vec![
+                named(safe_at(0x55, 1, vec![owner], vec![0], vec![]), "Treasury"),
+                named(safe_at(0x66, 1, vec![], vec![], vec![]), "Grants"),
+            ],
+        ));
+        app.setup_context = Some(SetupContext::AddAccount);
+        let screen =
+            SafeOnboardingScreen::new(app.network.clone(), app.existing_accounts_snapshot())
+                .with_existing_safes(app.existing_safes_snapshot())
+                .scanned_for_test(
+                    alloy::primitives::Address::repeat_byte(0x55),
+                    vec![(Chain::Mainnet, vec![owner]), (Chain::Base, vec![owner])],
+                );
+        // Review starts from the saved name.
+        assert_eq!(screen.review_name(), Some("Treasury"));
+        app.screen = Screen::SafeOnboarding(screen);
+        // Unticking the key leaves Base watch-only; Mainnet's saved link
+        // stays (a merge never unlinks — the role summary says so).
+        if let Screen::SafeOnboarding(s) = &mut app.screen {
+            let _ = s.update(crate::ui::safe_onboarding::Message::SignerToggled(0));
+        }
+        let (primary, siblings) = confirm_onboarding(&mut app);
+        let _ = app.save_safe_and_return_to_dashboard(primary, siblings);
+
+        let w = app.wallet.as_ref().unwrap();
+        let links_on = |chain_id| {
+            w.safe_index([0x55; 20], chain_id)
+                .map(|i| w.safes[i].linked_signer_indices.clone())
+        };
+        assert_eq!(links_on(1), Some(vec![0]));
+        assert_eq!(links_on(8453), Some(vec![]));
+        assert!(
+            w.safes
+                .iter()
+                .filter(|s| s.address == [0x55; 20])
+                .all(|s| s.name() == Some("Treasury")),
+            "one name on every chain, nothing renamed"
+        );
+        assert_eq!(w.safes[1].name(), Some("Grants"));
+    }
+
+    // ── Safe rename / removal / service URL (Settings → Safes, header) ──
+
+    fn named(mut safe: wallet::SafeDescriptor, name: &str) -> wallet::SafeDescriptor {
+        safe.set_name(Some(name.into()));
+        safe
+    }
+
+    #[test]
+    fn rename_safe_renames_the_address_on_every_chain_and_persists() {
+        let (_, a0) = local_signer_and_account(1);
+        let mut app = unlocked_app(wallet_of(
+            vec![a0],
+            vec![
+                named(safe_at(0x55, 1, vec![], vec![0], vec![8453]), "Old"),
+                named(safe_at(0x66, 1, vec![], vec![0], vec![]), "Grants"),
+                named(safe_at(0x55, 8453, vec![], vec![], vec![1]), "Old"),
+            ],
+        ));
+
+        let task = app.rename_safe([0x55; 20], Some("Treasury".into()));
+        assert!(task.units() > 0, "SafesUpdated push + save");
+        let names: Vec<_> = app
+            .wallet
+            .as_ref()
+            .unwrap()
+            .safes
+            .iter()
+            .map(|s| s.name())
+            .collect();
+        assert_eq!(
+            names,
+            vec![Some("Treasury"), Some("Grants"), Some("Treasury")]
+        );
+        assert_eq!(app.save_state_name(), "saving");
+
+        // Blank clears back to the positional default.
+        let _ = app.rename_safe([0x55; 20], Some("  ".into()));
+        let w = app.wallet.as_ref().unwrap();
+        assert_eq!(w.safes[0].display_name(0), "Safe 1");
+        assert_eq!(w.safes[2].display_name(2), "Safe 3");
+        assert_eq!(
+            app.save_state_name(),
+            "saving+queued",
+            "a quick second edit shares the save pipeline"
+        );
+    }
+
+    #[test]
+    fn remove_safe_drops_that_chain_only_and_persists() {
+        let (_, a0) = local_signer_and_account(1);
+        let mut app = unlocked_app(wallet_of(
+            vec![a0],
+            vec![
+                named(safe_at(0x55, 1, vec![], vec![0], vec![8453]), "Treasury"),
+                named(safe_at(0x55, 8453, vec![], vec![0], vec![1]), "Treasury"),
+                safe_at(0x66, 1, vec![], vec![0], vec![]),
+            ],
+        ));
+
+        let task = app.remove_safe([0x55; 20], 1);
+        assert!(task.units() > 0, "SafesUpdated push + save");
+        let w = app.wallet.as_ref().unwrap();
+        let keys: Vec<_> = w.safes.iter().map(wallet::SafeDescriptor::key).collect();
+        assert_eq!(keys, vec![([0x55; 20], 8453), ([0x66; 20], 1)]);
+        assert!(w.safes[0].sibling_chains.is_empty(), "peer forgets chain 1");
+        assert_eq!(
+            w.safes[1].display_name(1),
+            "Safe 3",
+            "the unnamed Safe after it keeps the name the user saw"
+        );
+        assert_eq!(app.save_state_name(), "saving");
+    }
+
+    #[test]
+    fn safe_edits_for_a_key_the_wallet_lacks_change_nothing() {
+        let (_, a0) = local_signer_and_account(1);
+        let safes = vec![safe_at(0x55, 1, vec![], vec![0], vec![])];
+        let mut app = unlocked_app(wallet_of(vec![a0], safes.clone()));
+
+        // Same address, other chain; other address entirely.
+        assert_eq!(app.remove_safe([0x55; 20], 8453).units(), 0);
+        assert_eq!(app.rename_safe([0x99; 20], Some("x".into())).units(), 0);
+        let url = Some("https://txs.example.org".to_string());
+        assert_eq!(app.set_safe_service_url([0x55; 20], 10, url).units(), 0);
+
+        let w = app.wallet.as_ref().unwrap();
+        assert_eq!(w.safes.len(), 1);
+        assert_eq!(w.safes[0].name(), None);
+        assert_eq!(w.safes[0].tx_service_url, None);
+        assert_eq!(app.save_state_name(), "idle");
+    }
+
+    #[test]
+    fn service_url_lands_on_the_keyed_chain_only() {
+        let (_, a0) = local_signer_and_account(1);
+        let mut app = unlocked_app(wallet_of(
+            vec![a0],
+            vec![
+                safe_at(0x55, 1, vec![], vec![0], vec![8453]),
+                safe_at(0x55, 8453, vec![], vec![0], vec![1]),
+            ],
+        ));
+        let url = Some("https://txs.example.org".to_string());
+        let _ = app.set_safe_service_url([0x55; 20], 8453, url.clone());
+        let w = app.wallet.as_ref().unwrap();
+        assert_eq!(w.safes[0].tx_service_url, None);
+        assert_eq!(w.safes[1].tx_service_url, url);
+        assert_eq!(app.save_state_name(), "saving");
+    }
+
+    // ── Account rename / removal (Settings → Accounts) ──────────────────
+
+    use crate::ui::wallet_dashboard::Nav;
+
+    fn addr_of(account: &AccountDescriptor) -> alloy::primitives::Address {
+        wallet::account_address(account).expect("test accounts have addresses")
+    }
+
+    fn dashboard(app: &App) -> &WalletScreen {
+        match &app.screen {
+            Screen::Wallet(screen) => screen,
+            other => panic!("expected the dashboard, on {}", other.name()),
+        }
+    }
+
+    fn dashboard_mut(app: &mut App) -> &mut WalletScreen {
+        match &mut app.screen {
+            Screen::Wallet(screen) => screen,
+            other => panic!("expected the dashboard, on {}", other.name()),
+        }
+    }
+
+    #[test]
+    fn removing_another_account_remaps_in_place_and_keeps_the_live_signer() {
+        let (_, a0) = local_signer_and_account(1);
+        let (_, a1) = local_signer_and_account(2);
+        // The active account is a Ledger whose device is connected, so the
+        // dashboard holds a live signer for it (a local key stands in for
+        // the device). A rebuild would drop it to the view-only placeholder.
+        let (live, stand_in) = local_signer_and_account(3);
+        let ledger = AccountDescriptor::Ledger {
+            name: None,
+            path: wallet::LedgerHdPath::LedgerLive(0),
+            address: addr_of(&stand_in).into_array(),
+        };
+        let (gone, ledger_addr) = (addr_of(&a0), addr_of(&ledger));
+        let mut app = unlocked_app(WalletDescriptor {
+            accounts: vec![a0, a1, ledger],
+            safes: vec![
+                safe_at(0x55, 1, vec![gone, ledger_addr], vec![0, 2], vec![]),
+                safe_at(0x66, 1, vec![gone], vec![0], vec![]),
+            ],
+            active_index: 2,
+            sibling_links_repaired: true,
+        });
+        let _ = app.enter_dashboard(live, Some(Nav::Settings));
+        dashboard_mut(&mut app).open_accounts_settings();
+
+        let task = app.remove_account(0, gone);
+        assert!(task.units() > 0, "save + toast");
+
+        let w = app.wallet.as_ref().unwrap();
+        assert_eq!(w.accounts.len(), 2);
+        assert_eq!(w.active_index, 1, "the Ledger slid down one");
+        assert_eq!(w.safes[0].linked_signer_indices, vec![1]);
+        assert!(
+            w.safes[1].linked_signer_indices.is_empty(),
+            "watch-only now"
+        );
+        assert_eq!(app.save_state_name(), "saving");
+
+        let screen = dashboard(&app);
+        assert!(
+            screen.test_signer_can_sign(),
+            "same dashboard, same connected signer"
+        );
+        assert_eq!(screen.test_address(), ledger_addr);
+        assert_eq!(screen.test_active_index(), 1);
+        assert_eq!(screen.test_accounts().len(), 2);
+        assert_eq!(screen.current_nav(), Nav::Settings);
+        assert_eq!(
+            screen.test_settings_pane(),
+            "Accounts",
+            "the pane stays open"
+        );
+    }
+
+    #[test]
+    fn removing_the_active_account_rebuilds_on_its_successor_and_reopens_accounts() {
+        let accounts: Vec<_> = (1..=3).map(|s| local_signer_and_account(s).1).collect();
+        let addrs: Vec<_> = accounts.iter().map(addr_of).collect();
+        let mut app = unlocked_app(WalletDescriptor {
+            accounts,
+            safes: Vec::new(),
+            active_index: 1,
+            sibling_links_repaired: true,
+        });
+        let _ = app.enter_active_from_wallet(Some(Nav::Settings));
+        dashboard_mut(&mut app).open_accounts_settings();
+
+        let _ = app.remove_account(1, addrs[1]);
+        let w = app.wallet.as_ref().unwrap();
+        assert_eq!(w.accounts.len(), 2);
+        assert_eq!(w.active_index, 1, "the next account took its slot");
+        assert_eq!(
+            w.accounts[1].name(),
+            Some("Account 3"),
+            "its default name froze"
+        );
+        assert_eq!(app.save_state_name(), "saving");
+
+        let screen = dashboard(&app);
+        assert_eq!(screen.test_address(), addrs[2], "rebuilt for the successor");
+        assert_eq!(screen.test_active_index(), 1);
+        assert_eq!(screen.current_nav(), Nav::Settings);
+        assert_eq!(screen.test_settings_pane(), "Accounts", "back where it was");
+    }
+
+    #[test]
+    fn the_last_account_cannot_be_removed() {
+        let (_, a0) = local_signer_and_account(1);
+        let only = addr_of(&a0);
+        let mut app = unlocked_app(WalletDescriptor::single(a0));
+        let task = app.remove_account(0, only);
+        assert_eq!(task.units(), 1, "just the toast");
+        assert_eq!(app.wallet.as_ref().unwrap().accounts.len(), 1);
+        assert_eq!(app.save_state_name(), "idle");
+    }
+
+    #[test]
+    fn a_removal_whose_position_moved_is_refused() {
+        let (_, a0) = local_signer_and_account(1);
+        let (_, a1) = local_signer_and_account(2);
+        let first = addr_of(&a0);
+        let mut app = unlocked_app(wallet_of(vec![a0, a1], vec![]));
+
+        // The pane saw `first` at position 1 — it isn't there (any more).
+        assert_eq!(app.remove_account(1, first).units(), 1, "just the toast");
+        assert_eq!(app.remove_account(7, first).units(), 1, "out of range");
+        let w = app.wallet.as_ref().unwrap();
+        assert_eq!(w.accounts.len(), 2);
+        assert_eq!(addr_of(&w.accounts[0]), first);
+        assert_eq!(app.save_state_name(), "idle");
+    }
+
+    #[test]
+    fn removing_an_account_is_refused_while_signing() {
+        let (signer, a0) = local_signer_and_account(1);
+        let (_, a1) = local_signer_and_account(2);
+        let other = addr_of(&a1);
+        let mut app = unlocked_app(wallet_of(vec![a0, a1], vec![]));
+        let _ = app.enter_dashboard(signer, None);
+        dashboard_mut(&mut app).test_mark_signing_busy();
+
+        let task = app.remove_account(1, other);
+        assert_eq!(task.units(), 1, "just the toast");
+        assert_eq!(app.wallet.as_ref().unwrap().accounts.len(), 2);
+        assert_eq!(dashboard(&app).test_accounts().len(), 2);
+        assert_eq!(app.save_state_name(), "idle");
+    }
+
+    #[test]
+    fn renaming_an_account_checks_its_position_still_holds_it() {
+        let (_, a0) = local_signer_and_account(1);
+        let (_, a1) = local_signer_and_account(2);
+        let second = addr_of(&a1);
+        let mut app = unlocked_app(wallet_of(vec![a0, a1], vec![]));
+
+        assert_eq!(
+            app.rename_account(0, second, Some("Cold".into())).units(),
+            0
+        );
+        assert!(
+            app.wallet
+                .as_ref()
+                .unwrap()
+                .accounts
+                .iter()
+                .all(|a| a.name().is_none())
+        );
+        assert_eq!(app.save_state_name(), "idle");
+
+        let _ = app.rename_account(1, second, Some(" Cold ".into()));
+        let w = app.wallet.as_ref().unwrap();
+        assert_eq!(w.accounts[1].name(), Some("Cold"));
+        assert_eq!(w.active_index, 0, "renaming never switches");
+        assert_eq!(app.save_state_name(), "saving");
+    }
+
+    #[test]
+    fn the_removal_toast_names_the_safes_left_watch_only() {
+        let (_, a0) = local_signer_and_account(1);
+        let (_, a1) = local_signer_and_account(2);
+        let (k0, k1) = (addr_of(&a0), addr_of(&a1));
+        let mut w = wallet_of(
+            vec![a0, a1],
+            vec![
+                named(safe_at(0x55, 8453, vec![k0], vec![0], vec![]), "Treasury"),
+                safe_at(0x66, 1, vec![k0, k1], vec![0, 1], vec![]),
+            ],
+        );
+        let removed = w.remove_account(0).unwrap();
+        assert_eq!(
+            removal_notice(&w, &removed),
+            "Removed Account 1 · Treasury on Base is watch-only now"
+        );
+
+        let removed = w.remove_account(0).unwrap_err();
+        assert_eq!(removed, wallet::RemoveAccountError::LastAccount);
+    }
+
+    #[test]
+    fn the_removal_toast_counts_a_leftover_view_only_link_as_watch_only() {
+        // The old onboarding linked view-only owners too: Treasury is
+        // linked [key A, view-only V]. Removing A leaves a link, but no key
+        // Kao can sign with — the toast must say so, and the live dashboard
+        // must leave Safe mode on it rather than offer a Safe that fails at
+        // sign time.
+        let (_, a0) = local_signer_and_account(1);
+        let (live, a2) = local_signer_and_account(3);
+        let (k0, k2) = (addr_of(&a0), addr_of(&a2));
+        let watched = alloy::primitives::Address::repeat_byte(0x77);
+        let mut app = unlocked_app(WalletDescriptor {
+            accounts: vec![a0, wallet::view_only_account(watched), a2],
+            safes: vec![named(
+                safe_at(0x55, 1, vec![k0, watched], vec![0, 1], vec![]),
+                "Treasury",
+            )],
+            active_index: 2,
+            sibling_links_repaired: true,
+        });
+        let _ = app.enter_dashboard(live, Some(Nav::Settings));
+        dashboard_mut(&mut app).test_enter_safe_mode(0);
+
+        let mut w = app.wallet.clone().unwrap();
+        let removed = w.remove_account(0).unwrap();
+        assert_eq!(w.safes[0].linked_signer_indices, vec![0], "V stays linked");
+        assert_eq!(
+            removal_notice(&w, &removed),
+            "Removed Account 1 · Treasury on Ethereum Mainnet is watch-only now"
+        );
+
+        let _ = app.remove_account(0, k0);
+        let screen = dashboard(&app);
+        assert_eq!(
+            screen.test_active_safe(),
+            None,
+            "no key in Kao signs for the active Safe any more"
+        );
+        assert_eq!(screen.test_address(), k2, "same account, now at 1");
     }
 }

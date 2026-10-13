@@ -73,8 +73,27 @@ pub fn main() -> iced::Result {
         tracing::info!("routing all outbound traffic through the configured SOCKS5 proxy");
     }
 
-    iced::application(App::new, App::update, App::view)
+    let app = iced::application(App::new, App::update, App::view)
         .title("Kao Wallet")
-        .subscription(App::subscription)
-        .run()
+        .subscription(App::subscription);
+    // Wayland/X11 app id, matching flatpak/com.kaowallet.kao.desktop so the
+    // session shell associates the window with that desktop entry.
+    #[cfg(target_os = "linux")]
+    let app = app.window(linux_window());
+    app.run()
+}
+
+/// Desktop id shared with the Flatpak manifest and the cargo-packager identifier.
+#[cfg(target_os = "linux")]
+const DESKTOP_APP_ID: &str = "com.kaowallet.kao";
+
+#[cfg(target_os = "linux")]
+fn linux_window() -> iced::window::Settings {
+    iced::window::Settings {
+        platform_specific: iced::window::settings::PlatformSpecific {
+            application_id: DESKTOP_APP_ID.to_owned(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
 }

@@ -51,3 +51,23 @@ xattr -dr com.apple.quarantine "/Applications/Kao Wallet.app"
 Then open it normally. (If it lives somewhere other than `/Applications`, point
 the path at wherever you put it. Still complaining? `xattr -cr "/Applications/Kao Wallet.app"`
 strips every extended attribute.)
+
+# ♡ Linux: Flatpak
+
+Release assets include a single-file bundle. It uses the Freedesktop 26.08
+runtime. Wallet files live in the sandbox at `~/.var/app/com.kaowallet.kao/`,
+separate from a deb or AppImage install (`~/.config/kao` and `~/.local/share/kao`).
+
+```sh
+flatpak remote-add --if-not-exists --user flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+flatpak install --user ./kao-vX.Y.Z-x86_64-unknown-linux-gnu.flatpak
+flatpak run com.kaowallet.kao
+```
+
+Ledger and Trezor need the host's usual udev rules. The bundle asks for USB
+device nodes (`--device=usb`), which Flatpak 1.15.11 and newer honor. On the
+Flatpak 1.14 shipped with Ubuntu 24.04 that permission is ignored; software
+wallets still run, and `flatpak override --user --device=all com.kaowallet.kao`
+opens the device nodes for hardware wallets.
+
+Build a bundle from a Linux release binary with `./flatpak/build.sh target/release/kao dist`.

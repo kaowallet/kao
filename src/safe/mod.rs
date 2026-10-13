@@ -447,9 +447,10 @@ impl RefreshDiff {
     }
 }
 
-/// Result of `refresh_all_safes`. One entry per Safe in `wallet.safes`
-/// (in the same positional order), tagged with the source index so the
-/// App handler can splice each new descriptor back into its slot. The
+/// Result of `refresh_all_safes`. One entry per Safe in the snapshot it
+/// was spawned with, tagged with its position *in that snapshot* (for
+/// logs only — the live list may have changed by the time it lands, so
+/// the App matches each descriptor back by `(address, chain_id)`). The
 /// per-safe `Result` lets a single unreachable RPC degrade gracefully
 /// without sinking the rest of the batch.
 ///
@@ -607,8 +608,11 @@ pub async fn scan_across_chains(
 /// Re-inspect an existing Safe and return the updated descriptor plus
 /// a diff of what changed.
 ///
-/// On Ok the caller should overwrite their cached descriptor with the
-/// returned one and use the diff to decide which UI banners to raise.
+/// On Ok the caller should take the returned descriptor's on-chain
+/// fields into its cached one (`SafeDescriptor::refresh_onchain_from`;
+/// the user-configured fields here are copies of `existing` and may be
+/// stale by the time this lands) and use the diff to decide which UI
+/// banners to raise.
 /// On Err the cached descriptor is unchanged — the address was
 /// unreadable, undeployed, or no longer looks like a Safe at all
 /// (e.g. self-destructed). The dashboard surfaces this as a
@@ -663,10 +667,10 @@ pub async fn refresh_one(
 }
 
 /// Fan `refresh_one` across every Safe in `safes` in parallel. Returns
-/// one entry per input safe, paired with its position so the caller can
-/// splice the result back into `wallet.safes[idx]` without losing
-/// ordering. Errors are per-safe — a single unreachable RPC for one
-/// Safe doesn't sink the whole batch.
+/// one entry per input safe, paired with its position in `safes` (see
+/// `RefreshBatch` — the caller lands results by `(address, chain_id)`).
+/// Errors are per-safe — a single unreachable RPC for one Safe doesn't
+/// sink the whole batch.
 ///
 /// Spawned by the App after unlock so the dashboard renders against
 /// freshly-verified owner sets / modules / guards. Wallet is saved

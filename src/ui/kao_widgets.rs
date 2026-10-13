@@ -443,6 +443,32 @@ pub fn small_secondary_button<'a, M: Clone + 'a>(
         })
 }
 
+/// Destructive sibling of `small_secondary_button` — same shape, label and
+/// border in the theme's `down` color so the user reads it as dangerous
+/// (contacts' "Confirm delete", Settings → Safes' "Remove"). Destructive
+/// actions never fire from one click: the first press only stages an
+/// inline Cancel / Confirm pair, and the confirm half is what acts.
+pub fn small_danger_button<'a, M: Clone + 'a>(
+    t: KaoTheme,
+    label: &'a str,
+) -> button::Button<'a, M> {
+    button(text(label.to_string()).size(11).color(t.down).font(bold()))
+        .padding(Padding::from([4, 10]))
+        .style(move |_theme, status| button::Style {
+            background: Some(Background::Color(match status {
+                button::Status::Hovered | button::Status::Pressed => hover_tint(t.card_alt, t.down),
+                _ => t.card_alt,
+            })),
+            text_color: t.down,
+            border: Border {
+                color: t.down,
+                width: 1.0,
+                radius: Radius::from(8),
+            },
+            ..button::Style::default()
+        })
+}
+
 /// Subtle text-only button used for "← Back" links in the corner of auth
 /// screens. Renders as a plain text label with no background.
 pub fn link_button<'a, M: Clone + 'a>(t: KaoTheme, label: &'a str) -> button::Button<'a, M> {

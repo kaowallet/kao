@@ -11,6 +11,7 @@ use alloy::signers::trezor::{HDPath as AlloyTrezorHDPath, TrezorSigner};
 use alloy::sol_types::{Eip712Domain, SolStruct};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use zeroize::Zeroizing;
 
 pub mod contacts;
@@ -196,6 +197,13 @@ impl AccountDescriptor {
             None => format!("Account {}", idx + 1),
         }
     }
+
+    /// Whether this account holds (or reaches, via a device) a key that can
+    /// sign: `Local`, `Ledger` and `Trezor` do, `ViewOnly` never does. Only
+    /// these may be linked as a Safe signer.
+    pub fn can_sign(&self) -> bool {
+        !matches!(self, AccountDescriptor::ViewOnly { .. })
+    }
 }
 
 /// Top-level wallet payload. Encrypted at rest inside `wallet.enc`. Holds the
@@ -210,6 +218,14 @@ pub struct WalletDescriptor {
     pub accounts: Vec<AccountDescriptor>,
     pub safes: Vec<SafeDescriptor>,
     pub active_index: usize,
+    /// Whether `repair_sibling_signer_links` has had its one run on this
+    /// wallet (see `repair_sibling_signer_links_once`). `false` only for a
+    /// wallet last saved before the repair shipped — the store reads a
+    /// missing marker that way — so the repair runs on the first unlock
+    /// after the upgrade and never again. Every new wallet starts `true`:
+    /// nothing in it was written by the old onboarding.
+    #[serde(default)]
+    pub sibling_links_repaired: bool,
 }
 
 impl WalletDescriptor {
@@ -218,6 +234,7 @@ impl WalletDescriptor {
             accounts: vec![account],
             safes: Vec::new(),
             active_index: 0,
+            sibling_links_repaired: true,
         }
     }
 
@@ -235,22 +252,353 @@ impl WalletDescriptor {
         self.addresses().contains(&target)
     }
 
-    /// True if any `(address, chain_id)` Safe descriptor matches. Used to
-    /// keep onboarding from creating a second descriptor for a Safe the
-    /// user already added on the same chain.
+    /// True if any `(address, chain_id)` Safe descriptor matches.
     ///
-    /// Tests exercise it directly; the onboarding flow consumer lands in
-    /// stage 2 of the Safe onboarding work.
+    /// Tests exercise it directly; the add flows now go through
+    /// `upsert_safe`, which needs the position (`safe_index`) rather than
+    /// a yes/no.
     #[allow(dead_code)]
     pub fn contains_safe(&self, target: Address, chain_id: u64) -> bool {
-        let target_bytes: [u8; 20] = target.into();
+        self.safe_index(target.into(), chain_id).is_some()
+    }
+
+    /// Position of the Safe keyed `(address, chain_id)` in `safes`, if the
+    /// wallet holds it. Safes are identified by that pair, never by
+    /// position: a position read before an await or a list edit can point
+    /// at a different Safe after it.
+    pub fn safe_index(&self, address: [u8; 20], chain_id: u64) -> Option<usize> {
         self.safes
             .iter()
-            .any(|s| s.chain_id == chain_id && s.address == target_bytes)
+            .position(|s| s.address == address && s.chain_id == chain_id)
+    }
+
+    /// Remove the account at `idx`, keeping every index-based reference to
+    /// the account list consistent in the same edit:
+    ///
+    /// * unnamed accounts after `idx` get their current "Account N" frozen
+    ///   in as a real name, so nothing the user sees is silently renamed
+    ///   ("Account 3" must not turn into "Account 2");
+    /// * every Safe's `linked_signer_indices` drops `idx` and shifts the
+    ///   indices above it down by one. A missed shift fails quietly — the
+    ///   link would point at a *different* key;
+    /// * `active_index` follows its account down, or, when the active
+    ///   account itself goes, lands on the one that slid into its slot
+    ///   (the new last account when it was last).
+    ///
+    /// Refuses an out-of-range index and the wallet's only account (the
+    /// store won't load a wallet without accounts, and `active()` assumes
+    /// one); a refusal changes nothing. The caller persists the result.
+    ///
+    /// Settings → Accounts' Remove (via `App::remove_account`) consumes this.
+    pub fn remove_account(&mut self, idx: usize) -> Result<RemovedAccount, RemoveAccountError> {
+        let len = self.accounts.len();
+        if idx >= len {
+            return Err(RemoveAccountError::OutOfRange { index: idx, len });
+        }
+        if len == 1 {
+            return Err(RemoveAccountError::LastAccount);
+        }
+        // Resolve the active slot the way `active()` does before shifting,
+        // so an out-of-range stored index can't survive the edit.
+        let active = self.active_index.min(len - 1);
+
+        for (i, acc) in self.accounts.iter_mut().enumerate().skip(idx + 1) {
+            if acc.name().is_none() {
+                let frozen = acc.display_name(i);
+                acc.set_name(Some(frozen));
+            }
+        }
+        // The descriptor drops at the end of this block; a `Local` key
+        // zeroizes with it.
+        let (name, address) = {
+            let account = self.accounts.remove(idx);
+            (account.display_name(idx), account_address(&account))
+        };
+
+        let gone = idx as u32;
+        let mut unlinked_safes = Vec::new();
+        let mut left_without_signing_key = Vec::new();
+        for safe in &mut self.safes {
+            let before = safe.linked_signer_indices.len();
+            safe.linked_signer_indices.retain(|&i| i != gone);
+            for i in &mut safe.linked_signer_indices {
+                if *i > gone {
+                    *i -= 1;
+                }
+            }
+            if safe.linked_signer_indices.len() != before {
+                unlinked_safes.push(safe.key());
+                // Remaining links don't count unless they can sign: a
+                // view-only account or an ex-owner left linked is still
+                // no way to sign for it.
+                if !safe.has_signing_link(&self.accounts) {
+                    left_without_signing_key.push(safe.key());
+                }
+            }
+        }
+
+        self.active_index = match active.cmp(&idx) {
+            std::cmp::Ordering::Less => active,
+            std::cmp::Ordering::Equal => idx.min(self.accounts.len() - 1),
+            std::cmp::Ordering::Greater => active - 1,
+        };
+
+        Ok(RemovedAccount {
+            name,
+            address,
+            unlinked_safes,
+            left_without_signing_key,
+        })
+    }
+
+    /// Remove the Safe keyed `(address, chain_id)`: that one deployment
+    /// only, the same address on other chains stays. Unnamed Safes after it
+    /// get their current "Safe N" frozen in as a real name (same reason as
+    /// `remove_account`), and same-address peers stop listing `chain_id` in
+    /// their informational `sibling_chains`.
+    ///
+    /// Returns the removed descriptor, or `None` when the wallet doesn't
+    /// hold that Safe (nothing changed). The caller persists the result.
+    ///
+    /// Settings → Safes' Remove (via `App::remove_safe`) consumes this.
+    pub fn remove_safe(&mut self, address: [u8; 20], chain_id: u64) -> Option<SafeDescriptor> {
+        let idx = self.safe_index(address, chain_id)?;
+        for (i, safe) in self.safes.iter_mut().enumerate().skip(idx + 1) {
+            if safe.name().is_none() {
+                let frozen = safe.display_name(i);
+                safe.set_name(Some(frozen));
+            }
+        }
+        let removed = self.safes.remove(idx);
+        for peer in self.safes.iter_mut().filter(|s| s.address == address) {
+            peer.sibling_chains.retain(|&c| c != chain_id);
+        }
+        Some(removed)
+    }
+
+    /// Rename the Safe at `address` on EVERY chain it is saved on. Siblings
+    /// are one Safe to the user, and the address-keyed lookups (sign-review
+    /// local names, the contacts merge) would otherwise disagree about which
+    /// name it has. Goes through `SafeDescriptor::set_name`, so blank input
+    /// reverts to the "Safe N" default.
+    ///
+    /// Returns how many descriptors were renamed — `0` means the wallet
+    /// doesn't hold that address. The caller persists the result.
+    ///
+    /// The header pencil in Safe mode and Settings → Safes' Name field
+    /// (via `App::rename_safe`) consume this.
+    pub fn rename_safe(&mut self, address: [u8; 20], name: Option<String>) -> usize {
+        let mut renamed = 0;
+        for safe in self.safes.iter_mut().filter(|s| s.address == address) {
+            safe.set_name(name.clone());
+            renamed += 1;
+        }
+        renamed
+    }
+
+    /// Add a freshly onboarded Safe, or fold it into the entry already
+    /// saved under its `(address, chain_id)`.
+    ///
+    /// Absent → appended. When the address is already saved on another
+    /// chain, a new chain arriving without a name or service URL takes the
+    /// saved one's, so one Safe keeps one name on every chain (address-keyed
+    /// lookups like the sign-review local names depend on it). An explicit
+    /// incoming name is kept here; `App::upsert_safes` then applies it to
+    /// every chain.
+    ///
+    /// Present → the incoming signer links are unioned into the saved ones
+    /// (sorted, deduped; nothing is ever unlinked), and the cached on-chain
+    /// fields are taken from the incoming scan when it is at least as
+    /// fresh. The saved name, service URL and `sibling_chains` stay as they
+    /// are — `sibling_chains` deliberately isn't unioned, so
+    /// `repair_sibling_signer_links`' mutual-listing test stays as tight as
+    /// the bug that wrote it.
+    ///
+    /// This is what makes "add it again to link your key" work: re-adding a
+    /// Safe that was saved watch-only used to be skipped silently.
+    pub fn upsert_safe(&mut self, mut incoming: SafeDescriptor) -> SafeUpsert {
+        let Some(index) = self.safe_index(incoming.address, incoming.chain_id) else {
+            let address = incoming.address;
+            let peers = || self.safes.iter().filter(|s| s.address == address);
+            if incoming.name().is_none()
+                && let Some(name) = peers().find_map(SafeDescriptor::name)
+            {
+                incoming.set_name(Some(name.to_owned()));
+            }
+            if incoming.tx_service_url.is_none()
+                && let Some(url) = peers().find_map(|s| s.tx_service_url.as_ref())
+            {
+                incoming.tx_service_url = Some(url.clone());
+            }
+            self.safes.push(incoming);
+            return SafeUpsert::Added;
+        };
+        let slot = &mut self.safes[index];
+        slot.refresh_onchain_from(&incoming);
+        let mut links: BTreeSet<u32> = slot.linked_signer_indices.iter().copied().collect();
+        let before = links.len();
+        links.extend(incoming.linked_signer_indices.iter().copied());
+        let newly_linked = links.len() - before;
+        slot.linked_signer_indices = links.into_iter().collect();
+        if newly_linked == 0 {
+            SafeUpsert::Unchanged(index)
+        } else {
+            SafeUpsert::Merged {
+                index,
+                newly_linked,
+            }
+        }
+    }
+
+    /// Repair Safes saved before sibling chains inherited signer links.
+    ///
+    /// Onboarding used to save every chain but the primary with no links,
+    /// so a Safe added on Mainnet + Base came back watch-only on Base even
+    /// when the user's key owned it there. That shape is recognisable: a
+    /// watch-only target with a linked "donor" at the same address on
+    /// another chain, the two listing each other in `sibling_chains` (the
+    /// buggy confirm wrote both directions). The target gets every donor
+    /// link whose account can sign (never a view-only one — the old flow
+    /// linked those too, onboarding no longer does) and whose address is
+    /// one of the target's own cached owners — owner sets can differ per
+    /// chain. Dangling indices drop out.
+    ///
+    /// Returns the positions repaired (empty when nothing matched). Only
+    /// ever adds links to a Safe that has none, so it is idempotent. It is
+    /// NOT safe to run on every unlock, though: re-adding one chain of a
+    /// saved pair links that chain while keeping its `sibling_chains`, which
+    /// recreates the bug's shape when the user left the other chain
+    /// watch-only on purpose. Unlock goes through
+    /// `repair_sibling_signer_links_once`.
+    pub fn repair_sibling_signer_links(&mut self) -> Vec<usize> {
+        // `None` for an account that can't sign: it is never copied.
+        let account_addrs: Vec<Option<[u8; 20]>> = self
+            .accounts
+            .iter()
+            .map(|a| {
+                a.can_sign()
+                    .then(|| account_address(a))
+                    .flatten()
+                    .map(Address::into_array)
+            })
+            .collect();
+        let donors: Vec<(SafeKey, Vec<u32>, Vec<u64>)> = self
+            .safes
+            .iter()
+            .filter(|s| s.is_signer())
+            .map(|s| {
+                (
+                    s.key(),
+                    s.linked_signer_indices.clone(),
+                    s.sibling_chains.clone(),
+                )
+            })
+            .collect();
+
+        let mut repaired = Vec::new();
+        for (i, target) in self.safes.iter_mut().enumerate() {
+            if target.is_signer() {
+                continue;
+            }
+            let links: BTreeSet<u32> = donors
+                .iter()
+                .filter(|((address, chain_id), _, donor_siblings)| {
+                    *address == target.address
+                        && *chain_id != target.chain_id
+                        && donor_siblings.contains(&target.chain_id)
+                        && target.sibling_chains.contains(chain_id)
+                })
+                .flat_map(|(_, links, _)| links.iter().copied())
+                .filter(|&idx| {
+                    account_addrs
+                        .get(idx as usize)
+                        .copied()
+                        .flatten()
+                        .is_some_and(|a| target.owners.contains(&a))
+                })
+                .collect();
+            if !links.is_empty() {
+                target.linked_signer_indices = links.into_iter().collect();
+                repaired.push(i);
+            }
+        }
+        repaired
+    }
+
+    /// Run `repair_sibling_signer_links` once per wallet: only while
+    /// `sibling_links_repaired` is unset, i.e. on a wallet last saved before
+    /// the repair shipped, whose data is all the old onboarding's. Sets the
+    /// marker either way.
+    ///
+    /// `None` when the repair already ran (nothing changed). Otherwise the
+    /// positions repaired — possibly none, but the marker changed, so the
+    /// caller must persist the wallet. The store writes the marker in the
+    /// same transaction as the links, so if that save never lands the
+    /// repair simply runs again next unlock against the same legacy data.
+    pub fn repair_sibling_signer_links_once(&mut self) -> Option<Vec<usize>> {
+        if self.sibling_links_repaired {
+            return None;
+        }
+        let repaired = self.repair_sibling_signer_links();
+        self.sibling_links_repaired = true;
+        Some(repaired)
     }
 }
 
+/// Why `WalletDescriptor::remove_account` refused. Nothing was changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveAccountError {
+    /// No account at `index`; the wallet has `len`.
+    OutOfRange { index: usize, len: usize },
+    /// It is the wallet's only account.
+    LastAccount,
+}
+
+impl std::fmt::Display for RemoveAccountError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OutOfRange { index, len } => {
+                write!(f, "no account at position {index} (the wallet has {len})")
+            }
+            Self::LastAccount => f.write_str("Your wallet needs at least one account."),
+        }
+    }
+}
+
+/// What `WalletDescriptor::remove_account` removed and what it touched —
+/// enough for the confirmation toast and any follow-up copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovedAccount {
+    /// The name it was shown under right before removal.
+    pub name: String,
+    /// Its address, when one could be derived.
+    pub address: Option<Address>,
+    /// Every Safe that listed it as a linked signer.
+    pub unlinked_safes: Vec<SafeKey>,
+    /// The subset of `unlinked_safes` that no remaining linked account can
+    /// sign for (`SafeDescriptor::has_signing_link`) — those are watch-only
+    /// now, even when a view-only or ex-owner link is left behind.
+    pub left_without_signing_key: Vec<SafeKey>,
+}
+
+/// Result of `WalletDescriptor::upsert_safe`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SafeUpsert {
+    /// Not in the wallet yet — appended.
+    Added,
+    /// Already saved at `index`; `newly_linked` (≥ 1) signer links were
+    /// added to it.
+    Merged { index: usize, newly_linked: usize },
+    /// Already saved at `index` with every incoming link. Nothing the user
+    /// configured changed (the cached on-chain fields may have refreshed).
+    Unchanged(usize),
+}
+
 // ── SafeDescriptor ─────────────────────────────────────────────────────────
+
+/// A Safe's identity: `(address, chain_id)`. The same address on another
+/// chain is a different Safe with its own owners.
+pub type SafeKey = ([u8; 20], u64);
 
 /// Whether Kao recognizes the on-chain implementation behind this Safe
 /// proxy. Determined at onboarding by reading proxy storage slot 0 and
@@ -351,12 +699,36 @@ pub struct SafeDescriptor {
     pub tx_service_url: Option<String>,
 }
 
-// Tests exercise these directly; the UI consumers (account list rendering,
-// the onboarding label step) land in stage 3 of the Safe onboarding work.
-#[allow(dead_code)]
 impl SafeDescriptor {
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
+    }
+
+    /// This Safe's identity, `(address, chain_id)`.
+    pub fn key(&self) -> SafeKey {
+        (self.address, self.chain_id)
+    }
+
+    /// Take the cached on-chain state — version, trust, threshold, owners,
+    /// modules, guard, fallback handler and `cached_at` — from `fresh`, a
+    /// newer read of the same Safe, leaving everything the user configured
+    /// (name, linked signers, `sibling_chains`, service URL) as it is.
+    ///
+    /// Skipped when `fresh` is older than what's cached, so a slow read can
+    /// never roll the cache back. Returns whether it adopted.
+    pub fn refresh_onchain_from(&mut self, fresh: &SafeDescriptor) -> bool {
+        if fresh.cached_at < self.cached_at {
+            return false;
+        }
+        self.version = fresh.version.clone();
+        self.trust = fresh.trust.clone();
+        self.threshold = fresh.threshold;
+        self.owners = fresh.owners.clone();
+        self.modules = fresh.modules.clone();
+        self.guard = fresh.guard;
+        self.fallback_handler = fresh.fallback_handler;
+        self.cached_at = fresh.cached_at;
+        true
     }
 
     /// Replace the user-assigned name. Mirrors `AccountDescriptor::set_name`:
@@ -387,6 +759,39 @@ impl SafeDescriptor {
     /// rendered in a visibly non-signing state.
     pub fn is_signer(&self) -> bool {
         !self.linked_signer_indices.is_empty()
+    }
+
+    /// Whether `account` can sign for this Safe: its kind holds or reaches
+    /// a key (`AccountDescriptor::can_sign`) and its address is one of the
+    /// cached owners. A link is the user's choice, not an ownership fact —
+    /// it can name a view-only account (the old onboarding linked those)
+    /// or outlive the owner's on-chain removal, and neither signs.
+    pub fn is_signing_owner(&self, account: &AccountDescriptor) -> bool {
+        account.can_sign()
+            && account_address(account).is_some_and(|a| self.owners.contains(&a.into_array()))
+    }
+
+    /// The linked indices whose account in `accounts` can sign for this
+    /// Safe (`is_signing_owner`). Dangling indices drop out.
+    pub fn signing_links<'a>(
+        &'a self,
+        accounts: &'a [AccountDescriptor],
+    ) -> impl Iterator<Item = u32> + 'a {
+        self.linked_signer_indices.iter().copied().filter(|&idx| {
+            accounts
+                .get(idx as usize)
+                .is_some_and(|a| self.is_signing_owner(a))
+        })
+    }
+
+    /// Whether at least one linked account can sign for this Safe — what
+    /// separates a Safe Kao can act as from a watch-only one. Stricter than
+    /// `is_signer`, which only sees that something is linked. Decides
+    /// whether the dashboard's Safe mode survives an update, which Safes
+    /// the account dropdown offers, and what removing an account warns
+    /// about.
+    pub fn has_signing_link(&self, accounts: &[AccountDescriptor]) -> bool {
+        self.signing_links(accounts).next().is_some()
     }
 
     pub fn address(&self) -> Address {
@@ -1161,6 +1566,7 @@ mod tests {
             ],
             safes: Vec::new(),
             active_index: 1,
+            sibling_links_repaired: true,
         };
         let encoded = postcard::to_stdvec(&desc).unwrap();
         let decoded: WalletDescriptor = postcard::from_bytes(&encoded).unwrap();
@@ -1287,6 +1693,7 @@ mod tests {
             safes: Vec::new(),
             // Bogus index larger than accounts.len(); active() must clamp.
             active_index: 99,
+            sibling_links_repaired: true,
         };
         match desc.active() {
             AccountDescriptor::Local { key_bytes, .. } => {
@@ -1722,6 +2129,7 @@ mod tests {
             accounts: vec![view_only_account(addr_a), view_only_account(addr_b)],
             safes: Vec::new(),
             active_index: 0,
+            sibling_links_repaired: true,
         };
         let addrs = desc.addresses();
         assert_eq!(addrs, vec![addr_a, addr_b]);
@@ -1789,5 +2197,721 @@ mod tests {
         let safes = [safe_linking(vec![]), safe_linking(vec![])];
         assert!(!account_is_safe_signer(0, &safes));
         assert!(!account_is_safe_signer(7, &safes));
+    }
+
+    // ── WalletDescriptor edit helpers ───────────────────────────────────
+
+    /// View-only account whose address is `[byte; 20]` — lets a test line
+    /// an account up with a Safe owner of the same byte.
+    fn watch(byte: u8) -> AccountDescriptor {
+        view_only_account(Address::repeat_byte(byte))
+    }
+
+    /// Ledger account whose address is `[byte; 20]` — the signing-capable
+    /// counterpart of `watch`.
+    fn ledger(byte: u8) -> AccountDescriptor {
+        AccountDescriptor::Ledger {
+            name: None,
+            path: LedgerHdPath::LedgerLive(0),
+            address: [byte; 20],
+        }
+    }
+
+    fn named_watch(byte: u8, name: &str) -> AccountDescriptor {
+        let mut acc = watch(byte);
+        acc.set_name(Some(name.into()));
+        acc
+    }
+
+    /// Safe at `[addr; 20]` on `chain_id` with owners `[o; 20]` for each
+    /// `o`, the given links and sibling list.
+    fn safe_on(
+        addr: u8,
+        chain_id: u64,
+        owners: &[u8],
+        linked: Vec<u32>,
+        sibling_chains: Vec<u64>,
+    ) -> SafeDescriptor {
+        SafeDescriptor {
+            chain_id,
+            address: [addr; 20],
+            owners: owners.iter().map(|o| [*o; 20]).collect(),
+            linked_signer_indices: linked,
+            sibling_chains,
+            ..safe_linking(Vec::new())
+        }
+    }
+
+    fn wallet(accounts: Vec<AccountDescriptor>, safes: Vec<SafeDescriptor>) -> WalletDescriptor {
+        WalletDescriptor {
+            accounts,
+            safes,
+            active_index: 0,
+            sibling_links_repaired: true,
+        }
+    }
+
+    fn display_names(w: &WalletDescriptor) -> Vec<String> {
+        w.accounts
+            .iter()
+            .enumerate()
+            .map(|(i, a)| a.display_name(i))
+            .collect()
+    }
+
+    fn safe_display_names(w: &WalletDescriptor) -> Vec<String> {
+        w.safes
+            .iter()
+            .enumerate()
+            .map(|(i, s)| s.display_name(i))
+            .collect()
+    }
+
+    #[test]
+    fn safe_index_matches_address_and_chain_together() {
+        let w = wallet(
+            vec![watch(1)],
+            vec![
+                safe_on(0x55, 1, &[], vec![], vec![]),
+                safe_on(0x55, 8453, &[], vec![], vec![]),
+            ],
+        );
+        assert_eq!(w.safe_index([0x55; 20], 1), Some(0));
+        assert_eq!(w.safe_index([0x55; 20], 8453), Some(1));
+        assert_eq!(w.safe_index([0x55; 20], 10), None);
+        assert_eq!(w.safe_index([0x66; 20], 1), None);
+        assert_eq!(w.safes[1].key(), ([0x55; 20], 8453));
+    }
+
+    #[test]
+    fn remove_account_refuses_out_of_range_and_the_last_account() {
+        let mut w = wallet(vec![watch(1), watch(2)], vec![]);
+        assert_eq!(
+            w.remove_account(2),
+            Err(RemoveAccountError::OutOfRange { index: 2, len: 2 })
+        );
+        assert_eq!(w.accounts.len(), 2, "a refusal changes nothing");
+
+        let mut solo = wallet(
+            vec![watch(1)],
+            vec![safe_on(0x55, 1, &[1], vec![0], vec![])],
+        );
+        assert_eq!(solo.remove_account(0), Err(RemoveAccountError::LastAccount));
+        assert_eq!(solo.accounts.len(), 1);
+        assert_eq!(solo.safes[0].linked_signer_indices, vec![0]);
+        assert_eq!(
+            RemoveAccountError::LastAccount.to_string(),
+            "Your wallet needs at least one account."
+        );
+    }
+
+    #[test]
+    fn remove_account_remaps_links_and_reports_affected_safes() {
+        let owners = [0xa0, 0xa1, 0xa2, 0xa3];
+        let mut w = wallet(
+            vec![ledger(0xa0), ledger(0xa1), ledger(0xa2), ledger(0xa3)],
+            vec![
+                safe_on(0x51, 1, &owners, vec![0, 1, 3], vec![]),
+                safe_on(0x52, 1, &owners, vec![1], vec![]),
+                safe_on(0x53, 10, &owners, vec![2, 3], vec![]),
+                safe_on(0x54, 8453, &owners, vec![], vec![]),
+            ],
+        );
+        let removed = w.remove_account(1).expect("removable");
+
+        assert_eq!(w.accounts.len(), 3);
+        // Index 1 dropped; everything above it shifted down by one so each
+        // link still names the same key.
+        assert_eq!(w.safes[0].linked_signer_indices, vec![0, 2]);
+        assert!(w.safes[1].linked_signer_indices.is_empty());
+        assert_eq!(w.safes[2].linked_signer_indices, vec![1, 2]);
+        assert!(w.safes[3].linked_signer_indices.is_empty());
+        for (safe, expected) in
+            w.safes
+                .iter()
+                .zip([vec![0xa0, 0xa3], vec![], vec![0xa2, 0xa3], vec![]])
+        {
+            let linked: Vec<u8> = safe
+                .linked_signer_indices
+                .iter()
+                .map(|&i| account_address(&w.accounts[i as usize]).unwrap()[0])
+                .collect();
+            assert_eq!(linked, expected, "links must keep naming the same keys");
+        }
+
+        assert_eq!(removed.name, "Account 2");
+        assert_eq!(removed.address, Some(Address::repeat_byte(0xa1)));
+        assert_eq!(
+            removed.unlinked_safes,
+            vec![([0x51; 20], 1), ([0x52; 20], 1)]
+        );
+        assert_eq!(removed.left_without_signing_key, vec![([0x52; 20], 1)]);
+    }
+
+    #[test]
+    fn remove_account_counts_only_links_that_can_still_sign() {
+        // Account 0 = the Safe owner's key; 1 = a view-only watch of a
+        // co-owner (the old onboarding linked those); 2 = a Ledger the
+        // owners have since removed on-chain. After account 0 goes, both
+        // Safes keep a link — but no key in Kao can sign for either.
+        let mut w = wallet(
+            vec![ledger(0xa0), watch(0xa1), ledger(0xa2), ledger(0xa3)],
+            vec![
+                safe_on(0x51, 1, &[0xa0, 0xa1], vec![0, 1], vec![]),
+                safe_on(0x52, 1, &[0xa0], vec![0, 2], vec![]),
+                safe_on(0x53, 1, &[0xa0, 0xa3], vec![0, 3], vec![]),
+            ],
+        );
+        let removed = w.remove_account(0).expect("removable");
+        assert_eq!(
+            w.safes[0].linked_signer_indices,
+            vec![0],
+            "kept, not signing"
+        );
+        assert_eq!(
+            w.safes[1].linked_signer_indices,
+            vec![1],
+            "kept, not signing"
+        );
+        assert_eq!(
+            removed.left_without_signing_key,
+            vec![([0x51; 20], 1), ([0x52; 20], 1)],
+            "0x53's other owner still signs"
+        );
+    }
+
+    #[test]
+    fn has_signing_link_needs_a_signing_kind_that_is_still_an_owner() {
+        let accounts = [ledger(0xa0), watch(0xa1), ledger(0xa2)];
+        let signs = |owners: &[u8], linked: Vec<u32>| {
+            safe_on(0x55, 1, owners, linked, vec![]).has_signing_link(&accounts)
+        };
+        assert!(signs(&[0xa0], vec![0]));
+        assert!(!signs(&[0xa0], vec![]), "nothing linked");
+        assert!(!signs(&[0xa1], vec![1]), "view-only never signs");
+        assert!(!signs(&[0xa0], vec![2]), "no longer an owner");
+        assert!(!signs(&[0xa0], vec![7]), "dangling index");
+        assert!(
+            signs(&[0xa0, 0xa1], vec![1, 0]),
+            "one signing link is enough"
+        );
+
+        let safe = safe_on(0x55, 1, &[0xa0, 0xa1, 0xa2], vec![0, 1, 2, 9], vec![]);
+        assert_eq!(
+            safe.signing_links(&accounts).collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+    }
+
+    #[test]
+    fn remove_account_freezes_default_names_after_the_removed_one() {
+        let mut w = wallet(
+            vec![watch(1), watch(2), named_watch(3, "Cold"), watch(4)],
+            vec![],
+        );
+        w.remove_account(1).unwrap();
+        // What the user saw for each surviving account is unchanged —
+        // "Account 4" did not become "Account 3".
+        assert_eq!(display_names(&w), vec!["Account 1", "Cold", "Account 4"]);
+        // Accounts before the removed one keep their positional default.
+        assert_eq!(w.accounts[0].name(), None);
+        assert_eq!(w.accounts[2].name(), Some("Account 4"));
+    }
+
+    #[test]
+    fn remove_account_keeps_the_active_account_or_takes_its_slot() {
+        let four = || vec![watch(1), watch(2), watch(3), watch(4)];
+
+        // Active below the removed one: untouched.
+        let mut w = wallet(four(), vec![]);
+        w.active_index = 0;
+        w.remove_account(2).unwrap();
+        assert_eq!(w.active_index, 0);
+
+        // Active above: follows its account down.
+        let mut w = wallet(four(), vec![]);
+        w.active_index = 3;
+        w.remove_account(1).unwrap();
+        assert_eq!(w.active_index, 2);
+        assert_eq!(account_address(w.active()), Some(Address::repeat_byte(4)));
+
+        // Active removed from the middle: the next account slid into it.
+        let mut w = wallet(four(), vec![]);
+        w.active_index = 1;
+        w.remove_account(1).unwrap();
+        assert_eq!(w.active_index, 1);
+        assert_eq!(account_address(w.active()), Some(Address::repeat_byte(3)));
+
+        // Active removed from the end: the new last account.
+        let mut w = wallet(four(), vec![]);
+        w.active_index = 3;
+        w.remove_account(3).unwrap();
+        assert_eq!(w.active_index, 2);
+
+        // An out-of-range stored index resolves like `active()` does (the
+        // last account) and comes out in range.
+        let mut w = wallet(four(), vec![]);
+        w.active_index = 99;
+        w.remove_account(0).unwrap();
+        assert_eq!(w.active_index, 2);
+        assert_eq!(account_address(w.active()), Some(Address::repeat_byte(4)));
+    }
+
+    #[test]
+    fn remove_safe_removes_one_chain_and_prunes_peer_sibling_lists() {
+        let mut w = wallet(
+            vec![watch(1)],
+            vec![
+                safe_on(0x55, 1, &[], vec![0], vec![8453, 10]),
+                safe_on(0x55, 8453, &[], vec![0], vec![1, 10]),
+                safe_on(0x55, 10, &[], vec![], vec![1, 8453]),
+                safe_on(0x66, 1, &[], vec![], vec![8453]),
+            ],
+        );
+        let removed = w.remove_safe([0x55; 20], 8453).expect("held");
+        assert_eq!(removed.key(), ([0x55; 20], 8453));
+        let keys: Vec<SafeKey> = w.safes.iter().map(SafeDescriptor::key).collect();
+        assert_eq!(
+            keys,
+            vec![([0x55; 20], 1), ([0x55; 20], 10), ([0x66; 20], 1)],
+            "only that deployment goes; the same address elsewhere stays",
+        );
+        assert_eq!(w.safes[0].sibling_chains, vec![10]);
+        assert_eq!(w.safes[1].sibling_chains, vec![1]);
+        // A different Safe's list is not ours to edit.
+        assert_eq!(w.safes[2].sibling_chains, vec![8453]);
+    }
+
+    #[test]
+    fn remove_safe_returns_none_for_a_safe_not_held() {
+        let mut w = wallet(vec![watch(1)], vec![safe_on(0x55, 1, &[], vec![], vec![])]);
+        let before = w.safes.clone();
+        assert!(w.remove_safe([0x55; 20], 8453).is_none());
+        assert!(w.remove_safe([0x66; 20], 1).is_none());
+        assert_eq!(w.safes, before);
+    }
+
+    #[test]
+    fn remove_safe_freezes_default_names_after_the_removed_one() {
+        let mut vault = safe_on(0x53, 1, &[], vec![], vec![]);
+        vault.set_name(Some("Vault".into()));
+        let mut w = wallet(
+            vec![watch(1)],
+            vec![
+                safe_on(0x51, 1, &[], vec![], vec![]),
+                safe_on(0x52, 1, &[], vec![], vec![]),
+                vault,
+                safe_on(0x54, 1, &[], vec![], vec![]),
+            ],
+        );
+        w.remove_safe([0x51; 20], 1).unwrap();
+        assert_eq!(safe_display_names(&w), vec!["Safe 2", "Vault", "Safe 4"]);
+    }
+
+    #[test]
+    fn rename_safe_renames_every_chain_of_that_address() {
+        let mut w = wallet(
+            vec![watch(1)],
+            vec![
+                safe_on(0x55, 1, &[], vec![], vec![]),
+                safe_on(0x66, 1, &[], vec![], vec![]),
+                safe_on(0x55, 8453, &[], vec![], vec![]),
+            ],
+        );
+        assert_eq!(w.rename_safe([0x55; 20], Some("  Treasury ".into())), 2);
+        assert_eq!(w.safes[0].name(), Some("Treasury"));
+        assert_eq!(w.safes[2].name(), Some("Treasury"));
+        assert_eq!(w.safes[1].name(), None, "a different Safe is untouched");
+
+        // Blank reverts to the positional default, on every chain.
+        assert_eq!(w.rename_safe([0x55; 20], Some("   ".into())), 2);
+        assert_eq!(w.safes[0].name(), None);
+        assert_eq!(w.safes[2].name(), None);
+
+        assert_eq!(w.rename_safe([0x77; 20], Some("Nope".into())), 0);
+    }
+
+    #[test]
+    fn upsert_safe_appends_a_safe_not_held() {
+        let mut w = wallet(
+            vec![watch(1)],
+            vec![safe_on(0x55, 1, &[1], vec![0], vec![])],
+        );
+        let base = safe_on(0x55, 8453, &[1], vec![0], vec![1]);
+        assert_eq!(w.upsert_safe(base.clone()), SafeUpsert::Added);
+        assert_eq!(w.safes.len(), 2);
+        assert_eq!(w.safes[1], base);
+    }
+
+    #[test]
+    fn upsert_safe_links_a_signer_into_a_watch_only_entry() {
+        // The multi-chain bug left Base watch-only; adding it again with
+        // the key that owns it must link it, not skip it.
+        let mut w = wallet(
+            vec![watch(1)],
+            vec![
+                safe_on(0x55, 1, &[1], vec![0], vec![8453]),
+                safe_on(0x55, 8453, &[1], vec![], vec![1]),
+            ],
+        );
+        let again = safe_on(0x55, 8453, &[1], vec![0], vec![1]);
+        assert_eq!(
+            w.upsert_safe(again),
+            SafeUpsert::Merged {
+                index: 1,
+                newly_linked: 1
+            }
+        );
+        assert_eq!(w.safes.len(), 2, "merged in place, no duplicate");
+        assert_eq!(w.safes[1].linked_signer_indices, vec![0]);
+    }
+
+    #[test]
+    fn upsert_safe_unions_links_and_keeps_user_configuration() {
+        let mut saved = safe_on(0x55, 1, &[1, 2, 3], vec![2, 0, 2], vec![8453]);
+        saved.set_name(Some("Vault".into()));
+        saved.tx_service_url = Some("https://txs.example.org".into());
+        let mut w = wallet(vec![watch(1), watch(2), watch(3)], vec![saved]);
+
+        let mut incoming = safe_on(0x55, 1, &[1, 2, 3], vec![1, 2], vec![8453, 10]);
+        incoming.set_name(Some("Other".into()));
+        incoming.tx_service_url = None;
+        assert_eq!(
+            w.upsert_safe(incoming),
+            SafeUpsert::Merged {
+                index: 0,
+                newly_linked: 1
+            }
+        );
+        let s = &w.safes[0];
+        assert_eq!(
+            s.linked_signer_indices,
+            vec![0, 1, 2],
+            "sorted, deduped union"
+        );
+        assert_eq!(s.name(), Some("Vault"));
+        assert_eq!(s.tx_service_url.as_deref(), Some("https://txs.example.org"));
+        assert_eq!(
+            s.sibling_chains,
+            vec![8453],
+            "sibling_chains is not unioned"
+        );
+    }
+
+    #[test]
+    fn upsert_safe_reports_unchanged_when_every_link_is_already_there() {
+        let mut w = wallet(
+            vec![watch(1), watch(2)],
+            vec![
+                safe_on(0x66, 1, &[], vec![], vec![]),
+                safe_on(0x55, 1, &[1, 2], vec![0, 1], vec![]),
+            ],
+        );
+        assert_eq!(
+            w.upsert_safe(safe_on(0x55, 1, &[1, 2], vec![1], vec![])),
+            SafeUpsert::Unchanged(1)
+        );
+        assert_eq!(
+            w.upsert_safe(safe_on(0x66, 1, &[], vec![], vec![])),
+            SafeUpsert::Unchanged(0),
+            "watch-only again is unchanged too"
+        );
+        assert_eq!(w.safes[1].linked_signer_indices, vec![0, 1]);
+    }
+
+    #[test]
+    fn upsert_safe_takes_onchain_fields_only_from_a_fresher_read() {
+        let mut saved = safe_on(0x55, 1, &[1], vec![], vec![]);
+        saved.cached_at = 100;
+        let mut w = wallet(vec![watch(1)], vec![saved]);
+
+        let mut stale = safe_on(0x55, 1, &[9], vec![], vec![]);
+        stale.cached_at = 50;
+        stale.threshold = 5;
+        w.upsert_safe(stale);
+        assert_eq!(
+            w.safes[0].owners,
+            vec![[1; 20]],
+            "an older read never rolls back"
+        );
+        assert_eq!(w.safes[0].cached_at, 100);
+
+        let mut fresh = safe_on(0x55, 1, &[1, 2], vec![], vec![]);
+        fresh.cached_at = 200;
+        fresh.threshold = 2;
+        fresh.trust = SafeTrust::UnrecognizedImpl;
+        w.upsert_safe(fresh);
+        assert_eq!(w.safes[0].owners, vec![[1; 20], [2; 20]]);
+        assert_eq!(w.safes[0].threshold, 2);
+        assert_eq!(w.safes[0].trust, SafeTrust::UnrecognizedImpl);
+        assert_eq!(w.safes[0].cached_at, 200);
+    }
+
+    #[test]
+    fn refresh_onchain_from_keeps_everything_the_user_configured() {
+        let mut live = safe_on(0x55, 1, &[1], vec![0], vec![8453]);
+        live.set_name(Some("Renamed meanwhile".into()));
+        live.tx_service_url = Some("https://txs.example.org".into());
+        live.cached_at = 10;
+        // A refresh built from an older snapshot: old name, no links, no URL.
+        let mut fresh = safe_on(0x55, 1, &[1, 2], vec![], vec![]);
+        fresh.cached_at = 20;
+        fresh.version = "1.4.1+L2".into();
+        fresh.modules = vec![[0xee; 20]];
+        fresh.guard = Some([0xd0; 20]);
+        fresh.fallback_handler = Some([0xfb; 20]);
+
+        assert!(live.refresh_onchain_from(&fresh));
+        assert_eq!(live.owners, fresh.owners);
+        assert_eq!(live.version, "1.4.1+L2");
+        assert_eq!(live.modules, vec![[0xee; 20]]);
+        assert_eq!(live.guard, Some([0xd0; 20]));
+        assert_eq!(live.fallback_handler, Some([0xfb; 20]));
+        assert_eq!(live.cached_at, 20);
+        assert_eq!(live.name(), Some("Renamed meanwhile"));
+        assert_eq!(live.linked_signer_indices, vec![0]);
+        assert_eq!(live.sibling_chains, vec![8453]);
+        assert_eq!(
+            live.tx_service_url.as_deref(),
+            Some("https://txs.example.org")
+        );
+    }
+
+    // ── repair_sibling_signer_links ─────────────────────────────────────
+
+    #[test]
+    fn repair_links_a_watch_only_sibling_from_its_linked_peer() {
+        let mut w = wallet(
+            vec![ledger(0xa)],
+            vec![
+                safe_on(0x55, 1, &[0xa], vec![0], vec![8453]),
+                safe_on(0x55, 8453, &[0xa], vec![], vec![1]),
+            ],
+        );
+        assert_eq!(w.repair_sibling_signer_links(), vec![1]);
+        assert_eq!(w.safes[1].linked_signer_indices, vec![0]);
+        assert_eq!(w.safes[0].linked_signer_indices, vec![0], "donor untouched");
+    }
+
+    #[test]
+    fn repair_only_copies_accounts_that_own_the_target_chain() {
+        // Accounts 0 (a) and 1 (b) are linked on Mainnet; Base is owned by
+        // b and c only — a must not be linked where it isn't an owner.
+        let mut w = wallet(
+            vec![ledger(0xa), ledger(0xb)],
+            vec![
+                safe_on(0x55, 1, &[0xa, 0xb], vec![0, 1], vec![8453]),
+                safe_on(0x55, 8453, &[0xb, 0xc], vec![], vec![1]),
+            ],
+        );
+        assert_eq!(w.repair_sibling_signer_links(), vec![1]);
+        assert_eq!(w.safes[1].linked_signer_indices, vec![1]);
+    }
+
+    #[test]
+    fn repair_skips_when_no_linked_account_owns_the_target() {
+        let mut w = wallet(
+            vec![ledger(0xa)],
+            vec![
+                safe_on(0x55, 1, &[0xa], vec![0], vec![8453]),
+                safe_on(0x55, 8453, &[0xb], vec![], vec![1]),
+            ],
+        );
+        assert!(w.repair_sibling_signer_links().is_empty());
+        assert!(w.safes[1].linked_signer_indices.is_empty());
+    }
+
+    #[test]
+    fn repair_requires_both_entries_to_list_each_other() {
+        // Donor doesn't list the target's chain.
+        let mut one_way = wallet(
+            vec![ledger(0xa)],
+            vec![
+                safe_on(0x55, 1, &[0xa], vec![0], vec![]),
+                safe_on(0x55, 8453, &[0xa], vec![], vec![1]),
+            ],
+        );
+        assert!(one_way.repair_sibling_signer_links().is_empty());
+        // Target doesn't list the donor's chain — the "onboarded Base
+        // first, watch-only, Mainnet unticked" shape stays deliberate.
+        let mut other_way = wallet(
+            vec![ledger(0xa)],
+            vec![
+                safe_on(0x55, 1, &[0xa], vec![0], vec![8453]),
+                safe_on(0x55, 8453, &[0xa], vec![], vec![]),
+            ],
+        );
+        assert!(other_way.repair_sibling_signer_links().is_empty());
+        assert!(other_way.safes[1].linked_signer_indices.is_empty());
+    }
+
+    #[test]
+    fn repair_ignores_other_addresses_and_same_chain_entries() {
+        let mut w = wallet(
+            vec![ledger(0xa)],
+            vec![
+                // Linked Safe at a different address listing chain 8453.
+                safe_on(0x66, 1, &[0xa], vec![0], vec![8453]),
+                safe_on(0x55, 8453, &[0xa], vec![], vec![1]),
+            ],
+        );
+        assert!(w.repair_sibling_signer_links().is_empty());
+    }
+
+    #[test]
+    fn repair_noop_when_everything_is_watch_only() {
+        let mut w = wallet(
+            vec![ledger(0xa)],
+            vec![
+                safe_on(0x55, 1, &[0xa], vec![], vec![8453]),
+                safe_on(0x55, 8453, &[0xa], vec![], vec![1]),
+            ],
+        );
+        assert!(w.repair_sibling_signer_links().is_empty());
+        assert!(w.safes.iter().all(|s| s.linked_signer_indices.is_empty()));
+    }
+
+    #[test]
+    fn repair_never_touches_an_already_linked_safe() {
+        let mut w = wallet(
+            vec![ledger(0xa), ledger(0xb), ledger(0xc)],
+            vec![
+                safe_on(0x55, 1, &[0xa, 0xc], vec![0], vec![8453]),
+                safe_on(0x55, 8453, &[0xa, 0xc], vec![2], vec![1]),
+            ],
+        );
+        assert!(w.repair_sibling_signer_links().is_empty());
+        assert_eq!(w.safes[1].linked_signer_indices, vec![2]);
+    }
+
+    #[test]
+    fn repair_drops_dangling_donor_indices_and_unions_donors() {
+        let mut w = wallet(
+            vec![ledger(0xa), ledger(0xb)],
+            vec![
+                safe_on(0x55, 1, &[0xa], vec![0, 9], vec![8453, 10]),
+                safe_on(0x55, 10, &[0xb], vec![1], vec![1, 8453]),
+                safe_on(0x55, 8453, &[0xa, 0xb], vec![], vec![1, 10]),
+            ],
+        );
+        assert_eq!(w.repair_sibling_signer_links(), vec![2]);
+        assert_eq!(
+            w.safes[2].linked_signer_indices,
+            vec![0, 1],
+            "both donors contribute their owning accounts; index 9 dangles"
+        );
+    }
+
+    #[test]
+    fn repair_is_idempotent() {
+        let mut w = wallet(
+            vec![ledger(0xa)],
+            vec![
+                safe_on(0x55, 1, &[0xa], vec![0], vec![8453, 10]),
+                safe_on(0x55, 8453, &[0xa], vec![], vec![1, 10]),
+                safe_on(0x55, 10, &[0xa], vec![], vec![1, 8453]),
+            ],
+        );
+        assert_eq!(w.repair_sibling_signer_links(), vec![1, 2]);
+        let after = w.safes.clone();
+        assert!(w.repair_sibling_signer_links().is_empty());
+        assert_eq!(w.safes, after);
+    }
+
+    #[test]
+    fn repair_never_copies_a_view_only_link() {
+        // The old onboarding linked view-only owners too. Account 0 is one,
+        // account 1 can sign; both own Base and are linked on Mainnet.
+        let mut w = wallet(
+            vec![watch(0xa), ledger(0xb)],
+            vec![
+                safe_on(0x55, 1, &[0xa, 0xb], vec![0, 1], vec![8453]),
+                safe_on(0x55, 8453, &[0xa, 0xb], vec![], vec![1]),
+            ],
+        );
+        assert_eq!(w.repair_sibling_signer_links(), vec![1]);
+        assert_eq!(w.safes[1].linked_signer_indices, vec![1], "only the key");
+
+        // A donor linked to nothing but a view-only account has nothing to
+        // give: Base stays watch-only rather than "signer" with no key.
+        let mut w = wallet(
+            vec![watch(0xa)],
+            vec![
+                safe_on(0x55, 1, &[0xa], vec![0], vec![8453]),
+                safe_on(0x55, 8453, &[0xa], vec![], vec![1]),
+            ],
+        );
+        assert!(w.repair_sibling_signer_links().is_empty());
+        assert!(w.safes[1].linked_signer_indices.is_empty());
+    }
+
+    #[test]
+    fn repair_once_runs_only_on_a_wallet_not_yet_repaired() {
+        let legacy_pair = || {
+            vec![
+                safe_on(0x55, 1, &[0xa], vec![0], vec![8453]),
+                safe_on(0x55, 8453, &[0xa], vec![], vec![1]),
+            ]
+        };
+        // A wallet saved before the marker: repaired, and marked.
+        let mut legacy = wallet(vec![ledger(0xa)], legacy_pair());
+        legacy.sibling_links_repaired = false;
+        assert_eq!(legacy.repair_sibling_signer_links_once(), Some(vec![1]));
+        assert!(legacy.sibling_links_repaired);
+        assert_eq!(legacy.safes[1].linked_signer_indices, vec![0]);
+        assert_eq!(legacy.repair_sibling_signer_links_once(), None);
+
+        // Nothing to repair still flips the marker — it must be persisted.
+        let mut clean = wallet(vec![ledger(0xa)], Vec::new());
+        clean.sibling_links_repaired = false;
+        assert_eq!(clean.repair_sibling_signer_links_once(), Some(Vec::new()));
+        assert!(clean.sibling_links_repaired);
+
+        // Already marked: the same shape is the user's choice, left alone.
+        let mut current = wallet(vec![ledger(0xa)], legacy_pair());
+        assert_eq!(current.repair_sibling_signer_links_once(), None);
+        assert!(current.safes[1].linked_signer_indices.is_empty());
+        assert!(WalletDescriptor::single(ledger(0xa)).sibling_links_repaired);
+    }
+
+    #[test]
+    fn upsert_safe_gives_a_new_chain_the_saved_name_and_service_url() {
+        let mut mainnet = safe_on(0x55, 1, &[1], vec![0], vec![]);
+        mainnet.set_name(Some("Treasury".into()));
+        mainnet.tx_service_url = Some("https://txs.example.org".into());
+        let mut w = wallet(
+            vec![ledger(1)],
+            vec![safe_on(0x66, 8453, &[], vec![], vec![]), mainnet],
+        );
+
+        // Blank Review name, no Advanced URL: the saved ones carry over.
+        assert_eq!(
+            w.upsert_safe(safe_on(0x55, 8453, &[1], vec![0], vec![1])),
+            SafeUpsert::Added
+        );
+        assert_eq!(w.safes[2].name(), Some("Treasury"));
+        assert_eq!(
+            w.safes[2].tx_service_url.as_deref(),
+            Some("https://txs.example.org")
+        );
+
+        // Explicit values win here (the App then renames every chain).
+        let mut typed = safe_on(0x55, 10, &[1], vec![0], vec![1]);
+        typed.set_name(Some("Vault".into()));
+        typed.tx_service_url = Some("https://mirror.example.org".into());
+        assert_eq!(w.upsert_safe(typed), SafeUpsert::Added);
+        assert_eq!(w.safes[3].name(), Some("Vault"));
+        assert_eq!(
+            w.safes[3].tx_service_url.as_deref(),
+            Some("https://mirror.example.org")
+        );
+
+        // A different address adopts nothing.
+        assert_eq!(
+            w.upsert_safe(safe_on(0x77, 1, &[], vec![], vec![])),
+            SafeUpsert::Added
+        );
+        assert_eq!(w.safes[4].name(), None);
+        assert_eq!(w.safes[4].tx_service_url, None);
     }
 }

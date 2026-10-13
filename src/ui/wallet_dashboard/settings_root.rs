@@ -1,6 +1,6 @@
 //! Settings root pane — the list of category cards under the Settings nav.
-//! Only "Networks" is wired up today; the others are placeholders for future
-//! sub-screens.
+//! Rows without a sub-screen yet ("Security", "Notifications", "About Kao")
+//! render as inert placeholders.
 
 use iced::border::Radius;
 use iced::widget::{Space, button, column, container, row, text};
@@ -14,7 +14,8 @@ use super::Message;
 const SETTINGS_ROWS: &[(&str, &str, &str)] = &[
     ("Security", "(⌐■_■)", "Seed phrase · lock screen"),
     ("Networks", "( ・∀・)ﾉ", "RPC · API · proxy · privacy"),
-    ("Safes", "(◐‿◐)", "Multisigs · transaction service"),
+    ("Accounts", "(◕‿◕)", "Rename · remove"),
+    ("Safes", "(◐‿◐)", "Rename · remove · transaction service"),
     ("Contacts", "(✿◠‿◠)", "Named addresses · saved recipients"),
     ("Notifications", "ヾ(＾∇＾)", "Price alerts · tx updates"),
     ("Appearance", "(｡◕‿◕｡)", "Theme · palette"),
@@ -26,6 +27,7 @@ pub fn view<'a>(t: KaoTheme) -> Element<'a, Message> {
     for (label, kao, sub) in SETTINGS_ROWS {
         let on_click = match *label {
             "Networks" => Some(Message::OpenNetworksSettings),
+            "Accounts" => Some(Message::OpenAccountsSettings),
             "Safes" => Some(Message::OpenSafesSettings),
             "Appearance" => Some(Message::OpenAppearanceSettings),
             "Contacts" => Some(Message::OpenContactsSettings),

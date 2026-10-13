@@ -16,11 +16,10 @@ use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 
 use alloy::primitives::Address;
-use iced::border::Radius;
 use iced::keyboard;
 use iced::widget::operation::{focus as focus_widget, focus_next, focus_previous};
-use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
-use iced::{Alignment, Background, Border, Element, Length, Padding, Subscription, Task};
+use iced::widget::{Space, column, container, row, scrollable, text, text_input};
+use iced::{Alignment, Element, Length, Padding, Subscription, Task};
 
 /// Stable ID for the NAME field so we can auto-focus it when the user
 /// opens Add / Edit. Tab navigation past the name then walks through
@@ -30,8 +29,9 @@ const NAME_INPUT_ID: &str = "contacts:name";
 
 use crate::ui::kao_theme::KaoTheme;
 use crate::ui::kao_widgets::{
-    black, bold, card_style, colored_address, ghost_button, hover_tint, kao_scrollable_style, mono,
-    primary_button, secondary_button, small_secondary_button, text_input_style,
+    black, bold, card_style, colored_address, ghost_button, kao_scrollable_style, mono,
+    primary_button, secondary_button, small_danger_button, small_secondary_button,
+    text_input_style,
 };
 use crate::wallet::{Contact, ContactEns, ContactsBook, short_address};
 
@@ -1155,31 +1155,6 @@ where
     column![label, Space::new().height(6), row]
         .width(Length::Fill)
         .into()
-}
-
-/// Compact destructive-action button used for the "Confirm delete" step.
-/// Mirrors `small_secondary_button`'s shape but renders the label and
-/// border in the theme's `down` color so the user reads it as the
-/// dangerous half of the Cancel / Confirm pair. Local to this file —
-/// the contacts pane is the only place a destructive action surfaces
-/// today, and giving the helper a wider home would be designing for a
-/// hypothetical future caller.
-fn small_danger_button<'a>(t: KaoTheme, label: &'a str) -> button::Button<'a, Message> {
-    button(text(label.to_string()).size(11).color(t.down).font(bold()))
-        .padding(Padding::from([4, 10]))
-        .style(move |_theme, status| button::Style {
-            background: Some(Background::Color(match status {
-                button::Status::Hovered | button::Status::Pressed => hover_tint(t.card_alt, t.down),
-                _ => t.card_alt,
-            })),
-            text_color: t.down,
-            border: Border {
-                color: t.down,
-                width: 1.0,
-                radius: Radius::from(8),
-            },
-            ..button::Style::default()
-        })
 }
 
 /// Pick a kaomoji from the pool. Avoids returning the current value so

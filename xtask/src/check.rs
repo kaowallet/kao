@@ -19,6 +19,11 @@ pub fn check(workspace_root: &Path) -> Result<()> {
             ],
         ),
         ("test", &["test", "--workspace", "--locked"]),
+        // cargo-deny takes yanked status from cargo's local index cache and
+        // only fetches entries missing from it, so a stale cache hides yanks
+        // that CI (cold cache) reports. A dry-run update re-resolves against
+        // the live index, refreshing the cache without touching Cargo.lock.
+        ("refresh-index", &["update", "--dry-run", "--quiet"]),
         (
             "cargo-deny",
             &["deny", "check", "advisories", "bans", "licenses", "sources"],

@@ -251,10 +251,10 @@ pub struct ContactsPane {
     /// the parse hint shown under the input and the address that
     /// actually gets saved.
     resolution: AddressResolution,
-    /// Bumped on every address-input change. ENS lookups tag their
-    /// result with the seq they were spawned at; stale results
-    /// (slow resolver finishing after the user keeps typing) are
-    /// dropped.
+    /// Fresh from [`super::next_task_seq`] on every address-input change.
+    /// ENS lookups tag their result with the seq they were spawned at;
+    /// stale results (slow resolver finishing after the user keeps typing,
+    /// or a lookup from an earlier pane) are dropped.
     resolution_seq: u64,
     /// Highest seq for which the dashboard has already spawned a task.
     /// Lets `take_pending_ens` return `Some` exactly once per fresh
@@ -383,7 +383,7 @@ impl ContactsPane {
                     ..Draft::default()
                 };
                 self.resolution = AddressResolution::Empty;
-                self.resolution_seq = self.resolution_seq.wrapping_add(1);
+                self.resolution_seq = super::next_task_seq();
                 self.validation.clear();
                 self.pending_delete = None;
                 (focus_widget(NAME_INPUT_ID), None)
@@ -563,7 +563,7 @@ impl ContactsPane {
 
     fn set_address(&mut self, raw: String) {
         self.draft.address_input = raw;
-        self.resolution_seq = self.resolution_seq.wrapping_add(1);
+        self.resolution_seq = super::next_task_seq();
         self.validation.clear();
         let trimmed = self.draft.address_input.trim();
         self.resolution = if trimmed.is_empty() {
@@ -583,7 +583,7 @@ impl ContactsPane {
         self.mode = Mode::List;
         self.draft = Draft::default();
         self.resolution = AddressResolution::Empty;
-        self.resolution_seq = self.resolution_seq.wrapping_add(1);
+        self.resolution_seq = super::next_task_seq();
         self.validation.clear();
         self.pending_delete = None;
     }

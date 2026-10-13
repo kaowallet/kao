@@ -347,7 +347,8 @@ pub struct PoolApp {
     withdraw_target: String,
     /// Resolution state of `withdraw_target` (address / name / picked contact).
     withdraw_resolution: TargetResolution,
-    /// Bumped on every target change so a stale resolution result is dropped.
+    /// Fresh from [`super::next_task_seq`] on every target change so a stale
+    /// resolution result (this pane's, or a rebuilt-away one's) is dropped.
     withdraw_resolution_seq: u64,
     /// The last seq the coordinator was handed for resolution — stops a repaint
     /// from re-dispatching the same lookup (mirrors Send's `last_dispatched_seq`).
@@ -654,7 +655,7 @@ impl PoolApp {
     /// Set the withdrawal target from raw input, updating the resolution state.
     fn set_target(&mut self, raw: String) {
         self.withdraw_target = raw;
-        self.withdraw_resolution_seq = self.withdraw_resolution_seq.wrapping_add(1);
+        self.withdraw_resolution_seq = super::next_task_seq();
         self.quote = None;
         let trimmed = self.withdraw_target.trim();
         self.withdraw_resolution = if trimmed.is_empty() {
@@ -889,7 +890,7 @@ impl PoolApp {
                 None
             }
             Message::PickTarget { address, ens } => {
-                self.withdraw_resolution_seq = self.withdraw_resolution_seq.wrapping_add(1);
+                self.withdraw_resolution_seq = super::next_task_seq();
                 self.withdraw_target = address.to_checksum(None);
                 self.withdraw_resolution = match ens {
                     // A pinned contact name is re-verified before it's trusted.

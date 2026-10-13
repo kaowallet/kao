@@ -76,6 +76,21 @@ const ACCOUNT_ORDERS_LIMIT: u16 = 100;
 /// progress bar fills this whole duration.
 const CLIPBOARD_CLEAR_SECS: u64 = 10;
 
+/// Next tag for an async reply's staleness guard — `SignReviewPrepared`'s
+/// `seq`, the clipboard auto-clear generation, and every app pane's `*_seq`.
+///
+/// Process-wide rather than per-screen: the dashboard is rebuilt on every
+/// account switch (and on return from add-account), but a task the old screen
+/// spawned still lands on the new one. Per-screen counters restarted at 0, so
+/// the old screen's reply for seq 1 matched the new screen's own seq 1 and was
+/// applied to an unrelated request (the previous account's Send quote appended
+/// to the review now open). Never returns 0, so a guard still at its initial 0
+/// matches nothing.
+fn next_task_seq() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 use modal_chrome::ModalChrome;
 pub use nav::Nav;
 
@@ -948,10 +963,6 @@ pub struct WalletScreen {
     /// from a child modal (Send, TxDetails). Drives the bottom-right
     /// countdown chip and the deferred ownership-checked clear.
     clipboard_clear: Option<ClipboardClearState>,
-    /// Monotonic counter bumped on every fresh copy so a stale
-    /// `ClipboardClearArmed` / `ClipboardClearProbe` from an older arm
-    /// can't clobber the chip or the clipboard.
-    clipboard_clear_gen: u64,
     /// CoW swap orders placed this session (both surfaces share this list).
     /// In-memory for v1; the poll subscription refreshes non-terminal entries.
     /// Filtered to the active address when rendered in the Apps pane.
@@ -980,9 +991,6 @@ pub struct WalletScreen {
     /// routes through this overlay so the user reviews the decoded transaction
     /// before the key is touched. `None` means no review is pending.
     sign_review: Option<sign_review::SignReview>,
-    /// Monotonic id for sign-review prepare tasks, so a decode result for a
-    /// review the user has since cancelled/replaced is dropped on arrival.
-    sign_review_seq: u64,
     /// The Privacy Pools account (dedicated pool mnemonic → master keys),
     /// derived by the App from the encrypted `pp` seed and pushed down here so
     /// the pool app can sync/prove. `None` until an identity exists + is loaded.
@@ -1028,8 +1036,9 @@ struct ClipboardClearState {
     /// chip subtracts `Instant::now()` from this each frame to draw the
     /// countdown text and the progress bar.
     deadline: Instant,
-    /// Generation tag matched by the ack messages. Bumped on every
-    /// fresh copy so a stale arm can't fire after a newer one.
+    /// Generation tag matched by the ack messages. Fresh from
+    /// [`next_task_seq`] on every copy, so a stale arm — this screen's or a
+    /// rebuilt-away one's — can't fire against a newer copy.
     generation: u64,
 }
 
@@ -1106,12 +1115,10 @@ impl WalletScreen {
             history_pending: Vec::new(),
             contacts,
             clipboard_clear: None,
-            clipboard_clear_gen: 0,
             tracked_orders: Vec::new(),
             order_op_in_flight: false,
             apps: AppsPane::new(address),
             sign_review: None,
-            sign_review_seq: 0,
             pp_account: None,
             pool_session_deposits: std::collections::HashMap::new(),
             pending_pool_deposit: None,
@@ -1459,7 +1466,7 @@ impl WalletScreen {
     }
 
     /// Write `text` to the system clipboard and arm the deferred clear.
-    /// Bumps the generation counter so any older arm fires stale and
+    /// Takes a fresh generation so any older arm fires stale and
     /// no-ops. The returned task batches the write itself with a
     /// `tokio::time::sleep` that emits `ClipboardClearArmed` once the
     /// deadline passes — the ownership check happens at that point, not
@@ -1471,8 +1478,7 @@ impl WalletScreen {
         // that routes through here. NOT in the `ClipboardWritten` handler —
         // that also fires for the 10s auto-clear write, which must stay silent.
         mark_copied();
-        self.clipboard_clear_gen = self.clipboard_clear_gen.wrapping_add(1);
-        let generation = self.clipboard_clear_gen;
+        let generation = next_task_seq();
         self.clipboard_clear = Some(ClipboardClearState {
             expected: text.clone(),
             deadline: Instant::now() + Duration::from_secs(CLIPBOARD_CLEAR_SECS),
@@ -1498,7 +1504,8 @@ impl WalletScreen {
     /// stale timer can't wipe this value.
     fn copy_without_clear(&mut self, text: String) -> Task<Message> {
         mark_copied();
-        self.clipboard_clear_gen = self.clipboard_clear_gen.wrapping_add(1);
+        // Both clear handlers require a live state with a matching generation,
+        // so dropping the state retires any arm already in flight.
         self.clipboard_clear = None;
         iced::clipboard::write(text).map(|_: ()| Message::ClipboardWritten)
     }
@@ -2034,8 +2041,7 @@ impl WalletScreen {
                 return Task::none();
             }
         };
-        self.sign_review_seq += 1;
-        let seq = self.sign_review_seq;
+        let seq = next_task_seq();
         let (title, subtitle, note) = pool_review_labels(&sign);
         let action = sign_review::SignAction::PrivacyPool { sign: sign.clone() };
         self.sign_review = Some(sign_review::SignReview::pending(
@@ -2151,8 +2157,7 @@ impl WalletScreen {
         // `tk`'s borrow of `self.portfolio` ends here (last use above), so the
         // mutable overlay assignment below is free of it.
 
-        self.sign_review_seq += 1;
-        let seq = self.sign_review_seq;
+        let seq = next_task_seq();
         let title = format!("Send {amount} {symbol}");
         let subtitle = Some(format!(
             "to {}",
@@ -2274,8 +2279,7 @@ impl WalletScreen {
             signing_addresses,
         };
 
-        self.sign_review_seq += 1;
-        let seq = self.sign_review_seq;
+        let seq = next_task_seq();
         let title = format!("Send {amount_str} {symbol}");
         let subtitle = Some(format!(
             "from Safe {} to {}",
@@ -2637,8 +2641,7 @@ impl WalletScreen {
                 return Task::none();
             }
         };
-        self.sign_review_seq += 1;
-        let seq = self.sign_review_seq;
+        let seq = next_task_seq();
         // What this batch leaves standing in allowance terms. A verdict, not a
         // count: the count could not distinguish a revoke that closes one of
         // *this batch's* grants from an unrelated one, so it printed the
@@ -2728,8 +2731,7 @@ impl WalletScreen {
             },
             prepared: None,
         });
-        self.sign_review_seq += 1;
-        let seq = self.sign_review_seq;
+        let seq = next_task_seq();
         let allowances = crate::txbuilder::flash_approval::allowance_verdict(&[]);
         let (title, subtitle, note, can_execute) = txbuilder_review_copy(&req, &allowances);
         let action = sign_review::SignAction::TxBuilder {
@@ -3561,8 +3563,7 @@ impl WalletScreen {
                 return Task::none();
             }
         }
-        self.sign_review_seq += 1;
-        let seq = self.sign_review_seq;
+        let seq = next_task_seq();
         let (title, subtitle, note) = name_review_labels(&sign);
         let action = sign_review::SignAction::Name { sign: sign.clone() };
         self.sign_review = Some(sign_review::SignReview::pending(
@@ -3590,8 +3591,7 @@ impl WalletScreen {
         if self.sign_review.is_some() {
             return Task::none();
         }
-        self.sign_review_seq += 1;
-        let seq = self.sign_review_seq;
+        let seq = next_task_seq();
         let user = match self.build_signer_context(SafeNeed::Swap) {
             Ok(ctx) => ctx.display_from(),
             Err(msg) => {
@@ -3702,8 +3702,7 @@ impl WalletScreen {
         };
         let (sell_s, _) = crate::portfolio::format_token_balance(o.sell_amount, o.sell_decimals);
         let sell_s = trim_trailing_decimal_zeros(&sell_s);
-        self.sign_review_seq += 1;
-        let seq = self.sign_review_seq;
+        let seq = next_task_seq();
         let title = format!(
             "Cancel order — {} {} → {}",
             sell_s, o.sell_symbol, o.buy_symbol
@@ -5758,11 +5757,18 @@ impl WalletScreen {
             },
             Message::SignReviewPrepared { seq, steps } => {
                 // Drop a decode result for a review the user has since cancelled
-                // or replaced (the seq guard mirrors the Send decode pipeline).
+                // or replaced (the seq guard mirrors the Send decode pipeline) —
+                // or one a rebuilt-away dashboard opened, whose tasks still land
+                // here; `next_task_seq` keeps its seqs disjoint from ours.
                 let Some(review) = self.sign_review.as_mut() else {
                     return (Task::none(), None);
                 };
                 if review.seq != seq {
+                    debug!(
+                        seq,
+                        open = review.seq,
+                        "sign review: dropping a stale prepare"
+                    );
                     return (Task::none(), None);
                 }
                 match steps {
@@ -18089,7 +18095,6 @@ mod tests {
         preflight: tx_builder::Preflight,
     ) -> WalletScreen {
         let mut s = screen_for(addr(0xAA), new_cache());
-        s.sign_review_seq = 1;
         s.sign_review = Some(sign_review::SignReview::pending(
             "Batch".into(),
             None,
@@ -18274,7 +18279,6 @@ mod tests {
         // thing that can carry it, and a hand-rolled `mem::replace` didn't.
         let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
         let mut s = screen_for(addr(0xAA), new_cache());
-        s.sign_review_seq = 1;
         s.sign_review = Some(sign_review::SignReview::pending(
             "Batch".into(),
             None,
@@ -18590,7 +18594,6 @@ mod tests {
             queued(2, addr(0xC2), 0, vec![0x02]),
         ];
         let mut s = screen_for(addr(0xAA), new_cache());
-        s.sign_review_seq = 1;
         s.sign_review = Some(sign_review::SignReview::pending(
             "Batch".into(),
             None,
@@ -18720,6 +18723,68 @@ mod tests {
         assert!(review.error.as_deref().unwrap().contains("not deployed"));
         assert!(review.confirm_disabled, "a failed prepare can't be signed");
         assert!(!review.legs_loading);
+    }
+
+    // ── staleness tags survive a dashboard rebuild ───────────────────
+
+    #[test]
+    fn a_prepare_from_a_rebuilt_away_dashboard_cannot_land_on_the_new_review() {
+        // An account switch rebuilds the dashboard, but a prepare the old
+        // screen spawned still routes to the new one. Each screen used to
+        // number its reviews from 0, so both screens' first review was seq 1
+        // and the old prepare's steps were appended to the unrelated review
+        // now open.
+        let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
+        let mut old = screen_with_key();
+        let _ = old.open_txbuilder_review(
+            calls.clone(),
+            tx_builder::QueueMap::default(),
+            PASSED_CLEAN,
+            None,
+            Vec::new(),
+        );
+        let stale = old.sign_review.as_ref().expect("old overlay").seq;
+
+        let mut new = screen_with_key();
+        let _ = new.open_txbuilder_review(
+            calls,
+            tx_builder::QueueMap::default(),
+            PASSED_CLEAN,
+            None,
+            Vec::new(),
+        );
+        new.update(Message::SignReviewPrepared {
+            seq: stale,
+            steps: Ok(vec![safe_exec_step(11, B256::repeat_byte(0xAB))]),
+        });
+
+        let review = new.sign_review.as_ref().expect("overlay stays open");
+        assert!(
+            review.steps.is_empty(),
+            "the old screen's steps were appended"
+        );
+        assert!(review.legs_loading, "still waiting on its own prepare");
+    }
+
+    #[test]
+    fn a_clipboard_clear_from_a_rebuilt_away_dashboard_spares_the_new_copy() {
+        // Same shape for the auto-clear: the old screen's timer matched the new
+        // screen's first copy and wiped it early, under a chip still counting.
+        let mut old = screen_for(addr(0xAA), new_cache());
+        let _ = old.arm_clipboard_clear("0xold".into());
+        let stale = old.clipboard_clear.as_ref().expect("armed").generation;
+
+        let mut new = screen_for(addr(0xBB), new_cache());
+        let _ = new.arm_clipboard_clear("0xnew".into());
+        new.update(Message::ClipboardClearProbe {
+            generation: stale,
+            actual: Some("0xnew".into()),
+        });
+
+        assert!(
+            new.clipboard_clear.is_some(),
+            "the new copy's clear is still pending",
+        );
     }
 
     #[test]

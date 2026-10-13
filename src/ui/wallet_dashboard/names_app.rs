@@ -230,9 +230,10 @@ pub struct NamesApp {
     // Search
     query: String,
     searching: bool,
-    /// Monotonic search id, bumped on every edit and per [`NamesApp::run_search`],
-    /// round-tripped through the reply so a slow result for a query the user has
-    /// since changed is dropped instead of painting over the current one.
+    /// Search id, taken fresh from [`super::next_task_seq`] on every edit and per
+    /// [`NamesApp::run_search`], round-tripped through the reply so a slow result
+    /// for a query the user has since changed (or one sent by a pane an account
+    /// switch rebuilt away) is dropped instead of painting over the current one.
     search_seq: u64,
     /// An auto-search is scheduled: the box has text the user hasn't submitted yet.
     /// Drives the debounce subscription and the in-progress display.
@@ -449,7 +450,7 @@ impl NamesApp {
                 // the seq guard in `on_search`.
                 self.results.clear();
                 self.searching = false;
-                self.search_seq += 1;
+                self.search_seq = super::next_task_seq();
                 self.idle_ticks = 0;
                 // Non-empty box ⇒ schedule an auto-search; empty ⇒ leave search mode.
                 self.pending_search = !self.query.trim().is_empty();
@@ -639,7 +640,7 @@ impl NamesApp {
         self.results.clear();
         self.searching = true;
         self.notice = None;
-        self.search_seq += 1;
+        self.search_seq = super::next_task_seq();
         let seq = self.search_seq;
         match parsed {
             Query::Bare(label) => Some(Outcome::Search {

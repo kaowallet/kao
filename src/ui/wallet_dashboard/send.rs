@@ -311,6 +311,9 @@ pub struct SendPane {
     step: u8,
     to: String,
     resolution: Resolution,
+    /// Tag the recipient lookup's reply must echo. Fresh from
+    /// [`super::next_task_seq`] per input change, so a lookup from an earlier
+    /// Send modal (or a rebuilt-away dashboard) can't match this one's.
     resolution_seq: u64,
     last_dispatched_seq: Option<u64>,
     amount: String,
@@ -467,7 +470,7 @@ impl SendPane {
 
     fn set_to(&mut self, raw: String) {
         self.to = raw;
-        self.resolution_seq = self.resolution_seq.wrapping_add(1);
+        self.resolution_seq = super::next_task_seq();
         let trimmed = self.to.trim();
         self.resolution = if trimmed.is_empty() {
             Resolution::Empty
@@ -668,7 +671,7 @@ impl SendPane {
                 (Task::none(), None)
             }
             Message::PickRecipient { address, ens } => {
-                self.resolution_seq = self.resolution_seq.wrapping_add(1);
+                self.resolution_seq = super::next_task_seq();
                 self.to = address.to_checksum(None);
                 self.resolution = match ens {
                     Some(name) => Resolution::AddressVerifying {

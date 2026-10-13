@@ -45,11 +45,12 @@ For too long we've been relying on slow and vulnerable JavaScript for building u
 From the [latest release](https://github.com/kaowallet/kao/releases/latest), grab
 the installer for your platform plus `SHA256SUMS` and `SHA256SUMS.sigstore.json`:
 
-| Platform                | File                                                           |
-| ----------------------- | -------------------------------------------------------------- |
-| macOS (Apple Silicon)   | `kao-vX.Y.Z-aarch64-apple-darwin.dmg`                          |
-| Windows (x64)           | `kao-vX.Y.Z-x86_64-pc-windows-msvc-setup.exe`                  |
-| Linux (x86_64, aarch64) | `kao-vX.Y.Z-<arch>-unknown-linux-gnu.AppImage`, `.deb` or `.flatpak` |
+| Platform                     | File                                                                 |
+| ---------------------------- | -------------------------------------------------------------------- |
+| macOS (Apple Silicon)        | `kao-vX.Y.Z-aarch64-apple-darwin.dmg`                                |
+| Windows (x64)                | `kao-vX.Y.Z-x86_64-pc-windows-msvc-setup.exe`                        |
+| Linux (x86_64, aarch64)      | `kao-vX.Y.Z-<arch>-unknown-linux-gnu.AppImage`, `.deb` or `.flatpak` |
+| Arch Linux (x86_64, aarch64) | `kao-vX.Y.Z-<arch>-unknown-linux-gnu.tar.gz` and `.PKGBUILD`         |
 
 There's no Intel Mac build; use `cargo install` (option 2) there.
 
@@ -89,7 +90,9 @@ Every installer also has its own `.sigstore.json`, so you can verify it directly
 the same way: `cosign verify-blob <file> --bundle <file>.sigstore.json …`.
 
 Then install as usual: open the `.dmg`, run the `-setup.exe`,
-`sudo apt install ./kao-….deb`, or `chmod +x` the AppImage and run it. On Linux,
+`sudo apt install ./kao-….deb`, or `chmod +x` the AppImage and run it. On Arch,
+put the `.tar.gz` and `.PKGBUILD` in one directory and run
+`makepkg -si -p kao-vX.Y.Z-<arch>-unknown-linux-gnu.PKGBUILD` there. On Linux,
 Ledger and Trezor need the host's usual udev rules.
 
 Windows builds aren't Authenticode-signed either, so SmartScreen may say

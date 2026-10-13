@@ -1,62 +1,95 @@
-//! Multi-step onboarding flow for adding a Safe to the wallet.
+//! Two-screen onboarding flow for adding a Safe to the wallet.
 //!
-//! The flow is six sub-steps held in a single `Step` enum so each step
-//! carries exactly the data it needs (invalid states are
-//! unrepresentable):
+//! The screen is one `Phase` enum so each phase carries exactly the data
+//! it needs:
 //!
-//! 1. `AddressInput` — paste a hex address or ENS name. ENS resolves
-//!    on mainnet via the same helper `ImportAddressScreen` uses.
-//! 2. `Scanning` — spawn `safe::scan_across_chains` and wait.
-//! 3. `ChainChooser` — skipped if exactly one chain hit; otherwise the
-//!    user picks among Canonical / UnrecognizedImpl results.
-//! 4. `Inspect` — show owners, threshold, modules, guard, fallback
-//!    handler (each with classification labels via `safe::classify_module`).
-//! 5. `RoleSelection` — intersect on-chain owners with the user's
-//!    existing accounts; offer to link any matches, proceed as
-//!    watch-only, OR enter the add-signer sub-flow to import a new
-//!    account that owns this Safe.
-//! 6. `PickSignerMethod` — only reachable from RoleSelection via "Add
-//!    a new signer". Offer seed phrase, private key, or hardware
-//!    wallet as the import method. Picking one emits
-//!    `Outcome::RequestAddSigner` so the parent app can run the import
-//!    flow with the allowed-owner constraint, then call back into the
-//!    screen via `apply_added_signer` / `apply_signer_import_error`.
-//! 7. `Label` — name the Safe, optionally add sibling chains where the
-//!    same address is also a Safe, confirm.
+//! 1. `Find` — paste a hex address or a name (`.eth` / `.gwei` / `.wei` /
+//!    `@xns`; names resolve on mainnet via the same helper
+//!    `ImportAddressScreen` uses), then `safe::scan_across_chains` runs
+//!    in place on the same card. A scan that finds no Safe on any chain
+//!    stays here and shows the per-chain reason.
+//! 2. `Review` — one wide card holding everything that used to be five
+//!    separate steps (chain chooser, inspect, role selection, signer
+//!    picker, label):
+//!    - a chain strip with one row per scanned chain — Safe hits can be
+//!      included / excluded and focused, misses say why;
+//!    - a Security column for the focused chain: trust, threshold,
+//!      owners, modules / guard / fallback handler (each with its
+//!      `safe::classify_module` label);
+//!    - a Setup column: name, which wallet accounts to link as signers,
+//!      the inline "Add a new signer" sub-flow, the Advanced transaction
+//!      service override, and a per-chain role summary above the
+//!      confirm button.
 //!
-//! On `Label` confirm the screen emits `Outcome::Done { descriptor,
-//! siblings }` so the parent can append to the wallet and persist.
+//! Signer links are worked out **per chain** on confirm: each included
+//! chain links exactly the ticked, signing-capable accounts that are an
+//! owner on THAT chain (owner sets can diverge across chains). A chain
+//! none of them own is saved watch-only — and the role summary says so
+//! before the user confirms.
+//!
+//! Re-adding a Safe the wallet already holds (`with_existing_safes`) folds
+//! each saved chain into its saved entry, which keeps its links, and the
+//! name applies to every chain of the address. So Review starts from the
+//! saved name (left as is, nothing is renamed), hints when the field would
+//! rename it, and the role summary counts a saved chain's kept links.
+//!
+//! "Add a new signer" emits `Outcome::RequestAddSigner`; the parent
+//! stashes this screen (still in `Review`) while it runs the import,
+//! then resumes it via `apply_added_signer` / `apply_added_nested_safe`
+//! / `apply_signer_import_error`.
+//!
+//! On confirm the screen emits `Outcome::Done { primary, siblings }` so
+//! the parent can add the descriptors to the wallet and persist.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::Address;
+use iced::border::Radius;
 use iced::keyboard;
-use iced::widget::{Space, column, container, row, scrollable, text, text_input};
-use iced::{Alignment, Element, Length, Padding, Subscription, Task};
+use iced::widget::operation::focus as focus_widget;
+use iced::widget::{
+    Scrollable, Space, column, container, responsive, row, scrollable, text, text_input,
+};
+use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Subscription, Task};
 
 use crate::chain::Chain;
 use crate::names;
 use crate::net::BalanceFetcher;
 use crate::safe::{self, SafeMetadata, ScanResult};
 use crate::settings;
-use crate::ui::kao_theme::KaoTheme;
+use crate::ui::kao_theme::{KaoTheme, with_alpha};
 use crate::ui::kao_widgets::{
-    auth_background, auth_card, colored_address, error_text, ghost_button, hint_pill, kao_checkbox,
-    kao_hero, link_button, method_card, mono, mono_bold, primary_button, screen_subtitle,
-    screen_title, text_input_style, vspace,
+    auth_background, auth_card, black, colored_address, error_text, ghost_button, hint_pill,
+    kao_checkbox, kao_hero, kao_scrollable_style, link_button, method_card, mono, mono_bold,
+    primary_button, screen_subtitle, screen_title, section_card, text_input_style, vspace,
 };
-use crate::wallet::{SafeDescriptor, SafeTrust};
+use crate::wallet::{SafeDescriptor, SafeKey, SafeTrust, short_address};
 
 pub const ADDRESS_INPUT_ID: &str = "safe_onboarding_address";
 pub const NAME_INPUT_ID: &str = "safe_onboarding_name";
+
+/// Review card cap. The card is `Fill` up to this so it shrinks with a
+/// narrow window instead of overflowing it (the default window is
+/// 1024 px wide).
+const REVIEW_CARD_MAX_W: f32 = 920.0;
+/// Review card height cap — the card fills the window height (so the two
+/// columns get a bounded height to scroll within) but doesn't turn into a
+/// wall on a tall monitor.
+const REVIEW_CARD_MAX_H: f32 = 860.0;
+/// Below this content width the Review card stacks Security above Setup
+/// in one scrollable. Each column must fit a full 42-char
+/// `colored_address` (~355 px at size 14) plus `section_card` padding and
+/// the scrollbar gutter (fits at ~820; the rest is margin); an address
+/// row that doesn't fit overlaps its own chunks rather than wrapping.
+const REVIEW_TWO_COLUMN_MIN_W: f32 = 840.0;
 
 // ── Messages ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    // AddressInput
+    // Find
     AddressInput(String),
     AddressSubmit,
     EnsResolved {
@@ -64,46 +97,33 @@ pub enum Message {
         name: String,
         result: Result<Option<Address>, String>,
     },
-
-    // Scanning
     ScanCompleted {
         seq: u64,
         address: Address,
         results: Vec<(Chain, ScanResult)>,
     },
 
-    // ChainChooser
-    ChainPicked(Chain),
+    // Review — chain strip
+    /// Include / exclude a chain the scan found the Safe on. The last
+    /// included chain can't be excluded.
+    ChainIncludeToggled(Chain),
+    /// Show this chain's details in the Security column.
+    ChainFocused(Chain),
 
-    // Inspect
-    InspectContinue,
-
-    // RoleSelection
-    SignerToggled(u32),
-    /// User chose to proceed as a non-signing observer. Implicitly
-    /// clears any signer checkboxes and advances to Label.
-    WatchOnlySelected,
-    /// User confirmed the signer selection from the matched-existing
-    /// list. Advances to Label with the currently-selected signers.
-    RoleConfirm,
-    /// User wants to import a new account that owns this Safe. Moves
-    /// to `PickSignerMethod`.
-    AddSignerPressed,
-
-    // PickSignerMethod
-    SignerMethodPicked(SignerMethod),
-
-    // Label
+    // Review — Setup column
     NameInput(String),
-    SiblingToggled(Chain),
+    SignerToggled(u32),
+    /// Expand / collapse the inline "Add a new signer" section.
+    AddSignerToggled,
+    SignerMethodPicked(SignerMethod),
     /// Expand/collapse the Advanced section (custom transaction
     /// service).
     AdvancedToggled,
     /// Custom Safe Transaction Service base URL input.
     ServiceUrlInput(String),
-    LabelConfirm,
+    Confirm,
 
-    // Cross-step
+    // Both phases
     BackPressed,
     KeyboardEvent(keyboard::Event),
 }
@@ -131,12 +151,13 @@ pub enum Outcome {
     /// `apply_added_signer` (success) or `apply_signer_import_error`
     /// (rejected) on this screen to resume. While the parent owns
     /// the sub-screen, this `SafeOnboardingScreen` instance is parked
-    /// at `PickSignerMethod` and must be kept alive (stashed).
+    /// in `Review` and must be kept alive (stashed).
     RequestAddSigner {
         method: SignerMethod,
-        /// Owners of the Safe whose key isn't already represented by
-        /// an account in the wallet. The parent enforces this set on
-        /// the imported address — anything outside is rejected.
+        /// Owners of the Safe — across every chain the user is adding —
+        /// whose key isn't already represented by an account in the
+        /// wallet. The parent enforces this set on the imported address;
+        /// anything outside is rejected.
         allowed_owners: Vec<Address>,
     },
 }
@@ -166,9 +187,9 @@ pub enum SignerMethod {
 
 // ── State ───────────────────────────────────────────────────────────────────
 
-/// A matched existing account — pre-computed by `new()` so we don't
-/// have to repeat the keccak-derived address calculation on every
-/// view. `account_idx` indexes into the wallet's `accounts` Vec.
+/// One wallet account, pre-computed by the parent so we don't have to
+/// repeat the keccak-derived address calculation on every view.
+/// `account_idx` indexes into the wallet's `accounts` Vec.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExistingAccount {
     pub account_idx: u32,
@@ -176,127 +197,396 @@ pub struct ExistingAccount {
     /// Display name as the dashboard would render it — passed in so we
     /// don't re-derive `display_name(idx)` here.
     pub label: String,
+    /// Watch-only account (no key). Listed when it owns the Safe so the
+    /// user isn't confused about where it went, but it can't sign, so
+    /// it is never linked.
+    pub view_only: bool,
+}
+
+/// One Safe entry already in the wallet, pre-computed by the parent like
+/// `ExistingAccount`. Review uses it to flag a chain that's already saved,
+/// to prefill the name the Safe already goes by, and to say what such a
+/// chain ends up as — confirming folds into the saved entry
+/// (`WalletDescriptor::upsert_safe`), which keeps its links.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExistingSafe {
+    /// `(address, chain_id)` — the entry's identity.
+    pub key: SafeKey,
+    /// User-assigned name (`SafeDescriptor::name`); `None` = unnamed.
+    pub name: Option<String>,
+    /// Saved signer links. Older wallets can hold indices that dangle or
+    /// point at a view-only account, so Review only counts the ones that
+    /// can actually sign.
+    pub linked_signer_indices: Vec<u32>,
+}
+
+impl From<&SafeDescriptor> for ExistingSafe {
+    fn from(safe: &SafeDescriptor) -> Self {
+        Self {
+            key: safe.key(),
+            name: safe.name().map(str::to_owned),
+            linked_signer_indices: safe.linked_signer_indices.clone(),
+        }
+    }
 }
 
 #[derive(Debug)]
-enum Step {
-    AddressInput {
-        input: String,
-        error: Option<String>,
-        /// `Some(seq)` while an ENS lookup is in flight.
-        ens_resolving: Option<u64>,
-    },
-    Scanning {
-        address: Address,
-        /// Display string for the address/ENS the user submitted.
-        /// Shown on the spinner so the user can confirm the right
-        /// target is being scanned.
-        what: String,
-    },
-    /// At least one chain returned `Canonical` or `UnrecognizedImpl`,
-    /// and the user has not yet picked one. Skipped automatically when
-    /// `safe_count == 1`.
-    ChainChooser {
-        address: Address,
-        results: Vec<(Chain, ScanResult)>,
-    },
-    /// Zero chains returned a Safe — terminal error screen with a
-    /// per-chain breakdown of *why*.
-    NoChain {
-        address: Address,
-        results: Vec<(Chain, ScanResult)>,
-    },
-    Inspect {
-        chain: Chain,
-        metadata: SafeMetadata,
-        trust: SafeTrust,
-        /// Carried forward so step 9 can offer sibling chains.
-        all_results: Vec<(Chain, ScanResult)>,
-    },
-    RoleSelection {
-        chain: Chain,
-        metadata: SafeMetadata,
-        trust: SafeTrust,
-        all_results: Vec<(Chain, ScanResult)>,
-        /// Existing accounts that intersect this Safe's owner set.
-        matched: Vec<ExistingAccount>,
-        /// Subset of `matched` (by `account_idx`) the user has
-        /// checked. Empty = will be a watch-only Safe.
-        selected: BTreeSet<u32>,
-        /// Owners that are themselves Safes the user has onboarded
-        /// during this session via the nested-Safe sub-flow.
-        /// Informational — the parent→child link is derived from the
-        /// owner-set intersection at signing time, not persisted on
-        /// `SafeDescriptor`.
-        linked_nested_safes: Vec<Address>,
-        /// Optional error from a previous add-signer attempt — shown
-        /// once when we return to this step. Cleared on any toggle.
-        signer_error: Option<String>,
-    },
-    /// Sub-step of RoleSelection: user has pressed "Add a new signer"
-    /// and is picking an import method. Carries forward the
-    /// RoleSelection state verbatim so backing out is a clean rewind.
-    PickSignerMethod {
-        chain: Chain,
-        metadata: SafeMetadata,
-        trust: SafeTrust,
-        all_results: Vec<(Chain, ScanResult)>,
-        matched: Vec<ExistingAccount>,
-        selected: BTreeSet<u32>,
-        linked_nested_safes: Vec<Address>,
-        /// Owners not yet represented by an existing wallet account.
-        /// Surfaced on the picker so the user knows which addresses
-        /// the import must derive to, and used by the parent as the
-        /// allowed-list when validating the imported signer.
-        unclaimed_owners: Vec<Address>,
-    },
-    Label {
-        chain: Chain,
-        metadata: SafeMetadata,
-        trust: SafeTrust,
-        linked: Vec<u32>,
-        name: String,
-        /// Other chains where this address is also a Safe. The bool
-        /// is "user wants to add this sibling too". Defaults to true.
-        siblings: Vec<(Chain, SafeMetadata, SafeTrust, bool)>,
-        /// Advanced section expanded. Collapsed by default — almost
-        /// everyone wants the public service.
-        advanced: bool,
-        /// Custom Transaction Service base URL, raw as typed.
-        /// Validated through `service::normalize_service_base` on
-        /// confirm; blank means the public default.
-        service_url: String,
-        /// Validation error from the last confirm attempt.
-        service_url_error: Option<String>,
-    },
+enum Phase {
+    Find(FindState),
+    // Boxed: the Review state is several times the size of Find's.
+    Review(Box<ReviewState>),
 }
 
-impl Step {
+impl Phase {
+    /// Coarse phase for the GUI state trace. Find's in-place sub-states
+    /// get their own names so the trace still reads like the flow does.
     fn name(&self) -> &'static str {
         match self {
-            Step::AddressInput { .. } => "AddressInput",
-            Step::Scanning { .. } => "Scanning",
-            Step::ChainChooser { .. } => "ChainChooser",
-            Step::NoChain { .. } => "NoChain",
-            Step::Inspect { .. } => "Inspect",
-            Step::RoleSelection { .. } => "RoleSelection",
-            Step::PickSignerMethod { .. } => "PickSignerMethod",
-            Step::Label { .. } => "Label",
+            Phase::Find(f) if f.scanning.is_some() => "Scanning",
+            Phase::Find(f) if f.ens_resolving.is_some() => "ResolvingName",
+            Phase::Find(f) if f.no_safe.is_some() => "NoSafe",
+            Phase::Find(_) => "Find",
+            Phase::Review(r) if r.awaiting_signer => "AwaitingSigner",
+            Phase::Review(_) => "Review",
         }
+    }
+}
+
+#[derive(Debug, Default)]
+struct FindState {
+    input: String,
+    error: Option<String>,
+    /// `Some(seq)` while a name lookup is in flight.
+    ens_resolving: Option<u64>,
+    /// `Some` while a scan is in flight. The button reads "Scanning…"
+    /// and the scanned string is shown so the user can confirm the
+    /// right target is being checked.
+    scanning: Option<ScanTarget>,
+    /// The last scan found no Safe on any chain — the per-chain
+    /// breakdown of *why*. Cleared by editing the input or rescanning.
+    no_safe: Option<NoSafe>,
+}
+
+#[derive(Debug)]
+struct ScanTarget {
+    address: Address,
+    /// The string the user submitted (address or name).
+    what: String,
+    /// `what` is a name the user typed rather than a hex address — it
+    /// becomes the default label on Review.
+    from_name: bool,
+}
+
+#[derive(Debug)]
+struct NoSafe {
+    address: Address,
+    results: Vec<(Chain, ScanResult)>,
+}
+
+#[derive(Debug)]
+struct ReviewState {
+    address: Address,
+    /// What was in the Find input, restored on Back so the user can
+    /// rescan with Enter.
+    find_input: String,
+    /// The name the user typed (ENS etc.) when it wasn't a hex address.
+    typed_name: Option<String>,
+    /// Every chain's scan result — hits and misses — in `Chain::ALL`
+    /// order.
+    results: Vec<(Chain, ScanResult)>,
+    /// Hit chains the user unticked. Every hit starts included.
+    excluded: Vec<Chain>,
+    /// Chain shown in the Security column. Always a hit; may be excluded.
+    focused: Chain,
+    /// Accounts the user has ticked as signers (by `account_idx`).
+    /// Starts as every signing-capable account that owns the Safe on any
+    /// chain. View-only accounts are never in here.
+    selected: BTreeSet<u32>,
+    /// Owners that are themselves Safes the user has onboarded during
+    /// this session via the nested-Safe sub-flow. Informational — the
+    /// parent→child link is derived from the owner-set intersection at
+    /// signing time, not persisted on `SafeDescriptor`.
+    linked_nested_safes: Vec<Address>,
+    /// Error from the last add-signer attempt. Cleared on any signer
+    /// toggle or a successful import.
+    signer_error: Option<String>,
+    /// The inline "Add a new signer" section is expanded.
+    add_signer_open: bool,
+    /// `RequestAddSigner` was emitted and the parent hasn't resumed us
+    /// yet. Trace-only: the screen is parked in Review either way, and
+    /// the next message it handles clears it.
+    awaiting_signer: bool,
+    name: String,
+    /// Advanced section expanded. Collapsed by default — almost
+    /// everyone wants the public service.
+    advanced: bool,
+    /// Custom Transaction Service base URL, raw as typed. Validated
+    /// through `service::normalize_service_base` on confirm; blank means
+    /// the public default.
+    service_url: String,
+    /// Validation error from the last confirm attempt.
+    service_url_error: Option<String>,
+}
+
+impl ReviewState {
+    fn new(
+        address: Address,
+        find_input: String,
+        target: ScanTarget,
+        results: Vec<(Chain, ScanResult)>,
+        existing: &[ExistingAccount],
+        existing_safes: &[ExistingSafe],
+    ) -> Self {
+        let focused = results
+            .iter()
+            .find_map(|(c, r)| hit_of(r).map(|_| *c))
+            .unwrap_or_default();
+        let owners: BTreeSet<Address> = results
+            .iter()
+            .filter_map(|(_, r)| hit_of(r))
+            .flat_map(|(md, _)| md.owners.iter().copied())
+            .collect();
+        // Default-check every signing-capable owner — the user opts
+        // out rather than in, and still has to confirm the screen.
+        let selected = existing
+            .iter()
+            .filter(|e| !e.view_only && owners.contains(&e.address))
+            .map(|e| e.account_idx)
+            .collect();
+        let typed_name = target.from_name.then_some(target.what);
+        // A Safe that's already saved starts from the name it already goes
+        // by — even when it was found by ENS: confirming applies the field
+        // to every chain, and a name typed into the finder is a lookup, not
+        // a rename. Untouched, it renames nothing. Otherwise the typed name
+        // (ENS etc.) is the label the user reached for.
+        let name = saved_name(existing_safes, address)
+            .map(str::to_owned)
+            .or_else(|| typed_name.clone())
+            .unwrap_or_default();
+        Self {
+            address,
+            find_input,
+            name,
+            typed_name,
+            results,
+            excluded: Vec::new(),
+            focused,
+            selected,
+            linked_nested_safes: Vec::new(),
+            signer_error: None,
+            add_signer_open: false,
+            awaiting_signer: false,
+            advanced: false,
+            service_url: String::new(),
+            service_url_error: None,
+        }
+    }
+
+    /// Chains the address is a Safe on, in `Chain::ALL` order.
+    fn hits(&self) -> impl Iterator<Item = (Chain, &SafeMetadata, SafeTrust)> + '_ {
+        self.results
+            .iter()
+            .filter_map(|(c, r)| hit_of(r).map(|(md, trust)| (*c, md, trust)))
+    }
+
+    fn hit(&self, chain: Chain) -> Option<(&SafeMetadata, SafeTrust)> {
+        self.hits()
+            .find(|(c, _, _)| *c == chain)
+            .map(|(_, md, trust)| (md, trust))
+    }
+
+    /// Hits the user is adding, in `Chain::ALL` order.
+    fn included(&self) -> impl Iterator<Item = (Chain, &SafeMetadata, SafeTrust)> + '_ {
+        self.hits().filter(|(c, _, _)| !self.excluded.contains(c))
+    }
+
+    fn is_included(&self, chain: Chain) -> bool {
+        self.hit(chain).is_some() && !self.excluded.contains(&chain)
+    }
+
+    /// The descriptor emitted as `primary`: the focused chain if it's
+    /// included, otherwise the first included chain.
+    fn primary_chain(&self) -> Option<Chain> {
+        if self.is_included(self.focused) {
+            return Some(self.focused);
+        }
+        self.included().next().map(|(c, _, _)| c)
+    }
+
+    /// Accounts to link on a chain whose owner set is `owners`: the
+    /// ticked, signing-capable accounts that are an owner THERE. Owner
+    /// sets diverge across chains, and linking a non-owner would offer
+    /// signing that reverts on-chain. Sorted and deduplicated.
+    fn links_on(&self, existing: &[ExistingAccount], owners: &[Address]) -> Vec<u32> {
+        existing
+            .iter()
+            .filter(|e| {
+                !e.view_only
+                    && self.selected.contains(&e.account_idx)
+                    && owners.contains(&e.address)
+            })
+            .map(|e| e.account_idx)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// What each included chain ends up as once confirmed — the role
+    /// summary above the confirm button.
+    ///
+    /// A chain that isn't saved yet gets exactly the ticked links. One that
+    /// is folds into its saved entry, which never unlinks, so it ends up
+    /// with the ticked links ∪ the saved ones. Either way only accounts
+    /// that can sign there count: signing-capable and an owner on this
+    /// scan — an older wallet's saved links can dangle, point at a
+    /// view-only account, or name an owner removed on-chain since.
+    fn chain_roles(
+        &self,
+        existing: &[ExistingAccount],
+        existing_safes: &[ExistingSafe],
+    ) -> Vec<ChainRole> {
+        self.included()
+            .map(|(chain, md, _)| {
+                let ticked = self.links_on(existing, &md.owners);
+                let saved = saved_entry(existing_safes, self.address, chain);
+                let mut signers: BTreeSet<u32> = ticked.iter().copied().collect();
+                if let Some(s) = saved {
+                    signers.extend(s.linked_signer_indices.iter().copied().filter(|idx| {
+                        existing.iter().any(|e| {
+                            e.account_idx == *idx && !e.view_only && md.owners.contains(&e.address)
+                        })
+                    }));
+                }
+                // `ticked` is deduplicated and a subset of `signers`.
+                let kept = signers.len() - ticked.len();
+                ChainRole {
+                    chain,
+                    saved: saved.is_some(),
+                    signers: signers.into_iter().collect(),
+                    kept,
+                }
+            })
+            .collect()
+    }
+
+    /// Included chains on which `address` is an owner.
+    fn owned_chains(&self, address: Address) -> Vec<Chain> {
+        self.included()
+            .filter(|(_, md, _)| md.owners.contains(&address))
+            .map(|(c, _, _)| c)
+            .collect()
+    }
+
+    /// Owners across every included chain whose key isn't already an
+    /// account in the wallet — the allow-list for an add-signer import.
+    /// First-seen order, deduplicated.
+    fn unclaimed_owners(&self, existing: &[ExistingAccount]) -> Vec<Address> {
+        let claimed: BTreeSet<Address> = existing.iter().map(|e| e.address).collect();
+        let mut out: Vec<Address> = Vec::new();
+        for (_, md, _) in self.included() {
+            for owner in &md.owners {
+                if !claimed.contains(owner) && !out.contains(owner) {
+                    out.push(*owner);
+                }
+            }
+        }
+        out
+    }
+
+    /// Some included chain's `key` differs from the focused chain's — i.e.
+    /// the Security column isn't showing everything that will be added.
+    fn differs_from_focused<K: PartialEq>(&self, key: impl Fn(&SafeMetadata) -> K) -> bool {
+        let Some((focused, _)) = self.hit(self.focused) else {
+            return false;
+        };
+        let shown = key(focused);
+        self.included().any(|(_, md, _)| key(md) != shown)
+    }
+
+    /// An included chain has a different owner set or threshold than the
+    /// one on screen.
+    fn owners_differ(&self) -> bool {
+        self.differs_from_focused(|md| {
+            let owners: BTreeSet<Address> = md.owners.iter().copied().collect();
+            (owners, md.threshold)
+        })
+    }
+
+    /// An included chain has different modules / guard / fallback handler
+    /// than the one on screen.
+    fn danger_surfaces_differ(&self) -> bool {
+        self.differs_from_focused(|md| {
+            let modules: BTreeSet<Address> = md.modules.iter().copied().collect();
+            (modules, md.guard, md.fallback_handler)
+        })
+    }
+}
+
+/// One included chain's line in the role summary (`ReviewState::chain_roles`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChainRole {
+    chain: Chain,
+    /// `(address, chain)` is already in the wallet; confirm merges into it.
+    saved: bool,
+    /// Accounts that can sign there once confirmed, sorted. Empty =
+    /// watch-only.
+    signers: Vec<u32>,
+    /// How many of `signers` stay only because the saved entry already
+    /// links them — unticked here, but a merge never unlinks.
+    kept: usize,
+}
+
+impl ChainRole {
+    /// "Mainnet — signer · 1 key", "Base — already in your wallet ·
+    /// watch-only (…)", plus " · owner Safe linked" when a nested Safe
+    /// onboarded in this session owns it there.
+    fn line(&self, owner_safe: bool) -> String {
+        let mut line = format!("{} — ", self.chain.label());
+        if self.saved {
+            line.push_str("already in your wallet · ");
+        }
+        if self.signers.is_empty() {
+            line.push_str("watch-only (none of your selected keys own it here)");
+        } else {
+            let n = self.signers.len();
+            line.push_str(&format!("signer · {n} key{}", plural(n)));
+            if self.kept > 0 {
+                line.push_str(&format!(" ({} already linked — kept)", self.kept));
+            }
+        }
+        if owner_safe {
+            line.push_str(" · owner Safe linked");
+        }
+        line
+    }
+}
+
+/// The confirm button: "Add as watch-only →" only when no included chain
+/// ends up with a key that can sign.
+fn confirm_label(roles: &[ChainRole]) -> &'static str {
+    if roles.iter().any(|r| !r.signers.is_empty()) {
+        "Add to wallet →"
+    } else {
+        "Add as watch-only →"
     }
 }
 
 pub struct SafeOnboardingScreen {
     network: Arc<dyn BalanceFetcher>,
     /// Snapshot of every account in the wallet right before the screen
-    /// opened — used in `RoleSelection` to intersect with the Safe's
-    /// owner set. Cheap pre-computation keeps the view function tight.
+    /// opened (plus any added through the add-signer sub-flow) — used in
+    /// Review to intersect with each chain's owner set.
     existing: Vec<ExistingAccount>,
-    step: Step,
-    /// Monotonic counter bumped on every address input change; ENS and
-    /// scan tasks stamp results with the value they were spawned at and
-    /// the screen drops stale results. Without this, a user who typed
-    /// fast could race a stale scan into the wrong step.
+    /// Every Safe entry already in the wallet, so Review can say "Already
+    /// in your wallet", prefill the saved name and show what a saved chain
+    /// ends up as.
+    existing_safes: Vec<ExistingSafe>,
+    phase: Phase,
+    /// Monotonic counter bumped on every address input change (and on
+    /// a cancelled scan); ENS and scan tasks stamp results with the
+    /// value they were spawned at and the screen drops stale results.
+    /// Without this, a user who typed fast could race a stale scan into
+    /// Review.
     input_seq: u64,
 }
 
@@ -304,7 +594,8 @@ impl std::fmt::Debug for SafeOnboardingScreen {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SafeOnboardingScreen")
             .field("existing_count", &self.existing.len())
-            .field("step", &self.step)
+            .field("existing_safes_count", &self.existing_safes.len())
+            .field("phase", &self.phase)
             .field("input_seq", &self.input_seq)
             .finish()
     }
@@ -315,13 +606,18 @@ impl SafeOnboardingScreen {
         Self {
             network,
             existing,
-            step: Step::AddressInput {
-                input: String::new(),
-                error: None,
-                ens_resolving: None,
-            },
+            existing_safes: Vec::new(),
+            phase: Phase::Find(FindState::default()),
             input_seq: 0,
         }
+    }
+
+    /// The Safes already in the wallet (one entry per `(address,
+    /// chain_id)`), so Review can flag a chain that's already saved, start
+    /// from the Safe's saved name and count its saved links.
+    pub fn with_existing_safes(mut self, safes: Vec<ExistingSafe>) -> Self {
+        self.existing_safes = safes;
+        self
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
@@ -330,11 +626,11 @@ impl SafeOnboardingScreen {
 
     pub fn update(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
         crate::trace_msg!("safe_onboarding", &message);
-        let step_before = self.step.name();
+        let phase_before = self.phase.name();
         let (task, outcome) = self.update_inner(message);
-        let step_after = self.step.name();
-        if step_before != step_after {
-            crate::trace::state("safe_onboarding", "step", step_before, step_after);
+        let phase_after = self.phase.name();
+        if phase_before != phase_after {
+            crate::trace::state("safe_onboarding", "phase", phase_before, phase_after);
         }
         if let Some(o) = &outcome {
             crate::trace::outcome("safe_onboarding", o.name());
@@ -343,6 +639,12 @@ impl SafeOnboardingScreen {
     }
 
     fn update_inner(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
+        // Handling a message means the parent has resumed us, whether or
+        // not it called an `apply_*` (Back out of an import sub-screen
+        // restores the stash as-is).
+        if let Phase::Review(r) = &mut self.phase {
+            r.awaiting_signer = false;
+        }
         match message {
             Message::BackPressed => self.handle_back(),
             Message::KeyboardEvent(keyboard::Event::KeyPressed { key, .. }) => {
@@ -363,85 +665,37 @@ impl SafeOnboardingScreen {
                 address,
                 results,
             } => self.handle_scan_completed(seq, address, results),
-            Message::ChainPicked(chain) => self.handle_chain_picked(chain),
-            Message::InspectContinue => self.handle_inspect_continue(),
-            Message::SignerToggled(idx) => self.handle_signer_toggled(idx),
-            Message::WatchOnlySelected => self.handle_watch_only(),
-            Message::RoleConfirm => self.handle_role_confirm(),
-            Message::AddSignerPressed => self.handle_add_signer_pressed(),
-            Message::SignerMethodPicked(method) => self.handle_signer_method_picked(method),
+            Message::ChainIncludeToggled(chain) => self.handle_chain_include_toggled(chain),
+            Message::ChainFocused(chain) => self.handle_chain_focused(chain),
             Message::NameInput(s) => self.handle_name_input(s),
-            Message::SiblingToggled(chain) => self.handle_sibling_toggled(chain),
+            Message::SignerToggled(idx) => self.handle_signer_toggled(idx),
+            Message::AddSignerToggled => self.handle_add_signer_toggled(),
+            Message::SignerMethodPicked(method) => self.handle_signer_method_picked(method),
             Message::AdvancedToggled => self.handle_advanced_toggled(),
             Message::ServiceUrlInput(s) => self.handle_service_url_input(s),
-            Message::LabelConfirm => self.handle_label_confirm(),
+            Message::Confirm => self.handle_confirm(),
         }
     }
 
     pub fn view(&self) -> Element<'_, Message> {
         let t = KaoTheme::for_kind(settings::theme());
-        let card_body = match &self.step {
-            Step::AddressInput {
-                input,
-                error,
-                ens_resolving,
-            } => view_address_input(t, input, error.as_deref(), ens_resolving.is_some()),
-            Step::Scanning { what, .. } => view_scanning(t, what),
-            Step::ChainChooser { address, results } => view_chain_chooser(t, *address, results),
-            Step::NoChain { address, results } => view_no_chain(t, *address, results),
-            Step::Inspect {
-                chain,
-                metadata,
-                trust,
-                ..
-            } => view_inspect(t, *chain, metadata, trust),
-            Step::RoleSelection {
-                chain,
-                metadata,
-                matched,
-                selected,
-                linked_nested_safes,
-                signer_error,
-                ..
-            } => view_role_selection(
-                t,
-                *chain,
-                metadata,
-                matched,
-                selected,
-                linked_nested_safes,
-                signer_error.as_deref(),
-            ),
-            Step::PickSignerMethod {
-                chain,
-                metadata,
-                unclaimed_owners,
-                ..
-            } => view_pick_signer_method(t, *chain, metadata, unclaimed_owners),
-            Step::Label {
-                chain,
-                metadata,
-                trust,
-                linked,
-                name,
-                siblings,
-                advanced,
-                service_url,
-                service_url_error,
-            } => view_label(
-                t,
-                *chain,
-                metadata,
-                trust,
-                linked,
-                name,
-                siblings,
-                *advanced,
-                service_url,
-                service_url_error.as_deref(),
-            ),
+        let card = match &self.phase {
+            Phase::Find(f) => auth_card(t, 560.0, view_find(t, f)),
+            Phase::Review(r) => {
+                let existing = self.existing.as_slice();
+                let existing_safes = self.existing_safes.as_slice();
+                let body = responsive(move |size| {
+                    view_review(
+                        t,
+                        r,
+                        existing,
+                        existing_safes,
+                        size.width >= REVIEW_TWO_COLUMN_MIN_W,
+                    )
+                });
+                review_card(t, body.into())
+            }
         };
-        let card = auth_card(t, 560.0, card_body);
         let back_bar = container(link_button(t, "← Back").on_press(Message::BackPressed))
             .padding(Padding::from([12, 14]))
             .width(Length::Fill);
@@ -451,56 +705,67 @@ impl SafeOnboardingScreen {
         auth_background(t, layout.into())
     }
 
-    // ── Step handlers ────────────────────────────────────────────────
+    // ── Find handlers ────────────────────────────────────────────────
 
     fn handle_back(&mut self) -> (Task<Message>, Option<Outcome>) {
-        // Within-screen back: rewind one step. Only AddressInput's
-        // back propagates Outcome::Back to the parent.
-        match &self.step {
-            Step::AddressInput { .. } => (Task::none(), Some(Outcome::Back)),
-            Step::PickSignerMethod { .. } => {
-                self.rewind_picker_to_role(None, |_, _, _| {});
+        match &mut self.phase {
+            // Back / Esc during a scan cancels it in place (the old
+            // Scanning screen's Back did the same). Bump the seq so the
+            // in-flight result is dropped when it lands.
+            Phase::Find(f) if f.scanning.is_some() => {
+                f.scanning = None;
+                self.input_seq = self.input_seq.wrapping_add(1);
                 (Task::none(), None)
             }
-            _ => {
-                self.step = Step::AddressInput {
-                    input: String::new(),
-                    error: None,
-                    ens_resolving: None,
-                };
+            Phase::Find(_) => (Task::none(), Some(Outcome::Back)),
+            // First Back folds an open add-signer section away.
+            Phase::Review(r) if r.add_signer_open => {
+                r.add_signer_open = false;
                 (Task::none(), None)
+            }
+            Phase::Review(r) => {
+                let input = std::mem::take(&mut r.find_input);
+                self.phase = Phase::Find(FindState {
+                    input,
+                    ..FindState::default()
+                });
+                (focus_widget(ADDRESS_INPUT_ID), None)
             }
         }
     }
 
     fn handle_address_input(&mut self, s: String) -> (Task<Message>, Option<Outcome>) {
-        let Step::AddressInput {
-            input,
-            error,
-            ens_resolving,
-        } = &mut self.step
-        else {
+        let Phase::Find(f) = &mut self.phase else {
             return (Task::none(), None);
         };
-        *input = s;
-        *error = None;
-        *ens_resolving = None;
+        // Editing abandons whatever was in flight or on display: any
+        // pending name lookup or scan is dropped by the seq bump.
+        f.input = s;
+        f.error = None;
+        f.ens_resolving = None;
+        f.scanning = None;
+        f.no_safe = None;
         self.input_seq = self.input_seq.wrapping_add(1);
         (Task::none(), None)
     }
 
     fn handle_address_submit(&mut self) -> (Task<Message>, Option<Outcome>) {
-        let Step::AddressInput { input, .. } = &self.step else {
+        let Phase::Find(f) = &self.phase else {
             return (Task::none(), None);
         };
-        let trimmed = input.trim().to_string();
+        // The button is disabled while busy, but Enter in the input
+        // still submits — don't stack a second lookup/scan.
+        if f.scanning.is_some() || f.ens_resolving.is_some() {
+            return (Task::none(), None);
+        }
+        let trimmed = f.input.trim().to_string();
         if trimmed.is_empty() {
             self.set_address_error("Please enter an Ethereum address or name.");
             return (Task::none(), None);
         }
         // Try hex address first; cheaper than spawning a name-resolution task.
         if let Ok(address) = trimmed.parse::<Address>() {
-            return self.kick_off_scan(address, trimmed);
+            return self.kick_off_scan(address, trimmed, false);
         }
         if names::looks_like_name(&trimmed) {
             return self.kick_off_ens(trimmed);
@@ -513,8 +778,10 @@ impl SafeOnboardingScreen {
 
     fn kick_off_ens(&mut self, name: String) -> (Task<Message>, Option<Outcome>) {
         let seq = self.input_seq;
-        if let Step::AddressInput { ens_resolving, .. } = &mut self.step {
-            *ens_resolving = Some(seq);
+        if let Phase::Find(f) = &mut self.phase {
+            f.ens_resolving = Some(seq);
+            f.error = None;
+            f.no_safe = None;
         }
         let network = self.network.clone();
         let task = Task::perform(
@@ -536,14 +803,14 @@ impl SafeOnboardingScreen {
         name: String,
         result: Result<Option<Address>, String>,
     ) -> (Task<Message>, Option<Outcome>) {
-        let Step::AddressInput { ens_resolving, .. } = &self.step else {
+        let Phase::Find(f) = &self.phase else {
             return (Task::none(), None);
         };
-        if *ens_resolving != Some(seq) {
+        if f.ens_resolving != Some(seq) {
             return (Task::none(), None);
         }
         match result {
-            Ok(Some(address)) => self.kick_off_scan(address, name),
+            Ok(Some(address)) => self.kick_off_scan(address, name, true),
             Ok(None) => {
                 self.set_address_error(&format!("“{name}” has no address record."));
                 (Task::none(), None)
@@ -559,12 +826,20 @@ impl SafeOnboardingScreen {
         &mut self,
         address: Address,
         what: String,
+        from_name: bool,
     ) -> (Task<Message>, Option<Outcome>) {
-        let seq = self.input_seq;
-        self.step = Step::Scanning {
-            address,
-            what: what.clone(),
+        let Phase::Find(f) = &mut self.phase else {
+            return (Task::none(), None);
         };
+        let seq = self.input_seq;
+        f.scanning = Some(ScanTarget {
+            address,
+            what,
+            from_name,
+        });
+        f.ens_resolving = None;
+        f.error = None;
+        f.no_safe = None;
         let network = self.network.clone();
         let task = Task::perform(
             async move {
@@ -584,166 +859,107 @@ impl SafeOnboardingScreen {
         &mut self,
         seq: u64,
         address: Address,
-        results: Vec<(Chain, ScanResult)>,
+        mut results: Vec<(Chain, ScanResult)>,
     ) -> (Task<Message>, Option<Outcome>) {
         if seq != self.input_seq {
-            // User backed out and started over; drop stale scan.
+            // User edited the input or cancelled; drop the stale scan.
             return (Task::none(), None);
         }
-        let Step::Scanning {
-            address: scan_addr, ..
-        } = &self.step
-        else {
+        let Phase::Find(f) = &mut self.phase else {
             return (Task::none(), None);
         };
-        if *scan_addr != address {
+        if !matches!(&f.scanning, Some(target) if target.address == address) {
             return (Task::none(), None);
         }
-        let hits: Vec<(Chain, &ScanResult)> = results
-            .iter()
-            .filter(|(_, r)| {
-                matches!(
-                    r,
-                    ScanResult::Canonical(_) | ScanResult::UnrecognizedImpl(_)
-                )
-            })
-            .map(|(c, r)| (*c, r))
-            .collect();
-        match hits.len() {
-            0 => {
-                self.step = Step::NoChain { address, results };
-            }
-            1 => {
-                let chain = hits[0].0;
-                self.enter_inspect_from_results(chain, results);
-            }
-            _ => {
-                self.step = Step::ChainChooser { address, results };
-            }
+        let Some(target) = f.scanning.take() else {
+            return (Task::none(), None);
+        };
+        // `scan_across_chains` already answers in `Chain::ALL` order, but
+        // the strip and the primary-chain fallback rely on it — don't
+        // trust the producer.
+        results.sort_by_key(|(c, _)| chain_rank(*c));
+        results.dedup_by_key(|(c, _)| *c);
+        if !results.iter().any(|(_, r)| hit_of(r).is_some()) {
+            f.no_safe = Some(NoSafe { address, results });
+            return (Task::none(), None);
+        }
+        let find_input = f.input.clone();
+        self.phase = Phase::Review(Box::new(ReviewState::new(
+            address,
+            find_input,
+            target,
+            results,
+            &self.existing,
+            &self.existing_safes,
+        )));
+        (focus_widget(NAME_INPUT_ID), None)
+    }
+
+    fn set_address_error(&mut self, msg: &str) {
+        if let Phase::Find(f) = &mut self.phase {
+            f.error = Some(msg.to_string());
+            f.ens_resolving = None;
+        }
+    }
+
+    // ── Review handlers ──────────────────────────────────────────────
+
+    fn handle_chain_include_toggled(&mut self, chain: Chain) -> (Task<Message>, Option<Outcome>) {
+        let Phase::Review(r) = &mut self.phase else {
+            return (Task::none(), None);
+        };
+        if r.hit(chain).is_none() {
+            return (Task::none(), None);
+        }
+        if let Some(pos) = r.excluded.iter().position(|c| *c == chain) {
+            r.excluded.remove(pos);
+        } else if r.included().count() > 1 {
+            // The last included chain stays — there'd be nothing to add.
+            r.excluded.push(chain);
         }
         (Task::none(), None)
     }
 
-    fn enter_inspect_from_results(&mut self, chain: Chain, results: Vec<(Chain, ScanResult)>) {
-        let found = results
-            .iter()
-            .find(|(c, _)| *c == chain)
-            .and_then(|(_, r)| match r {
-                ScanResult::Canonical(md) => Some((md.clone(), SafeTrust::Canonical)),
-                ScanResult::UnrecognizedImpl(md) => Some((md.clone(), SafeTrust::UnrecognizedImpl)),
-                _ => None,
-            });
-        // Callers pre-filter so `chain` always has a Canonical/UnrecognizedImpl
-        // result, but don't panic the whole GUI if that ever stops holding —
-        // just decline the transition into Inspect.
-        let Some((metadata, trust)) = found else {
-            return;
-        };
-        self.step = Step::Inspect {
-            chain,
-            metadata,
-            trust,
-            all_results: results,
-        };
-    }
-
-    fn handle_chain_picked(&mut self, chain: Chain) -> (Task<Message>, Option<Outcome>) {
-        let Step::ChainChooser { results, .. } = &self.step else {
-            return (Task::none(), None);
-        };
-        let results = results.clone();
-        self.enter_inspect_from_results(chain, results);
+    fn handle_chain_focused(&mut self, chain: Chain) -> (Task<Message>, Option<Outcome>) {
+        if let Phase::Review(r) = &mut self.phase
+            && r.hit(chain).is_some()
+        {
+            r.focused = chain;
+        }
         (Task::none(), None)
     }
 
-    fn handle_inspect_continue(&mut self) -> (Task<Message>, Option<Outcome>) {
-        let Step::Inspect {
-            chain,
-            metadata,
-            trust,
-            all_results,
-        } = &self.step
-        else {
-            return (Task::none(), None);
-        };
-        let owners: BTreeSet<Address> = metadata.owners.iter().copied().collect();
-        let matched: Vec<ExistingAccount> = self
-            .existing
-            .iter()
-            .filter(|acc| owners.contains(&acc.address))
-            .cloned()
-            .collect();
-        // Default-check every match — the design says "show as a match
-        // with a default-checked checkbox", letting the user opt out
-        // rather than opt in. They still have to confirm the screen.
-        let selected: BTreeSet<u32> = matched.iter().map(|m| m.account_idx).collect();
-        self.step = Step::RoleSelection {
-            chain: *chain,
-            metadata: metadata.clone(),
-            trust: trust.clone(),
-            all_results: all_results.clone(),
-            matched,
-            selected,
-            linked_nested_safes: Vec::new(),
-            signer_error: None,
-        };
+    fn handle_name_input(&mut self, s: String) -> (Task<Message>, Option<Outcome>) {
+        if let Phase::Review(r) = &mut self.phase {
+            r.name = s;
+        }
         (Task::none(), None)
     }
 
     fn handle_signer_toggled(&mut self, idx: u32) -> (Task<Message>, Option<Outcome>) {
-        if let Step::RoleSelection {
-            selected,
-            signer_error,
-            ..
-        } = &mut self.step
+        let Phase::Review(r) = &mut self.phase else {
+            return (Task::none(), None);
+        };
+        // Only signing-capable accounts can be ticked; a view-only row is
+        // rendered disabled, this is the backstop.
+        if !self
+            .existing
+            .iter()
+            .any(|e| e.account_idx == idx && !e.view_only)
         {
-            if !selected.remove(&idx) {
-                selected.insert(idx);
-            }
-            *signer_error = None;
+            return (Task::none(), None);
         }
+        if !r.selected.remove(&idx) {
+            r.selected.insert(idx);
+        }
+        r.signer_error = None;
         (Task::none(), None)
     }
 
-    fn handle_add_signer_pressed(&mut self) -> (Task<Message>, Option<Outcome>) {
-        if !matches!(self.step, Step::RoleSelection { .. }) {
-            return (Task::none(), None);
+    fn handle_add_signer_toggled(&mut self) -> (Task<Message>, Option<Outcome>) {
+        if let Phase::Review(r) = &mut self.phase {
+            r.add_signer_open = !r.add_signer_open;
         }
-        let existing_addrs: BTreeSet<Address> = self.existing.iter().map(|e| e.address).collect();
-        let placeholder = Step::AddressInput {
-            input: String::new(),
-            error: None,
-            ens_resolving: None,
-        };
-        let Step::RoleSelection {
-            chain,
-            metadata,
-            trust,
-            all_results,
-            matched,
-            selected,
-            linked_nested_safes,
-            ..
-        } = std::mem::replace(&mut self.step, placeholder)
-        else {
-            unreachable!("guarded above")
-        };
-        let unclaimed_owners: Vec<Address> = metadata
-            .owners
-            .iter()
-            .copied()
-            .filter(|a| !existing_addrs.contains(a))
-            .collect();
-        self.step = Step::PickSignerMethod {
-            chain,
-            metadata,
-            trust,
-            all_results,
-            matched,
-            selected,
-            linked_nested_safes,
-            unclaimed_owners,
-        };
         (Task::none(), None)
     }
 
@@ -751,20 +967,16 @@ impl SafeOnboardingScreen {
         &mut self,
         method: SignerMethod,
     ) -> (Task<Message>, Option<Outcome>) {
-        let Step::PickSignerMethod {
-            unclaimed_owners, ..
-        } = &self.step
-        else {
+        let Phase::Review(r) = &mut self.phase else {
             return (Task::none(), None);
         };
-        if unclaimed_owners.is_empty() {
-            self.rewind_picker_to_role(
-                Some("Every owner of this Safe is already in your wallet.".to_string()),
-                |_, _, _| {},
-            );
+        let allowed_owners = r.unclaimed_owners(&self.existing);
+        if allowed_owners.is_empty() {
+            r.signer_error =
+                Some("Every owner of this Safe is already in your wallet.".to_string());
             return (Task::none(), None);
         }
-        let allowed_owners = unclaimed_owners.clone();
+        r.awaiting_signer = true;
         (
             Task::none(),
             Some(Outcome::RequestAddSigner {
@@ -776,10 +988,11 @@ impl SafeOnboardingScreen {
 
     /// Called by the parent after a successful import + owner
     /// validation. Pushes `new_account` into the screen's `existing`
-    /// snapshot (so subsequent picker entries treat it as already
-    /// claimed) and the RoleSelection's matched/selected lists.
+    /// snapshot (so the next add-signer allow-list treats it as already
+    /// claimed) and ticks it as a signer — it's then linked on every
+    /// included chain it owns.
     pub fn apply_added_signer(&mut self, new_account: ExistingAccount) {
-        let step_before = self.step.name();
+        let phase_before = self.phase.name();
         if !self
             .existing
             .iter()
@@ -787,320 +1000,227 @@ impl SafeOnboardingScreen {
         {
             self.existing.push(new_account.clone());
         }
-        self.rewind_picker_to_role(None, |matched, selected, _| {
-            if !matched
-                .iter()
-                .any(|m| m.account_idx == new_account.account_idx)
-            {
-                matched.push(new_account.clone());
+        if let Phase::Review(r) = &mut self.phase {
+            if !new_account.view_only {
+                r.selected.insert(new_account.account_idx);
             }
-            selected.insert(new_account.account_idx);
-        });
-        if step_before != self.step.name() {
-            crate::trace::state("safe_onboarding", "step", step_before, self.step.name());
+            r.signer_error = None;
+            r.add_signer_open = false;
+            r.awaiting_signer = false;
         }
+        if phase_before != self.phase.name() {
+            crate::trace::state("safe_onboarding", "phase", phase_before, self.phase.name());
+        }
+    }
+
+    /// Called by the parent on a screen that is still parked UNDER a
+    /// nested-Safe sub-flow when that sub-flow imported `account`. This
+    /// screen didn't ask for it, so its add-signer section, error and
+    /// parked marker stay as they are (`apply_added_signer` is for the
+    /// screen that did).
+    ///
+    /// The account joins the snapshot, so Review lists it, stops offering
+    /// its address as unclaimed and a rescan sees it. A signing-capable
+    /// account that owns this Safe on a scanned chain is also ticked — the
+    /// default Review gives every owner it knew at scan time — so it gets
+    /// linked on each included chain it owns. No-op for an account the
+    /// snapshot already holds (the user's tick stays theirs).
+    pub fn note_account(&mut self, account: ExistingAccount) {
+        if self
+            .existing
+            .iter()
+            .any(|e| e.account_idx == account.account_idx)
+        {
+            return;
+        }
+        if let Phase::Review(r) = &mut self.phase
+            && !account.view_only
+            && r.hits()
+                .any(|(_, md, _)| md.owners.contains(&account.address))
+        {
+            r.selected.insert(account.account_idx);
+        }
+        self.existing.push(account);
     }
 
     /// Called by the parent after a nested-Safe sub-flow finished and
     /// the inner Safe was saved to the wallet. Records the nested
-    /// Safe's address as a linked owner so the RoleSelection view can
-    /// surface it as a sign-capable owner.
+    /// Safe's address as a linked owner so Review can surface it as a
+    /// sign-capable owner.
     pub fn apply_added_nested_safe(&mut self, address: Address) {
-        let step_before = self.step.name();
-        self.rewind_picker_to_role(None, |_, _, linked| {
-            if !linked.contains(&address) {
-                linked.push(address);
+        let phase_before = self.phase.name();
+        if let Phase::Review(r) = &mut self.phase {
+            if !r.linked_nested_safes.contains(&address) {
+                r.linked_nested_safes.push(address);
             }
-        });
-        if step_before != self.step.name() {
-            crate::trace::state("safe_onboarding", "step", step_before, self.step.name());
+            r.signer_error = None;
+            r.add_signer_open = false;
+            r.awaiting_signer = false;
+        }
+        if phase_before != self.phase.name() {
+            crate::trace::state("safe_onboarding", "phase", phase_before, self.phase.name());
         }
     }
 
     /// Called by the parent when an import attempt failed validation
-    /// (e.g., the derived address wasn't an owner of this Safe). Bounce
-    /// the user back to RoleSelection with the error displayed.
+    /// (e.g., the derived address wasn't an owner of this Safe). Review
+    /// shows the error; the add-signer section stays as it was so the
+    /// user can retry.
     pub fn apply_signer_import_error(&mut self, message: String) {
-        let step_before = self.step.name();
-        self.rewind_picker_to_role(Some(message), |_, _, _| {});
-        if step_before != self.step.name() {
-            crate::trace::state("safe_onboarding", "step", step_before, self.step.name());
+        let phase_before = self.phase.name();
+        if let Phase::Review(r) = &mut self.phase {
+            r.signer_error = Some(message);
+            r.awaiting_signer = false;
         }
-    }
-
-    /// Common rewind from `PickSignerMethod` to `RoleSelection`. Moves
-    /// the carried-forward state by value (no metadata/all_results
-    /// clone) and runs `mutate` on the matched/selected/nested-safe
-    /// lists before rebuilding the step. No-op if the current step
-    /// isn't the picker.
-    fn rewind_picker_to_role(
-        &mut self,
-        signer_error: Option<String>,
-        mutate: impl FnOnce(&mut Vec<ExistingAccount>, &mut BTreeSet<u32>, &mut Vec<Address>),
-    ) {
-        if !matches!(self.step, Step::PickSignerMethod { .. }) {
-            return;
+        if phase_before != self.phase.name() {
+            crate::trace::state("safe_onboarding", "phase", phase_before, self.phase.name());
         }
-        let placeholder = Step::AddressInput {
-            input: String::new(),
-            error: None,
-            ens_resolving: None,
-        };
-        let Step::PickSignerMethod {
-            chain,
-            metadata,
-            trust,
-            all_results,
-            mut matched,
-            mut selected,
-            mut linked_nested_safes,
-            ..
-        } = std::mem::replace(&mut self.step, placeholder)
-        else {
-            unreachable!("guarded above")
-        };
-        mutate(&mut matched, &mut selected, &mut linked_nested_safes);
-        self.step = Step::RoleSelection {
-            chain,
-            metadata,
-            trust,
-            all_results,
-            matched,
-            selected,
-            linked_nested_safes,
-            signer_error,
-        };
-    }
-
-    fn handle_watch_only(&mut self) -> (Task<Message>, Option<Outcome>) {
-        let Step::RoleSelection {
-            chain,
-            metadata,
-            trust,
-            all_results,
-            ..
-        } = &self.step
-        else {
-            return (Task::none(), None);
-        };
-        self.enter_label(
-            *chain,
-            metadata.clone(),
-            trust.clone(),
-            Vec::new(),
-            all_results.clone(),
-        );
-        (Task::none(), None)
-    }
-
-    fn handle_role_confirm(&mut self) -> (Task<Message>, Option<Outcome>) {
-        let Step::RoleSelection {
-            chain,
-            metadata,
-            trust,
-            all_results,
-            selected,
-            ..
-        } = &self.step
-        else {
-            return (Task::none(), None);
-        };
-        let linked: Vec<u32> = selected.iter().copied().collect();
-        self.enter_label(
-            *chain,
-            metadata.clone(),
-            trust.clone(),
-            linked,
-            all_results.clone(),
-        );
-        (Task::none(), None)
-    }
-
-    fn enter_label(
-        &mut self,
-        chain: Chain,
-        metadata: SafeMetadata,
-        trust: SafeTrust,
-        linked: Vec<u32>,
-        all_results: Vec<(Chain, ScanResult)>,
-    ) {
-        // Siblings = every chain hit OTHER than the primary, each
-        // default-checked. Sourced from the same scan results so we
-        // don't have to re-fetch.
-        let siblings: Vec<(Chain, SafeMetadata, SafeTrust, bool)> = all_results
-            .into_iter()
-            .filter_map(|(c, r)| {
-                if c == chain {
-                    return None;
-                }
-                match r {
-                    ScanResult::Canonical(md) => Some((c, md, SafeTrust::Canonical, true)),
-                    ScanResult::UnrecognizedImpl(md) => {
-                        Some((c, md, SafeTrust::UnrecognizedImpl, true))
-                    }
-                    _ => None,
-                }
-            })
-            .collect();
-        self.step = Step::Label {
-            chain,
-            metadata,
-            trust,
-            linked,
-            name: String::new(),
-            siblings,
-            advanced: false,
-            service_url: String::new(),
-            service_url_error: None,
-        };
-    }
-
-    fn handle_name_input(&mut self, s: String) -> (Task<Message>, Option<Outcome>) {
-        if let Step::Label { name, .. } = &mut self.step {
-            *name = s;
-        }
-        (Task::none(), None)
-    }
-
-    fn handle_sibling_toggled(&mut self, chain: Chain) -> (Task<Message>, Option<Outcome>) {
-        if let Step::Label { siblings, .. } = &mut self.step
-            && let Some(entry) = siblings.iter_mut().find(|(c, _, _, _)| *c == chain)
-        {
-            entry.3 = !entry.3;
-        }
-        (Task::none(), None)
     }
 
     fn handle_advanced_toggled(&mut self) -> (Task<Message>, Option<Outcome>) {
-        if let Step::Label { advanced, .. } = &mut self.step {
-            *advanced = !*advanced;
+        if let Phase::Review(r) = &mut self.phase {
+            r.advanced = !r.advanced;
         }
         (Task::none(), None)
     }
 
     fn handle_service_url_input(&mut self, s: String) -> (Task<Message>, Option<Outcome>) {
-        if let Step::Label {
-            service_url,
-            service_url_error,
-            ..
-        } = &mut self.step
-        {
-            *service_url = s;
-            *service_url_error = None;
+        if let Phase::Review(r) = &mut self.phase {
+            r.service_url = s;
+            r.service_url_error = None;
         }
         (Task::none(), None)
     }
 
-    fn handle_label_confirm(&mut self) -> (Task<Message>, Option<Outcome>) {
-        let Step::Label {
-            chain,
-            metadata,
-            trust,
-            linked,
-            name,
-            siblings,
-            service_url,
-            ..
-        } = &self.step
-        else {
+    fn handle_confirm(&mut self) -> (Task<Message>, Option<Outcome>) {
+        let existing = &self.existing;
+        let Phase::Review(r) = &mut self.phase else {
+            return (Task::none(), None);
+        };
+        let Some(primary_chain) = r.primary_chain() else {
             return (Task::none(), None);
         };
         // Validate the Advanced service URL before anything is built —
         // a typo'd mirror must not get persisted and then silently
         // 404/timeout every queue fetch.
-        let tx_service_url = match crate::safe::service::normalize_service_base(service_url) {
+        let tx_service_url = match crate::safe::service::normalize_service_base(&r.service_url) {
             Ok(v) => v,
             Err(e) => {
-                if let Step::Label {
-                    advanced,
-                    service_url_error,
-                    ..
-                } = &mut self.step
-                {
-                    // Re-open the section so the error is visible even
-                    // if the user collapsed it after typing.
-                    *advanced = true;
-                    *service_url_error = Some(e);
-                }
+                // Re-open the section so the error is visible even if
+                // the user collapsed it after typing.
+                r.advanced = true;
+                r.service_url_error = Some(e);
                 return (Task::none(), None);
             }
         };
         let now = unix_seconds();
-        let clean_name = clean_label(name);
-        let primary = descriptor_from(
-            metadata,
-            *chain,
-            trust.clone(),
-            clean_name.clone(),
-            linked.clone(),
-            siblings
+        let clean_name = clean_label(&r.name);
+        // Every included chain becomes its own (address, chain_id)
+        // record (separate owner cache; the storage layer treats them
+        // as independent). Primary first, then the rest in
+        // `Chain::ALL` order; each lists every OTHER chosen chain as a
+        // sibling so it self-describes its peer list.
+        let mut chosen: Vec<(Chain, &SafeMetadata, SafeTrust)> = r.included().collect();
+        chosen.sort_by_key(|(c, _, _)| *c != primary_chain);
+        let all_chain_ids: Vec<u64> = chosen.iter().map(|(c, _, _)| c.chain_id()).collect();
+        let mut descriptors = chosen.iter().map(|(chain, md, trust)| {
+            let others: Vec<u64> = all_chain_ids
                 .iter()
-                .filter(|(_, _, _, on)| *on)
-                .map(|(c, _, _, _)| c.chain_id())
-                .collect(),
-            now,
-            tx_service_url.clone(),
-        );
-        // Sibling descriptors: each is its own (address, chain_id)
-        // record (separate owner cache; the storage layer treats
-        // them as independent). All siblings of a sibling include
-        // the primary plus the OTHER siblings, so each descriptor
-        // self-describes its peer list — matches what the dashboard
-        // needs to render "this Safe is also deployed on chain X".
-        let all_chain_ids: Vec<u64> = std::iter::once(chain.chain_id())
-            .chain(
-                siblings
-                    .iter()
-                    .filter(|(_, _, _, on)| *on)
-                    .map(|(c, _, _, _)| c.chain_id()),
+                .copied()
+                .filter(|id| *id != chain.chain_id())
+                .collect();
+            descriptor_from(
+                md,
+                *chain,
+                trust.clone(),
+                clean_name.clone(),
+                // Per chain: owner sets can diverge, so each descriptor
+                // links only the ticked accounts that own THIS chain.
+                r.links_on(existing, &md.owners),
+                others,
+                now,
+                // A custom mirror serves the multi-chain
+                // /tx-service/{chain} layout, so siblings share it.
+                // Adjustable per Safe later in Settings → Safes.
+                tx_service_url.clone(),
             )
-            .collect();
-        let siblings_descriptors: Vec<SafeDescriptor> = siblings
-            .iter()
-            .filter(|(_, _, _, on)| *on)
-            .map(|(c, md, sibling_trust, _)| {
-                let others: Vec<u64> = all_chain_ids
-                    .iter()
-                    .copied()
-                    .filter(|id| *id != c.chain_id())
-                    .collect();
-                descriptor_from(
-                    md,
-                    *c,
-                    sibling_trust.clone(),
-                    clean_name.clone(),
-                    // Sibling owner sets can diverge; we don't
-                    // auto-link signers on siblings. The user can
-                    // re-onboard each sibling individually later
-                    // to link signers there. Conservative default.
-                    Vec::new(),
-                    others,
-                    now,
-                    // A custom mirror serves the multi-chain
-                    // /tx-service/{chain} layout, so siblings share it.
-                    // Adjustable per Safe later in Settings → Safes.
-                    tx_service_url.clone(),
-                )
-            })
-            .collect();
+        });
+        let Some(primary) = descriptors.next() else {
+            return (Task::none(), None);
+        };
+        let siblings: Vec<SafeDescriptor> = descriptors.collect();
         (
             Task::none(),
             Some(Outcome::Done {
                 primary: Box::new(primary),
-                siblings: siblings_descriptors,
+                siblings,
             }),
         )
     }
+}
 
-    fn set_address_error(&mut self, msg: &str) {
-        if let Step::AddressInput {
-            error,
-            ens_resolving,
-            ..
-        } = &mut self.step
-        {
-            *error = Some(msg.to_string());
-            *ens_resolving = None;
+/// Hooks for App-level tests, which can't drive a scan (its result is
+/// stamped with the private `input_seq`) or look inside Review.
+#[cfg(test)]
+impl SafeOnboardingScreen {
+    /// This screen on Review for Safe `address`, as if typed in hex and
+    /// scanned as a canonical Safe on each of `hits` (chain → owners).
+    pub(crate) fn scanned_for_test(
+        mut self,
+        address: Address,
+        hits: Vec<(Chain, Vec<Address>)>,
+    ) -> Self {
+        let results = hits
+            .into_iter()
+            .map(|(chain, owners)| {
+                let md = SafeMetadata {
+                    chain_id: chain.chain_id(),
+                    address,
+                    implementation: Address::ZERO,
+                    version: "1.4.1".into(),
+                    threshold: 1,
+                    owners,
+                    modules: Vec::new(),
+                    guard: None,
+                    fallback_handler: None,
+                    nonce: alloy::primitives::U256::ZERO,
+                };
+                (chain, ScanResult::Canonical(md))
+            })
+            .collect();
+        let what = format!("{address:?}");
+        let target = ScanTarget {
+            address,
+            what: what.clone(),
+            from_name: false,
+        };
+        let review = ReviewState::new(
+            address,
+            what,
+            target,
+            results,
+            &self.existing,
+            &self.existing_safes,
+        );
+        self.phase = Phase::Review(Box::new(review));
+        self
+    }
+
+    /// The account snapshot holds `account_idx`.
+    pub(crate) fn knows_account(&self, account_idx: u32) -> bool {
+        self.existing.iter().any(|e| e.account_idx == account_idx)
+    }
+
+    /// Review has `account_idx` ticked as a signer.
+    pub(crate) fn ticks_signer(&self, account_idx: u32) -> bool {
+        matches!(&self.phase, Phase::Review(r) if r.selected.contains(&account_idx))
+    }
+
+    /// Review's name field.
+    pub(crate) fn review_name(&self) -> Option<&str> {
+        match &self.phase {
+            Phase::Review(r) => Some(r.name.as_str()),
+            Phase::Find(_) => None,
         }
     }
 }
@@ -1121,6 +1241,106 @@ fn clean_label(raw: &str) -> Option<String> {
     } else {
         Some(t.to_string())
     }
+}
+
+/// Position in `Chain::ALL` — the display and primary-fallback order.
+fn chain_rank(chain: Chain) -> usize {
+    Chain::ALL
+        .iter()
+        .position(|c| *c == chain)
+        .unwrap_or(usize::MAX)
+}
+
+/// The Safe a scan found, with the trust level its implementation earns.
+/// `None` for the not-a-Safe outcomes.
+fn hit_of(result: &ScanResult) -> Option<(&SafeMetadata, SafeTrust)> {
+    match result {
+        ScanResult::Canonical(md) => Some((md, SafeTrust::Canonical)),
+        ScanResult::UnrecognizedImpl(md) => Some((md, SafeTrust::UnrecognizedImpl)),
+        ScanResult::NotDeployed | ScanResult::NotASafe { .. } => None,
+    }
+}
+
+/// Why a chain's scan isn't (or is) a Safe, for the Find breakdown.
+fn scan_reason(result: &ScanResult) -> String {
+    match result {
+        ScanResult::NotDeployed => "no contract at this address".to_string(),
+        ScanResult::NotASafe { reason } => format!("not a Safe: {reason}"),
+        ScanResult::Canonical(_) | ScanResult::UnrecognizedImpl(_) => "Safe found".to_string(),
+    }
+}
+
+/// The detail after "not a Safe on {chain}" in the Review chain strip.
+fn miss_detail(result: &ScanResult) -> String {
+    match result {
+        ScanResult::NotDeployed => "no contract at this address".to_string(),
+        ScanResult::NotASafe { reason } => reason.clone(),
+        ScanResult::Canonical(_) | ScanResult::UnrecognizedImpl(_) => "Safe found".to_string(),
+    }
+}
+
+/// The wallet's entry for this Safe on `chain`, if it's already saved there.
+fn saved_entry(
+    existing_safes: &[ExistingSafe],
+    address: Address,
+    chain: Chain,
+) -> Option<&ExistingSafe> {
+    let key = (<[u8; 20]>::from(address), chain.chain_id());
+    existing_safes.iter().find(|s| s.key == key)
+}
+
+/// Every saved entry for this Safe's address, on any chain.
+fn saved_peers(
+    existing_safes: &[ExistingSafe],
+    address: Address,
+) -> impl Iterator<Item = &ExistingSafe> {
+    let address = <[u8; 20]>::from(address);
+    existing_safes.iter().filter(move |s| s.key.0 == address)
+}
+
+/// The name the wallet already gives this address — its first named
+/// entry, the same one `WalletDescriptor::upsert_safe` hands a new chain.
+fn saved_name(existing_safes: &[ExistingSafe], address: Address) -> Option<&str> {
+    saved_peers(existing_safes, address).find_map(|s| s.name.as_deref())
+}
+
+/// The hint under Review's name field for a Safe that's already saved on
+/// some chain: the field applies to every chain of the address
+/// (`App::upsert_safes`), so say what confirming does to the saved name.
+/// `(text, renames)`; `None` when the address isn't saved anywhere.
+fn name_hint(
+    existing_safes: &[ExistingSafe],
+    address: Address,
+    name: &str,
+) -> Option<(String, bool)> {
+    saved_peers(existing_safes, address).next()?;
+    let hint = match clean_label(name) {
+        // Mirrors `upsert_safes`: a given name differing from any saved
+        // entry's renames them all.
+        Some(name)
+            if saved_peers(existing_safes, address)
+                .any(|s| s.name.as_deref() != Some(name.as_str())) =>
+        {
+            ("Renames this Safe on every chain".to_string(), true)
+        }
+        Some(_) => (
+            "Already saved under this name — it applies on every chain".to_string(),
+            false,
+        ),
+        // Blank renames nothing; a new chain takes the saved name.
+        None => match saved_name(existing_safes, address) {
+            Some(saved) => (
+                format!("Left blank, it keeps its saved name “{saved}”"),
+                false,
+            ),
+            None => ("Applies to this Safe on every chain".to_string(), false),
+        },
+    };
+    Some(hint)
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1152,15 +1372,10 @@ fn descriptor_from(
     }
 }
 
-// ── Views (per step) ────────────────────────────────────────────────────────
+// ── Views: Find ─────────────────────────────────────────────────────────────
 
-fn view_address_input<'a>(
-    t: KaoTheme,
-    input: &'a str,
-    error: Option<&'a str>,
-    resolving: bool,
-) -> Element<'a, Message> {
-    let addr_input = text_input("0x… or a name (.eth / .gwei / .wei / @xns)", input)
+fn view_find(t: KaoTheme, f: &FindState) -> Element<'_, Message> {
+    let addr_input = text_input("0x… or a name (.eth / .gwei / .wei / @xns)", &f.input)
         .id(ADDRESS_INPUT_ID)
         .on_input(Message::AddressInput)
         .on_submit(Message::AddressSubmit)
@@ -1169,18 +1384,24 @@ fn view_address_input<'a>(
         .font(mono())
         .style(move |_theme, status| text_input_style(t, status));
 
-    let btn_label = if resolving {
-        "Resolving name…"
+    let (btn_label, ready) = if f.scanning.is_some() {
+        ("Scanning…", false)
+    } else if f.ens_resolving.is_some() {
+        ("Resolving name…", false)
     } else {
-        "Scan →"
+        ("Scan →", true)
     };
-    let btn = primary_button(t, btn_label, !resolving).on_press_maybe(if resolving {
-        None
-    } else {
-        Some(Message::AddressSubmit)
-    });
+    let btn =
+        primary_button(t, btn_label, ready).on_press_maybe(ready.then_some(Message::AddressSubmit));
 
-    let hint = container(
+    // While scanning, Enter does nothing and Esc cancels the scan.
+    let hint_row = if f.scanning.is_some() {
+        row![
+            hint_pill(t, "Esc"),
+            Space::new().width(6),
+            text("to cancel").size(11).color(t.sub),
+        ]
+    } else {
         row![
             hint_pill(t, "Enter"),
             Space::new().width(6),
@@ -1189,13 +1410,21 @@ fn view_address_input<'a>(
             Space::new().width(6),
             text("to go back").size(11).color(t.sub),
         ]
-        .align_y(Alignment::Center),
-    )
-    .width(Length::Fill)
-    .center_x(Length::Fill);
+    };
+    let hint = container(hint_row.align_y(Alignment::Center))
+        .width(Length::Fill)
+        .center_x(Length::Fill);
+
+    let hero = if f.scanning.is_some() {
+        "ദ്ദി◝ ⩊ ◜.ᐟ"
+    } else if f.no_safe.is_some() {
+        "(*ᴗ͈ˬᴗ͈)ꕤ*.ﾟ"
+    } else {
+        "(˶>⩊<˶)"
+    };
 
     let mut content = column![
-        kao_hero(t, "(˶>⩊<˶)", 56.0),
+        kao_hero(t, hero, 56.0),
         vspace(10),
         screen_title(t, "Add a Safe"),
         vspace(6),
@@ -1213,130 +1442,50 @@ fn view_address_input<'a>(
     .width(Length::Fill)
     .align_x(Alignment::Center);
 
-    if let Some(e) = error {
+    if let Some(target) = &f.scanning {
+        content = content
+            .push(vspace(16))
+            .push(
+                text("Checking Mainnet, Optimism, and Base in parallel…")
+                    .size(12)
+                    .color(t.sub),
+            )
+            .push(vspace(4))
+            .push(
+                text(target.what.as_str())
+                    .size(13)
+                    .color(t.sub)
+                    .font(mono()),
+            );
+    }
+    if let Some(e) = &f.error {
         content = content.push(vspace(10)).push(error_text(t, e));
+    }
+    if let Some(ns) = &f.no_safe {
+        content = content.push(vspace(18)).push(view_no_safe(t, ns));
     }
     content.into()
 }
 
-fn view_scanning<'a>(t: KaoTheme, what: &'a str) -> Element<'a, Message> {
-    column![
-        kao_hero(t, "ദ്ദി◝ ⩊ ◜.ᐟ", 56.0),
-        vspace(10),
-        screen_title(t, "Scanning…"),
-        vspace(6),
-        screen_subtitle(t, "Checking Mainnet, Optimism, and Base in parallel."),
-        vspace(22),
-        text(what).size(13).color(t.sub).font(mono()),
-    ]
-    .width(Length::Fill)
-    .align_x(Alignment::Center)
-    .into()
-}
-
-fn view_chain_chooser<'a>(
-    t: KaoTheme,
-    address: Address,
-    results: &'a [(Chain, ScanResult)],
-) -> Element<'a, Message> {
+/// "No Safe anywhere" breakdown shown inline on Find: one row per chain
+/// with the reason it isn't a Safe there.
+fn view_no_safe(t: KaoTheme, ns: &NoSafe) -> Element<'_, Message> {
     let mut col = column![
-        kao_hero(t, "(๑ᵔ⤙ᵔ๑)", 56.0),
-        vspace(10),
-        screen_title(t, "Pick a chain"),
-        vspace(6),
-        screen_subtitle(
-            t,
-            "This address is a Safe on more than one chain. Pick the one to add now — siblings can be added at the next step."
-        ),
-        vspace(14),
-        container(colored_address(t, address)).center_x(Length::Fill),
-        vspace(18),
+        text("No Safe found at this address on Mainnet, Optimism, or Base.")
+            .size(12)
+            .color(t.a2)
+            .font(mono_bold()),
+        vspace(8),
+        colored_address(t, ns.address),
+        vspace(8),
     ]
     .width(Length::Fill)
     .align_x(Alignment::Center);
-
-    for (chain, result) in results {
-        if let ScanResult::Canonical(md) | ScanResult::UnrecognizedImpl(md) = result {
-            let trust_label = match result {
-                ScanResult::Canonical(_) => "Canonical",
-                _ => "Unrecognized impl",
-            };
-            let inner: Element<'_, Message> = column![
-                row![
-                    text(chain.display_name())
-                        .size(14)
-                        .color(t.text)
-                        .font(mono_bold()),
-                    Space::new().width(8),
-                    text(trust_label).size(11).color(t.sub).font(mono()),
-                ]
-                .align_y(Alignment::Center),
-                vspace(4),
-                row![
-                    text(format!("threshold {}", md.threshold))
-                        .size(12)
-                        .color(t.sub)
-                        .font(mono()),
-                    Space::new().width(12),
-                    text(format!(
-                        "{} owner{}",
-                        md.owners.len(),
-                        if md.owners.len() == 1 { "" } else { "s" }
-                    ))
-                    .size(12)
-                    .color(t.sub)
-                    .font(mono()),
-                    Space::new().width(12),
-                    text(format!("v{}", md.version))
-                        .size(12)
-                        .color(t.sub)
-                        .font(mono()),
-                ]
-                .align_y(Alignment::Center),
-            ]
-            .spacing(0)
-            .into();
-            let btn = ghost_button(t, inner)
-                .padding(Padding::from([10, 12]))
-                .width(Length::Fill)
-                .on_press(Message::ChainPicked(*chain));
-            col = col.push(btn).push(vspace(8));
-        }
-    }
-    col.into()
-}
-
-fn view_no_chain<'a>(
-    t: KaoTheme,
-    address: Address,
-    results: &'a [(Chain, ScanResult)],
-) -> Element<'a, Message> {
-    let mut col = column![
-        kao_hero(t, "(*ᴗ͈ˬᴗ͈)ꕤ*.ﾟ", 56.0),
-        vspace(10),
-        screen_title(t, "No Safe found"),
-        vspace(6),
-        screen_subtitle(
-            t,
-            "Couldn't find a Safe at this address on Mainnet, Optimism, or Base."
-        ),
-        vspace(14),
-        container(colored_address(t, address)).center_x(Length::Fill),
-        vspace(18),
-    ]
-    .width(Length::Fill)
-    .align_x(Alignment::Center);
-
-    for (chain, result) in results {
-        let reason = match result {
-            ScanResult::NotDeployed => "no contract at this address".to_string(),
-            ScanResult::NotASafe { reason } => format!("not a Safe: {reason}"),
-            _ => unreachable!("filtered to non-Safe variants"),
-        };
+    for (chain, result) in &ns.results {
         let line = row![
             text(chain.label()).size(12).color(t.text).font(mono_bold()),
             Space::new().width(10),
-            text(reason).size(11).color(t.sub).font(mono()),
+            text(scan_reason(result)).size(11).color(t.sub).font(mono()),
         ]
         .align_y(Alignment::Center);
         col = col.push(line).push(vspace(4));
@@ -1344,21 +1493,336 @@ fn view_no_chain<'a>(
     col.into()
 }
 
-fn view_inspect<'a>(
+// ── Views: Review ───────────────────────────────────────────────────────────
+
+/// Wide sibling of `auth_card` for Review: same chrome, but `Fill` up to
+/// `REVIEW_CARD_MAX_W` so it shrinks with the window instead of
+/// overflowing it, and `Fill` height (capped) so the columns below get a
+/// bounded height to scroll within — a vertical scrollable hands its
+/// content infinite height, so it needs a bounded parent.
+fn review_card<'a>(t: KaoTheme, content: Element<'a, Message>) -> Element<'a, Message> {
+    let card = container(content)
+        .padding(Padding::from([24, 28]))
+        .width(Length::Fill)
+        .max_width(REVIEW_CARD_MAX_W)
+        .height(Length::Fill)
+        .max_height(REVIEW_CARD_MAX_H)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(t.card)),
+            border: Border {
+                color: t.border,
+                width: 1.0,
+                radius: Radius::from(24),
+            },
+            text_color: Some(t.text),
+            shadow: iced::Shadow {
+                color: Color::from_rgba(0.0, 0.0, 0.0, if t.dark { 0.45 } else { 0.10 }),
+                offset: iced::Vector::new(0.0, 12.0),
+                blur_radius: 36.0,
+            },
+            ..container::Style::default()
+        });
+    // `align_x`/`align_y`, not `center_x(len)` — that would SET the
+    // card's width and defeat `max_width`.
+    container(card)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(Padding::from([0, 16]).bottom(16))
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Center)
+        .into()
+}
+
+/// The whole Review body. `wide` = two columns (Security | Setup, each
+/// with its own scrollable); otherwise one stacked scrollable.
+fn view_review<'a>(
+    t: KaoTheme,
+    r: &'a ReviewState,
+    existing: &'a [ExistingAccount],
+    existing_safes: &'a [ExistingSafe],
+    wide: bool,
+) -> Element<'a, Message> {
+    let header = view_review_header(t, r, existing_safes, wide);
+    let security = view_security(t, r, existing);
+    let setup = view_setup(t, r, existing, existing_safes);
+    let footer = view_review_footer(t, r, existing, existing_safes);
+
+    let body: Element<'a, Message> = if wide {
+        let left = container(review_scroll(t, security).height(Length::Shrink))
+            .width(Length::FillPortion(1))
+            .height(Length::Fill);
+        let rule = container(Space::new().width(1).height(Length::Fill))
+            .height(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(Background::Color(t.border)),
+                ..container::Style::default()
+            });
+        // The Setup scrollable is `Fill` so the footer (role summary +
+        // confirm) is laid out first and stays pinned under it — a
+        // `Shrink` scrollable laid out before it could take the whole
+        // height and push the button off the card.
+        let right = column![
+            review_scroll(t, setup).height(Length::Fill),
+            vspace(12),
+            footer,
+        ]
+        .width(Length::FillPortion(1))
+        .height(Length::Fill);
+        row![left, rule, right]
+            .spacing(14)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    } else {
+        column![
+            review_scroll(t, column![security, vspace(22), setup].into()).height(Length::Fill),
+            vspace(12),
+            footer,
+        ]
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+    };
+
+    column![header, vspace(14), body]
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
+/// A Review column's own scrollable. The right padding keeps the
+/// (floating) scrollbar off the content.
+fn review_scroll<'a>(t: KaoTheme, content: Element<'a, Message>) -> Scrollable<'a, Message> {
+    scrollable(
+        container(content)
+            .width(Length::Fill)
+            .padding(Padding::ZERO.right(12)),
+    )
+    .width(Length::Fill)
+    .style(move |_theme, status| kao_scrollable_style(t, status))
+}
+
+fn view_review_header<'a>(
+    t: KaoTheme,
+    r: &'a ReviewState,
+    existing_safes: &'a [ExistingSafe],
+    wide: bool,
+) -> Element<'a, Message> {
+    let mut col = column![
+        screen_title(t, "Review Safe"),
+        vspace(8),
+        colored_address(t, r.address),
+    ]
+    .width(Length::Fill)
+    .align_x(Alignment::Center);
+    if let Some(name) = &r.typed_name {
+        col = col.push(vspace(2)).push(
+            text(format!("resolved from {name}"))
+                .size(12)
+                .color(t.sub)
+                .font(mono()),
+        );
+    }
+    col = col
+        .push(vspace(14))
+        .push(view_chain_strip(t, r, existing_safes, wide));
+    col.into()
+}
+
+/// One row per scanned chain: hits get an include box, a focus target
+/// and their at-a-glance numbers; misses say why they aren't a Safe.
+fn view_chain_strip<'a>(
+    t: KaoTheme,
+    r: &'a ReviewState,
+    existing_safes: &'a [ExistingSafe],
+    wide: bool,
+) -> Element<'a, Message> {
+    let included_count = r.included().count();
+    let mut col = column![].spacing(6).width(Length::Fill);
+    for (chain, result) in &r.results {
+        let chain = *chain;
+        let line = match hit_of(result) {
+            Some((md, trust)) => {
+                let included = r.is_included(chain);
+                view_chain_hit(
+                    t,
+                    chain,
+                    md,
+                    &trust,
+                    ChainRowState {
+                        included,
+                        locked: included && included_count == 1,
+                        focused: r.focused == chain,
+                        saved: saved_entry(existing_safes, r.address, chain).is_some(),
+                    },
+                    wide,
+                )
+            }
+            None => container(
+                text(format!(
+                    "not a Safe on {} — {}",
+                    chain.display_name(),
+                    miss_detail(result)
+                ))
+                .size(11)
+                .color(t.sub)
+                .font(mono()),
+            )
+            // Line up with the hit rows' chain names (row padding +
+            // checkbox + gap + button padding).
+            .padding(Padding::from([2, 10]).left(40))
+            .width(Length::Fill)
+            .into(),
+        };
+        col = col.push(line);
+    }
+    col.into()
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChainRowState {
+    included: bool,
+    /// The last included chain: its box can't be unticked.
+    locked: bool,
+    focused: bool,
+    saved: bool,
+}
+
+fn view_chain_hit<'a>(
     t: KaoTheme,
     chain: Chain,
     md: &'a SafeMetadata,
     trust: &SafeTrust,
+    st: ChainRowState,
+    wide: bool,
 ) -> Element<'a, Message> {
-    let trust_badge = match trust {
-        SafeTrust::Canonical => text("✓ Canonical").size(11).color(t.a1).font(mono_bold()),
+    let include = kao_checkbox(t, st.included).size(16).on_toggle_maybe(
+        (!st.locked).then_some(move |_: bool| Message::ChainIncludeToggled(chain)),
+    );
+    let name = text(chain.display_name())
+        .size(13)
+        .color(t.text)
+        .font(mono_bold());
+    let details = text(format!(
+        "threshold {} of {} · v{}",
+        md.threshold,
+        md.owners.len(),
+        md.version
+    ))
+    .size(12)
+    .color(t.sub)
+    .font(mono());
+    let saved: Element<'a, Message> = if st.saved {
+        text("Already in your wallet")
+            .size(11)
+            .color(t.a3)
+            .font(mono_bold())
+            .into()
+    } else {
+        Space::new().into()
+    };
+    let info: Element<'a, Message> = if wide {
+        row![
+            name,
+            Space::new().width(10),
+            trust_badge(t, trust),
+            Space::new().width(12),
+            details,
+            Space::new().width(Length::Fill),
+            saved,
+        ]
+        .align_y(Alignment::Center)
+        .into()
+    } else {
+        column![
+            row![name, Space::new().width(10), trust_badge(t, trust)].align_y(Alignment::Center),
+            row![details, Space::new().width(10), saved].align_y(Alignment::Center),
+        ]
+        .spacing(2)
+        .into()
+    };
+    // The name/numbers are the focus target; the checkbox sits outside
+    // the button so ticking it never also refocuses.
+    let focus = ghost_button(
+        t,
+        container(info)
+            .width(Length::Fill)
+            .padding(Padding::from([6, 10])),
+    )
+    .width(Length::Fill)
+    .on_press(Message::ChainFocused(chain));
+    let focused = st.focused;
+    container(
+        row![include, Space::new().width(4), focus]
+            .align_y(Alignment::Center)
+            .width(Length::Fill),
+    )
+    .padding(Padding::from([2, 10]))
+    .width(Length::Fill)
+    .style(move |_| container::Style {
+        background: Some(Background::Color(if focused {
+            t.card_alt
+        } else {
+            Color::TRANSPARENT
+        })),
+        border: Border {
+            color: if focused {
+                with_alpha(t.a1, 0.55)
+            } else {
+                t.border
+            },
+            width: 1.0,
+            radius: Radius::from(12),
+        },
+        text_color: Some(t.text),
+        ..container::Style::default()
+    })
+    .into()
+}
+
+fn trust_badge<'a>(t: KaoTheme, trust: &SafeTrust) -> Element<'a, Message> {
+    match trust {
+        SafeTrust::Canonical => text("✓ Canonical")
+            .size(11)
+            .color(t.a1)
+            .font(mono_bold())
+            .into(),
         SafeTrust::UnrecognizedImpl => text("⚠ Unrecognized impl")
             .size(11)
             .color(t.a2)
-            .font(mono_bold()),
+            .font(mono_bold())
+            .into(),
+    }
+}
+
+fn column_title<'a>(t: KaoTheme, label: &'a str) -> Element<'a, Message> {
+    container(text(label).size(15).color(t.text).font(black()))
+        .width(Length::Fill)
+        .into()
+}
+
+fn field_heading<'a>(t: KaoTheme, label: &'a str) -> Element<'a, Message> {
+    text(label).size(12).color(t.text).font(mono_bold()).into()
+}
+
+/// The Security column for the focused chain: version and trust,
+/// threshold, owners, and the module / guard / fallback-handler surfaces.
+fn view_security<'a>(
+    t: KaoTheme,
+    r: &'a ReviewState,
+    existing: &'a [ExistingAccount],
+) -> Element<'a, Message> {
+    let mut col = column![column_title(t, "Security"), vspace(10)]
+        .width(Length::Fill)
+        .align_x(Alignment::Center);
+    let chain = r.focused;
+    let Some((md, trust)) = r.hit(chain) else {
+        // `focused` is only ever set to a hit; render nothing rather
+        // than panic if that stops holding.
+        return col.into();
     };
 
-    let header = column![
+    col = col.push(
         row![
             text(chain.display_name())
                 .size(13)
@@ -1370,71 +1834,104 @@ fn view_inspect<'a>(
                 .color(t.sub)
                 .font(mono()),
             Space::new().width(10),
-            trust_badge,
+            trust_badge(t, &trust),
         ]
         .align_y(Alignment::Center),
-        vspace(8),
-        colored_address(t, md.address),
-    ];
-
-    let threshold_line = text(format!(
-        "threshold {} of {} owner{}",
-        md.threshold,
-        md.owners.len(),
-        if md.owners.len() == 1 { "" } else { "s" }
-    ))
-    .size(12)
-    .color(t.sub)
-    .font(mono());
-
-    let mut owners_col = column![text("Owners").size(12).color(t.text).font(mono_bold())];
-    for owner in &md.owners {
-        owners_col = owners_col.push(vspace(4)).push(colored_address(t, *owner));
+    );
+    if let Some(reason) = trust.signing_block_reason() {
+        col = col
+            .push(vspace(4))
+            .push(text(reason).size(11).color(t.a2).font(mono_bold()));
+    }
+    if !r.is_included(chain) {
+        col = col.push(vspace(4)).push(
+            text("Not being added — tick it above to include it.")
+                .size(11)
+                .color(t.sub)
+                .font(mono()),
+        );
     }
 
-    let modules_col = danger_block(t, "Modules", &md.modules, "no modules enabled");
-    let guard_col = danger_block(t, "Guard", md.guard.as_slice(), "no guard set");
-    let fallback_col = danger_block(
-        t,
-        "Fallback handler",
-        md.fallback_handler.as_slice(),
-        "no fallback handler set",
+    col = col.push(vspace(10)).push(
+        text(format!(
+            "threshold {} of {} owner{}",
+            md.threshold,
+            md.owners.len(),
+            plural(md.owners.len())
+        ))
+        .size(12)
+        .color(t.sub)
+        .font(mono()),
     );
-
-    let mut body = column![
-        kao_hero(t, "⸜(｡˃ ᵕ ˂ )⸝♡", 48.0),
-        vspace(8),
-        screen_title(t, "Safe found"),
-        vspace(12),
-        header,
-        vspace(14),
-        threshold_line,
-    ]
-    .width(Length::Fill)
-    .align_x(Alignment::Center);
-
     if md.threshold == 1 {
-        body = body.push(vspace(6)).push(
+        col = col.push(vspace(6)).push(
             text("⚠ Threshold = 1 — any owner can act alone")
                 .size(11)
                 .color(t.a2)
                 .font(mono_bold()),
         );
     }
+    // Only the focused chain is spelled out below; flag any included
+    // chain that would add something different.
+    if r.owners_differ() {
+        col = col.push(vspace(6)).push(
+            text("⚠ Owners differ across chains — review each one")
+                .size(11)
+                .color(t.a2)
+                .font(mono_bold()),
+        );
+    }
+    if r.danger_surfaces_differ() {
+        col = col.push(vspace(6)).push(
+            text("⚠ Modules / guard / fallback handler differ across chains — review each one")
+                .size(11)
+                .color(t.a2)
+                .font(mono_bold()),
+        );
+    }
 
-    body = body
-        .push(vspace(14))
-        .push(owners_col)
-        .push(vspace(14))
-        .push(modules_col)
-        .push(vspace(10))
-        .push(guard_col)
-        .push(vspace(10))
-        .push(fallback_col)
-        .push(vspace(18))
-        .push(primary_button(t, "Continue →", true).on_press(Message::InspectContinue));
+    col = col.push(vspace(14)).push(field_heading(t, "Owners"));
+    for owner in &md.owners {
+        col = col.push(vspace(4)).push(colored_address(t, *owner));
+        if let Some(acc) = existing.iter().find(|e| e.address == *owner) {
+            let (label, color) = if acc.view_only {
+                (format!("· {} (view-only)", acc.label), t.sub)
+            } else {
+                (format!("· {}", acc.label), t.a1)
+            };
+            col = col.push(text(label).size(11).color(color).font(mono_bold()));
+        } else if r.linked_nested_safes.contains(owner) {
+            col = col.push(
+                text("· linked owner Safe")
+                    .size(11)
+                    .color(t.a1)
+                    .font(mono_bold()),
+            );
+        }
+    }
 
-    scrollable(body).height(Length::Shrink).into()
+    col.push(vspace(14))
+        .push(danger_block(
+            t,
+            "Modules",
+            &md.modules,
+            "no modules enabled",
+        ))
+        .push(vspace(10))
+        .push(danger_block(
+            t,
+            "Guard",
+            md.guard.as_slice(),
+            "no guard set",
+        ))
+        .push(vspace(10))
+        .push(danger_block(
+            t,
+            "Fallback handler",
+            md.fallback_handler.as_slice(),
+            "no fallback handler set",
+        ))
+        .into()
 }
 
 /// Render one of the "danger surfaces" — modules / guard / fallback —
@@ -1452,7 +1949,8 @@ fn danger_block<'a, T: AsRef<[Address]>>(
             .size(12)
             .color(t.text)
             .font(mono_bold())
-    ];
+    ]
+    .align_x(Alignment::Center);
     let addrs = addrs.as_ref();
     if addrs.is_empty() {
         col = col
@@ -1476,289 +1974,153 @@ fn danger_block<'a, T: AsRef<[Address]>>(
     col.into()
 }
 
-fn view_role_selection<'a>(
+/// The Setup column: name, which accounts to link as signers, the inline
+/// add-signer section and the Advanced transaction-service override.
+fn view_setup<'a>(
     t: KaoTheme,
-    chain: Chain,
-    md: &'a SafeMetadata,
-    matched: &'a [ExistingAccount],
-    selected: &BTreeSet<u32>,
-    linked_nested_safes: &'a [Address],
-    signer_error: Option<&'a str>,
+    r: &'a ReviewState,
+    existing: &'a [ExistingAccount],
+    existing_safes: &'a [ExistingSafe],
 ) -> Element<'a, Message> {
-    let header = column![
-        screen_title(t, "Your role"),
-        vspace(6),
-        screen_subtitle(
-            t,
-            "Link the wallet accounts that own this Safe — or continue as a watch-only observer."
-        ),
-        vspace(8),
-        text(format!("Safe on {} — {}", chain.display_name(), md.address))
-            .size(11)
-            .color(t.sub)
-            .font(mono()),
-    ]
-    .width(Length::Fill)
-    .align_x(Alignment::Center);
-
-    let mut body = column![header, vspace(18)]
-        .width(Length::Fill)
-        .align_x(Alignment::Center);
-
-    if matched.is_empty() {
-        body = body.push(
-            text("No accounts in this wallet are owners of this Safe.")
-                .size(12)
-                .color(t.sub)
-                .font(mono()),
-        );
-    } else {
-        body = body.push(
-            text("Matched owners")
-                .size(12)
-                .color(t.text)
-                .font(mono_bold()),
-        );
-        for m in matched {
-            let is_selected = selected.contains(&m.account_idx);
-            let idx = m.account_idx;
-            let cb = kao_checkbox(t, is_selected)
-                .label(format!("{} · {}", m.label, m.address))
-                .on_toggle(move |_| Message::SignerToggled(idx))
-                .size(16)
-                .spacing(10)
-                .text_size(13)
-                .text_line_height(1.4)
-                .font(mono());
-            body = body.push(vspace(6)).push(cb);
-        }
-    }
-
-    if !linked_nested_safes.is_empty() {
-        body = body.push(vspace(14)).push(
-            text("Linked owner Safes")
-                .size(12)
-                .color(t.text)
-                .font(mono_bold()),
-        );
-        for a in linked_nested_safes {
-            body = body.push(vspace(6)).push(colored_address(t, *a));
-        }
-    }
-
-    let confirm_label = match (selected.is_empty(), linked_nested_safes.is_empty()) {
-        (true, true) => "Continue as watch-only →",
-        (true, false) => "Continue →",
-        (false, _) => "Link signers →",
-    };
-    body = body
-        .push(vspace(20))
-        .push(
-            primary_button(t, confirm_label, true).on_press(if selected.is_empty() {
-                Message::WatchOnlySelected
-            } else {
-                Message::RoleConfirm
-            }),
-        )
-        .push(vspace(10))
-        .push({
-            let label: Element<'_, Message> =
-                text("Add a new signer →").size(12).color(t.text).into();
-            ghost_button(t, label)
-                .padding(Padding::from([10, 14]))
-                .on_press(Message::AddSignerPressed)
-        });
-    if let Some(err) = signer_error {
-        body = body.push(vspace(10)).push(error_text(t, err));
-    }
-    body.into()
-}
-
-/// Pick the import method for a new signer. Surfaces the list of
-/// owners the user still needs to "claim" (i.e., own a key for) so
-/// they can verify the upcoming import is targeting the right one.
-fn view_pick_signer_method<'a>(
-    t: KaoTheme,
-    chain: Chain,
-    md: &'a SafeMetadata,
-    unclaimed_owners: &'a [Address],
-) -> Element<'a, Message> {
-    let header = column![
-        kao_hero(t, "(っ◔◡◔)っ", 48.0),
-        vspace(8),
-        screen_title(t, "Add a new signer"),
-        vspace(6),
-        screen_subtitle(
-            t,
-            "Pick an import method. The address it derives must be one of this Safe's owners.",
-        ),
-        vspace(8),
-        text(format!("Safe on {} — {}", chain.display_name(), md.address))
-            .size(11)
-            .color(t.sub)
-            .font(mono()),
-    ]
-    .width(Length::Fill)
-    .align_x(Alignment::Center);
-
-    let mut owners_col = column![
-        text("Unclaimed owners")
-            .size(12)
-            .color(t.text)
-            .font(mono_bold())
-    ];
-    if unclaimed_owners.is_empty() {
-        owners_col = owners_col.push(vspace(4)).push(
-            text("Every owner is already in your wallet — nothing to import.")
-                .size(11)
-                .color(t.sub)
-                .font(mono()),
-        );
-    } else {
-        for a in unclaimed_owners {
-            owners_col = owners_col.push(vspace(4)).push(colored_address(t, *a));
-        }
-    }
-
-    let mut body = column![header, vspace(16), owners_col]
-        .width(Length::Fill)
-        .align_x(Alignment::Center);
-
-    if !unclaimed_owners.is_empty() {
-        body = body
-            .push(vspace(18))
-            .push(method_card(
-                t,
-                t.ab1,
-                t.a1,
-                "1",
-                "Seed phrase",
-                "Restore an account from a 12 or 24-word phrase, then pick the matching HD index.",
-                Message::SignerMethodPicked(SignerMethod::SeedPhrase),
-            ))
-            .push(vspace(10))
-            .push(method_card(
-                t,
-                t.ab2,
-                t.a2,
-                "2",
-                "Private key",
-                "Paste a raw 32-byte hex key. Rejected if it doesn't derive to an owner.",
-                Message::SignerMethodPicked(SignerMethod::PrivateKey),
-            ))
-            .push(vspace(10))
-            .push(method_card(
-                t,
-                t.ab3,
-                t.a3,
-                "3",
-                "Hardware wallet",
-                "Connect a Ledger or Trezor and pick the matching account.",
-                Message::SignerMethodPicked(SignerMethod::Hardware),
-            ))
-            .push(vspace(10))
-            .push(method_card(
-                t,
-                t.ab1,
-                t.a1,
-                "4",
-                "Nested Safe",
-                "The owner is itself a Safe — onboard it as its own entry and link it as an owner.",
-                Message::SignerMethodPicked(SignerMethod::NestedSafe),
-            ));
-    }
-    scrollable(body).height(Length::Shrink).into()
-}
-
-#[allow(clippy::too_many_arguments)]
-fn view_label<'a>(
-    t: KaoTheme,
-    chain: Chain,
-    md: &'a SafeMetadata,
-    trust: &SafeTrust,
-    linked: &[u32],
-    name: &str,
-    siblings: &'a [(Chain, SafeMetadata, SafeTrust, bool)],
-    advanced: bool,
-    service_url: &str,
-    service_url_error: Option<&'a str>,
-) -> Element<'a, Message> {
-    let trust_badge = match trust {
-        SafeTrust::Canonical => text("Canonical").size(11).color(t.a1).font(mono()),
-        SafeTrust::UnrecognizedImpl => text("Unrecognized impl").size(11).color(t.a2).font(mono()),
-    };
-    let role_label = if linked.is_empty() {
-        format!("Watch-only Safe on {}", chain.display_name())
-    } else {
-        format!(
-            "Signer Safe on {} ({} linked key{})",
-            chain.display_name(),
-            linked.len(),
-            if linked.len() == 1 { "" } else { "s" }
-        )
-    };
-
-    let name_input = text_input("Treasury · Council · Personal hot…", name)
+    let name_input = text_input("Treasury · Council · Personal hot…", &r.name)
         .id(NAME_INPUT_ID)
         .on_input(Message::NameInput)
-        .on_submit(Message::LabelConfirm)
+        .on_submit(Message::Confirm)
         .padding(Padding::from([12, 14]))
         .size(14)
         .font(mono())
         .style(move |_theme, status| text_input_style(t, status));
 
-    let mut siblings_col = column![];
-    if !siblings.is_empty() {
-        siblings_col = siblings_col
+    let mut col = column![
+        column_title(t, "Setup"),
+        vspace(10),
+        field_heading(t, "Name"),
+        vspace(6),
+        name_input,
+    ]
+    .width(Length::Fill);
+    if let Some((hint, renames)) = name_hint(existing_safes, r.address, &r.name) {
+        col = col.push(vspace(4)).push(
+            text(hint)
+                .size(11)
+                .color(if renames { t.a2 } else { t.sub })
+                .font(mono()),
+        );
+    }
+    col = col
+        .push(vspace(18))
+        .push(field_heading(t, "Your signers"))
+        .push(vspace(6));
+
+    let mut any_signer_row = false;
+    for acc in existing {
+        let chains = r.owned_chains(acc.address);
+        if chains.is_empty() {
+            continue;
+        }
+        any_signer_row = true;
+        let idx = acc.account_idx;
+        let checkbox = kao_checkbox(t, !acc.view_only && r.selected.contains(&idx))
+            .label(format!("{} · {}", acc.label, short_address(acc.address)))
+            .size(16)
+            .spacing(10)
+            .text_size(13)
+            .text_line_height(1.4)
+            .font(mono())
+            .on_toggle_maybe(
+                (!acc.view_only).then_some(move |_: bool| Message::SignerToggled(idx)),
+            );
+        let sub = if acc.view_only {
+            "view-only — can't sign".to_string()
+        } else {
+            let names: Vec<&str> = chains.iter().map(|c| c.label()).collect();
+            let mut sub = format!("owner on {}", names.join(" · "));
+            // A saved chain already linking it keeps the link even if
+            // it's unticked here — a merge never unlinks.
+            let linked: Vec<&str> = chains
+                .iter()
+                .filter(|c| {
+                    saved_entry(existing_safes, r.address, **c)
+                        .is_some_and(|s| s.linked_signer_indices.contains(&idx))
+                })
+                .map(|c| c.label())
+                .collect();
+            if !linked.is_empty() {
+                sub.push_str(&format!(" — already linked on {}", linked.join(" · ")));
+            }
+            sub
+        };
+        col = col
+            .push(checkbox)
             .push(
-                text("Also detected on")
-                    .size(12)
-                    .color(t.text)
-                    .font(mono_bold()),
+                container(text(sub).size(11).color(t.sub).font(mono()))
+                    .padding(Padding::ZERO.left(26)),
             )
             .push(vspace(6));
-        for (sib_chain, _md, _trust, on) in siblings {
-            let chain_label = sib_chain.display_name().to_string();
-            let captured_chain = *sib_chain;
-            let cb = kao_checkbox(t, *on)
-                .label(format!("Add as separate entry · {chain_label}"))
-                .on_toggle(move |_| Message::SiblingToggled(captured_chain))
-                .size(16)
-                .spacing(10)
-                .text_size(13)
-                .font(mono());
-            siblings_col = siblings_col.push(cb).push(vspace(4));
+    }
+    if !any_signer_row {
+        col = col.push(
+            text("None of your accounts own this Safe.")
+                .size(12)
+                .color(t.sub)
+                .font(mono()),
+        );
+    }
+
+    if !r.linked_nested_safes.is_empty() {
+        col = col
+            .push(vspace(12))
+            .push(field_heading(t, "Linked owner Safes"));
+        for a in &r.linked_nested_safes {
+            col = col.push(vspace(6)).push(colored_address(t, *a));
         }
+    }
+
+    col = col.push(vspace(12)).push(
+        link_button(
+            t,
+            if r.add_signer_open {
+                "Add a new signer ▾"
+            } else {
+                "Add a new signer ▸"
+            },
+        )
+        .on_press(Message::AddSignerToggled),
+    );
+    if r.add_signer_open {
+        col = col.push(vspace(6)).push(view_add_signer(t, r, existing));
+    }
+    if let Some(err) = &r.signer_error {
+        col = col.push(vspace(10)).push(error_text(t, err));
     }
 
     // Advanced section — collapsed by default; holds the custom
     // Transaction Service mirror. Per-Safe, validated on confirm.
-    let advanced_header = link_button(
-        t,
-        if advanced {
-            "Advanced ▾"
-        } else {
-            "Advanced ▸"
-        },
-    )
-    .on_press(Message::AdvancedToggled);
-    let mut advanced_col = column![advanced_header].width(Length::Fill);
-    if advanced {
-        let service_input = text_input(crate::safe::service::DEFAULT_TX_SERVICE_BASE, service_url)
-            .on_input(Message::ServiceUrlInput)
-            .on_submit(Message::LabelConfirm)
-            .padding(Padding::from([10, 12]))
-            .size(13)
-            .font(mono())
-            .style(move |_theme, status| text_input_style(t, status));
-        advanced_col = advanced_col
+    col = col.push(vspace(10)).push(
+        link_button(
+            t,
+            if r.advanced {
+                "Advanced ▾"
+            } else {
+                "Advanced ▸"
+            },
+        )
+        .on_press(Message::AdvancedToggled),
+    );
+    if r.advanced {
+        let service_input = text_input(
+            crate::safe::service::DEFAULT_TX_SERVICE_BASE,
+            &r.service_url,
+        )
+        .on_input(Message::ServiceUrlInput)
+        .on_submit(Message::Confirm)
+        .padding(Padding::from([10, 12]))
+        .size(13)
+        .font(mono())
+        .style(move |_theme, status| text_input_style(t, status));
+        col = col
             .push(vspace(8))
-            .push(
-                text("Transaction service")
-                    .size(12)
-                    .color(t.text)
-                    .font(mono_bold()),
-            )
+            .push(field_heading(t, "Transaction service"))
             .push(vspace(4))
             .push(service_input)
             .push(vspace(4))
@@ -1770,38 +2132,117 @@ fn view_label<'a>(
                 .size(11)
                 .color(t.sub),
             );
-        if let Some(err) = service_url_error {
-            advanced_col = advanced_col.push(vspace(6)).push(error_text(t, err));
+        if let Some(err) = &r.service_url_error {
+            col = col.push(vspace(6)).push(error_text(t, err));
         }
     }
+    col.push(vspace(8)).into()
+}
 
-    let body = column![
-        screen_title(t, "Label this Safe"),
-        vspace(8),
-        row![
-            text(format!("v{}", md.version))
+/// The inline "Add a new signer" section: who the import must derive to,
+/// then the four import methods.
+fn view_add_signer<'a>(
+    t: KaoTheme,
+    r: &'a ReviewState,
+    existing: &'a [ExistingAccount],
+) -> Element<'a, Message> {
+    let unclaimed = r.unclaimed_owners(existing);
+    let mut body = column![field_heading(t, "Unclaimed owners")]
+        .width(Length::Fill)
+        .align_x(Alignment::Center);
+    if unclaimed.is_empty() {
+        body = body.push(vspace(4)).push(
+            text("Every owner is already in your wallet — nothing to import.")
                 .size(11)
                 .color(t.sub)
                 .font(mono()),
-            Space::new().width(10),
-            trust_badge,
-        ]
-        .align_y(Alignment::Center),
-        vspace(4),
-        text(role_label).size(11).color(t.sub).font(mono()),
-        vspace(18),
-        name_input,
-        vspace(16),
-        siblings_col,
-        vspace(12),
-        advanced_col,
-        vspace(20),
-        primary_button(t, "Add to wallet →", true).on_press(Message::LabelConfirm),
-    ]
-    .width(Length::Fill)
-    .align_x(Alignment::Center);
+        );
+    } else {
+        for a in &unclaimed {
+            body = body.push(vspace(4)).push(colored_address(t, *a));
+        }
+        body = body
+            .push(vspace(10))
+            .push(
+                text("Pick an import method. The address it derives must be one of this Safe's owners.")
+                    .size(12)
+                    .color(t.sub),
+            )
+            .push(vspace(10))
+            .push(method_card(
+                t,
+                t.ab1,
+                t.a1,
+                "1",
+                "Seed phrase",
+                "Restore an account from a 12 or 24-word phrase, then pick the matching HD index.",
+                Message::SignerMethodPicked(SignerMethod::SeedPhrase),
+            ))
+            .push(vspace(8))
+            .push(method_card(
+                t,
+                t.ab2,
+                t.a2,
+                "2",
+                "Private key",
+                "Paste a raw 32-byte hex key. Rejected if it doesn't derive to an owner.",
+                Message::SignerMethodPicked(SignerMethod::PrivateKey),
+            ))
+            .push(vspace(8))
+            .push(method_card(
+                t,
+                t.ab3,
+                t.a3,
+                "3",
+                "Hardware wallet",
+                "Connect a Ledger or Trezor and pick the matching account.",
+                Message::SignerMethodPicked(SignerMethod::Hardware),
+            ))
+            .push(vspace(8))
+            .push(method_card(
+                t,
+                t.ab1,
+                t.a1,
+                "4",
+                "Nested Safe",
+                "The owner is itself a Safe — onboard it as its own entry and link it as an owner.",
+                Message::SignerMethodPicked(SignerMethod::NestedSafe),
+            ));
+    }
+    section_card(t, "ADD A NEW SIGNER", body.into())
+}
 
-    body.into()
+/// Pinned under the Setup column: what each included chain will be
+/// saved as, then the confirm button. This is where a chain the user's
+/// keys don't own shows up as watch-only BEFORE they confirm — and where a
+/// chain that's already saved says it keeps its links.
+fn view_review_footer<'a>(
+    t: KaoTheme,
+    r: &'a ReviewState,
+    existing: &'a [ExistingAccount],
+    existing_safes: &'a [ExistingSafe],
+) -> Element<'a, Message> {
+    let mut col = column![field_heading(t, "Adding as"), vspace(4)].width(Length::Fill);
+    let roles = r.chain_roles(existing, existing_safes);
+    for role in &roles {
+        let owner_safe = r
+            .hit(role.chain)
+            .is_some_and(|(md, _)| r.linked_nested_safes.iter().any(|a| md.owners.contains(a)));
+        let color = if role.signers.is_empty() {
+            t.sub
+        } else {
+            t.text
+        };
+        col = col.push(
+            text(role.line(owner_safe))
+                .size(12)
+                .color(color)
+                .font(mono()),
+        );
+    }
+    col.push(vspace(12))
+        .push(primary_button(t, confirm_label(&roles), true).on_press(Message::Confirm))
+        .into()
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -1822,11 +2263,32 @@ mod tests {
     fn owner_b() -> Address {
         address!("0x000000000000000000000000000000000000dead")
     }
+    fn owner_c() -> Address {
+        address!("0x0000000000000000000000000000000000000c0c")
+    }
+    fn owner_d() -> Address {
+        address!("0x0000000000000000000000000000000000000d0d")
+    }
 
-    /// Canned `SafeMetadata` for tests that need to inject Inspect or
-    /// Label state directly. Versioned 1.4.1 with the canonical L1
-    /// singleton so it would classify as `Canonical` if it went
-    /// through the registry; we set the trust explicitly in callers.
+    fn acct(idx: u32, address: Address) -> ExistingAccount {
+        ExistingAccount {
+            account_idx: idx,
+            address,
+            label: format!("Account {}", idx + 1),
+            view_only: false,
+        }
+    }
+
+    fn watched(idx: u32, address: Address) -> ExistingAccount {
+        ExistingAccount {
+            view_only: true,
+            ..acct(idx, address)
+        }
+    }
+
+    /// Canned `SafeMetadata`. Versioned 1.4.1 with the canonical L1
+    /// singleton so it would classify as `Canonical` if it went through
+    /// the registry; callers pick the `ScanResult` variant explicitly.
     fn fake_metadata_with_owners(owners: Vec<Address>, threshold: u32) -> SafeMetadata {
         SafeMetadata {
             chain_id: 1,
@@ -1842,335 +2304,850 @@ mod tests {
         }
     }
 
-    fn canonical_hit(chain: Chain, owners: Vec<Address>) -> (Chain, ScanResult) {
+    fn hit_with(chain: Chain, owners: Vec<Address>, threshold: u32) -> (Chain, ScanResult) {
         (
             chain,
             ScanResult::Canonical(SafeMetadata {
                 chain_id: chain.chain_id(),
-                ..fake_metadata_with_owners(owners, 1)
+                ..fake_metadata_with_owners(owners, threshold)
             }),
         )
     }
 
-    fn screen(
-        mock: Arc<dyn BalanceFetcher>,
-        existing: Vec<ExistingAccount>,
-    ) -> SafeOnboardingScreen {
-        SafeOnboardingScreen::new(mock, existing)
+    fn canonical_hit(chain: Chain, owners: Vec<Address>) -> (Chain, ScanResult) {
+        hit_with(chain, owners, 1)
     }
 
+    fn screen(existing: Vec<ExistingAccount>) -> SafeOnboardingScreen {
+        let net: Arc<dyn BalanceFetcher> = Arc::new(CallMock::new());
+        SafeOnboardingScreen::new(net, existing)
+    }
+
+    /// Type the Safe's hex address on Find and submit, so a scan is in
+    /// flight (the returned task is dropped — tests inject the result).
+    fn scanning(existing: Vec<ExistingAccount>) -> SafeOnboardingScreen {
+        let mut s = screen(existing);
+        let _ = s.update(Message::AddressInput(format!("{:?}", safe_addr())));
+        let _ = s.update(Message::AddressSubmit);
+        assert_eq!(s.phase.name(), "Scanning");
+        s
+    }
+
+    fn complete_scan(s: &mut SafeOnboardingScreen, results: Vec<(Chain, ScanResult)>) {
+        let _ = s.update(Message::ScanCompleted {
+            seq: s.input_seq,
+            address: safe_addr(),
+            results,
+        });
+    }
+
+    /// A screen on Review after a scan that returned `results`. `CallMock`
+    /// ignores the chain, so per-chain owner differences are injected
+    /// through `ScanCompleted` directly.
+    fn reviewing(
+        existing: Vec<ExistingAccount>,
+        results: Vec<(Chain, ScanResult)>,
+    ) -> SafeOnboardingScreen {
+        let mut s = scanning(existing);
+        complete_scan(&mut s, results);
+        assert_eq!(s.phase.name(), "Review");
+        s
+    }
+
+    fn review(s: &SafeOnboardingScreen) -> &ReviewState {
+        match &s.phase {
+            Phase::Review(r) => r,
+            other => panic!("expected Review, got {other:?}"),
+        }
+    }
+
+    fn review_mut(s: &mut SafeOnboardingScreen) -> &mut ReviewState {
+        match &mut s.phase {
+            Phase::Review(r) => r,
+            other => panic!("expected Review, got {other:?}"),
+        }
+    }
+
+    /// Review's role summary as `(chain, signers)` per included chain.
+    fn signers_by_chain(s: &SafeOnboardingScreen) -> Vec<(Chain, Vec<u32>)> {
+        review(s)
+            .chain_roles(&s.existing, &s.existing_safes)
+            .into_iter()
+            .map(|r| (r.chain, r.signers))
+            .collect()
+    }
+
+    /// The wallet's entry for the test Safe on `chain_id`.
+    fn saved(chain_id: u64, name: Option<&str>, links: Vec<u32>) -> ExistingSafe {
+        ExistingSafe {
+            key: (safe_addr().into(), chain_id),
+            name: name.map(str::to_owned),
+            linked_signer_indices: links,
+        }
+    }
+
+    fn find(s: &SafeOnboardingScreen) -> &FindState {
+        match &s.phase {
+            Phase::Find(f) => f,
+            other => panic!("expected Find, got {other:?}"),
+        }
+    }
+
+    fn confirm(s: &mut SafeOnboardingScreen) -> (SafeDescriptor, Vec<SafeDescriptor>) {
+        let (_task, outcome) = s.update(Message::Confirm);
+        let Some(Outcome::Done { primary, siblings }) = outcome else {
+            panic!("expected Done, got {outcome:?}");
+        };
+        (*primary, siblings)
+    }
+
+    /// `(chain_id, linked_signer_indices)` for every emitted descriptor,
+    /// sorted by chain id.
+    fn links_by_chain(
+        primary: &SafeDescriptor,
+        siblings: &[SafeDescriptor],
+    ) -> Vec<(u64, Vec<u32>)> {
+        let mut out: Vec<(u64, Vec<u32>)> = std::iter::once(primary)
+            .chain(siblings.iter())
+            .map(|d| (d.chain_id, d.linked_signer_indices.clone()))
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn three_chain_hits(owners: Vec<Address>) -> Vec<(Chain, ScanResult)> {
+        vec![
+            canonical_hit(Chain::Mainnet, owners.clone()),
+            canonical_hit(Chain::Optimism, owners.clone()),
+            canonical_hit(Chain::Base, owners),
+        ]
+    }
+
+    // ── Find ─────────────────────────────────────────────────────────
+
     #[test]
-    fn initial_step_is_address_input() {
-        let mock = Arc::new(CallMock::new()) as Arc<dyn BalanceFetcher>;
-        let s = screen(mock, Vec::new());
-        assert!(matches!(s.step, Step::AddressInput { .. }));
+    fn initial_phase_is_an_idle_find() {
+        let s = screen(Vec::new());
+        assert_eq!(s.phase.name(), "Find");
+        let f = find(&s);
+        assert!(f.input.is_empty() && f.error.is_none() && f.no_safe.is_none());
     }
 
     #[test]
     fn address_submit_with_invalid_input_sets_error_and_stays() {
-        let mock = Arc::new(CallMock::new()) as Arc<dyn BalanceFetcher>;
-        let mut s = screen(mock, Vec::new());
+        let mut s = screen(Vec::new());
         let _ = s.update(Message::AddressInput("not an address".into()));
         let _ = s.update(Message::AddressSubmit);
-        match &s.step {
-            Step::AddressInput { error, .. } => assert!(error.is_some()),
-            other => panic!("expected AddressInput, got {other:?}"),
-        }
+        assert!(find(&s).error.is_some());
+        assert!(find(&s).scanning.is_none());
     }
 
     #[test]
     fn address_submit_with_empty_input_sets_error() {
-        let mock = Arc::new(CallMock::new()) as Arc<dyn BalanceFetcher>;
-        let mut s = screen(mock, Vec::new());
+        let mut s = screen(Vec::new());
         let _ = s.update(Message::AddressSubmit);
-        match &s.step {
-            Step::AddressInput { error, .. } => assert!(error.is_some()),
-            _ => panic!("expected AddressInput"),
-        }
+        assert!(find(&s).error.is_some());
+    }
+
+    #[test]
+    fn submitting_a_hex_address_scans_in_place() {
+        let s = scanning(Vec::new());
+        let target = find(&s).scanning.as_ref().expect("scan in flight");
+        assert_eq!(target.address, safe_addr());
+        assert!(!target.from_name);
+        // The typed text stays in the input while it scans.
+        assert_eq!(find(&s).input, format!("{:?}", safe_addr()));
+    }
+
+    #[test]
+    fn submit_while_scanning_does_not_restart_the_scan() {
+        let mut s = scanning(Vec::new());
+        let seq = s.input_seq;
+        let (_task, outcome) = s.update(Message::AddressSubmit);
+        assert!(outcome.is_none());
+        assert_eq!(s.input_seq, seq);
+        assert_eq!(s.phase.name(), "Scanning");
     }
 
     #[tokio::test]
-    async fn scan_with_zero_hits_transitions_to_no_chain() {
+    async fn scan_with_zero_hits_stays_on_find_with_breakdown() {
         // Mock returns empty get_code for every chain → ScanResult::NotDeployed.
         let mock = Arc::new(CallMock::new());
         let net: Arc<dyn BalanceFetcher> = mock.clone();
-        let mut s = screen(net, Vec::new());
+        let mut s = SafeOnboardingScreen::new(net, Vec::new());
         let _ = s.update(Message::AddressInput(format!("{:?}", safe_addr())));
         let _ = s.update(Message::AddressSubmit);
-        // Scanning is in flight — simulate the completion message.
         let results = safe::scan_across_chains(mock.as_ref(), safe_addr()).await;
-        let _ = s.update(Message::ScanCompleted {
-            seq: s.input_seq,
-            address: safe_addr(),
-            results,
-        });
-        assert!(matches!(s.step, Step::NoChain { .. }));
+        complete_scan(&mut s, results);
+        assert_eq!(s.phase.name(), "NoSafe");
+        let f = find(&s);
+        assert!(f.scanning.is_none());
+        let ns = f.no_safe.as_ref().expect("per-chain breakdown");
+        assert_eq!(ns.address, safe_addr());
+        assert_eq!(ns.results.len(), Chain::ALL.len());
+        assert!(
+            ns.results
+                .iter()
+                .all(|(_, r)| scan_reason(r) == "no contract at this address")
+        );
+        // The input survives so the user can fix a typo and rescan.
+        assert_eq!(f.input, format!("{:?}", safe_addr()));
     }
 
-    #[tokio::test]
-    async fn single_chain_hit_skips_chooser_and_goes_straight_to_inspect() {
-        let mock = Arc::new(CallMock::new());
-        // We deliberately only plant on the network — CallMock ignores
-        // chain, so every chain "hits". Plant once, then the post-scan
-        // logic should see 3 hits and go to the chooser. To test the
-        // single-hit branch we need a different setup: skip planting
-        // and use the per-chain inspect path indirectly. The simplest
-        // path is to skip the scan and inject results directly via
-        // ScanCompleted.
-        let net: Arc<dyn BalanceFetcher> = mock.clone();
-        let mut s = screen(net, Vec::new());
-        // Move the screen into Scanning manually so the precondition
-        // is satisfied; ScanCompleted ignores the message if step != Scanning.
-        s.step = Step::Scanning {
+    #[test]
+    fn no_hit_breakdown_names_every_reason() {
+        let mut s = scanning(Vec::new());
+        complete_scan(
+            &mut s,
+            vec![
+                (Chain::Mainnet, ScanResult::NotDeployed),
+                (
+                    Chain::Base,
+                    ScanResult::NotASafe {
+                        reason: "VERSION() reverted".into(),
+                    },
+                ),
+                (Chain::Optimism, ScanResult::NotDeployed),
+            ],
+        );
+        let ns = find(&s).no_safe.as_ref().expect("breakdown");
+        let reasons: Vec<(Chain, String)> = ns
+            .results
+            .iter()
+            .map(|(c, r)| (*c, scan_reason(r)))
+            .collect();
+        assert_eq!(
+            reasons,
+            vec![
+                (Chain::Mainnet, "no contract at this address".to_string()),
+                (Chain::Base, "not a Safe: VERSION() reverted".to_string()),
+                (Chain::Optimism, "no contract at this address".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn editing_the_input_clears_the_breakdown_and_cancels_a_scan() {
+        let mut s = scanning(Vec::new());
+        complete_scan(&mut s, vec![(Chain::Mainnet, ScanResult::NotDeployed)]);
+        assert!(find(&s).no_safe.is_some());
+        let _ = s.update(Message::AddressInput("0x12".into()));
+        assert!(find(&s).no_safe.is_none());
+
+        // Edit mid-scan: the scan is abandoned and its result dropped.
+        let mut s = scanning(Vec::new());
+        let stale_seq = s.input_seq;
+        let _ = s.update(Message::AddressInput("0x1".into()));
+        assert_eq!(s.phase.name(), "Find");
+        let _ = s.update(Message::ScanCompleted {
+            seq: stale_seq,
             address: safe_addr(),
-            what: format!("{:?}", safe_addr()),
+            results: three_chain_hits(vec![owner_a()]),
+        });
+        assert_eq!(s.phase.name(), "Find");
+    }
+
+    #[test]
+    fn stale_scan_completion_is_dropped() {
+        let mut s = scanning(Vec::new());
+        let stale_seq = s.input_seq.wrapping_sub(1);
+        let _ = s.update(Message::ScanCompleted {
+            seq: stale_seq,
+            address: safe_addr(),
+            results: three_chain_hits(vec![owner_a()]),
+        });
+        // Still scanning because the seq was stale.
+        assert_eq!(s.phase.name(), "Scanning");
+        // Right seq, wrong address: also dropped.
+        let _ = s.update(Message::ScanCompleted {
+            seq: s.input_seq,
+            address: owner_a(),
+            results: three_chain_hits(vec![owner_a()]),
+        });
+        assert_eq!(s.phase.name(), "Scanning");
+    }
+
+    #[test]
+    fn back_while_scanning_cancels_in_place() {
+        let mut s = scanning(Vec::new());
+        let seq_at_spawn = s.input_seq;
+        let (_task, outcome) = s.update(Message::BackPressed);
+        assert!(
+            outcome.is_none(),
+            "cancelling a scan must not leave the screen"
+        );
+        assert_eq!(s.phase.name(), "Find");
+        assert_eq!(find(&s).input, format!("{:?}", safe_addr()));
+        // The in-flight result lands later and is dropped.
+        let _ = s.update(Message::ScanCompleted {
+            seq: seq_at_spawn,
+            address: safe_addr(),
+            results: three_chain_hits(vec![owner_a()]),
+        });
+        assert_eq!(s.phase.name(), "Find");
+    }
+
+    #[test]
+    fn back_from_find_propagates_outcome_back() {
+        let mut s = screen(Vec::new());
+        let (_task, outcome) = s.update(Message::BackPressed);
+        assert!(matches!(outcome, Some(Outcome::Back)));
+    }
+
+    #[test]
+    fn stale_ens_result_is_dropped() {
+        let mut s = screen(Vec::new());
+        let _ = s.update(Message::AddressInput("treasury.eth".into()));
+        let _ = s.update(Message::AddressSubmit);
+        assert_eq!(s.phase.name(), "ResolvingName");
+        let seq = s.input_seq;
+        // User keeps typing — the lookup in flight is abandoned.
+        let _ = s.update(Message::AddressInput("treasury2.eth".into()));
+        let _ = s.update(Message::EnsResolved {
+            seq,
+            name: "treasury.eth".into(),
+            result: Ok(Some(safe_addr())),
+        });
+        assert_eq!(s.phase.name(), "Find");
+    }
+
+    // ── Scan → Review ────────────────────────────────────────────────
+
+    #[test]
+    fn single_chain_hit_goes_straight_to_review() {
+        let s = reviewing(
+            Vec::new(),
+            vec![
+                canonical_hit(Chain::Mainnet, vec![owner_a()]),
+                (Chain::Optimism, ScanResult::NotDeployed),
+                (Chain::Base, ScanResult::NotASafe { reason: "x".into() }),
+            ],
+        );
+        let r = review(&s);
+        assert_eq!(r.focused, Chain::Mainnet);
+        let included: Vec<Chain> = r.included().map(|(c, _, _)| c).collect();
+        assert_eq!(included, vec![Chain::Mainnet]);
+        // Misses stay for the strip, normalized to `Chain::ALL` order.
+        let order: Vec<Chain> = r.results.iter().map(|(c, _)| *c).collect();
+        assert_eq!(order, Chain::ALL.to_vec());
+    }
+
+    #[test]
+    fn multi_chain_hit_includes_every_chain_by_default() {
+        let s = reviewing(Vec::new(), three_chain_hits(vec![owner_a()]));
+        let r = review(&s);
+        let included: Vec<Chain> = r.included().map(|(c, _, _)| c).collect();
+        assert_eq!(included, Chain::ALL.to_vec());
+        // First hit in `Chain::ALL` order is focused.
+        assert_eq!(r.focused, Chain::Mainnet);
+    }
+
+    #[test]
+    fn chain_focused_switches_the_security_column() {
+        let mut s = reviewing(
+            Vec::new(),
+            vec![
+                canonical_hit(Chain::Mainnet, vec![owner_a()]),
+                canonical_hit(Chain::Base, vec![owner_a()]),
+                (Chain::Optimism, ScanResult::NotDeployed),
+            ],
+        );
+        let _ = s.update(Message::ChainFocused(Chain::Base));
+        assert_eq!(review(&s).focused, Chain::Base);
+        // A miss can't be focused — there's nothing to review.
+        let _ = s.update(Message::ChainFocused(Chain::Optimism));
+        assert_eq!(review(&s).focused, Chain::Base);
+    }
+
+    #[test]
+    fn review_default_checks_only_owner_accounts() {
+        let stranger = address!("0x000000000000000000000000000000000000c0de");
+        let s = reviewing(
+            vec![acct(0, owner_a()), acct(1, stranger)],
+            vec![canonical_hit(Chain::Mainnet, vec![owner_a(), owner_b()])],
+        );
+        // Only account 0 (owner_a) is a real owner; account 1 isn't, so
+        // it's neither listed nor checked.
+        assert_eq!(review(&s).selected, BTreeSet::from([0u32]));
+        assert!(review(&s).owned_chains(stranger).is_empty());
+    }
+
+    #[test]
+    fn ens_name_prefills_the_label() {
+        let mut s = screen(Vec::new());
+        let _ = s.update(Message::AddressInput("treasury.eth".into()));
+        let _ = s.update(Message::AddressSubmit);
+        assert_eq!(s.phase.name(), "ResolvingName");
+        let _ = s.update(Message::EnsResolved {
+            seq: s.input_seq,
+            name: "treasury.eth".into(),
+            result: Ok(Some(safe_addr())),
+        });
+        let target = find(&s).scanning.as_ref().expect("scan in flight");
+        assert!(target.from_name);
+        complete_scan(&mut s, vec![canonical_hit(Chain::Mainnet, vec![owner_a()])]);
+        let r = review(&s);
+        assert_eq!(r.name, "treasury.eth");
+        assert_eq!(r.typed_name.as_deref(), Some("treasury.eth"));
+    }
+
+    #[test]
+    fn hex_address_leaves_the_label_blank() {
+        let s = reviewing(
+            Vec::new(),
+            vec![canonical_hit(Chain::Mainnet, vec![owner_a()])],
+        );
+        assert!(review(&s).name.is_empty());
+        assert!(review(&s).typed_name.is_none());
+    }
+
+    #[test]
+    fn back_from_review_returns_to_find_keeping_the_input() {
+        let mut s = reviewing(
+            Vec::new(),
+            vec![canonical_hit(Chain::Mainnet, vec![owner_a()])],
+        );
+        let (_task, outcome) = s.update(Message::BackPressed);
+        assert!(outcome.is_none(), "in-flow back must not propagate");
+        let f = find(&s);
+        assert_eq!(f.input, format!("{:?}", safe_addr()));
+        assert!(f.error.is_none() && f.scanning.is_none() && f.no_safe.is_none());
+        // Enter rescans the same address.
+        let _ = s.update(Message::AddressSubmit);
+        assert_eq!(s.phase.name(), "Scanning");
+    }
+
+    #[test]
+    fn existing_safes_are_flagged_per_chain() {
+        let s = screen(Vec::new()).with_existing_safes(vec![saved(8453, None, vec![])]);
+        let is_saved = |address, chain| saved_entry(&s.existing_safes, address, chain).is_some();
+        assert!(is_saved(safe_addr(), Chain::Base));
+        assert!(!is_saved(safe_addr(), Chain::Mainnet));
+        assert!(!is_saved(owner_a(), Chain::Base));
+    }
+
+    // ── A Safe that's already saved ──────────────────────────────────
+
+    #[test]
+    fn hex_address_of_a_saved_safe_prefills_its_saved_name() {
+        // Base saved unnamed (frozen-default shapes aside), Mainnet named:
+        // the first named entry wins, as `upsert_safe` picks for a new
+        // chain.
+        let mut s = scanning(Vec::new()).with_existing_safes(vec![
+            saved(8453, None, vec![]),
+            saved(1, Some("Treasury"), vec![]),
+        ]);
+        complete_scan(&mut s, three_chain_hits(vec![owner_a()]));
+        assert_eq!(review(&s).name, "Treasury");
+        assert!(review(&s).typed_name.is_none());
+
+        // Saved but unnamed everywhere: nothing to prefill.
+        let mut s = scanning(Vec::new()).with_existing_safes(vec![saved(1, None, vec![])]);
+        complete_scan(&mut s, three_chain_hits(vec![owner_a()]));
+        assert!(review(&s).name.is_empty());
+
+        // Another Safe's name never leaks in.
+        let other = ExistingSafe {
+            key: (owner_c().into(), 1),
+            ..saved(1, Some("Grants"), vec![])
         };
-        let single_hit_results = vec![
-            (
-                Chain::Mainnet,
-                ScanResult::Canonical(SafeMetadata {
-                    chain_id: 1,
-                    address: safe_addr(),
-                    implementation: address!("0x41675C099F32341bf84BFc5382aF534df5C7461a"),
-                    version: "1.4.1".into(),
-                    threshold: 1,
-                    owners: vec![owner_a()],
-                    modules: vec![],
-                    guard: None,
-                    fallback_handler: None,
-                    nonce: U256::ZERO,
-                }),
-            ),
-            (Chain::Optimism, ScanResult::NotDeployed),
-            (Chain::Base, ScanResult::NotASafe { reason: "x".into() }),
-        ];
-        let _ = s.update(Message::ScanCompleted {
-            seq: s.input_seq,
-            address: safe_addr(),
-            results: single_hit_results,
-        });
-        match &s.step {
-            Step::Inspect { chain, .. } => assert_eq!(*chain, Chain::Mainnet),
-            other => panic!("expected Inspect on Mainnet, got {other:?}"),
-        }
+        let mut s = scanning(Vec::new()).with_existing_safes(vec![other]);
+        complete_scan(&mut s, three_chain_hits(vec![owner_a()]));
+        assert!(review(&s).name.is_empty());
     }
 
-    #[tokio::test]
-    async fn multi_chain_hit_transitions_to_chain_chooser() {
-        // Inject the scan-complete message directly. The integration
-        // with `safe::scan_across_chains` is covered by that module's
-        // own tests — here we're testing the state-machine branching
-        // on `hits.len() > 1`.
-        let net: Arc<dyn BalanceFetcher> = Arc::new(CallMock::new());
-        let mut s = screen(net, Vec::new());
-        s.step = Step::Scanning {
-            address: safe_addr(),
-            what: format!("{:?}", safe_addr()),
-        };
-        let results = vec![
-            canonical_hit(Chain::Mainnet, vec![owner_a()]),
-            canonical_hit(Chain::Optimism, vec![owner_a()]),
-            canonical_hit(Chain::Base, vec![owner_a()]),
-        ];
-        let _ = s.update(Message::ScanCompleted {
+    #[test]
+    fn the_saved_name_wins_over_a_name_typed_into_the_finder() {
+        // Finding a saved Safe by ENS is a lookup, not a rename: the field
+        // keeps the saved name, so confirming untouched renames nothing.
+        let mut s =
+            screen(Vec::new()).with_existing_safes(vec![saved(1, Some("Treasury"), vec![])]);
+        let _ = s.update(Message::AddressInput("dao.eth".into()));
+        let _ = s.update(Message::AddressSubmit);
+        let _ = s.update(Message::EnsResolved {
             seq: s.input_seq,
-            address: safe_addr(),
-            results,
+            name: "dao.eth".into(),
+            result: Ok(Some(safe_addr())),
         });
-        match &s.step {
-            Step::ChainChooser { results, .. } => assert_eq!(results.len(), 3),
-            other => panic!("expected ChainChooser, got {other:?}"),
-        }
+        complete_scan(&mut s, vec![canonical_hit(Chain::Mainnet, vec![owner_a()])]);
+        assert_eq!(review(&s).name, "Treasury");
+        // The typed name is still remembered (shown as "resolved from").
+        assert_eq!(review(&s).typed_name.as_deref(), Some("dao.eth"));
+        let (_, renames) =
+            name_hint(&s.existing_safes, safe_addr(), &review(&s).name).expect("saved");
+        assert!(!renames);
+        let (primary, _) = confirm(&mut s);
+        assert_eq!(primary.name.as_deref(), Some("Treasury"));
     }
 
-    #[tokio::test]
-    async fn chain_picked_transitions_chooser_to_inspect() {
-        let net: Arc<dyn BalanceFetcher> = Arc::new(CallMock::new());
-        let mut s = screen(net, Vec::new());
-        s.step = Step::ChainChooser {
-            address: safe_addr(),
-            results: vec![
+    #[test]
+    fn untouched_prefill_confirms_the_saved_name() {
+        // The emitted name equals every saved entry's, so the App's
+        // `upsert_safes` renames nothing.
+        let mut s = scanning(vec![acct(0, owner_a())]).with_existing_safes(vec![saved(
+            1,
+            Some("Treasury"),
+            vec![0],
+        )]);
+        complete_scan(&mut s, three_chain_hits(vec![owner_a()]));
+        let (primary, siblings) = confirm(&mut s);
+        assert!(
+            std::iter::once(&primary)
+                .chain(&siblings)
+                .all(|d| d.name.as_deref() == Some("Treasury"))
+        );
+    }
+
+    #[test]
+    fn name_hint_says_what_confirming_does_to_the_saved_name() {
+        let safes = vec![
+            saved(1, Some("Treasury"), vec![]),
+            saved(8453, None, vec![]),
+        ];
+        // Not saved anywhere: no hint.
+        assert_eq!(name_hint(&safes, owner_a(), "Vault"), None);
+        // Blank renames nothing; new chains take the saved name.
+        assert_eq!(
+            name_hint(&safes, safe_addr(), "  "),
+            Some((
+                "Left blank, it keeps its saved name “Treasury”".to_string(),
+                false
+            ))
+        );
+        // A different name renames every chain.
+        assert_eq!(
+            name_hint(&safes, safe_addr(), "Vault"),
+            Some(("Renames this Safe on every chain".to_string(), true))
+        );
+        // The saved name still renames the unnamed Base entry (the
+        // App heals a split name) — so it says so.
+        assert_eq!(
+            name_hint(&safes, safe_addr(), " Treasury "),
+            Some(("Renames this Safe on every chain".to_string(), true))
+        );
+        // One name everywhere and the field matches: nothing changes.
+        let one_name = vec![
+            saved(1, Some("Treasury"), vec![]),
+            saved(8453, Some("Treasury"), vec![]),
+        ];
+        assert_eq!(
+            name_hint(&one_name, safe_addr(), "Treasury"),
+            Some((
+                "Already saved under this name — it applies on every chain".to_string(),
+                false
+            ))
+        );
+        // Saved unnamed, field blank.
+        assert_eq!(
+            name_hint(&[saved(1, None, vec![])], safe_addr(), ""),
+            Some(("Applies to this Safe on every chain".to_string(), false))
+        );
+    }
+
+    #[test]
+    fn a_saved_chain_keeps_its_links_in_the_role_summary() {
+        // Mainnet is saved linking account 0. Unticking 0 doesn't unlink
+        // it there (a merge never unlinks), so Mainnet still reads
+        // signer; Base, new, goes watch-only.
+        let mut s = scanning(vec![acct(0, owner_a())]).with_existing_safes(vec![saved(
+            1,
+            Some("Treasury"),
+            vec![0],
+        )]);
+        complete_scan(
+            &mut s,
+            vec![
                 canonical_hit(Chain::Mainnet, vec![owner_a()]),
                 canonical_hit(Chain::Base, vec![owner_a()]),
             ],
-        };
-        let _ = s.update(Message::ChainPicked(Chain::Base));
-        match &s.step {
-            Step::Inspect { chain, .. } => assert_eq!(*chain, Chain::Base),
-            other => panic!("expected Inspect on Base, got {other:?}"),
-        }
+        );
+        let _ = s.update(Message::SignerToggled(0));
+        let roles = review(&s).chain_roles(&s.existing, &s.existing_safes);
+        assert_eq!(
+            roles,
+            vec![
+                ChainRole {
+                    chain: Chain::Mainnet,
+                    saved: true,
+                    signers: vec![0],
+                    kept: 1,
+                },
+                ChainRole {
+                    chain: Chain::Base,
+                    saved: false,
+                    signers: vec![],
+                    kept: 0,
+                },
+            ]
+        );
+        assert_eq!(
+            roles[0].line(false),
+            "Mainnet — already in your wallet · signer · 1 key (1 already linked — kept)"
+        );
+        assert_eq!(
+            roles[1].line(false),
+            "Base — watch-only (none of your selected keys own it here)"
+        );
+        assert_eq!(
+            confirm_label(&roles),
+            "Add to wallet →",
+            "Mainnet still signs"
+        );
+
+        // Ticked again: the saved link is just a tick, nothing "kept".
+        let _ = s.update(Message::SignerToggled(0));
+        let roles = review(&s).chain_roles(&s.existing, &s.existing_safes);
+        assert_eq!(
+            roles[0].line(true),
+            "Mainnet — already in your wallet · signer · 1 key · owner Safe linked"
+        );
     }
 
-    #[tokio::test]
-    async fn inspect_continue_intersects_existing_accounts_and_default_checks_them() {
-        let mock = Arc::new(CallMock::new());
-        let net: Arc<dyn BalanceFetcher> = mock.clone();
-        let existing = vec![
-            ExistingAccount {
-                account_idx: 0,
-                address: owner_a(),
-                label: "Account 1".into(),
-            },
-            ExistingAccount {
-                account_idx: 1,
-                address: address!("0x000000000000000000000000000000000000c0de"),
-                label: "Account 2".into(),
-            },
-        ];
-        let mut s = screen(net, existing);
-        s.step = Step::Inspect {
-            chain: Chain::Mainnet,
-            metadata: SafeMetadata {
-                chain_id: 1,
-                address: safe_addr(),
-                implementation: address!("0x41675C099F32341bf84BFc5382aF534df5C7461a"),
-                version: "1.4.1".into(),
-                threshold: 1,
-                owners: vec![owner_a(), owner_b()],
-                modules: vec![],
-                guard: None,
-                fallback_handler: None,
-                nonce: U256::ZERO,
-            },
-            trust: SafeTrust::Canonical,
-            all_results: vec![],
-        };
-        let _ = s.update(Message::InspectContinue);
-        match &s.step {
-            Step::RoleSelection {
-                matched, selected, ..
-            } => {
-                // Only account 0 (owner_a) is a real owner; account 1
-                // isn't in the owner set, so it's not in `matched`.
-                assert_eq!(matched.len(), 1);
-                assert_eq!(matched[0].account_idx, 0);
-                // Default-checked.
-                assert!(selected.contains(&0));
-            }
-            other => panic!("expected RoleSelection, got {other:?}"),
-        }
+    #[test]
+    fn saved_links_that_cannot_sign_are_not_counted() {
+        // Mainnet's saved links: a dangling index (9), a view-only
+        // account (1) and an account the fresh scan no longer lists as
+        // an owner (2). None can sign, so the chain is watch-only and —
+        // with nothing ticked — so is the whole add.
+        let mut s = scanning(vec![
+            acct(0, owner_a()),
+            watched(1, owner_b()),
+            acct(2, owner_c()),
+        ])
+        .with_existing_safes(vec![saved(1, None, vec![9, 1, 2])]);
+        complete_scan(
+            &mut s,
+            vec![canonical_hit(Chain::Mainnet, vec![owner_a(), owner_b()])],
+        );
+        let _ = s.update(Message::SignerToggled(0));
+        let roles = review(&s).chain_roles(&s.existing, &s.existing_safes);
+        assert_eq!(roles.len(), 1);
+        assert!(roles[0].saved);
+        assert!(roles[0].signers.is_empty());
+        assert_eq!(
+            roles[0].line(false),
+            "Mainnet — already in your wallet · watch-only (none of your selected keys own it here)"
+        );
+        assert_eq!(confirm_label(&roles), "Add as watch-only →");
     }
 
-    #[tokio::test]
-    async fn watch_only_exit_advances_to_label_with_no_linked_signers() {
-        let net: Arc<dyn BalanceFetcher> = Arc::new(CallMock::new());
-        let mut s = screen(net, Vec::new());
-        s.step = Step::RoleSelection {
-            chain: Chain::Mainnet,
-            metadata: SafeMetadata {
-                chain_id: 1,
-                address: safe_addr(),
-                implementation: address!("0x41675C099F32341bf84BFc5382aF534df5C7461a"),
-                version: "1.4.1".into(),
-                threshold: 1,
-                owners: vec![owner_a()],
-                modules: vec![],
-                guard: None,
-                fallback_handler: None,
-                nonce: U256::ZERO,
-            },
-            trust: SafeTrust::Canonical,
-            all_results: vec![],
-            matched: vec![],
-            selected: BTreeSet::new(),
-            linked_nested_safes: Vec::new(),
-            signer_error: None,
-        };
-        let _ = s.update(Message::WatchOnlySelected);
-        match &s.step {
-            Step::Label { linked, .. } => assert!(linked.is_empty()),
-            other => panic!("expected Label, got {other:?}"),
-        }
+    // ── Parked under a nested sub-flow ───────────────────────────────
+
+    #[test]
+    fn note_account_lists_and_ticks_an_owner_without_resuming() {
+        let mut s = reviewing(
+            vec![acct(0, owner_a())],
+            vec![
+                canonical_hit(Chain::Mainnet, vec![owner_a(), owner_b()]),
+                canonical_hit(Chain::Base, vec![owner_b()]),
+            ],
+        );
+        let _ = s.update(Message::AddSignerToggled);
+        let _ = s.update(Message::SignerMethodPicked(SignerMethod::NestedSafe));
+        assert_eq!(s.phase.name(), "AwaitingSigner");
+        s.note_account(acct(5, owner_b()));
+        // Still parked: this screen didn't ask for the account.
+        assert_eq!(s.phase.name(), "AwaitingSigner");
+        assert!(review(&s).add_signer_open);
+        assert!(review(&s).selected.contains(&5));
+        assert!(review(&s).unclaimed_owners(&s.existing).is_empty());
+        assert_eq!(
+            signers_by_chain(&s),
+            vec![(Chain::Mainnet, vec![0, 5]), (Chain::Base, vec![5])]
+        );
+
+        // A non-owner joins the snapshot unticked; a known index (the
+        // user's tick or untick) is left alone; view-only is never ticked.
+        s.note_account(acct(6, owner_d()));
+        assert!(s.existing.iter().any(|e| e.account_idx == 6));
+        assert!(!review(&s).selected.contains(&6));
+        let _ = s.update(Message::SignerToggled(5));
+        s.note_account(acct(5, owner_b()));
+        assert!(!review(&s).selected.contains(&5));
+        s.note_account(watched(7, owner_b()));
+        assert!(!review(&s).selected.contains(&7));
     }
 
-    #[tokio::test]
-    async fn label_confirm_emits_done_with_descriptor() {
-        let net: Arc<dyn BalanceFetcher> = Arc::new(CallMock::new());
-        let mut s = screen(net, Vec::new());
-        s.step = Step::Label {
-            chain: Chain::Mainnet,
-            metadata: SafeMetadata {
-                chain_id: 1,
-                address: safe_addr(),
-                implementation: address!("0x41675C099F32341bf84BFc5382aF534df5C7461a"),
-                version: "1.4.1".into(),
-                threshold: 2,
-                owners: vec![owner_a(), owner_b()],
-                modules: vec![],
-                guard: None,
-                fallback_handler: None,
-                nonce: U256::ZERO,
-            },
-            trust: SafeTrust::Canonical,
-            linked: vec![0],
-            name: "  Treasury  ".into(),
-            siblings: vec![],
-            advanced: false,
-            service_url: String::new(),
-            service_url_error: None,
-        };
-        let (_task, outcome) = s.update(Message::LabelConfirm);
-        let Some(Outcome::Done { primary, siblings }) = outcome else {
-            panic!("expected Done, got {outcome:?}");
-        };
-        let primary = *primary;
+    #[test]
+    fn owners_differ_considers_only_included_chains() {
+        let mut s = reviewing(
+            Vec::new(),
+            vec![
+                canonical_hit(Chain::Mainnet, vec![owner_a()]),
+                canonical_hit(Chain::Base, vec![owner_b()]),
+            ],
+        );
+        assert!(review(&s).owners_differ());
+        let _ = s.update(Message::ChainIncludeToggled(Chain::Base));
+        assert!(!review(&s).owners_differ());
+        // Same owners in another order, different threshold also counts.
+        let s = reviewing(
+            Vec::new(),
+            vec![
+                hit_with(Chain::Mainnet, vec![owner_a(), owner_b()], 1),
+                hit_with(Chain::Base, vec![owner_b(), owner_a()], 2),
+            ],
+        );
+        assert!(review(&s).owners_differ());
+        let s = reviewing(
+            Vec::new(),
+            vec![
+                hit_with(Chain::Mainnet, vec![owner_a(), owner_b()], 2),
+                hit_with(Chain::Base, vec![owner_b(), owner_a()], 2),
+            ],
+        );
+        assert!(!review(&s).owners_differ());
+    }
+
+    #[test]
+    fn danger_surfaces_differ_flags_a_chain_not_on_screen() {
+        let mut s = reviewing(
+            Vec::new(),
+            vec![
+                canonical_hit(Chain::Mainnet, vec![owner_a()]),
+                (
+                    Chain::Base,
+                    ScanResult::Canonical(SafeMetadata {
+                        chain_id: 8453,
+                        modules: vec![owner_d()],
+                        ..fake_metadata_with_owners(vec![owner_a()], 1)
+                    }),
+                ),
+            ],
+        );
+        assert!(review(&s).danger_surfaces_differ());
+        assert!(!review(&s).owners_differ());
+        // Focused-but-excluded Mainnet is still what's on screen, and
+        // Base (which will be added) has a module it doesn't.
+        let _ = s.update(Message::ChainIncludeToggled(Chain::Mainnet));
+        assert!(review(&s).danger_surfaces_differ());
+        // Looking at Base itself: nothing hidden any more.
+        let _ = s.update(Message::ChainFocused(Chain::Base));
+        assert!(!review(&s).danger_surfaces_differ());
+    }
+
+    // ── Chain inclusion ──────────────────────────────────────────────
+
+    #[test]
+    fn last_included_chain_cannot_be_excluded() {
+        let mut s = reviewing(
+            Vec::new(),
+            vec![canonical_hit(Chain::Mainnet, vec![owner_a()])],
+        );
+        let _ = s.update(Message::ChainIncludeToggled(Chain::Mainnet));
+        assert!(review(&s).is_included(Chain::Mainnet));
+
+        let mut s = reviewing(Vec::new(), three_chain_hits(vec![owner_a()]));
+        let _ = s.update(Message::ChainIncludeToggled(Chain::Mainnet));
+        let _ = s.update(Message::ChainIncludeToggled(Chain::Base));
+        let _ = s.update(Message::ChainIncludeToggled(Chain::Optimism));
+        let included: Vec<Chain> = review(&s).included().map(|(c, _, _)| c).collect();
+        assert_eq!(included, vec![Chain::Optimism]);
+        // Re-including works.
+        let _ = s.update(Message::ChainIncludeToggled(Chain::Base));
+        assert!(review(&s).is_included(Chain::Base));
+    }
+
+    #[test]
+    fn excluded_chain_is_not_emitted() {
+        let mut s = reviewing(Vec::new(), three_chain_hits(vec![owner_a()]));
+        let _ = s.update(Message::ChainIncludeToggled(Chain::Base));
+        let (primary, siblings) = confirm(&mut s);
+        assert_eq!(primary.chain_id, 1);
+        assert_eq!(primary.sibling_chains, vec![10]);
+        assert_eq!(siblings.len(), 1);
+        assert_eq!(siblings[0].chain_id, 10);
+        assert_eq!(siblings[0].sibling_chains, vec![1]);
+    }
+
+    #[test]
+    fn primary_is_the_focused_chain() {
+        let mut s = reviewing(Vec::new(), three_chain_hits(vec![owner_a()]));
+        let _ = s.update(Message::ChainFocused(Chain::Base));
+        let (primary, siblings) = confirm(&mut s);
+        assert_eq!(primary.chain_id, 8453);
+        // Remaining chosen chains in `Chain::ALL` order.
+        assert_eq!(primary.sibling_chains, vec![1, 10]);
+        let sib_ids: Vec<u64> = siblings.iter().map(|d| d.chain_id).collect();
+        assert_eq!(sib_ids, vec![1, 10]);
+
+        // A focused-but-excluded chain falls back to the first included.
+        let mut s = reviewing(Vec::new(), three_chain_hits(vec![owner_a()]));
+        let _ = s.update(Message::ChainFocused(Chain::Mainnet));
+        let _ = s.update(Message::ChainIncludeToggled(Chain::Mainnet));
+        let (primary, siblings) = confirm(&mut s);
+        assert_eq!(primary.chain_id, 8453);
+        assert_eq!(siblings.len(), 1);
+        assert_eq!(siblings[0].chain_id, 10);
+    }
+
+    // ── Confirm ──────────────────────────────────────────────────────
+
+    #[test]
+    fn confirm_emits_done_with_descriptor() {
+        let mut s = reviewing(
+            vec![acct(0, owner_a())],
+            vec![hit_with(Chain::Mainnet, vec![owner_a(), owner_b()], 2)],
+        );
+        let _ = s.update(Message::NameInput("  Treasury  ".into()));
+        let (primary, siblings) = confirm(&mut s);
         assert_eq!(primary.name.as_deref(), Some("Treasury"));
         assert_eq!(primary.chain_id, 1);
+        assert_eq!(primary.address, <[u8; 20]>::from(safe_addr()));
         assert_eq!(primary.threshold, 2);
         assert_eq!(primary.linked_signer_indices, vec![0]);
         assert_eq!(primary.trust, SafeTrust::Canonical);
         // No Advanced input → public service (stored as None).
         assert!(primary.tx_service_url.is_none());
+        assert!(primary.sibling_chains.is_empty());
         assert!(siblings.is_empty());
     }
 
-    #[tokio::test]
-    async fn sibling_chains_become_separate_descriptors_with_cross_links() {
-        let net: Arc<dyn BalanceFetcher> = Arc::new(CallMock::new());
-        let mut s = screen(net, Vec::new());
-        let md = SafeMetadata {
-            chain_id: 1,
-            address: safe_addr(),
-            implementation: address!("0x41675C099F32341bf84BFc5382aF534df5C7461a"),
-            version: "1.4.1".into(),
-            threshold: 1,
-            owners: vec![owner_a()],
-            modules: vec![],
-            guard: None,
-            fallback_handler: None,
-            nonce: U256::ZERO,
-        };
-        s.step = Step::Label {
-            chain: Chain::Mainnet,
-            metadata: md.clone(),
-            trust: SafeTrust::Canonical,
-            linked: vec![],
-            name: "Treasury".into(),
-            siblings: vec![
-                (Chain::Optimism, md.clone(), SafeTrust::Canonical, true),
-                (Chain::Base, md.clone(), SafeTrust::Canonical, true),
-            ],
-            advanced: true,
-            service_url: "https://txs.example-dao.org/".into(),
-            service_url_error: None,
-        };
-        let (_task, outcome) = s.update(Message::LabelConfirm);
-        let Some(Outcome::Done { primary, siblings }) = outcome else {
-            panic!("expected Done");
-        };
-        let primary = *primary;
+    #[test]
+    fn unrecognized_impl_keeps_its_trust() {
+        let mut s = reviewing(
+            Vec::new(),
+            vec![(
+                Chain::Mainnet,
+                ScanResult::UnrecognizedImpl(fake_metadata_with_owners(vec![owner_a()], 1)),
+            )],
+        );
+        let (primary, _) = confirm(&mut s);
+        assert_eq!(primary.trust, SafeTrust::UnrecognizedImpl);
+    }
+
+    #[test]
+    fn blank_name_is_stored_as_none() {
+        let mut s = reviewing(
+            Vec::new(),
+            vec![canonical_hit(Chain::Mainnet, vec![owner_a()])],
+        );
+        let _ = s.update(Message::NameInput("   ".into()));
+        let (primary, _) = confirm(&mut s);
+        assert!(primary.name.is_none());
+    }
+
+    #[test]
+    fn sibling_chains_become_separate_descriptors_with_cross_links() {
+        let mut s = reviewing(Vec::new(), three_chain_hits(vec![owner_a()]));
+        let _ = s.update(Message::NameInput("Treasury".into()));
+        let _ = s.update(Message::AdvancedToggled);
+        let _ = s.update(Message::ServiceUrlInput(
+            "https://txs.example-dao.org/".into(),
+        ));
+        let (primary, siblings) = confirm(&mut s);
         // Primary lists OP + Base as siblings (chain IDs 10 + 8453).
         let mut primary_siblings = primary.sibling_chains.clone();
         primary_siblings.sort();
         assert_eq!(primary_siblings, vec![10, 8453]);
-        // Two sibling descriptors, neither linking any signers
-        // (sibling owner sets can diverge; user must re-onboard each
-        // explicitly to link).
         assert_eq!(siblings.len(), 2);
         for sib in &siblings {
+            // No wallet accounts at all → nothing to link anywhere.
             assert!(sib.linked_signer_indices.is_empty());
             // Each sibling lists the OTHER two chains as siblings.
             assert_eq!(sib.sibling_chains.len(), 2);
+            assert!(!sib.sibling_chains.contains(&sib.chain_id));
+            assert_eq!(sib.name.as_deref(), Some("Treasury"));
             // The custom mirror serves the multi-chain layout, so
             // siblings inherit it (normalized: trailing slash gone).
             assert_eq!(
@@ -2184,132 +3161,198 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn label_confirm_rejects_bad_service_url_and_stays() {
-        let net: Arc<dyn BalanceFetcher> = Arc::new(CallMock::new());
-        let mut s = screen(net, Vec::new());
-        s.step = Step::Label {
-            chain: Chain::Mainnet,
-            metadata: fake_metadata_with_owners(vec![owner_a()], 1),
-            trust: SafeTrust::Canonical,
-            linked: vec![],
-            name: "Treasury".into(),
-            siblings: vec![],
-            // Collapsed on purpose: the error must force it back open.
-            advanced: false,
-            service_url: "http://txs.example-dao.org".into(), // non-loopback http
-            service_url_error: None,
-        };
-        let (_task, outcome) = s.update(Message::LabelConfirm);
-        assert!(outcome.is_none(), "must not emit Done with a bad URL");
-        match &s.step {
-            Step::Label {
-                advanced,
-                service_url_error,
-                ..
-            } => {
-                assert!(*advanced, "section reopens to show the error");
-                assert!(service_url_error.is_some());
-            }
-            other => panic!("expected to stay on Label, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn back_from_address_input_propagates_outcome_back() {
-        let net: Arc<dyn BalanceFetcher> = Arc::new(CallMock::new());
-        let mut s = screen(net, Vec::new());
-        let (_task, outcome) = s.update(Message::BackPressed);
-        assert!(matches!(outcome, Some(Outcome::Back)));
-    }
-
-    #[tokio::test]
-    async fn back_from_later_step_rewinds_to_address_input_without_outcome() {
-        let net: Arc<dyn BalanceFetcher> = Arc::new(CallMock::new());
-        let mut s = screen(net, Vec::new());
-        s.step = Step::Inspect {
-            chain: Chain::Mainnet,
-            metadata: SafeMetadata {
-                chain_id: 1,
-                address: safe_addr(),
-                implementation: address!("0x41675C099F32341bf84BFc5382aF534df5C7461a"),
-                version: "1.4.1".into(),
-                threshold: 1,
-                owners: vec![owner_a()],
-                modules: vec![],
-                guard: None,
-                fallback_handler: None,
-                nonce: U256::ZERO,
-            },
-            trust: SafeTrust::Canonical,
-            all_results: vec![],
-        };
-        let (_task, outcome) = s.update(Message::BackPressed);
-        assert!(outcome.is_none(), "in-flow back must not propagate");
-        assert!(matches!(s.step, Step::AddressInput { .. }));
-    }
-
-    /// Build a RoleSelection step with the given owner set, matched
-    /// accounts, and selection. The screen's `existing` snapshot is
-    /// derived from `matched` so the picker's "unclaimed owners"
-    /// computation has a real intersection to work against.
-    fn role_selection_with(
-        owners: Vec<Address>,
-        matched: Vec<ExistingAccount>,
-        selected: BTreeSet<u32>,
-    ) -> SafeOnboardingScreen {
-        let net: Arc<dyn BalanceFetcher> = Arc::new(CallMock::new());
-        let mut s = SafeOnboardingScreen::new(net, matched.clone());
-        s.step = Step::RoleSelection {
-            chain: Chain::Mainnet,
-            metadata: fake_metadata_with_owners(owners, 1),
-            trust: SafeTrust::Canonical,
-            all_results: vec![],
-            matched,
-            selected,
-            linked_nested_safes: Vec::new(),
-            signer_error: None,
-        };
-        s
-    }
-
-    #[tokio::test]
-    async fn add_signer_pressed_transitions_to_picker_with_unclaimed_owners() {
-        let owner_c = address!("0x0000000000000000000000000000000000000c0c");
-        let matched = vec![ExistingAccount {
-            account_idx: 0,
-            address: owner_a(),
-            label: "Account 1".into(),
-        }];
-        let mut s = role_selection_with(
-            vec![owner_a(), owner_b(), owner_c],
-            matched,
-            BTreeSet::from([0u32]),
+    #[test]
+    fn bad_service_url_blocks_confirm_and_opens_advanced() {
+        let mut s = reviewing(
+            Vec::new(),
+            vec![canonical_hit(Chain::Mainnet, vec![owner_a()])],
         );
-        let (_task, outcome) = s.update(Message::AddSignerPressed);
-        assert!(outcome.is_none());
-        match &s.step {
-            Step::PickSignerMethod {
-                unclaimed_owners, ..
-            } => {
-                // owner_a is already in the wallet (via existing), so
-                // only owner_b and owner_c are unclaimed.
-                let mut unclaimed = unclaimed_owners.clone();
-                unclaimed.sort();
-                let mut expected = vec![owner_b(), owner_c];
-                expected.sort();
-                assert_eq!(unclaimed, expected);
-            }
-            other => panic!("expected PickSignerMethod, got {other:?}"),
-        }
+        // Typed, then collapsed on purpose: the error must force it back open.
+        let _ = s.update(Message::AdvancedToggled);
+        // Non-loopback http.
+        let _ = s.update(Message::ServiceUrlInput(
+            "http://txs.example-dao.org".into(),
+        ));
+        let _ = s.update(Message::AdvancedToggled);
+        assert!(!review(&s).advanced);
+        let (_task, outcome) = s.update(Message::Confirm);
+        assert!(outcome.is_none(), "must not emit Done with a bad URL");
+        let r = review(&s);
+        assert!(r.advanced, "section reopens to show the error");
+        assert!(r.service_url_error.is_some());
+        // Editing the URL clears the error.
+        let _ = s.update(Message::ServiceUrlInput(String::new()));
+        assert!(review(&s).service_url_error.is_none());
     }
 
-    #[tokio::test]
-    async fn picking_method_emits_request_add_signer_with_allowed_owners() {
-        let owner_c = address!("0x0000000000000000000000000000000000000c0c");
-        let mut s =
-            role_selection_with(vec![owner_a(), owner_b(), owner_c], vec![], BTreeSet::new());
-        let _ = s.update(Message::AddSignerPressed);
+    #[test]
+    fn multichain_flow_links_signer_on_every_owned_chain() {
+        // The reported bug: a Safe on several chains was saved watch-only
+        // on every chain but the one picked first. Account 0 owns the
+        // Safe on Mainnet and Base; Optimism's owner is someone else.
+        let mut s = scanning(vec![acct(0, owner_a())]);
+        complete_scan(
+            &mut s,
+            vec![
+                canonical_hit(Chain::Mainnet, vec![owner_a()]),
+                canonical_hit(Chain::Base, vec![owner_a()]),
+                canonical_hit(Chain::Optimism, vec![owner_b()]),
+            ],
+        );
+        // The role summary shows it before confirming.
+        assert_eq!(
+            signers_by_chain(&s),
+            vec![
+                (Chain::Mainnet, vec![0]),
+                (Chain::Base, vec![0]),
+                (Chain::Optimism, vec![]),
+            ]
+        );
+        let (primary, siblings) = confirm(&mut s);
+        assert_eq!(primary.chain_id, 1);
+        assert_eq!(
+            links_by_chain(&primary, &siblings),
+            vec![(1, vec![0]), (10, vec![]), (8453, vec![0])]
+        );
+    }
+
+    #[test]
+    fn signer_that_owns_only_a_sibling_chain_is_linked_there() {
+        let mut s = reviewing(
+            vec![acct(0, owner_a()), acct(2, owner_c())],
+            vec![
+                canonical_hit(Chain::Mainnet, vec![owner_a()]),
+                canonical_hit(Chain::Base, vec![owner_a(), owner_c()]),
+            ],
+        );
+        let (primary, siblings) = confirm(&mut s);
+        assert_eq!(
+            links_by_chain(&primary, &siblings),
+            vec![(1, vec![0]), (8453, vec![0, 2])]
+        );
+    }
+
+    #[test]
+    fn unchecking_a_signer_unlinks_it_on_every_chain() {
+        let mut s = reviewing(
+            vec![acct(0, owner_a()), acct(1, owner_b())],
+            three_chain_hits(vec![owner_a(), owner_b()]),
+        );
+        let _ = s.update(Message::SignerToggled(0));
+        let (primary, siblings) = confirm(&mut s);
+        assert_eq!(
+            links_by_chain(&primary, &siblings),
+            vec![(1, vec![1]), (10, vec![1]), (8453, vec![1])]
+        );
+    }
+
+    #[test]
+    fn unchecking_every_signer_saves_watch_only() {
+        let mut s = reviewing(vec![acct(0, owner_a())], three_chain_hits(vec![owner_a()]));
+        assert!(
+            signers_by_chain(&s)
+                .iter()
+                .all(|(_, links)| !links.is_empty())
+        );
+        let _ = s.update(Message::SignerToggled(0));
+        assert!(
+            signers_by_chain(&s)
+                .iter()
+                .all(|(_, links)| links.is_empty()),
+            "every chain reads watch-only"
+        );
+        let r = review(&s);
+        assert_eq!(
+            confirm_label(&r.chain_roles(&s.existing, &s.existing_safes)),
+            "Add as watch-only →"
+        );
+        let (primary, siblings) = confirm(&mut s);
+        assert!(primary.linked_signer_indices.is_empty());
+        assert!(siblings.iter().all(|d| d.linked_signer_indices.is_empty()));
+    }
+
+    #[test]
+    fn view_only_account_is_never_linked() {
+        let mut s = reviewing(
+            vec![watched(0, owner_a()), acct(1, owner_b())],
+            vec![canonical_hit(Chain::Mainnet, vec![owner_a(), owner_b()])],
+        );
+        // Listed (it owns the Safe) but not pre-checked, and its toggle
+        // is refused.
+        assert_eq!(review(&s).owned_chains(owner_a()), vec![Chain::Mainnet]);
+        assert_eq!(review(&s).selected, BTreeSet::from([1u32]));
+        let _ = s.update(Message::SignerToggled(0));
+        assert!(!review(&s).selected.contains(&0));
+        // Even a selection that sneaks in is filtered on confirm.
+        review_mut(&mut s).selected.insert(0);
+        let (primary, _) = confirm(&mut s);
+        assert_eq!(primary.linked_signer_indices, vec![1]);
+    }
+
+    // ── Add-signer sub-flow ──────────────────────────────────────────
+
+    #[test]
+    fn add_signer_section_lists_unclaimed_owners() {
+        let mut s = reviewing(
+            vec![acct(0, owner_a())],
+            vec![canonical_hit(
+                Chain::Mainnet,
+                vec![owner_a(), owner_b(), owner_c()],
+            )],
+        );
+        let (_task, outcome) = s.update(Message::AddSignerToggled);
+        assert!(outcome.is_none());
+        let r = review(&s);
+        assert!(r.add_signer_open);
+        // owner_a is already in the wallet, so only b and c are unclaimed.
+        assert_eq!(r.unclaimed_owners(&s.existing), vec![owner_b(), owner_c()]);
+    }
+
+    #[test]
+    fn allowed_owners_is_union_over_included_chains_minus_existing() {
+        let mut s = reviewing(
+            vec![acct(0, owner_a())],
+            vec![
+                canonical_hit(Chain::Mainnet, vec![owner_a(), owner_b()]),
+                canonical_hit(Chain::Base, vec![owner_b(), owner_c()]),
+                canonical_hit(Chain::Optimism, vec![owner_d()]),
+            ],
+        );
+        let _ = s.update(Message::ChainIncludeToggled(Chain::Optimism));
+        let _ = s.update(Message::AddSignerToggled);
+        let (_task, outcome) = s.update(Message::SignerMethodPicked(SignerMethod::Hardware));
+        let Some(Outcome::RequestAddSigner {
+            method,
+            allowed_owners,
+        }) = outcome
+        else {
+            panic!("expected RequestAddSigner, got {outcome:?}");
+        };
+        assert_eq!(method, SignerMethod::Hardware);
+        assert_eq!(allowed_owners, vec![owner_b(), owner_c()]);
+    }
+
+    #[test]
+    fn view_only_owner_is_not_offered_for_import() {
+        // Its address is already in the wallet, so the parent would
+        // refuse the import as a duplicate anyway.
+        let s = reviewing(
+            vec![watched(0, owner_a())],
+            vec![canonical_hit(Chain::Mainnet, vec![owner_a(), owner_b()])],
+        );
+        assert_eq!(review(&s).unclaimed_owners(&s.existing), vec![owner_b()]);
+    }
+
+    #[test]
+    fn picking_method_emits_request_add_signer_with_allowed_owners() {
+        let mut s = reviewing(
+            Vec::new(),
+            vec![canonical_hit(
+                Chain::Mainnet,
+                vec![owner_a(), owner_b(), owner_c()],
+            )],
+        );
+        let _ = s.update(Message::AddSignerToggled);
         let (_task, outcome) = s.update(Message::SignerMethodPicked(SignerMethod::PrivateKey));
         let Some(Outcome::RequestAddSigner {
             method,
@@ -2321,182 +3364,231 @@ mod tests {
         assert_eq!(method, SignerMethod::PrivateKey);
         let mut got = allowed_owners.clone();
         got.sort();
-        let mut want = vec![owner_a(), owner_b(), owner_c];
+        let mut want = vec![owner_a(), owner_b(), owner_c()];
         want.sort();
         assert_eq!(got, want);
-        // Screen stays at PickSignerMethod waiting for the parent's
-        // callback (apply_added_signer or apply_signer_import_error).
-        assert!(matches!(s.step, Step::PickSignerMethod { .. }));
+        // Parked in Review, waiting for the parent's callback.
+        assert_eq!(s.phase.name(), "AwaitingSigner");
+        assert!(review(&s).add_signer_open);
     }
 
-    #[tokio::test]
-    async fn picking_method_with_no_unclaimed_owners_returns_role_with_error() {
-        let matched = vec![ExistingAccount {
-            account_idx: 0,
-            address: owner_a(),
-            label: "Account 1".into(),
-        }];
-        let mut s = role_selection_with(vec![owner_a()], matched, BTreeSet::from([0u32]));
-        let _ = s.update(Message::AddSignerPressed);
+    #[test]
+    fn picking_method_with_no_unclaimed_owners_sets_error() {
+        let mut s = reviewing(
+            vec![acct(0, owner_a())],
+            vec![canonical_hit(Chain::Mainnet, vec![owner_a()])],
+        );
+        let _ = s.update(Message::AddSignerToggled);
         let (_task, outcome) = s.update(Message::SignerMethodPicked(SignerMethod::SeedPhrase));
         assert!(outcome.is_none());
-        match &s.step {
-            Step::RoleSelection { signer_error, .. } => assert!(signer_error.is_some()),
-            other => panic!("expected RoleSelection with error, got {other:?}"),
-        }
+        assert_eq!(s.phase.name(), "Review");
+        assert!(review(&s).signer_error.is_some());
+        // Toggling a signer clears it.
+        let _ = s.update(Message::SignerToggled(0));
+        assert!(review(&s).signer_error.is_none());
     }
 
-    #[tokio::test]
-    async fn back_from_picker_returns_to_role_selection() {
-        let mut s = role_selection_with(
-            vec![owner_a(), owner_b()],
-            vec![ExistingAccount {
-                account_idx: 0,
-                address: owner_a(),
-                label: "Account 1".into(),
-            }],
-            BTreeSet::from([0u32]),
+    #[test]
+    fn back_collapses_add_signer_section_before_leaving_review() {
+        let mut s = reviewing(
+            vec![acct(0, owner_a())],
+            vec![canonical_hit(Chain::Mainnet, vec![owner_a(), owner_b()])],
         );
-        let _ = s.update(Message::AddSignerPressed);
+        let _ = s.update(Message::AddSignerToggled);
         let (_task, outcome) = s.update(Message::BackPressed);
         assert!(outcome.is_none());
-        match &s.step {
-            Step::RoleSelection { selected, .. } => assert!(selected.contains(&0)),
-            other => panic!("expected RoleSelection, got {other:?}"),
-        }
+        let r = review(&s);
+        assert!(!r.add_signer_open);
+        assert!(r.selected.contains(&0), "selection preserved");
+        // Second Back leaves Review.
+        let _ = s.update(Message::BackPressed);
+        assert_eq!(s.phase.name(), "Find");
     }
 
-    #[tokio::test]
-    async fn apply_added_signer_returns_to_role_selection_with_new_match_checked() {
-        let mut s = role_selection_with(vec![owner_a(), owner_b()], vec![], BTreeSet::new());
-        let _ = s.update(Message::AddSignerPressed);
-        s.apply_added_signer(ExistingAccount {
-            account_idx: 7,
-            address: owner_b(),
-            label: "Account 8".into(),
-        });
-        match &s.step {
-            Step::RoleSelection {
-                matched,
-                selected,
-                signer_error,
-                ..
-            } => {
-                assert_eq!(matched.len(), 1);
-                assert_eq!(matched[0].account_idx, 7);
-                assert_eq!(matched[0].address, owner_b());
-                assert!(selected.contains(&7));
-                assert!(signer_error.is_none());
-            }
-            other => panic!("expected RoleSelection, got {other:?}"),
-        }
-        // Snapshot is also updated so future picker entries see the new
-        // account as already-claimed.
+    #[test]
+    fn restoring_the_stash_without_a_callback_resumes_review() {
+        // Back out of the import sub-screen: the parent restores the
+        // parked screen as-is. The next message clears the parked marker.
+        let mut s = reviewing(
+            Vec::new(),
+            vec![canonical_hit(Chain::Mainnet, vec![owner_a()])],
+        );
+        let _ = s.update(Message::AddSignerToggled);
+        let _ = s.update(Message::SignerMethodPicked(SignerMethod::PrivateKey));
+        assert_eq!(s.phase.name(), "AwaitingSigner");
+        let _ = s.update(Message::NameInput("Vault".into()));
+        assert_eq!(s.phase.name(), "Review");
+        assert_eq!(review(&s).name, "Vault");
+    }
+
+    #[test]
+    fn apply_added_signer_links_new_account_checked() {
+        let mut s = reviewing(
+            Vec::new(),
+            vec![canonical_hit(Chain::Mainnet, vec![owner_a(), owner_b()])],
+        );
+        let _ = s.update(Message::AddSignerToggled);
+        let _ = s.update(Message::SignerMethodPicked(SignerMethod::PrivateKey));
+        review_mut(&mut s).signer_error = Some("stale".into());
+        s.apply_added_signer(acct(7, owner_b()));
+        assert_eq!(s.phase.name(), "Review");
+        let r = review(&s);
+        assert!(r.selected.contains(&7));
+        assert!(r.signer_error.is_none());
+        assert!(!r.add_signer_open, "section folds away after a success");
+        assert_eq!(r.owned_chains(owner_b()), vec![Chain::Mainnet]);
+        // Snapshot is also updated so the next allow-list sees the new
+        // account as already claimed.
         assert!(s.existing.iter().any(|e| e.account_idx == 7));
+        assert_eq!(r.unclaimed_owners(&s.existing), vec![owner_a()]);
     }
 
-    #[tokio::test]
-    async fn nested_safe_method_emits_request_with_allowed_owners() {
-        let mut s = role_selection_with(vec![owner_a(), owner_b()], vec![], BTreeSet::new());
-        let _ = s.update(Message::AddSignerPressed);
+    #[test]
+    fn signer_added_mid_flow_is_linked_on_every_chain_it_owns() {
+        let mut s = reviewing(
+            Vec::new(),
+            vec![
+                canonical_hit(Chain::Mainnet, vec![owner_a(), owner_b()]),
+                canonical_hit(Chain::Base, vec![owner_b()]),
+                canonical_hit(Chain::Optimism, vec![owner_a()]),
+            ],
+        );
+        let _ = s.update(Message::AddSignerToggled);
+        let (_task, outcome) = s.update(Message::SignerMethodPicked(SignerMethod::PrivateKey));
+        assert!(matches!(outcome, Some(Outcome::RequestAddSigner { .. })));
+        s.apply_added_signer(acct(7, owner_b()));
+        let (primary, siblings) = confirm(&mut s);
+        assert_eq!(
+            links_by_chain(&primary, &siblings),
+            vec![(1, vec![7]), (10, vec![]), (8453, vec![7])]
+        );
+    }
+
+    #[test]
+    fn nested_safe_method_emits_request_with_allowed_owners() {
+        let mut s = reviewing(
+            Vec::new(),
+            vec![canonical_hit(Chain::Mainnet, vec![owner_a(), owner_b()])],
+        );
+        let _ = s.update(Message::AddSignerToggled);
         let (_task, outcome) = s.update(Message::SignerMethodPicked(SignerMethod::NestedSafe));
-        let Some(Outcome::RequestAddSigner { method, .. }) = outcome else {
+        let Some(Outcome::RequestAddSigner {
+            method,
+            allowed_owners,
+        }) = outcome
+        else {
             panic!("expected RequestAddSigner");
         };
         assert_eq!(method, SignerMethod::NestedSafe);
+        assert_eq!(allowed_owners, vec![owner_a(), owner_b()]);
     }
 
-    #[tokio::test]
-    async fn apply_added_nested_safe_records_owner_and_returns_to_role() {
-        let mut s = role_selection_with(vec![owner_a(), owner_b()], vec![], BTreeSet::new());
-        let _ = s.update(Message::AddSignerPressed);
+    #[test]
+    fn apply_added_nested_safe_records_owner() {
+        let mut s = reviewing(
+            Vec::new(),
+            vec![canonical_hit(Chain::Mainnet, vec![owner_a(), owner_b()])],
+        );
+        let _ = s.update(Message::AddSignerToggled);
+        let _ = s.update(Message::SignerMethodPicked(SignerMethod::NestedSafe));
         s.apply_added_nested_safe(owner_b());
-        match &s.step {
-            Step::RoleSelection {
-                linked_nested_safes,
-                signer_error,
-                ..
-            } => {
-                assert_eq!(linked_nested_safes, &vec![owner_b()]);
-                assert!(signer_error.is_none());
-            }
-            other => panic!("expected RoleSelection, got {other:?}"),
-        }
+        assert_eq!(s.phase.name(), "Review");
+        let r = review(&s);
+        assert_eq!(r.linked_nested_safes, vec![owner_b()]);
+        assert!(r.signer_error.is_none());
+        assert!(!r.add_signer_open);
     }
 
-    #[tokio::test]
-    async fn nested_safes_persist_across_picker_roundtrip() {
-        let mut s = role_selection_with(vec![owner_a(), owner_b()], vec![], BTreeSet::new());
-        let _ = s.update(Message::AddSignerPressed);
+    #[test]
+    fn nested_safes_persist_across_add_signer_roundtrip() {
+        let mut s = reviewing(
+            Vec::new(),
+            vec![canonical_hit(Chain::Mainnet, vec![owner_a(), owner_b()])],
+        );
+        let _ = s.update(Message::AddSignerToggled);
+        let _ = s.update(Message::SignerMethodPicked(SignerMethod::NestedSafe));
         s.apply_added_nested_safe(owner_b());
-        // Re-enter the picker; the already-linked nested Safe should
-        // survive the round-trip.
-        let _ = s.update(Message::AddSignerPressed);
-        match &s.step {
-            Step::PickSignerMethod {
-                linked_nested_safes,
-                ..
-            } => assert_eq!(linked_nested_safes, &vec![owner_b()]),
-            other => panic!("expected PickSignerMethod, got {other:?}"),
-        }
+        // Re-open the section and back out of it again; the already
+        // linked nested Safe survives.
+        let _ = s.update(Message::AddSignerToggled);
+        assert!(review(&s).add_signer_open);
         let _ = s.update(Message::BackPressed);
-        match &s.step {
-            Step::RoleSelection {
-                linked_nested_safes,
-                ..
-            } => assert_eq!(linked_nested_safes, &vec![owner_b()]),
-            other => panic!("expected RoleSelection, got {other:?}"),
-        }
+        assert!(!review(&s).add_signer_open);
+        assert_eq!(review(&s).linked_nested_safes, vec![owner_b()]);
     }
 
-    #[tokio::test]
-    async fn apply_added_nested_safe_is_idempotent() {
-        let mut s = role_selection_with(vec![owner_a(), owner_b()], vec![], BTreeSet::new());
-        let _ = s.update(Message::AddSignerPressed);
+    #[test]
+    fn apply_added_nested_safe_is_idempotent() {
+        let mut s = reviewing(
+            Vec::new(),
+            vec![canonical_hit(Chain::Mainnet, vec![owner_a(), owner_b()])],
+        );
         s.apply_added_nested_safe(owner_b());
         // Second call with the same address must not duplicate.
-        let _ = s.update(Message::AddSignerPressed);
+        let _ = s.update(Message::AddSignerToggled);
         s.apply_added_nested_safe(owner_b());
-        match &s.step {
-            Step::RoleSelection {
-                linked_nested_safes,
-                ..
-            } => assert_eq!(linked_nested_safes, &vec![owner_b()]),
-            other => panic!("expected RoleSelection, got {other:?}"),
-        }
+        assert_eq!(review(&s).linked_nested_safes, vec![owner_b()]);
     }
 
-    #[tokio::test]
-    async fn apply_signer_import_error_returns_to_role_selection_with_error() {
-        let mut s = role_selection_with(vec![owner_a(), owner_b()], vec![], BTreeSet::new());
-        let _ = s.update(Message::AddSignerPressed);
+    #[test]
+    fn apply_signer_import_error_sets_error_and_stays_in_review() {
+        let mut s = reviewing(
+            Vec::new(),
+            vec![canonical_hit(Chain::Mainnet, vec![owner_a(), owner_b()])],
+        );
+        let _ = s.update(Message::AddSignerToggled);
+        let _ = s.update(Message::SignerMethodPicked(SignerMethod::PrivateKey));
         s.apply_signer_import_error("Imported address is not an owner.".to_string());
-        match &s.step {
-            Step::RoleSelection { signer_error, .. } => {
-                assert_eq!(
-                    signer_error.as_deref(),
-                    Some("Imported address is not an owner.")
-                );
-            }
-            other => panic!("expected RoleSelection, got {other:?}"),
-        }
+        assert_eq!(s.phase.name(), "Review");
+        let r = review(&s);
+        assert_eq!(
+            r.signer_error.as_deref(),
+            Some("Imported address is not an owner.")
+        );
+        // Section stays open so the user can retry.
+        assert!(r.add_signer_open);
     }
 
-    #[tokio::test]
-    async fn stale_scan_completion_is_dropped() {
-        let net: Arc<dyn BalanceFetcher> = Arc::new(CallMock::new());
-        let mut s = screen(net, Vec::new());
-        s.step = Step::Scanning {
-            address: safe_addr(),
-            what: "x".into(),
-        };
-        let stale_seq = s.input_seq.wrapping_sub(1);
-        let _ = s.update(Message::ScanCompleted {
-            seq: stale_seq,
-            address: safe_addr(),
-            results: vec![],
-        });
-        // Still in Scanning because the seq was stale.
-        assert!(matches!(s.step, Step::Scanning { .. }));
+    // ── Views ────────────────────────────────────────────────────────
+
+    #[test]
+    fn view_builds_in_every_phase() {
+        let t = KaoTheme::for_kind(settings::theme());
+        let mut s = screen(vec![acct(0, owner_a()), watched(1, owner_b())]);
+        let _ = s.view();
+        let _ = s.update(Message::AddressInput(format!("{:?}", safe_addr())));
+        let _ = s.update(Message::AddressSubmit);
+        let _ = s.view();
+        complete_scan(&mut s, vec![(Chain::Mainnet, ScanResult::NotDeployed)]);
+        let _ = s.view();
+
+        let mut s = reviewing(
+            vec![acct(0, owner_a()), watched(1, owner_b())],
+            vec![
+                hit_with(Chain::Mainnet, vec![owner_a(), owner_b()], 1),
+                (
+                    Chain::Base,
+                    ScanResult::UnrecognizedImpl(SafeMetadata {
+                        modules: vec![owner_d()],
+                        guard: Some(owner_c()),
+                        fallback_handler: Some(owner_c()),
+                        ..fake_metadata_with_owners(vec![owner_c()], 1)
+                    }),
+                ),
+                (Chain::Optimism, ScanResult::NotASafe { reason: "x".into() }),
+            ],
+        )
+        .with_existing_safes(vec![saved(1, Some("Treasury"), vec![0, 9])]);
+        let _ = s.update(Message::ChainFocused(Chain::Base));
+        let _ = s.update(Message::AddSignerToggled);
+        let _ = s.update(Message::AdvancedToggled);
+        s.apply_added_nested_safe(owner_c());
+        review_mut(&mut s).signer_error = Some("x".into());
+        review_mut(&mut s).service_url_error = Some("x".into());
+        let _ = s.view();
+        // The layout pass picks the column mode; build both directly.
+        let r = review(&s);
+        let _ = view_review(t, r, &s.existing, &s.existing_safes, true);
+        let _ = view_review(t, r, &s.existing, &s.existing_safes, false);
     }
 }

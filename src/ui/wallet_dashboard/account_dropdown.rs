@@ -1,5 +1,6 @@
 //! Account picker overlay anchored under the sidebar account card. Lists all
-//! accounts in the unlocked wallet and an "Add new address" action.
+//! accounts in the unlocked wallet, then "Add new address" and "Manage
+//! accounts" (Settings → Accounts: rename / remove) actions.
 //!
 //! TEA component: owns no internal state today (it's a pure view of the
 //! coordinator's accounts + active_index), but wrapping it in the standard
@@ -26,6 +27,7 @@ pub enum Message {
     Select(usize),
     SelectSafe(usize),
     Add,
+    Manage,
     Close,
     BoxClickIgnored,
     Key(keyboard::Event),
@@ -36,6 +38,8 @@ pub enum Outcome {
     Switch(usize),
     SelectSafe(usize),
     Add,
+    /// Open Settings → Accounts.
+    Manage,
     Closed,
 }
 
@@ -46,6 +50,7 @@ impl Outcome {
             Outcome::Switch(_) => "Switch",
             Outcome::SelectSafe(_) => "SelectSafe",
             Outcome::Add => "Add",
+            Outcome::Manage => "Manage",
             Outcome::Closed => "Closed",
         }
     }
@@ -74,6 +79,7 @@ impl AccountDropdown {
             Message::Select(idx) => (Task::none(), Some(Outcome::Switch(idx))),
             Message::SelectSafe(idx) => (Task::none(), Some(Outcome::SelectSafe(idx))),
             Message::Add => (Task::none(), Some(Outcome::Add)),
+            Message::Manage => (Task::none(), Some(Outcome::Manage)),
             Message::Close => (Task::none(), Some(Outcome::Closed)),
             Message::BoxClickIgnored => (Task::none(), None),
             Message::Key(keyboard::Event::KeyPressed { key, .. }) => {
@@ -127,10 +133,12 @@ impl AccountDropdown {
             list = list.push(account_row(t, idx, account, eoa_active_index, is_signer));
         }
         for (idx, safe) in safes.iter().enumerate() {
-            list = list.push(safe_row(t, idx, safe, active_safe == Some(idx)));
+            let watch_only = !safe.has_signing_link(accounts);
+            list = list.push(safe_row(t, idx, safe, active_safe == Some(idx), watch_only));
         }
         list = list.push(thin_divider(t));
         list = list.push(add_account_row(t));
+        list = list.push(manage_accounts_row(t));
 
         let panel = container(
             scrollable(list)
@@ -248,11 +256,13 @@ fn account_row<'a>(
 
 /// Render one Safe row.
 ///
-/// Signing Safes (`linked_signer_indices` non-empty) are clickable
-/// and emit `Message::SelectSafe(idx)` — the dashboard then opens
-/// the Safe-send modal. Watch-only Safes (no linked owners in this
-/// wallet) stay non-clickable: there's no signing path, so the click
-/// would be a false affordance.
+/// Signing Safes are clickable and emit `Message::SelectSafe(idx)` — the
+/// dashboard then opens the Safe-send modal. Watch-only Safes stay
+/// non-clickable: there's no signing path, so the click would be a false
+/// affordance. `watch_only` is `!SafeDescriptor::has_signing_link` — no
+/// linked account that can sign and is still an owner — the same rule
+/// that drops the dashboard out of Safe mode, so a Safe offered here
+/// stays active once picked.
 ///
 /// Layout mirrors `account_row`: avatar + info column + active
 /// indicator on the right (◉ when this Safe is the active context,
@@ -264,8 +274,8 @@ fn safe_row<'a>(
     idx: usize,
     safe: &'a SafeDescriptor,
     active: bool,
+    watch_only: bool,
 ) -> Element<'a, Message> {
-    let watch_only = safe.linked_signer_indices.is_empty();
     let label = safe.display_name(idx);
     let chain_label = chain_label_for_id(safe.chain_id);
     let badge_text = if watch_only { "Safe (watch)" } else { "Safe" };
@@ -389,5 +399,23 @@ fn add_account_row<'a>(t: KaoTheme) -> Element<'a, Message> {
         .padding(Padding::from([8, 8]))
         .width(Length::Fill)
         .on_press(Message::Add)
+        .into()
+}
+
+/// "✎ Manage accounts" under "Add new address" — the way to Settings →
+/// Accounts (rename any account, remove one) from where accounts live.
+fn manage_accounts_row<'a>(t: KaoTheme) -> Element<'a, Message> {
+    let inner = row![
+        text("✎").size(14).color(t.sub).font(bold()),
+        Space::new().width(10),
+        text("Manage accounts").size(13).color(t.text).font(bold()),
+    ]
+    .align_y(Alignment::Center)
+    .width(Length::Fill);
+
+    ghost_button(t, inner)
+        .padding(Padding::from([8, 8]))
+        .width(Length::Fill)
+        .on_press(Message::Manage)
         .into()
 }

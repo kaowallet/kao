@@ -947,6 +947,10 @@ pub struct TxBuilderApp {
     pub(crate) raw_nothing_deployed: bool,
     /// Generation guard for [`Outcome::ProbeCode`]: a reply for an address the
     /// user has since retyped must not land on the new one.
+    ///
+    /// Every `*_seq` guard here is drawn from [`super::next_task_seq`] rather
+    /// than counted up from 0: the pane is rebuilt with the dashboard on an
+    /// account switch, and the old pane's replies still arrive at the new one.
     probe_seq: u64,
     /// The EIP-7702 delegate this account currently runs, if any. `None` while
     /// unknown (not yet probed, in flight, or a Safe / custom network that
@@ -1218,7 +1222,7 @@ impl TxBuilderApp {
                 || self.pending_delegation_probe
                 || self.del_key.is_some()
             {
-                self.del_seq += 1;
+                self.del_seq = super::next_task_seq();
                 self.delegated_to = None;
                 self.del_key = None;
                 self.pending_delegation_probe = false;
@@ -1231,7 +1235,7 @@ impl TxBuilderApp {
         }
         self.del_key = Some(key);
         self.delegated_to = None;
-        self.del_seq += 1;
+        self.del_seq = super::next_task_seq();
         self.pending_delegation_probe = true;
     }
 
@@ -1487,7 +1491,7 @@ impl TxBuilderApp {
     /// The generation is bumped for *every* dispatch and stored alongside the
     /// name, so `on_name_resolved` can match on both.
     fn resolve_name_for(&mut self, slot: NameSlot, name: &str) -> Option<Outcome> {
-        self.name_seq += 1;
+        self.name_seq = super::next_task_seq();
         let name = name.trim().to_string();
         self.names.insert(
             slot,
@@ -1700,7 +1704,7 @@ impl TxBuilderApp {
 
     /// Bubble a code probe for `address` if it is worth asking about.
     fn probe_code(&mut self, address: Address) -> Option<Outcome> {
-        self.probe_seq += 1;
+        self.probe_seq = super::next_task_seq();
         Some(Outcome::ProbeCode {
             seq: self.probe_seq,
             net: self.net,
@@ -2051,7 +2055,7 @@ impl TxBuilderApp {
                 // the attached ETH with it. Cleared first: the old answer
                 // belongs to the old address.
                 self.raw_nothing_deployed = false;
-                self.probe_seq += 1;
+                self.probe_seq = super::next_task_seq();
                 if let Ok(addr) = encode::parse_address(self.raw_to.trim()) {
                     self.names.remove(&NameSlot::RawTo);
                     return self.probe_code(addr);
@@ -2537,7 +2541,7 @@ impl TxBuilderApp {
     fn reset_raw_composer(&mut self) {
         // Retire any probe still in flight: its answer describes the address
         // and chain being left behind.
-        self.probe_seq += 1;
+        self.probe_seq = super::next_task_seq();
         self.raw_to.clear();
         self.raw_value = "0".into();
         self.raw_data.clear();
@@ -2550,7 +2554,7 @@ impl TxBuilderApp {
     /// Bumping the generation is belt-and-braces: `on_name_resolved` gates on
     /// the *stored* `Resolving` entry, which clearing the map already removes.
     fn invalidate_names(&mut self) {
-        self.name_seq += 1;
+        self.name_seq = super::next_task_seq();
         self.names.clear();
     }
 
@@ -2585,7 +2589,7 @@ impl TxBuilderApp {
         // erase the label the user is watching resolve.
         self.names
             .retain(|slot, _| matches!(slot, NameSlot::Contract | NameSlot::RawTo));
-        self.name_seq += 1;
+        self.name_seq = super::next_task_seq();
     }
 
     /// Retire any resolve still in flight. `on_contract_resolved` applies its
@@ -2593,11 +2597,11 @@ impl TxBuilderApp {
     /// to that target — a new address, a curated hit, a pasted ABI, a network
     /// switch — has to bump the sequence or the answer gets misapplied.
     fn invalidate_resolve(&mut self) {
-        self.resolve_seq += 1;
+        self.resolve_seq = super::next_task_seq();
     }
 
     fn invalidate_abi_fetch(&mut self) {
-        self.abi_fetch_seq += 1;
+        self.abi_fetch_seq = super::next_task_seq();
         self.abi_fetching = false;
     }
 
@@ -2609,7 +2613,7 @@ impl TxBuilderApp {
     /// leaving the spinner up forever — `on_read` returns on the stale-sequence
     /// check before it gets to reset the flag.
     fn invalidate_read(&mut self) {
-        self.read_seq += 1;
+        self.read_seq = super::next_task_seq();
         self.read_busy = false;
         self.read_result = None;
     }
@@ -2690,7 +2694,7 @@ impl TxBuilderApp {
         self.sim = None;
         self.sim_at = None;
         self.sim_busy = false;
-        self.sim_seq += 1;
+        self.sim_seq = super::next_task_seq();
     }
 
     /// The preflight verdict for the batch as it currently stands, for the

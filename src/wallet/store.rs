@@ -63,6 +63,11 @@ const SALT_LEN: usize = 16;
 
 const HEADER_KEY: &str = "header";
 const ACTIVE_INDEX_KEY: &str = "active_index";
+// `WalletDescriptor::sibling_links_repaired`, as one byte (0/1). Plaintext
+// like `active_index`: it only says whether the one-time legacy repair still
+// has to run. A wallet saved before the repair shipped has no such key, which
+// reads as "not yet".
+const SIBLING_LINKS_REPAIRED_KEY: &str = "sibling_links_repaired";
 const PP_SEED_KEY: &str = "seed";
 const HEADER_AAD: &[u8] = b"header:auth_check";
 const ACCOUNT_AAD_PREFIX: &[u8] = b"accounts:";
@@ -216,6 +221,11 @@ fn save_to(path: &Path, desc: &WalletDescriptor, pw: &SecretString) -> Result<()
         let active = (desc.active_index as u32).to_le_bytes();
         meta.insert(ACTIVE_INDEX_KEY, active.as_slice())
             .map_err(redb_err)?;
+        // Same txn as the Safes below, so a repaired wallet is never saved
+        // without its marker (or the marker without the repaired links).
+        let repaired = [u8::from(desc.sibling_links_repaired)];
+        meta.insert(SIBLING_LINKS_REPAIRED_KEY, repaired.as_slice())
+            .map_err(redb_err)?;
     }
 
     {
@@ -324,6 +334,10 @@ fn load_from(path: &Path, pw: &SecretString) -> Result<WalletDescriptor, WalletE
         }
         None => 0,
     };
+    let sibling_links_repaired = meta
+        .get(SIBLING_LINKS_REPAIRED_KEY)
+        .map_err(redb_err)?
+        .is_some_and(|v| v.value() == [1]);
 
     let accounts_tbl = txn.open_table(ACCOUNTS_TABLE).map_err(redb_err)?;
     let mut accounts: Vec<(u32, AccountDescriptor)> = Vec::new();
@@ -371,6 +385,7 @@ fn load_from(path: &Path, pw: &SecretString) -> Result<WalletDescriptor, WalletE
         accounts,
         safes,
         active_index,
+        sibling_links_repaired,
     })
 }
 
@@ -987,6 +1002,7 @@ mod tests {
             ],
             safes: Vec::new(),
             active_index: 2,
+            sibling_links_repaired: true,
         };
         save_to(&path, &desc, &pw("hunter2")).unwrap();
         let loaded = load_from(&path, &pw("hunter2")).unwrap();
@@ -1017,6 +1033,46 @@ mod tests {
             }
             _ => panic!("expected Local"),
         }
+    }
+
+    #[test]
+    fn sibling_links_repaired_marker_round_trips_both_ways() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet.redb");
+        let mut desc = wallet_with_safes(Vec::new());
+        assert!(desc.sibling_links_repaired);
+
+        save_to(&path, &desc, &pw("pw")).unwrap();
+        assert!(load_from(&path, &pw("pw")).unwrap().sibling_links_repaired);
+
+        // A later save carries whatever the wallet says now — the same
+        // write as the accounts and Safes.
+        desc.sibling_links_repaired = false;
+        save_to(&path, &desc, &pw("pw")).unwrap();
+        assert!(!load_from(&path, &pw("pw")).unwrap().sibling_links_repaired);
+    }
+
+    #[test]
+    fn a_wallet_saved_before_the_marker_loads_as_not_yet_repaired() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet.redb");
+        save_to(&path, &wallet_with_safes(Vec::new()), &pw("pw")).unwrap();
+        // What a pre-marker build wrote: no such key in `meta`.
+        {
+            let db = Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut meta = txn.open_table(META_TABLE).unwrap();
+                assert!(meta.remove(SIBLING_LINKS_REPAIRED_KEY).unwrap().is_some());
+            }
+            txn.commit().unwrap();
+        }
+        let loaded = load_from(&path, &pw("pw")).unwrap();
+        assert!(
+            !loaded.sibling_links_repaired,
+            "a legacy wallet gets its one repair on the next unlock"
+        );
+        assert_eq!(loaded.accounts.len(), 1, "and otherwise loads as before");
     }
 
     #[cfg(unix)]
@@ -1162,6 +1218,7 @@ mod tests {
             ],
             safes: Vec::new(),
             active_index: 2,
+            sibling_links_repaired: true,
         };
         save_to(&path, &big, &pw("pw")).unwrap();
 
@@ -1201,6 +1258,7 @@ mod tests {
             ],
             safes: Vec::new(),
             active_index: 0,
+            sibling_links_repaired: true,
         };
         save_to(&path, &desc, &pw("pw")).unwrap();
 
@@ -1494,6 +1552,7 @@ mod tests {
             }],
             safes,
             active_index: 0,
+            sibling_links_repaired: true,
         }
     }
 
@@ -1622,6 +1681,7 @@ mod tests {
             ],
             safes: vec![minimal_safe(0x77, 1)],
             active_index: 1,
+            sibling_links_repaired: true,
         };
         save_to(&path, &updated, &pw("pw")).unwrap();
 
@@ -1808,6 +1868,131 @@ mod tests {
         assert!(!desc.contains_safe(same, 10));
         // Different address, same chain → not a duplicate.
         assert!(!desc.contains_safe(other, 1));
+    }
+
+    /// Removing an account from the middle re-indexes everything after it.
+    /// The save re-encrypts each surviving row under its NEW index (AAD is
+    /// bound to the position), so a reload must decrypt every row, keep the
+    /// remapped links and active index, and drop the removed account's row.
+    #[test]
+    fn remove_account_then_save_and_load_roundtrip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet.redb");
+        let key = |b: u8| crate::wallet::SecretKeyBytes::new([b; 32]);
+        let mut desc = WalletDescriptor {
+            accounts: vec![
+                AccountDescriptor::Local {
+                    name: None,
+                    key_bytes: key(0x01),
+                },
+                AccountDescriptor::Local {
+                    name: Some("Doomed".into()),
+                    key_bytes: key(0x02),
+                },
+                AccountDescriptor::Ledger {
+                    name: None,
+                    path: LedgerHdPath::LedgerLive(4),
+                    address: [0x33; 20],
+                },
+                AccountDescriptor::Local {
+                    name: None,
+                    key_bytes: key(0x04),
+                },
+            ],
+            safes: vec![
+                SafeDescriptor {
+                    linked_signer_indices: vec![0, 1, 3],
+                    ..minimal_safe(0x51, 1)
+                },
+                SafeDescriptor {
+                    linked_signer_indices: vec![1],
+                    ..minimal_safe(0x52, 8453)
+                },
+            ],
+            active_index: 3,
+            sibling_links_repaired: true,
+        };
+        save_to(&path, &desc, &pw("pw")).unwrap();
+
+        let removed = desc.remove_account(1).unwrap();
+        assert_eq!(removed.name, "Doomed");
+        save_to(&path, &desc, &pw("pw")).unwrap();
+
+        let loaded = load_from(&path, &pw("pw")).unwrap();
+        assert_eq!(loaded.accounts.len(), 3, "the removed row is gone");
+        assert_eq!(loaded.active_index, 2, "active followed its account");
+        match &loaded.accounts[0] {
+            AccountDescriptor::Local { name, key_bytes } => {
+                assert!(
+                    name.is_none(),
+                    "accounts before the removed one keep defaults"
+                );
+                assert_eq!(key_bytes.as_array(), &[0x01; 32]);
+            }
+            other => panic!("expected Local, got {other:?}"),
+        }
+        match &loaded.accounts[1] {
+            AccountDescriptor::Ledger {
+                name,
+                path,
+                address,
+            } => {
+                assert_eq!(name.as_deref(), Some("Account 3"), "default name frozen");
+                assert!(matches!(path, LedgerHdPath::LedgerLive(4)));
+                assert_eq!(*address, [0x33; 20]);
+            }
+            other => panic!("expected Ledger, got {other:?}"),
+        }
+        match &loaded.accounts[2] {
+            AccountDescriptor::Local { name, key_bytes } => {
+                assert_eq!(name.as_deref(), Some("Account 4"));
+                assert_eq!(key_bytes.as_array(), &[0x04; 32]);
+            }
+            other => panic!("expected Local, got {other:?}"),
+        }
+        assert_eq!(loaded.safes[0].linked_signer_indices, vec![0, 2]);
+        assert!(
+            loaded.safes[1].linked_signer_indices.is_empty(),
+            "lost its only signer → watch-only, and that persisted"
+        );
+        assert_eq!(loaded.safes, desc.safes);
+    }
+
+    /// A removed Safe stays removed across a reload, its surviving
+    /// same-address sibling keeps its row (re-indexed) with the pruned
+    /// sibling list, and a later unnamed Safe keeps the name it was shown
+    /// under.
+    #[test]
+    fn remove_safe_then_save_and_load_roundtrip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet.redb");
+        let mut desc = wallet_with_safes(vec![
+            SafeDescriptor {
+                sibling_chains: vec![8453],
+                ..minimal_safe(0x55, 1)
+            },
+            SafeDescriptor {
+                name: None,
+                sibling_chains: vec![1],
+                ..minimal_safe(0x55, 8453)
+            },
+            SafeDescriptor {
+                name: None,
+                ..minimal_safe(0x66, 10)
+            },
+        ]);
+        save_to(&path, &desc, &pw("pw")).unwrap();
+
+        desc.remove_safe([0x55; 20], 1).expect("held");
+        save_to(&path, &desc, &pw("pw")).unwrap();
+
+        let loaded = load_from(&path, &pw("pw")).unwrap();
+        assert_eq!(loaded.safes, desc.safes);
+        let keys: Vec<_> = loaded.safes.iter().map(SafeDescriptor::key).collect();
+        assert_eq!(keys, vec![([0x55; 20], 8453), ([0x66; 20], 10)]);
+        assert!(loaded.safes[0].sibling_chains.is_empty());
+        assert_eq!(loaded.safes[0].name(), Some("Safe 2"));
+        assert_eq!(loaded.safes[1].name(), Some("Safe 3"));
     }
 
     // ── Privacy Pools seed tests ─────────────────────────────────────────

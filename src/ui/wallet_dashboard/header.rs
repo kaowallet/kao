@@ -1,7 +1,7 @@
-//! Top header strip — wallet name (with inline rename), Helios verification
-//! badge, mood pill. The account selector and network/privacy status moved
-//! into the sidebar; this strip is now just the active-account title and the
-//! at-a-glance verification + mood affordances.
+//! Top header strip — account or Safe name (with inline rename), Helios
+//! verification badge, mood pill. The account selector and network/privacy
+//! status moved into the sidebar; this strip is now just the active
+//! identity's title and the at-a-glance verification + mood affordances.
 
 use iced::border::Radius;
 use iced::widget::{Space, button, container, row, text, text_input};
@@ -10,7 +10,7 @@ use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 use crate::net::VerificationStatus;
 use crate::ui::kao_theme::{KaoTheme, with_alpha};
 use crate::ui::kao_widgets::{
-    black, bold, hover_tint, kao_text, text_input_style, verification_badge,
+    black, bold, hover_tint, kao_text, mono_bold, text_input_style, verification_badge,
 };
 
 use super::{MOOD, Message};
@@ -24,17 +24,27 @@ pub const RENAME_INPUT_ID: &str = "wallet_dashboard_rename_input";
 pub fn view<'a>(
     t: KaoTheme,
     verification: VerificationStatus,
-    display_name: String,
+    name: String,
+    // `Some("Safe 2 of 3")` in Safe mode: shown as a badge after the
+    // name (and its pencil), and the rename input asks for a Safe name.
+    // `None` for an account.
+    safe_badge: Option<String>,
     rename_draft: Option<&'a str>,
-    // When `true`, the title slot renders a non-editable Safe name
-    // row (no rename pencil) — Safe rename isn't a feature yet, so
-    // the affordance would be a false promise.
-    is_safe: bool,
 ) -> Element<'a, Message> {
-    let title_slot: Element<'a, Message> = match (rename_draft, is_safe) {
-        (Some(draft), _) => rename_input(t, draft),
-        (None, false) => static_name(t, display_name),
-        (None, true) => safe_name_static(t, display_name),
+    let placeholder = if safe_badge.is_some() {
+        "Safe name"
+    } else {
+        "Wallet name"
+    };
+    let title = match rename_draft {
+        Some(draft) => rename_input(t, draft, placeholder),
+        None => static_name(t, name),
+    };
+    let title_slot: Element<'a, Message> = match safe_badge {
+        Some(badge) => row![title, Space::new().width(10), threshold_badge(t, badge)]
+            .align_y(Alignment::Center)
+            .into(),
+        None => title,
     };
 
     let mood_pill = container(kao_text(t, MOOD, 15.0))
@@ -73,8 +83,8 @@ pub fn view<'a>(
     .into()
 }
 
-/// Static "Wallet name ✎" row. Clicking the pencil swaps the slot to the
-/// editable input variant.
+/// Static "Name ✎" row — an account's or, in Safe mode, the Safe's own
+/// name. Clicking the pencil swaps the slot to the editable input variant.
 fn static_name<'a>(t: KaoTheme, display_name: String) -> Element<'a, Message> {
     let name = text(display_name).size(17).color(t.text).font(bold());
 
@@ -102,21 +112,29 @@ fn static_name<'a>(t: KaoTheme, display_name: String) -> Element<'a, Message> {
         .into()
 }
 
-/// Safe-mode title row — no pencil, just the name (which already
-/// carries the threshold badge). Sized identically to `static_name`
-/// so swapping between EOA / Safe modes doesn't shift the layout.
-fn safe_name_static<'a>(t: KaoTheme, display_name: String) -> Element<'a, Message> {
-    text(display_name)
-        .size(17)
-        .color(t.text)
-        .font(bold())
+/// Safe-mode "Safe 2 of 3" pill after the name. Kept out of the name so
+/// the pencil sits by what it edits, and so it stays put while the name
+/// swaps to the rename input.
+fn threshold_badge<'a>(t: KaoTheme, label: String) -> Element<'a, Message> {
+    container(text(label).size(11).color(t.a1).font(mono_bold()))
+        .padding(Padding::from([3, 8]))
+        .style(move |_| container::Style {
+            background: Some(Background::Color(with_alpha(t.a1, 0.14))),
+            border: Border {
+                color: with_alpha(t.a1, 0.3),
+                width: 1.0,
+                radius: Radius::from(6),
+            },
+            text_color: Some(t.a1),
+            ..container::Style::default()
+        })
         .into()
 }
 
 /// Editable "[input] ✓ ✗" row used while renaming. Enter (text_input
 /// `on_submit`) commits; the ✗ button cancels.
-fn rename_input<'a>(t: KaoTheme, draft: &'a str) -> Element<'a, Message> {
-    let input = text_input("Wallet name", draft)
+fn rename_input<'a>(t: KaoTheme, draft: &'a str, placeholder: &str) -> Element<'a, Message> {
+    let input = text_input(placeholder, draft)
         .id(RENAME_INPUT_ID)
         .on_input(Message::RenameInput)
         .on_submit(Message::CommitRename)

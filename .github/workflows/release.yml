@@ -54,9 +54,32 @@ jobs:
           echo "Timed out waiting for CI."
           exit 1
 
+  verify-version:
+    name: verify tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: compare tag and package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Skipped in-script, not via job `if:`, because a skipped job
+          # also skips every job that needs it.
+          if [ "$GITHUB_REF_TYPE" != tag ]; then
+            echo "Not a tag build; skipping."
+            exit 0
+          fi
+          want="${GITHUB_REF_NAME#v}"
+          have=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          if [ "$have" != "$want" ]; then
+            echo "::error::tag is $GITHUB_REF_NAME but Cargo.toml says $have. Bump Cargo.toml and Cargo.lock, then re-tag."
+            exit 1
+          fi
+          echo "Cargo.toml version $have matches $GITHUB_REF_NAME."
+
   build:
     name: build (${{ matrix.target }})
-    needs: verify-ci
+    needs: [verify-ci, verify-version]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -123,21 +146,54 @@ jobs:
             --formats ${{ matrix.packager-formats }} \
             --out-dir dist/installers
 
+      - name: package flatpak
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Ubuntu 24.04's Flatpak is 1.14, which rejects --device=usb.
+          # The Freedesktop 26.08 image has a current Flatpak plus the runtime.
+          # It runs privileged over the checkout, so it is pinned to the
+          # multi-arch index digest of the freedesktop-26.08 tag; bump by
+          # re-resolving that tag.
+          docker run --rm --privileged --user root --entrypoint bash \
+            -e KAO_FLATPAK_VERSION="${GITHUB_REF_NAME#v}" \
+            -e KAO_FLATPAK_OWNER="$(id -u):$(id -g)" \
+            -v "$PWD:/src" \
+            -w /src \
+            ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-26.08@sha256:6ed6921bb5a9e1a916989971844f159b854b7b225880c381fa34f7a158863039 \
+            -lc './flatpak/build.sh "target/${{ matrix.target }}/release/kao" dist/installers'
+
       - name: rename artifacts
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist/out
+          stem="kao-${{ github.ref_name }}-${{ matrix.target }}"
           for f in dist/installers/*; do
             [ -f "$f" ] || continue
             base=$(basename "$f")
-            ext="${base##*.}"
             case "$base" in
-              *.pkg.tar.gz) mv "$f" "dist/out/kao-${{ github.ref_name }}-${{ matrix.target }}.pkg.tar.gz" ;;
-              *.exe)        mv "$f" "dist/out/kao-${{ github.ref_name }}-${{ matrix.target }}-setup.exe" ;;
-              *.dmg)        mv "$f" "dist/out/kao-${{ github.ref_name }}-${{ matrix.target }}.dmg" ;;
-              *.AppImage)   mv "$f" "dist/out/kao-${{ github.ref_name }}-${{ matrix.target }}.AppImage" ;;
-              *.deb)        mv "$f" "dist/out/kao-${{ github.ref_name }}-${{ matrix.target }}.deb" ;;
+              # cargo-packager's pacman format is not a .pkg.tar.* package:
+              # it emits a kao_<version>_<arch>.tar.gz filesystem tarball
+              # plus a PKGBUILD whose source= names that tarball. Both Linux
+              # legs emit a file called PKGBUILD, which download-artifact's
+              # merge-multiple would collapse into one, so it gets the
+              # target in its name and its source= follows the rename.
+              kao_*.tar.gz) mv "$f" "dist/out/$stem.tar.gz" ;;
+              PKGBUILD)
+                sed -E "s|^source=\(.*\)\$|source=(\"$stem.tar.gz\")|" "$f" > "dist/out/$stem.PKGBUILD"
+                grep -qxF "source=(\"$stem.tar.gz\")" "dist/out/$stem.PKGBUILD" || {
+                  echo "::error::PKGBUILD has no single-line source=() to point at $stem.tar.gz"
+                  exit 1
+                }
+                rm "$f"
+                ;;
+              *.exe)        mv "$f" "dist/out/$stem-setup.exe" ;;
+              *.dmg)        mv "$f" "dist/out/$stem.dmg" ;;
+              *.AppImage)   mv "$f" "dist/out/$stem.AppImage" ;;
+              *.deb)        mv "$f" "dist/out/$stem.deb" ;;
+              *.flatpak)    mv "$f" "dist/out/$stem.flatpak" ;;
               *)            mv "$f" "dist/out/${base}" ;;
             esac
           done
@@ -169,8 +225,12 @@ jobs:
           set -euo pipefail
           cd dist
           shopt -s nullglob
-          for f in *.exe *.dmg *.AppImage *.deb *.pkg.tar.gz SHA256SUMS; do
+          # The .sigstore.json bundle is what the README verifies against:
+          # cosign 3 deprecates verify-blob's --signature/--certificate and
+          # its next major drops them. .sig/.pem stay for older cosign.
+          for f in *.exe *.dmg *.AppImage *.deb *.tar.gz *.PKGBUILD *.flatpak SHA256SUMS; do
             cosign sign-blob --yes "$f" \
+              --new-bundle-format --bundle "$f.sigstore.json" \
               --output-signature "$f.sig" \
               --output-certificate "$f.pem"
           done

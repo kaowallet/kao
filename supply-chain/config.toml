@@ -5546,6 +5546,10 @@ criteria = "safe-to-deploy"
 version = "0.8.3"
 criteria = "safe-to-deploy"
 
+[[exemptions.yoke-derive]]
+version = "0.8.4"
+criteria = "safe-to-deploy"
+
 [[exemptions.zbus]]
 version = "4.4.0"
 criteria = "safe-to-deploy"

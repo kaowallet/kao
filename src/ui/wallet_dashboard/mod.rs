@@ -17,6 +17,7 @@ use iced::{Alignment, Background, Border, Element, Length, Padding, Subscription
 use tracing::{debug, error, info, warn};
 
 mod account_dropdown;
+mod accounts_settings;
 mod activity;
 mod appearance;
 mod approvals_app;
@@ -43,6 +44,7 @@ mod tx_builder;
 mod tx_details;
 
 use account_dropdown::AccountDropdown;
+use accounts_settings::AccountsPane;
 use apps::AppsPane;
 use contacts_settings::ContactsPane;
 use receive::ReceivePane;
@@ -73,6 +75,21 @@ const ACCOUNT_ORDERS_LIMIT: u16 = 100;
 /// the lifetime of the bottom-right "autoclear in N…" chip — the chip's
 /// progress bar fills this whole duration.
 const CLIPBOARD_CLEAR_SECS: u64 = 10;
+
+/// Next tag for an async reply's staleness guard — `SignReviewPrepared`'s
+/// `seq`, the clipboard auto-clear generation, and every app pane's `*_seq`.
+///
+/// Process-wide rather than per-screen: the dashboard is rebuilt on every
+/// account switch (and on return from add-account), but a task the old screen
+/// spawned still lands on the new one. Per-screen counters restarted at 0, so
+/// the old screen's reply for seq 1 matched the new screen's own seq 1 and was
+/// applied to an unrelated request (the previous account's Send quote appended
+/// to the review now open). Never returns 0, so a guard still at its initial 0
+/// matches nothing.
+fn next_task_seq() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 
 use modal_chrome::ModalChrome;
 pub use nav::Nav;
@@ -139,6 +156,11 @@ impl CopyKick for contacts_settings::Message {
 impl CopyKick for safes_settings::Message {
     fn copy_kick() -> Option<Self> {
         Some(safes_settings::Message::AddressCopied)
+    }
+}
+impl CopyKick for accounts_settings::Message {
+    fn copy_kick() -> Option<Self> {
+        Some(accounts_settings::Message::AddressCopied)
     }
 }
 impl CopyKick for safe_tx_detail::Message {
@@ -248,6 +270,18 @@ pub enum Message {
     /// stops rendering old labels / owner sets / watch-vs-signer
     /// classifications. Sent at most once per unlock.
     SafesUpdated(Vec<SafeDescriptor>),
+    /// The App removed an account other than the one this dashboard signs
+    /// with, and updates the dashboard in place instead of rebuilding it —
+    /// a rebuild would drop a connected Ledger/Trezor to its placeholder
+    /// and reset the pane the user is on. Every later account shifted down
+    /// one position, so the full account list, the Safes (whose signer
+    /// links were remapped with it) and the active account's new position
+    /// arrive together and replace the mirrors in one step.
+    AccountsUpdated {
+        accounts: Vec<AccountDescriptor>,
+        safes: Vec<SafeDescriptor>,
+        active_index: usize,
+    },
     /// Per-chain portfolio result. The dashboard issues one fetch per
     /// configured chain in parallel and merges by `chain` as each lands,
     /// so a slow Optimism RPC never blocks the Mainnet rows from
@@ -322,6 +356,10 @@ pub enum Message {
     NetworkWizard(network_setup::Message),
     OpenSafesSettings,
     SafesSettings(safes_settings::Message),
+    /// Open Settings → Accounts — from the Settings root or the account
+    /// dropdown's "Manage accounts".
+    OpenAccountsSettings,
+    AccountsSettings(accounts_settings::Message),
     OpenAppearanceSettings,
     CloseAppearanceSettings,
     OpenContactsSettings,
@@ -372,11 +410,13 @@ pub enum Message {
     /// success label for the modal's notice line.
     SafeTxActionDone(Result<String, String>),
     /// Header pencil clicked — switch the title slot to an editable text
-    /// input pre-filled with the active account's current display name.
+    /// input pre-filled with the active identity's own name: the active
+    /// Safe's in Safe mode, otherwise the active account's.
     BeginRenameAccount,
     /// Each keystroke while the rename input is open.
     RenameInput(String),
-    /// User pressed Enter (or clicked ✓) — commit the draft to the account.
+    /// User pressed Enter (or clicked ✓) — commit the draft to the account
+    /// or Safe it was opened for.
     CommitRename,
     /// User pressed Escape (or clicked ✗) — discard the draft.
     CancelRename,
@@ -641,11 +681,48 @@ pub enum Outcome {
         open_send: bool,
     },
     /// User changed a Safe's transaction-service mirror in Settings →
-    /// Safes. The App writes it into `wallet.safes[index]`, persists,
-    /// and pushes the updated list back via `Message::SafesUpdated`.
+    /// Safes. The App writes it into the Safe keyed `(address,
+    /// chain_id)`, persists, and pushes the updated list back via
+    /// `Message::SafesUpdated`.
     SetSafeServiceUrl {
-        index: usize,
+        address: [u8; 20],
+        chain_id: u64,
         url: Option<String>,
+    },
+    /// User renamed a Safe — from the header in Safe mode or in Settings →
+    /// Safes. Applies to every chain `address` is saved on; `None` clears
+    /// back to the "Safe N" default. The dashboard has already mirrored
+    /// it; the App persists and pushes the list back via `SafesUpdated`.
+    RenameSafe {
+        address: [u8; 20],
+        name: Option<String>,
+    },
+    /// User confirmed removing the Safe keyed `(address, chain_id)` in
+    /// Settings → Safes (that chain only). The App drops it, persists, and
+    /// pushes the list back via `SafesUpdated`, which leaves Safe mode if
+    /// it was the active one. Never emitted for the active Safe while a
+    /// signature is in flight.
+    RemoveSafe {
+        address: [u8; 20],
+        chain_id: u64,
+    },
+    /// User renamed an account in Settings → Accounts — any account, not
+    /// just the active one. `index` is where the dashboard's list had it and
+    /// `address` which account that was; the App re-checks the pair against
+    /// its own list before renaming. The dashboard has already mirrored it.
+    RenameAccount {
+        index: usize,
+        address: Address,
+        name: Option<String>,
+    },
+    /// User confirmed removing an account in Settings → Accounts (never the
+    /// last one). The App re-checks that `index` still holds `address`,
+    /// removes it, persists, and either rebuilds the dashboard (it was the
+    /// active account) or pushes `AccountsUpdated`. Never emitted while a
+    /// signature is in flight.
+    RemoveAccount {
+        index: usize,
+        address: Address,
     },
     /// Generate a fresh 24-word Privacy Pools mnemonic, persist it under the
     /// wallet passphrase, derive the account, and push it back via
@@ -669,6 +746,10 @@ impl Outcome {
             Outcome::SaveContacts(_) => "SaveContacts",
             Outcome::NeedsHardwareReconnect { .. } => "NeedsHardwareReconnect",
             Outcome::SetSafeServiceUrl { .. } => "SetSafeServiceUrl",
+            Outcome::RenameSafe { .. } => "RenameSafe",
+            Outcome::RemoveSafe { .. } => "RemoveSafe",
+            Outcome::RenameAccount { .. } => "RenameAccount",
+            Outcome::RemoveAccount { .. } => "RemoveAccount",
             Outcome::PoolCreateIdentity => "PoolCreateIdentity",
             Outcome::PoolRestoreIdentity(_) => "PoolRestoreIdentity",
             Outcome::PoolRevealBackup => "PoolRevealBackup",
@@ -729,6 +810,7 @@ enum SettingsPane {
     Root,
     NetworkWizard(NetworkSetupScreen),
     Safes(SafesPane),
+    Accounts(AccountsPane),
     Appearance,
     Contacts(ContactsPane),
 }
@@ -740,6 +822,7 @@ impl SettingsPane {
             SettingsPane::Root => "Root",
             SettingsPane::NetworkWizard(_) => "NetworkWizard",
             SettingsPane::Safes(_) => "Safes",
+            SettingsPane::Accounts(_) => "Accounts",
             SettingsPane::Appearance => "Appearance",
             SettingsPane::Contacts(_) => "Contacts",
         }
@@ -755,6 +838,25 @@ fn nav_name(nav: Nav) -> &'static str {
         Nav::Activity => "Activity",
         Nav::Settings => "Settings",
     }
+}
+
+/// What an open header rename edits, pinned when the pencil is clicked so
+/// a commit can never land on a different identity than the one the input
+/// was opened for (e.g. the EOA behind a Safe the user switched to).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenameTarget {
+    /// `accounts[index]` — the active account when renaming started.
+    Account(usize),
+    /// The active Safe, by key. A rename applies to every chain the
+    /// address is saved on (`WalletDescriptor::rename_safe`).
+    Safe { address: [u8; 20], chain_id: u64 },
+}
+
+/// An open header rename: its target and the text typed so far.
+#[derive(Debug)]
+struct RenameDraft {
+    target: RenameTarget,
+    text: String,
 }
 
 #[derive(Debug)]
@@ -806,10 +908,11 @@ pub struct WalletScreen {
     /// previously-loaded account renders its tokens immediately while a
     /// fresh fetch refreshes them in the background.
     portfolio_cache: PortfolioCache,
-    /// Inline rename draft for the active account. `Some(s)` means the
-    /// header is showing the rename text input; `None` means it's showing
-    /// the static name + pencil affordance.
-    rename_draft: Option<String>,
+    /// Inline rename draft for the active identity (account or Safe).
+    /// `Some` means the header is showing the rename text input; `None`
+    /// means it's showing the static name + pencil affordance. Cleared
+    /// whenever the identity it targets stops being the one on screen.
+    rename_draft: Option<RenameDraft>,
     /// Merged transactions across every configured chain, newest first
     /// (sorted by timestamp). Empty while every chain is still in flight
     /// or when no source returned rows.
@@ -860,10 +963,6 @@ pub struct WalletScreen {
     /// from a child modal (Send, TxDetails). Drives the bottom-right
     /// countdown chip and the deferred ownership-checked clear.
     clipboard_clear: Option<ClipboardClearState>,
-    /// Monotonic counter bumped on every fresh copy so a stale
-    /// `ClipboardClearArmed` / `ClipboardClearProbe` from an older arm
-    /// can't clobber the chip or the clipboard.
-    clipboard_clear_gen: u64,
     /// CoW swap orders placed this session (both surfaces share this list).
     /// In-memory for v1; the poll subscription refreshes non-terminal entries.
     /// Filtered to the active address when rendered in the Apps pane.
@@ -892,9 +991,6 @@ pub struct WalletScreen {
     /// routes through this overlay so the user reviews the decoded transaction
     /// before the key is touched. `None` means no review is pending.
     sign_review: Option<sign_review::SignReview>,
-    /// Monotonic id for sign-review prepare tasks, so a decode result for a
-    /// review the user has since cancelled/replaced is dropped on arrival.
-    sign_review_seq: u64,
     /// The Privacy Pools account (dedicated pool mnemonic → master keys),
     /// derived by the App from the encrypted `pp` seed and pushed down here so
     /// the pool app can sync/prove. `None` until an identity exists + is loaded.
@@ -940,8 +1036,9 @@ struct ClipboardClearState {
     /// chip subtracts `Instant::now()` from this each frame to draw the
     /// countdown text and the progress bar.
     deadline: Instant,
-    /// Generation tag matched by the ack messages. Bumped on every
-    /// fresh copy so a stale arm can't fire after a newer one.
+    /// Generation tag matched by the ack messages. Fresh from
+    /// [`next_task_seq`] on every copy, so a stale arm — this screen's or a
+    /// rebuilt-away one's — can't fire against a newer copy.
     generation: u64,
 }
 
@@ -1018,12 +1115,10 @@ impl WalletScreen {
             history_pending: Vec::new(),
             contacts,
             clipboard_clear: None,
-            clipboard_clear_gen: 0,
             tracked_orders: Vec::new(),
             order_op_in_flight: false,
             apps: AppsPane::new(address),
             sign_review: None,
-            sign_review_seq: 0,
             pp_account: None,
             pool_session_deposits: std::collections::HashMap::new(),
             pending_pool_deposit: None,
@@ -1116,24 +1211,166 @@ impl WalletScreen {
         self.active_safe.and_then(|i| self.safes.get(i))
     }
 
+    /// Leave Safe mode for the EOA behind it, in place. The dashboard is
+    /// NOT rebuilt, so this re-points everything the Safe identity owned:
+    /// the Builder (nothing else would tell it its identity moved), the
+    /// Safe's history and pending queue, and the portfolio — which still
+    /// holds the Safe's single-chain rows (a Base Safe fetches Base only,
+    /// via `allowed_chains`), so it re-seeds from the EOA's cache (now that
+    /// `display_address` is the EOA and every chain is back in scope) and
+    /// refetches so all the EOA's chains repopulate.
+    ///
+    /// Outside Safe mode only the Builder re-sync runs.
+    fn exit_safe_mode(&mut self) -> Task<Message> {
+        let was_safe = self.active_safe.take().is_some();
+        self.refresh_txbuilder_context();
+        let probe = self.drain_txbuilder_delegation_probe();
+        if !was_safe {
+            return probe;
+        }
+        self.clear_safe_feeds();
+        self.seed_portfolio_from_cache();
+        self.portfolio_loading = self.portfolio.is_empty();
+        Task::batch([
+            self.refresh_verification_task(),
+            self.fetch_portfolio_task(),
+            probe,
+        ])
+    }
+
+    /// Replace the Safe mirror with the App's full list (`SafesUpdated`,
+    /// `AccountsUpdated`) and re-find the active Safe by key across it.
+    /// `active_safe` is a position, and a removal shifts every later Safe
+    /// down; if the active one is gone or no linked account can sign for
+    /// it any more (watch-only Safes can't be active), drop to the EOA
+    /// rather than leave an index pointing at the wrong Safe or at nothing.
+    ///
+    /// "Can sign" is `SafeDescriptor::has_signing_link` against
+    /// `self.accounts`, so `AccountsUpdated` replaces those first: a
+    /// leftover view-only or ex-owner link keeps no Safe active.
+    fn adopt_safes(&mut self, safes: Vec<SafeDescriptor>) -> Task<Message> {
+        let active_key = self.active_safe_descriptor().map(SafeDescriptor::key);
+        self.safes = safes;
+        let still_active = active_key.and_then(|(address, chain_id)| {
+            self.safes
+                .iter()
+                .position(|s| s.address == address && s.chain_id == chain_id)
+                .filter(|&i| self.safes[i].has_signing_link(&self.accounts))
+        });
+        match still_active {
+            Some(i) => {
+                self.active_safe = Some(i);
+                Task::none()
+            }
+            None if self.active_safe.is_some() => self.exit_safe_mode(),
+            None => Task::none(),
+        }
+    }
+
+    /// Drop the Safe's history so the EOA's lazy-loads on the next
+    /// Activity visit instead of showing stale Safe txs. The pending queue
+    /// is Safe-only, so it clears outright.
+    fn clear_safe_feeds(&mut self) {
+        self.history.clear();
+        self.history_loaded = false;
+        self.history_errors = PerChain::default();
+        self.safe_pending.clear();
+        self.safe_pending_error = None;
+        self.safe_pending_loading = false;
+    }
+
     /// Display name for the active identity — the Safe's name with its
     /// threshold badge in Safe mode, otherwise the active account's name
-    /// (falling back to a positional default). Shown both in the sidebar
-    /// account card and as the header title.
+    /// (falling back to a positional default). Shown in the sidebar
+    /// account card; the header renders the two halves separately.
     fn display_name(&self) -> String {
+        match self.safe_threshold_badge() {
+            Some(badge) => format!("{} — {badge}", self.identity_name()),
+            None => self.identity_name(),
+        }
+    }
+
+    /// The active identity's own name, without the Safe badge: the active
+    /// Safe's (or its "Safe N" default) in Safe mode, else the active
+    /// account's. What the header pencil renames.
+    fn identity_name(&self) -> String {
         match self.active_safe_descriptor() {
-            Some(safe) => {
-                let idx = self.active_safe.unwrap_or(0);
-                let base = safe.display_name(idx);
-                let total_owners = safe.owners.len().max(safe.linked_signer_indices.len());
-                format!("{base} — Safe {} of {}", safe.threshold, total_owners)
-            }
+            Some(safe) => safe.display_name(self.active_safe.unwrap_or(0)),
             None => self
                 .accounts
                 .get(self.active_index)
                 .map(|a| a.display_name(self.active_index))
                 .unwrap_or_else(|| format!("Account {}", self.active_index + 1)),
         }
+    }
+
+    /// "Safe {threshold} of {owners}" in Safe mode, `None` for an account.
+    fn safe_threshold_badge(&self) -> Option<String> {
+        self.active_safe_descriptor().map(|safe| {
+            let total_owners = safe.owners.len().max(safe.linked_signer_indices.len());
+            format!("Safe {} of {}", safe.threshold, total_owners)
+        })
+    }
+
+    /// The identity a header rename opened now would edit.
+    fn current_rename_target(&self) -> RenameTarget {
+        match self.active_safe_descriptor() {
+            Some(safe) => RenameTarget::Safe {
+                address: safe.address,
+                chain_id: safe.chain_id,
+            },
+            None => RenameTarget::Account(self.active_index),
+        }
+    }
+
+    /// Close a header rename whose target is no longer the identity on
+    /// screen (the Safe was removed, or Safe mode was left under it), so a
+    /// commit can't rename something the user isn't looking at.
+    fn drop_stale_rename(&mut self) {
+        if self
+            .rename_draft
+            .as_ref()
+            .is_some_and(|d| d.target != self.current_rename_target())
+        {
+            self.rename_draft = None;
+        }
+    }
+
+    /// Mirror a Safe rename into the dashboard's copy — every chain the
+    /// address is saved on, like `WalletDescriptor::rename_safe` does for
+    /// the App's — and reseed an open Settings → Safes pane from it. The
+    /// App's `SafesUpdated` round-trip lands the same values.
+    fn mirror_safe_rename(&mut self, address: [u8; 20], name: Option<String>) {
+        for safe in self.safes.iter_mut().filter(|s| s.address == address) {
+            safe.set_name(name.clone());
+        }
+        if let SettingsPane::Safes(p) = &mut self.settings_pane {
+            p.set_safes(self.safes.clone());
+        }
+        // Settings → Accounts names the Safes each account signs for.
+        self.reseed_accounts_pane();
+    }
+
+    /// Re-sync an open Settings → Accounts pane with the account and Safe
+    /// mirrors after either changed (a rename from the header or the pane,
+    /// an ENS auto-name, a Safe edit, an in-place account removal).
+    fn reseed_accounts_pane(&mut self) {
+        if let SettingsPane::Accounts(p) = &mut self.settings_pane {
+            p.set_accounts(&self.accounts, &self.safes, self.active_index);
+        }
+    }
+
+    /// Show Settings → Accounts: from the Settings root, the account
+    /// dropdown's "Manage accounts", or the App right after removing the
+    /// active account rebuilt this dashboard (so the user lands back where
+    /// they were).
+    pub fn open_accounts_settings(&mut self) {
+        self.nav = Nav::Settings;
+        self.settings_pane = SettingsPane::Accounts(AccountsPane::new(
+            &self.accounts,
+            &self.safes,
+            self.active_index,
+        ));
     }
 
     /// Short network label for the sidebar footer — the Safe's chain in
@@ -1229,7 +1466,7 @@ impl WalletScreen {
     }
 
     /// Write `text` to the system clipboard and arm the deferred clear.
-    /// Bumps the generation counter so any older arm fires stale and
+    /// Takes a fresh generation so any older arm fires stale and
     /// no-ops. The returned task batches the write itself with a
     /// `tokio::time::sleep` that emits `ClipboardClearArmed` once the
     /// deadline passes — the ownership check happens at that point, not
@@ -1241,8 +1478,7 @@ impl WalletScreen {
         // that routes through here. NOT in the `ClipboardWritten` handler —
         // that also fires for the 10s auto-clear write, which must stay silent.
         mark_copied();
-        self.clipboard_clear_gen = self.clipboard_clear_gen.wrapping_add(1);
-        let generation = self.clipboard_clear_gen;
+        let generation = next_task_seq();
         self.clipboard_clear = Some(ClipboardClearState {
             expected: text.clone(),
             deadline: Instant::now() + Duration::from_secs(CLIPBOARD_CLEAR_SECS),
@@ -1268,7 +1504,8 @@ impl WalletScreen {
     /// stale timer can't wipe this value.
     fn copy_without_clear(&mut self, text: String) -> Task<Message> {
         mark_copied();
-        self.clipboard_clear_gen = self.clipboard_clear_gen.wrapping_add(1);
+        // Both clear handlers require a live state with a matching generation,
+        // so dropping the state retires any arm already in flight.
         self.clipboard_clear = None;
         iced::clipboard::write(text).map(|_: ()| Message::ClipboardWritten)
     }
@@ -1293,6 +1530,14 @@ impl WalletScreen {
     /// handoff. Name writes also refuse to start while this is true.
     pub fn is_signing_busy(&self) -> bool {
         self.is_send_busy() || self.order_op_in_flight
+    }
+
+    /// [`Self::is_signing_busy`], or a clear-sign review still open. An open
+    /// review has already resolved its signer and owners by account / Safe
+    /// position, so removing an account (or the active Safe) under it would
+    /// leave those pointing at the wrong one. Gates both removals.
+    pub fn is_signing_or_reviewing(&self) -> bool {
+        self.is_signing_busy() || self.sign_review.is_some()
     }
 
     /// The active address in short `0xabcd…ef01` form. For diagnostic logs.
@@ -1796,8 +2041,7 @@ impl WalletScreen {
                 return Task::none();
             }
         };
-        self.sign_review_seq += 1;
-        let seq = self.sign_review_seq;
+        let seq = next_task_seq();
         let (title, subtitle, note) = pool_review_labels(&sign);
         let action = sign_review::SignAction::PrivacyPool { sign: sign.clone() };
         self.sign_review = Some(sign_review::SignReview::pending(
@@ -1913,8 +2157,7 @@ impl WalletScreen {
         // `tk`'s borrow of `self.portfolio` ends here (last use above), so the
         // mutable overlay assignment below is free of it.
 
-        self.sign_review_seq += 1;
-        let seq = self.sign_review_seq;
+        let seq = next_task_seq();
         let title = format!("Send {amount} {symbol}");
         let subtitle = Some(format!(
             "to {}",
@@ -2036,8 +2279,7 @@ impl WalletScreen {
             signing_addresses,
         };
 
-        self.sign_review_seq += 1;
-        let seq = self.sign_review_seq;
+        let seq = next_task_seq();
         let title = format!("Send {amount_str} {symbol}");
         let subtitle = Some(format!(
             "from Safe {} to {}",
@@ -2399,8 +2641,7 @@ impl WalletScreen {
                 return Task::none();
             }
         };
-        self.sign_review_seq += 1;
-        let seq = self.sign_review_seq;
+        let seq = next_task_seq();
         // What this batch leaves standing in allowance terms. A verdict, not a
         // count: the count could not distinguish a revoke that closes one of
         // *this batch's* grants from an unrelated one, so it printed the
@@ -2490,8 +2731,7 @@ impl WalletScreen {
             },
             prepared: None,
         });
-        self.sign_review_seq += 1;
-        let seq = self.sign_review_seq;
+        let seq = next_task_seq();
         let allowances = crate::txbuilder::flash_approval::allowance_verdict(&[]);
         let (title, subtitle, note, can_execute) = txbuilder_review_copy(&req, &allowances);
         let action = sign_review::SignAction::TxBuilder {
@@ -3323,8 +3563,7 @@ impl WalletScreen {
                 return Task::none();
             }
         }
-        self.sign_review_seq += 1;
-        let seq = self.sign_review_seq;
+        let seq = next_task_seq();
         let (title, subtitle, note) = name_review_labels(&sign);
         let action = sign_review::SignAction::Name { sign: sign.clone() };
         self.sign_review = Some(sign_review::SignReview::pending(
@@ -3352,8 +3591,7 @@ impl WalletScreen {
         if self.sign_review.is_some() {
             return Task::none();
         }
-        self.sign_review_seq += 1;
-        let seq = self.sign_review_seq;
+        let seq = next_task_seq();
         let user = match self.build_signer_context(SafeNeed::Swap) {
             Ok(ctx) => ctx.display_from(),
             Err(msg) => {
@@ -3464,8 +3702,7 @@ impl WalletScreen {
         };
         let (sell_s, _) = crate::portfolio::format_token_balance(o.sell_amount, o.sell_decimals);
         let sell_s = trim_trailing_decimal_zeros(&sell_s);
-        self.sign_review_seq += 1;
-        let seq = self.sign_review_seq;
+        let seq = next_task_seq();
         let title = format!(
             "Cancel order — {} {} → {}",
             sell_s, o.sell_symbol, o.buy_symbol
@@ -4236,6 +4473,22 @@ impl WalletScreen {
                     )
                 );
             }
+            // Shape only: the payload is every account's name and address
+            // (keys are redacted by type, but the lot clamps to noise).
+            Message::AccountsUpdated {
+                accounts,
+                safes,
+                active_index,
+            } => {
+                crate::trace_msg!(
+                    "dashboard",
+                    &format_args!(
+                        "AccountsUpdated {{ accounts: {}, safes: {}, active_index: {active_index} }}",
+                        accounts.len(),
+                        safes.len()
+                    )
+                );
+            }
             _ => crate::trace_msg!("dashboard", &message),
         }
         // Diff the coarse dashboard state across the dispatch so every
@@ -4367,17 +4620,23 @@ impl WalletScreen {
                 }
             }
             Message::SafesUpdated(safes) => {
-                // Wholesale replace — refresh-on-open runs in batch
-                // and returns the complete updated list, so there's
-                // nothing to merge.
-                self.safes = safes;
+                // Wholesale replace — the App sends its complete list, so
+                // there's nothing to merge; the active Safe is re-found by
+                // key (Safe mode exits if it's gone or turned watch-only).
+                let exit = self.adopt_safes(safes);
+                // A header rename opened for a Safe that's now gone (or no
+                // longer active) must not commit onto whatever is shown.
+                self.drop_stale_rename();
                 // Keep the Settings → Safes pane (if open) in sync so
                 // its drafts reseed from what actually persisted.
                 if let SettingsPane::Safes(p) = &mut self.settings_pane {
                     p.set_safes(self.safes.clone());
                 }
-                // Third and last place the active identity's facts can move
-                // under the Builder. A re-fetch can revise the active Safe's
+                // …and Settings → Accounts, which lists each account's Safes.
+                self.reseed_accounts_pane();
+                // One of the places the active identity's facts can move
+                // under the Builder (with Safe entry/exit and
+                // `AccountsUpdated`). A re-fetch can revise the active Safe's
                 // *version*, which is the one ctx field not re-read live at
                 // build time — leaving the pane's standing refusal banner
                 // silent about a version that is now outside the signable
@@ -4388,9 +4647,60 @@ impl WalletScreen {
                 self.safe_pending_loading = pending.is_some();
                 return (
                     Task::batch([
+                        exit,
                         pending.unwrap_or_else(Task::none),
                         self.drain_txbuilder_delegation_probe(),
                     ]),
+                    None,
+                );
+            }
+            Message::AccountsUpdated {
+                accounts,
+                safes,
+                active_index,
+            } => {
+                // Same identity, new positions: the signer, nav, open pane
+                // and feeds all stay. Only the mirrors move, together.
+                let old_active = self.active_index;
+                self.accounts = accounts;
+                self.active_index = active_index;
+                if self.accounts.get(active_index).and_then(account_address) != Some(self.address) {
+                    // The App only takes this path when the active account
+                    // survived; a mismatch means its index math is off.
+                    error!(
+                        active_index,
+                        "accounts update: the active position no longer holds the signer's account"
+                    );
+                }
+                // An open header rename of the active account follows it to
+                // its new position instead of being dropped as stale.
+                if let Some(draft) = &mut self.rename_draft
+                    && draft.target == RenameTarget::Account(old_active)
+                {
+                    draft.target = RenameTarget::Account(active_index);
+                }
+                // A Safe Send resolved its signers by account position when
+                // it opened. (It can't really be open here — removal happens
+                // in Settings, under no modal — but stale positions would be
+                // signed with, so close it rather than trust that.)
+                if matches!(&self.modal, Modal::Send(p) if p.is_safe() && !p.busy()) {
+                    self.modal = Modal::None;
+                }
+                // The removed account may have been the last key that could
+                // sign for the active Safe: re-find it by key, leaving Safe
+                // mode if it turned watch-only (a view-only link left
+                // behind doesn't count — `adopt_safes`).
+                let exit = self.adopt_safes(safes);
+                self.drop_stale_rename();
+                if let SettingsPane::Safes(p) = &mut self.settings_pane {
+                    p.set_safes(self.safes.clone());
+                }
+                self.reseed_accounts_pane();
+                // Which owners can sign for the active Safe moved with the
+                // accounts — the Builder reads that from its context.
+                self.refresh_txbuilder_context();
+                return (
+                    Task::batch([exit, self.drain_txbuilder_delegation_probe()]),
                     None,
                 );
             }
@@ -5119,6 +5429,7 @@ impl WalletScreen {
                     _ => return (Task::none(), None),
                 };
                 acc.set_name(Some(name.clone()));
+                self.reseed_accounts_pane();
                 // Bubble up so the App persists the rename to disk via
                 // its existing rename pipeline.
                 return (Task::none(), Some(Outcome::RenameActive(Some(name))));
@@ -5446,11 +5757,18 @@ impl WalletScreen {
             },
             Message::SignReviewPrepared { seq, steps } => {
                 // Drop a decode result for a review the user has since cancelled
-                // or replaced (the seq guard mirrors the Send decode pipeline).
+                // or replaced (the seq guard mirrors the Send decode pipeline) —
+                // or one a rebuilt-away dashboard opened, whose tasks still land
+                // here; `next_task_seq` keeps its seqs disjoint from ours.
                 let Some(review) = self.sign_review.as_mut() else {
                     return (Task::none(), None);
                 };
                 if review.seq != seq {
+                    debug!(
+                        seq,
+                        open = review.seq,
+                        "sign review: dropping a stale prepare"
+                    );
                     return (Task::none(), None);
                 }
                 match steps {
@@ -6082,6 +6400,9 @@ impl WalletScreen {
                 sort_portfolio_rows(&mut self.portfolio);
             }
             Message::OpenAccountDropdown => {
+                // Picking from the dropdown changes the identity under the
+                // header, so an open rename is abandoned up front.
+                self.rename_draft = None;
                 self.modal = Modal::AccountDropdown(AccountDropdown::new());
             }
             Message::OpenTxDetails(idx) => {
@@ -6121,55 +6442,29 @@ impl WalletScreen {
                 match outcome {
                     Some(account_dropdown::Outcome::Switch(idx)) => {
                         self.modal = Modal::None;
+                        self.rename_draft = None;
                         // Switching to an EOA exits Safe mode in the
                         // same gesture.
-                        let was_safe = self.active_safe.is_some();
-                        self.active_safe = None;
-                        // Stepping out of Safe mode onto the *same* EOA doesn't
-                        // rebuild the dashboard, so nothing else would tell the
-                        // Builder its identity moved.
-                        self.refresh_txbuilder_context();
-                        let probe = self.drain_txbuilder_delegation_probe();
-                        if was_safe {
-                            // Drop the Safe's history so the EOA's
-                            // history lazy-loads on the next Activity
-                            // visit instead of showing stale Safe
-                            // txs. The pending queue is Safe-only, so
-                            // clear it outright.
-                            self.history.clear();
-                            self.history_loaded = false;
-                            self.history_errors = PerChain::default();
-                            self.safe_pending.clear();
-                            self.safe_pending_error = None;
-                            self.safe_pending_loading = false;
-                        }
                         if idx != self.active_index && idx < self.accounts.len() {
                             // Different account: the App rebuilds the
                             // dashboard and kicks the multi-chain
-                            // portfolio fetch for the new EOA there.
+                            // portfolio fetch for the new EOA there, so
+                            // only the Safe identity needs dropping here.
+                            let was_safe = self.active_safe.take().is_some();
+                            self.refresh_txbuilder_context();
+                            let probe = self.drain_txbuilder_delegation_probe();
+                            if was_safe {
+                                self.clear_safe_feeds();
+                            }
                             return (Task::batch([task, probe]), Some(Outcome::Switch(idx)));
                         }
-                        // Same underlying EOA — the App does NOT rebuild,
-                        // so nothing else will refresh the portfolio. If
-                        // we just left Safe mode, `self.portfolio` still
-                        // holds the Safe's single-chain rows (a Base Safe
-                        // fetches Base only via `allowed_chains`). Re-seed
-                        // from the EOA's cache (now `display_address` is
-                        // the EOA and every chain is back in scope) and
-                        // refetch so all the EOA's chains repopulate.
-                        if was_safe {
-                            self.seed_portfolio_from_cache();
-                            self.portfolio_loading = self.portfolio.is_empty();
-                            let refresh = Task::batch([
-                                self.refresh_verification_task(),
-                                self.fetch_portfolio_task(),
-                            ]);
-                            return (Task::batch([task, refresh, probe]), None);
-                        }
-                        return (Task::batch([task, probe]), None);
+                        // Same underlying EOA — the App does NOT rebuild.
+                        let exit = self.exit_safe_mode();
+                        return (Task::batch([task, exit]), None);
                     }
                     Some(account_dropdown::Outcome::SelectSafe(idx)) => {
                         self.modal = Modal::None;
+                        self.rename_draft = None;
                         if idx < self.safes.len() {
                             self.active_safe = Some(idx);
                             // Activating a Safe never rebuilds the dashboard,
@@ -6208,6 +6503,11 @@ impl WalletScreen {
                     Some(account_dropdown::Outcome::Add) => {
                         self.modal = Modal::None;
                         return (task, Some(Outcome::Add));
+                    }
+                    Some(account_dropdown::Outcome::Manage) => {
+                        self.modal = Modal::None;
+                        self.open_accounts_settings();
+                        return (task, None);
                     }
                     Some(account_dropdown::Outcome::Closed) => {
                         self.modal = Modal::None;
@@ -6574,11 +6874,112 @@ impl WalletScreen {
                         self.settings_pane = SettingsPane::Root;
                         return (task, None);
                     }
-                    Some(safes_settings::Outcome::SetServiceUrl { index, url }) => {
+                    Some(safes_settings::Outcome::SetServiceUrl {
+                        address,
+                        chain_id,
+                        url,
+                    }) => {
                         // Bubble to the App, which owns the wallet and
                         // the disk write; it pushes the updated list
                         // back via `SafesUpdated` (reseeding the pane).
-                        return (task, Some(Outcome::SetSafeServiceUrl { index, url }));
+                        return (
+                            task,
+                            Some(Outcome::SetSafeServiceUrl {
+                                address,
+                                chain_id,
+                                url,
+                            }),
+                        );
+                    }
+                    Some(safes_settings::Outcome::Rename { address, name }) => {
+                        self.mirror_safe_rename(address, name.clone());
+                        return (task, Some(Outcome::RenameSafe { address, name }));
+                    }
+                    Some(safes_settings::Outcome::Remove { address, chain_id }) => {
+                        // Removing the Safe a signature is in flight for
+                        // would yank the identity out from under it (Safe
+                        // mode exits on the `SafesUpdated` round-trip).
+                        // Any other Safe can go.
+                        let is_active = self
+                            .active_safe_descriptor()
+                            .is_some_and(|s| s.key() == (address, chain_id));
+                        if is_active && self.is_signing_or_reviewing() {
+                            warn!("safe removal refused: signing with it in flight");
+                            if let SettingsPane::Safes(p) = &mut self.settings_pane {
+                                p.refuse_remove(
+                                    (address, chain_id),
+                                    "Kao is signing with this Safe right now — finish or \
+                                     cancel that first, then remove it."
+                                        .to_string(),
+                                );
+                            }
+                            return (task, None);
+                        }
+                        return (task, Some(Outcome::RemoveSafe { address, chain_id }));
+                    }
+                    None => return (task, None),
+                }
+            }
+            Message::OpenAccountsSettings => self.open_accounts_settings(),
+            Message::AccountsSettings(child_msg) => {
+                let SettingsPane::Accounts(p) = &mut self.settings_pane else {
+                    return (Task::none(), None);
+                };
+                let (task, outcome) = p.update(child_msg);
+                let task = task.map(Message::AccountsSettings);
+                match outcome {
+                    Some(accounts_settings::Outcome::Closed) => {
+                        self.settings_pane = SettingsPane::Root;
+                        return (task, None);
+                    }
+                    Some(accounts_settings::Outcome::Rename {
+                        index,
+                        address,
+                        name,
+                    }) => {
+                        // Mirror first, so the header (when it's the active
+                        // account), the sidebar and the dropdown show it on
+                        // this frame; the App persists the same edit.
+                        let Some(account) = self
+                            .accounts
+                            .get_mut(index)
+                            .filter(|a| account_address(a) == Some(address))
+                        else {
+                            warn!(
+                                index,
+                                "account rename dropped: the list moved under the pane"
+                            );
+                            self.reseed_accounts_pane();
+                            return (task, None);
+                        };
+                        account.set_name(name.clone());
+                        self.reseed_accounts_pane();
+                        return (
+                            task,
+                            Some(Outcome::RenameAccount {
+                                index,
+                                address,
+                                name,
+                            }),
+                        );
+                    }
+                    Some(accounts_settings::Outcome::Remove { index, address }) => {
+                        // A signature in flight (or under review) has its
+                        // signer and owners resolved by account position —
+                        // removing any account would shift them under it.
+                        if self.is_signing_or_reviewing() {
+                            warn!("account removal refused: signing op in flight");
+                            if let SettingsPane::Accounts(p) = &mut self.settings_pane {
+                                p.refuse_remove(
+                                    address,
+                                    "Kao is signing right now — finish or cancel that first, \
+                                     then remove the account."
+                                        .to_string(),
+                                );
+                            }
+                            return (task, None);
+                        }
+                        return (task, Some(Outcome::RemoveAccount { index, address }));
                     }
                     None => return (task, None),
                 }
@@ -6643,36 +7044,81 @@ impl WalletScreen {
                 }
             }
             Message::BeginRenameAccount => {
-                let current = self
-                    .accounts
-                    .get(self.active_index)
-                    .map(|a| a.name().unwrap_or("").to_string())
-                    .unwrap_or_default();
-                self.rename_draft = Some(current);
+                // Seed from the RAW name ("" when unnamed), never the
+                // rendered one — that would save "Safe 2" (or "Account 1")
+                // as a real name on an untouched commit.
+                let target = self.current_rename_target();
+                let current = match self.active_safe_descriptor() {
+                    Some(safe) => safe.name().unwrap_or("").to_string(),
+                    None => self
+                        .accounts
+                        .get(self.active_index)
+                        .map(|a| a.name().unwrap_or("").to_string())
+                        .unwrap_or_default(),
+                };
+                self.rename_draft = Some(RenameDraft {
+                    target,
+                    text: current,
+                });
                 return (focus_widget(header::RENAME_INPUT_ID), None);
             }
             Message::RenameInput(s) => {
-                if self.rename_draft.is_some() {
-                    self.rename_draft = Some(s);
+                if let Some(draft) = &mut self.rename_draft {
+                    draft.text = s;
                 }
             }
             Message::CommitRename => {
                 let Some(draft) = self.rename_draft.take() else {
                     return (Task::none(), None);
                 };
+                // Every identity change clears the draft, so this only
+                // trips if one was missed — drop it rather than rename
+                // whatever is on screen now.
+                if draft.target != self.current_rename_target() {
+                    warn!("rename dropped: its target is no longer on screen");
+                    return (Task::none(), None);
+                }
                 // Match `AccountDescriptor::set_name`'s trim-and-collapse rule
                 // so the in-memory copy and the persisted copy agree on what
                 // counts as "no name set".
-                let trimmed = draft.trim();
+                let trimmed = draft.text.trim();
                 let cleaned = if trimmed.is_empty() {
                     None
                 } else {
                     Some(trimmed.to_string())
                 };
-                if let Some(acc) = self.accounts.get_mut(self.active_index) {
-                    acc.set_name(cleaned.clone());
+                // Unchanged → just close, like the settings panes' Save. A
+                // Safe rename writes every chain of its address, so an
+                // untouched commit of an unnamed Safe would clear the
+                // default names `remove_safe` froze on its siblings.
+                let current = match draft.target {
+                    RenameTarget::Account(idx) => self.accounts.get(idx).and_then(|a| a.name()),
+                    RenameTarget::Safe { .. } => {
+                        self.active_safe_descriptor().and_then(SafeDescriptor::name)
+                    }
+                };
+                if cleaned.as_deref() == current {
+                    return (Task::none(), None);
                 }
-                return (Task::none(), Some(Outcome::RenameActive(cleaned)));
+                match draft.target {
+                    RenameTarget::Account(idx) => {
+                        if let Some(acc) = self.accounts.get_mut(idx) {
+                            acc.set_name(cleaned.clone());
+                        }
+                        self.reseed_accounts_pane();
+                        return (Task::none(), Some(Outcome::RenameActive(cleaned)));
+                    }
+                    RenameTarget::Safe { address, .. } => {
+                        self.mirror_safe_rename(address, cleaned.clone());
+                        return (
+                            Task::none(),
+                            Some(Outcome::RenameSafe {
+                                address,
+                                name: cleaned,
+                            }),
+                        );
+                    }
+                }
             }
             Message::CancelRename => {
                 self.rename_draft = None;
@@ -7062,7 +7508,8 @@ impl WalletScreen {
             Nav::Settings => match &self.settings_pane {
                 SettingsPane::Root => settings_root::view(t),
                 SettingsPane::NetworkWizard(p) => p.view().map(Message::NetworkWizard),
-                SettingsPane::Safes(p) => p.view(t).map(Message::SafesSettings),
+                SettingsPane::Safes(p) => p.view(t, &self.accounts).map(Message::SafesSettings),
+                SettingsPane::Accounts(p) => p.view(t).map(Message::AccountsSettings),
                 SettingsPane::Appearance => appearance::view(t, self.theme_kind),
                 SettingsPane::Contacts(p) => p.view(t).map(Message::Contacts),
             },
@@ -7072,9 +7519,9 @@ impl WalletScreen {
             header::view(
                 t,
                 self.verification,
-                self.display_name(),
-                self.rename_draft.as_deref(),
-                self.active_safe.is_some(),
+                self.identity_name(),
+                self.safe_threshold_badge(),
+                self.rename_draft.as_ref().map(|d| d.text.as_str()),
             ),
             body
         ]
@@ -12307,6 +12754,49 @@ fn sort_portfolio_rows(rows: &mut [LiveToken]) {
     });
 }
 
+/// Read-outs (and one busy switch) for the App's tests, which drive the
+/// dashboard from outside this module and can't reach its private state.
+#[cfg(test)]
+impl WalletScreen {
+    pub(crate) fn test_accounts(&self) -> &[AccountDescriptor] {
+        &self.accounts
+    }
+
+    pub(crate) fn test_active_index(&self) -> usize {
+        self.active_index
+    }
+
+    pub(crate) fn test_address(&self) -> Address {
+        self.address
+    }
+
+    /// Whether the live signer can sign — `false` once a rebuild swapped a
+    /// connected hardware signer for its view-only placeholder.
+    pub(crate) fn test_signer_can_sign(&self) -> bool {
+        self.signer.can_sign()
+    }
+
+    pub(crate) fn test_settings_pane(&self) -> &'static str {
+        self.settings_pane.name()
+    }
+
+    /// Mark a CoW / name write as holding the signer.
+    pub(crate) fn test_mark_signing_busy(&mut self) {
+        self.order_op_in_flight = true;
+    }
+
+    pub(crate) fn test_active_safe(&self) -> Option<usize> {
+        self.active_safe
+    }
+
+    /// Make the Safe at `idx` the active identity, as the account
+    /// dropdown's `SelectSafe` does (minus its feed refetches).
+    pub(crate) fn test_enter_safe_mode(&mut self, idx: usize) {
+        assert!(idx < self.safes.len(), "no Safe at {idx}");
+        self.active_safe = Some(idx);
+    }
+}
+
 #[cfg(test)]
 #[allow(unused_must_use)]
 mod tests {
@@ -14111,6 +14601,762 @@ mod tests {
         assert!(outcome.is_none());
         assert!(screen.active_safe.is_none());
         assert!(!screen.history_loaded);
+    }
+
+    #[test]
+    fn switch_to_another_account_from_safe_mode_drops_the_safe_and_bubbles() {
+        let mut screen = WalletScreen::new(
+            KaoSigner::ViewOnly(addr(1)),
+            vec![view_only_account(addr(1)), view_only_account(addr(2))],
+            vec![safe_descriptor(0x77, 1)],
+            0,
+            Arc::new(MockFetcher::new()),
+            crate::portfolio::new_cache(),
+            Arc::new(RwLock::new(ContactsBook::new())),
+            None,
+        );
+        screen.active_safe = Some(0);
+        screen.history_loaded = true;
+        screen.safe_pending_loading = true;
+        screen.modal = Modal::AccountDropdown(AccountDropdown::new());
+        let (_, outcome) = screen.update(Message::AccountDropdown(
+            account_dropdown::Message::Select(1),
+        ));
+        assert!(matches!(outcome, Some(Outcome::Switch(1))));
+        assert!(screen.active_safe.is_none());
+        assert!(!screen.history_loaded);
+        assert!(!screen.safe_pending_loading);
+    }
+
+    #[test]
+    fn exit_safe_mode_returns_to_the_eoa_and_refetches_its_portfolio() {
+        let mut screen = screen_with_safes(addr(1), vec![safe_descriptor(0x77, 1)]);
+        screen.active_safe = Some(0);
+        screen.history_loaded = true;
+        screen.safe_pending_error = Some("stale".into());
+        let task = screen.exit_safe_mode();
+        assert!(screen.active_safe.is_none());
+        assert_eq!(screen.display_address(), addr(1));
+        assert!(!screen.history_loaded);
+        assert!(screen.safe_pending_error.is_none());
+        assert!(
+            task.units() > 0,
+            "verification + portfolio refetch for the EOA"
+        );
+
+        // Outside Safe mode it is just the Builder re-sync.
+        screen.history_loaded = true;
+        let _ = screen.exit_safe_mode();
+        assert!(screen.history_loaded, "EOA feeds are left alone");
+    }
+
+    fn safes_updated(screen: &mut WalletScreen, safes: Vec<SafeDescriptor>) {
+        let _ = screen.update(Message::SafesUpdated(safes));
+    }
+
+    /// `safe_descriptor` owned by `addr(1)` — linking account 0 of
+    /// `screen_with_signing_safes`, a key that can sign for it.
+    fn signing_safe(byte: u8, chain_id: u64) -> SafeDescriptor {
+        let mut s = safe_descriptor(byte, chain_id);
+        s.owners = vec![addr(1).into_array()];
+        s
+    }
+
+    /// `screen_with_safes(addr(1), ..)` whose account 0 is a Ledger, so a
+    /// `signing_safe` stays active across `SafesUpdated` (`adopt_safes`
+    /// keeps Safe mode only while a linked key can sign). The signer is
+    /// the Ledger's view-only placeholder, as before the device connects.
+    fn screen_with_signing_safes(safes: Vec<SafeDescriptor>) -> WalletScreen {
+        WalletScreen::new(
+            KaoSigner::ViewOnly(addr(1)),
+            vec![ledger_acct(addr(1))],
+            safes,
+            0,
+            Arc::new(MockFetcher::new()),
+            crate::portfolio::new_cache(),
+            Arc::new(RwLock::new(ContactsBook::new())),
+            None,
+        )
+    }
+
+    #[test]
+    fn safes_updated_follows_the_active_safe_when_an_earlier_one_goes() {
+        let (a, b, c) = (
+            signing_safe(0xa1, 1),
+            signing_safe(0xb2, 1),
+            signing_safe(0xc3, 8453),
+        );
+        let mut screen = screen_with_signing_safes(vec![a, b.clone(), c.clone()]);
+        screen.active_safe = Some(2);
+        screen.history_loaded = true;
+
+        // A was removed: C slides from 2 to 1.
+        safes_updated(&mut screen, vec![b, c]);
+        assert_eq!(screen.active_safe, Some(1));
+        assert_eq!(screen.display_address(), Address::from([0xc3; 20]));
+        assert!(screen.history_loaded, "still the same Safe — feeds kept");
+    }
+
+    #[test]
+    fn safes_updated_tells_same_address_siblings_apart() {
+        let mainnet = signing_safe(0x55, 1);
+        let base = signing_safe(0x55, 8453);
+        let mut screen = screen_with_signing_safes(vec![mainnet, base.clone()]);
+        screen.active_safe = Some(1);
+
+        // Mainnet removed: Base is still active, now at 0.
+        safes_updated(&mut screen, vec![base.clone()]);
+        assert_eq!(screen.active_safe, Some(0));
+        assert_eq!(screen.active_safe_descriptor().unwrap().chain_id, 8453);
+
+        // Base removed with Mainnet back at 0: not the same Safe → exit.
+        safes_updated(&mut screen, vec![signing_safe(0x55, 1)]);
+        assert!(screen.active_safe.is_none());
+    }
+
+    #[test]
+    fn safes_updated_exits_safe_mode_when_the_active_safe_is_gone() {
+        // Signing fixtures: A would keep Safe mode, so only B's absence
+        // can end it.
+        let (a, b) = (signing_safe(0xa1, 1), signing_safe(0xb2, 1));
+        let mut screen = screen_with_signing_safes(vec![a.clone(), b]);
+        screen.active_safe = Some(1);
+        screen.history_loaded = true;
+
+        safes_updated(&mut screen, vec![a]);
+        assert!(screen.active_safe.is_none(), "no index left pointing at A");
+        assert_eq!(screen.display_address(), addr(1));
+        assert!(!screen.history_loaded, "the Safe's history was dropped");
+        assert!(!screen.safe_pending_loading);
+    }
+
+    #[test]
+    fn safes_updated_exits_safe_mode_when_the_active_safe_turns_watch_only() {
+        // The account still owns the Safe and can sign — only the cleared
+        // link can end Safe mode.
+        let mut screen = screen_with_signing_safes(vec![signing_safe(0xa1, 1)]);
+        screen.active_safe = Some(0);
+        let mut unlinked = signing_safe(0xa1, 1);
+        unlinked.linked_signer_indices.clear();
+        safes_updated(&mut screen, vec![unlinked]);
+        assert!(screen.active_safe.is_none());
+    }
+
+    #[test]
+    fn safes_updated_keeps_an_unchanged_active_safe_and_clears_a_dangling_one() {
+        let mut screen = screen_with_signing_safes(vec![signing_safe(0xa1, 1)]);
+        screen.active_safe = Some(0);
+        screen.history_loaded = true;
+        safes_updated(&mut screen, vec![signing_safe(0xa1, 1)]);
+        assert_eq!(screen.active_safe, Some(0));
+        assert!(screen.history_loaded);
+
+        // A stale index from before (shouldn't happen) is never carried on.
+        screen.active_safe = Some(5);
+        safes_updated(&mut screen, vec![signing_safe(0xa1, 1)]);
+        assert!(screen.active_safe.is_none());
+
+        // EOA mode stays EOA mode.
+        safes_updated(&mut screen, vec![signing_safe(0xa1, 1)]);
+        assert!(screen.active_safe.is_none());
+    }
+
+    #[test]
+    fn safes_updated_exits_safe_mode_when_no_linked_key_can_sign_any_more() {
+        // Still linked, but the link can't sign: the owners removed the
+        // key on-chain (a refresh brought the new owner set)…
+        let mut screen = screen_with_signing_safes(vec![signing_safe(0xa1, 1)]);
+        screen.active_safe = Some(0);
+        let mut ex_owner = signing_safe(0xa1, 1);
+        ex_owner.owners = vec![addr(9).into_array()];
+        safes_updated(&mut screen, vec![ex_owner]);
+        assert!(
+            screen.active_safe.is_none(),
+            "an ex-owner's link can't sign"
+        );
+
+        // …or the only linked account is view-only (the old onboarding
+        // linked those).
+        let mut screen = screen_with_safes(addr(1), vec![signing_safe(0xa1, 1)]);
+        screen.active_safe = Some(0);
+        safes_updated(&mut screen, vec![signing_safe(0xa1, 1)]);
+        assert!(screen.active_safe.is_none(), "a view-only link can't sign");
+    }
+
+    // ── Header rename (account / Safe) ──────────────────────────────────
+
+    fn named_safe(byte: u8, chain_id: u64, name: &str) -> SafeDescriptor {
+        let mut s = safe_descriptor(byte, chain_id);
+        s.set_name(Some(name.into()));
+        s
+    }
+
+    fn rename_target(screen: &WalletScreen) -> Option<RenameTarget> {
+        screen.rename_draft.as_ref().map(|d| d.target)
+    }
+
+    #[test]
+    fn header_rename_in_safe_mode_seeds_the_safes_raw_name() {
+        let mut screen = screen_with_safes(
+            addr(1),
+            vec![safe_descriptor(0x55, 1), named_safe(0x66, 8453, "Vault")],
+        );
+        screen.active_safe = Some(0);
+        let _ = screen.update(Message::BeginRenameAccount);
+        assert_eq!(
+            rename_target(&screen),
+            Some(RenameTarget::Safe {
+                address: [0x55; 20],
+                chain_id: 1
+            })
+        );
+        assert_eq!(
+            screen.rename_draft.as_ref().unwrap().text,
+            "",
+            "unnamed: not the rendered \"Safe 1\" nor the threshold badge"
+        );
+
+        let _ = screen.update(Message::CancelRename);
+        screen.active_safe = Some(1);
+        let _ = screen.update(Message::BeginRenameAccount);
+        assert_eq!(screen.rename_draft.as_ref().unwrap().text, "Vault");
+    }
+
+    #[test]
+    fn header_rename_in_safe_mode_renames_every_chain_of_that_address() {
+        let mut screen = screen_with_safes(
+            addr(1),
+            vec![
+                named_safe(0x55, 1, "Old"),
+                named_safe(0x66, 1, "Grants"),
+                named_safe(0x55, 8453, "Old"),
+            ],
+        );
+        screen.active_safe = Some(2);
+        assert_eq!(screen.display_name(), "Old — Safe 1 of 1");
+        let _ = screen.update(Message::BeginRenameAccount);
+        let _ = screen.update(Message::RenameInput("  Treasury ".into()));
+        let (_, outcome) = screen.update(Message::CommitRename);
+        match outcome {
+            Some(Outcome::RenameSafe { address, name }) => {
+                assert_eq!(address, [0x55; 20]);
+                assert_eq!(name.as_deref(), Some("Treasury"));
+            }
+            other => panic!("expected RenameSafe, got {other:?}"),
+        }
+        let names: Vec<_> = screen.safes.iter().map(|s| s.name()).collect();
+        assert_eq!(
+            names,
+            vec![Some("Treasury"), Some("Grants"), Some("Treasury")]
+        );
+        assert_eq!(
+            screen.accounts[0].name(),
+            None,
+            "the EOA behind it is untouched"
+        );
+        assert_eq!(screen.identity_name(), "Treasury");
+        assert_eq!(
+            screen.safe_threshold_badge().as_deref(),
+            Some("Safe 1 of 1")
+        );
+        assert!(screen.rename_draft.is_none());
+    }
+
+    #[test]
+    fn header_rename_in_account_mode_still_renames_the_account() {
+        let mut screen = screen_with_safes(addr(1), vec![safe_descriptor(0x55, 1)]);
+        let _ = screen.update(Message::BeginRenameAccount);
+        assert_eq!(rename_target(&screen), Some(RenameTarget::Account(0)));
+        assert!(screen.safe_threshold_badge().is_none());
+        let _ = screen.update(Message::RenameInput("Main".into()));
+        let (_, outcome) = screen.update(Message::CommitRename);
+        assert!(matches!(outcome, Some(Outcome::RenameActive(Some(ref n))) if n == "Main"));
+        assert_eq!(screen.accounts[0].name(), Some("Main"));
+        assert_eq!(screen.safes[0].name(), None);
+    }
+
+    #[test]
+    fn picking_a_safe_abandons_an_open_account_rename() {
+        // The old bug: the EOA's rename input stayed open into Safe mode,
+        // and its commit renamed the EOA behind the Safe.
+        let mut screen = screen_with_safes(addr(1), vec![safe_descriptor(0x55, 1)]);
+        let _ = screen.update(Message::BeginRenameAccount);
+        let _ = screen.update(Message::OpenAccountDropdown);
+        assert!(
+            screen.rename_draft.is_none(),
+            "opening the dropdown closes it"
+        );
+
+        // Reopened under the open dropdown: the pick itself clears it.
+        let _ = screen.update(Message::BeginRenameAccount);
+        let _ = screen.update(Message::AccountDropdown(
+            account_dropdown::Message::SelectSafe(0),
+        ));
+        assert_eq!(screen.active_safe, Some(0));
+        assert!(screen.rename_draft.is_none());
+        let (_, outcome) = screen.update(Message::CommitRename);
+        assert!(outcome.is_none());
+        assert_eq!(screen.accounts[0].name(), None);
+    }
+
+    #[test]
+    fn switching_back_to_the_eoa_abandons_a_safe_rename() {
+        let mut screen = screen_with_safes(addr(1), vec![safe_descriptor(0x55, 1)]);
+        screen.active_safe = Some(0);
+        let _ = screen.update(Message::BeginRenameAccount);
+        screen.modal = Modal::AccountDropdown(AccountDropdown::new());
+        let _ = screen.update(Message::AccountDropdown(account_dropdown::Message::Select(
+            0,
+        )));
+        assert!(screen.active_safe.is_none());
+        assert!(screen.rename_draft.is_none());
+    }
+
+    #[test]
+    fn a_safe_rename_closes_when_its_safe_goes_away() {
+        let both = vec![signing_safe(0x55, 1), signing_safe(0x66, 1)];
+        let mut screen = screen_with_signing_safes(both.clone());
+        screen.active_safe = Some(1);
+        let _ = screen.update(Message::BeginRenameAccount);
+
+        // A refresh that keeps it leaves the rename open.
+        safes_updated(&mut screen, both);
+        assert!(screen.rename_draft.is_some());
+
+        // Removed: Safe mode exits and the rename closes with it.
+        safes_updated(&mut screen, vec![signing_safe(0x55, 1)]);
+        assert!(screen.active_safe.is_none());
+        assert!(screen.rename_draft.is_none());
+        let (_, outcome) = screen.update(Message::CommitRename);
+        assert!(outcome.is_none());
+        assert_eq!(screen.accounts[0].name(), None);
+    }
+
+    #[test]
+    fn a_rename_whose_target_left_the_screen_commits_nothing() {
+        // Backstop for an identity change that didn't clear the draft.
+        let mut screen = screen_with_safes(addr(1), vec![safe_descriptor(0x55, 1)]);
+        screen.active_safe = Some(0);
+        let _ = screen.update(Message::BeginRenameAccount);
+        let _ = screen.update(Message::RenameInput("Oops".into()));
+        screen.active_safe = None;
+        let (_, outcome) = screen.update(Message::CommitRename);
+        assert!(outcome.is_none());
+        assert_eq!(screen.accounts[0].name(), None);
+        assert_eq!(screen.safes[0].name(), None);
+    }
+
+    #[test]
+    fn an_unchanged_header_rename_closes_without_renaming_anything() {
+        // Removing a Safe froze its later sibling's default ("Safe 2") while
+        // the earlier, active one stayed unnamed. Committing the untouched
+        // pencil draft ("") used to send `RenameSafe { name: None }` to every
+        // chain of the address, clearing the frozen name.
+        let mut screen = screen_with_safes(
+            addr(1),
+            vec![safe_descriptor(0x55, 1), named_safe(0x55, 8453, "Safe 2")],
+        );
+        screen.active_safe = Some(0);
+        let _ = screen.update(Message::BeginRenameAccount);
+        let (_, outcome) = screen.update(Message::CommitRename);
+        assert!(outcome.is_none(), "nothing changed: {outcome:?}");
+        assert!(screen.rename_draft.is_none(), "the draft still closes");
+        assert_eq!(screen.safes[1].name(), Some("Safe 2"), "frozen name kept");
+
+        // Same for a named Safe re-committed with only extra whitespace…
+        screen.active_safe = Some(1);
+        let _ = screen.update(Message::BeginRenameAccount);
+        let _ = screen.update(Message::RenameInput("  Safe 2 ".into()));
+        let (_, outcome) = screen.update(Message::CommitRename);
+        assert!(outcome.is_none());
+
+        // …and for an account.
+        screen.active_safe = None;
+        let _ = screen.update(Message::BeginRenameAccount);
+        let (_, outcome) = screen.update(Message::CommitRename);
+        assert!(outcome.is_none());
+        assert!(screen.rename_draft.is_none());
+
+        // A real change still goes through.
+        let _ = screen.update(Message::BeginRenameAccount);
+        let _ = screen.update(Message::RenameInput("Main".into()));
+        let (_, outcome) = screen.update(Message::CommitRename);
+        assert!(matches!(outcome, Some(Outcome::RenameActive(Some(ref n))) if n == "Main"));
+    }
+
+    // ── Settings → Safes: rename / remove / service URL ────────────────
+
+    fn safes_pane(screen: &mut WalletScreen, msg: safes_settings::Message) -> Option<Outcome> {
+        screen.update(Message::SafesSettings(msg)).1
+    }
+
+    #[test]
+    fn safes_pane_rename_mirrors_every_chain_and_bubbles() {
+        let mut screen = screen_with_safes(
+            addr(1),
+            vec![safe_descriptor(0x55, 1), safe_descriptor(0x55, 8453)],
+        );
+        let _ = screen.update(Message::OpenSafesSettings);
+        let key = ([0x55; 20], 8453);
+        safes_pane(
+            &mut screen,
+            safes_settings::Message::NameChanged(key, "Vault".into()),
+        );
+        let outcome = safes_pane(&mut screen, safes_settings::Message::SaveName(key));
+        assert!(matches!(
+            outcome,
+            Some(Outcome::RenameSafe { address, name: Some(ref n) })
+                if address == [0x55; 20] && n == "Vault"
+        ));
+        assert!(screen.safes.iter().all(|s| s.name() == Some("Vault")));
+    }
+
+    #[test]
+    fn safes_pane_service_url_bubbles_by_key() {
+        let mut screen = screen_with_safes(
+            addr(1),
+            vec![safe_descriptor(0x55, 1), safe_descriptor(0x55, 8453)],
+        );
+        let _ = screen.update(Message::OpenSafesSettings);
+        let key = ([0x55; 20], 8453);
+        safes_pane(
+            &mut screen,
+            safes_settings::Message::UrlChanged(key, "https://txs.example.org".into()),
+        );
+        let outcome = safes_pane(&mut screen, safes_settings::Message::SaveUrl(key));
+        assert!(matches!(
+            outcome,
+            Some(Outcome::SetSafeServiceUrl { address, chain_id: 8453, url: Some(_) })
+                if address == [0x55; 20]
+        ));
+    }
+
+    #[test]
+    fn safes_pane_remove_bubbles_only_after_the_confirm() {
+        let mut screen = screen_with_safes(addr(1), vec![safe_descriptor(0x55, 1)]);
+        let _ = screen.update(Message::OpenSafesSettings);
+        let key = ([0x55; 20], 1);
+        assert!(safes_pane(&mut screen, safes_settings::Message::RemoveRequested(key)).is_none());
+        let outcome = safes_pane(&mut screen, safes_settings::Message::RemoveConfirmed(key));
+        assert!(matches!(
+            outcome,
+            Some(Outcome::RemoveSafe { address, chain_id: 1 }) if address == [0x55; 20]
+        ));
+        assert_eq!(
+            screen.safes.len(),
+            1,
+            "dropped only when the App's SafesUpdated lands"
+        );
+    }
+
+    fn try_remove(screen: &mut WalletScreen, key: crate::wallet::SafeKey) -> Option<Outcome> {
+        safes_pane(screen, safes_settings::Message::RemoveRequested(key));
+        safes_pane(screen, safes_settings::Message::RemoveConfirmed(key))
+    }
+
+    #[test]
+    fn removing_the_active_safe_is_refused_while_a_signature_is_in_flight() {
+        let mut screen = screen_with_safes(
+            addr(1),
+            vec![safe_descriptor(0x55, 1), safe_descriptor(0x66, 1)],
+        );
+        screen.active_safe = Some(0);
+        let _ = screen.update(Message::OpenSafesSettings);
+        let active = ([0x55; 20], 1);
+        let other = ([0x66; 20], 1);
+
+        // A CoW / name write has the signer parked.
+        screen.order_op_in_flight = true;
+        assert!(try_remove(&mut screen, active).is_none());
+        // The refusal unstaged it — a stray confirm can't replay it.
+        assert!(
+            safes_pane(
+                &mut screen,
+                safes_settings::Message::RemoveConfirmed(active)
+            )
+            .is_none()
+        );
+        // Any other Safe can still go.
+        assert!(matches!(
+            try_remove(&mut screen, other),
+            Some(Outcome::RemoveSafe { .. })
+        ));
+
+        // An open clear-sign review counts too.
+        screen.order_op_in_flight = false;
+        screen.sign_review = Some(sign_review::SignReview::pending(
+            "Deposit".into(),
+            None,
+            Vec::new(),
+            None,
+            1,
+            sign_review::SignAction::PrivacyPool {
+                sign: sign_review::PoolSign::Deposit {
+                    chain: Chain::Mainnet,
+                    symbol: "ETH".into(),
+                    to: addr(0x10),
+                    value: U256::from(1u64),
+                    calldata: alloy::primitives::Bytes::new(),
+                    approve: None,
+                },
+            },
+        ));
+        assert!(try_remove(&mut screen, active).is_none());
+
+        // Nothing in flight: the active Safe can go.
+        screen.sign_review = None;
+        assert!(matches!(
+            try_remove(&mut screen, active),
+            Some(Outcome::RemoveSafe { address, chain_id: 1 }) if address == [0x55; 20]
+        ));
+    }
+
+    // ── Settings → Accounts / in-place account updates ─────────────────
+
+    /// A dashboard over three watch-only accounts at `addr(1..=3)`, signing
+    /// as the one at `active`.
+    fn screen_with_accounts(active: usize, safes: Vec<SafeDescriptor>) -> WalletScreen {
+        WalletScreen::new(
+            KaoSigner::ViewOnly(addr(active as u8 + 1)),
+            (1..=3).map(|b| view_only_account(addr(b))).collect(),
+            safes,
+            active,
+            Arc::new(MockFetcher::new()),
+            new_cache(),
+            Arc::new(RwLock::new(ContactsBook::new())),
+            None,
+        )
+    }
+
+    fn accounts_pane(
+        screen: &mut WalletScreen,
+        msg: accounts_settings::Message,
+    ) -> Option<Outcome> {
+        screen.update(Message::AccountsSettings(msg)).1
+    }
+
+    fn try_remove_account(screen: &mut WalletScreen, address: Address) -> Option<Outcome> {
+        accounts_pane(screen, accounts_settings::Message::RemoveRequested(address));
+        accounts_pane(screen, accounts_settings::Message::RemoveConfirmed(address))
+    }
+
+    /// What the App pushes after removing account 1 (`addr(1)`): the other
+    /// two shift down, with their default names frozen.
+    fn after_removing_the_first(active_index: usize, safes: Vec<SafeDescriptor>) -> Message {
+        let frozen = |b: u8, name: &str| {
+            let mut a = view_only_account(addr(b));
+            a.set_name(Some(name.into()));
+            a
+        };
+        Message::AccountsUpdated {
+            accounts: vec![frozen(2, "Account 2"), frozen(3, "Account 3")],
+            safes,
+            active_index,
+        }
+    }
+
+    #[test]
+    fn manage_accounts_in_the_dropdown_opens_settings_accounts() {
+        let mut screen = screen_with_accounts(0, Vec::new());
+        let _ = screen.update(Message::OpenAccountDropdown);
+        let _ = screen.update(Message::AccountDropdown(account_dropdown::Message::Manage));
+        assert!(matches!(screen.modal, Modal::None));
+        assert_eq!(screen.nav, Nav::Settings);
+        assert_eq!(screen.settings_pane.name(), "Accounts");
+
+        accounts_pane(&mut screen, accounts_settings::Message::Back);
+        assert_eq!(screen.settings_pane.name(), "Root");
+        // The Settings root row leads there too.
+        let _ = screen.update(Message::OpenAccountsSettings);
+        assert_eq!(screen.settings_pane.name(), "Accounts");
+    }
+
+    #[test]
+    fn renaming_in_the_pane_mirrors_into_the_header_and_bubbles_with_the_address() {
+        let mut screen = screen_with_accounts(1, Vec::new());
+        let _ = screen.update(Message::OpenAccountsSettings);
+        accounts_pane(
+            &mut screen,
+            accounts_settings::Message::NameChanged(addr(2), "Main".into()),
+        );
+        let outcome = accounts_pane(&mut screen, accounts_settings::Message::SaveName(addr(2)));
+        assert!(matches!(
+            outcome,
+            Some(Outcome::RenameAccount { index: 1, address, name: Some(ref n) })
+                if address == addr(2) && n == "Main"
+        ));
+        assert_eq!(screen.identity_name(), "Main", "the header shows it now");
+
+        // Any account, not just the active one.
+        accounts_pane(
+            &mut screen,
+            accounts_settings::Message::NameChanged(addr(3), "Cold".into()),
+        );
+        let outcome = accounts_pane(&mut screen, accounts_settings::Message::SaveName(addr(3)));
+        assert!(matches!(
+            outcome,
+            Some(Outcome::RenameAccount { index: 2, .. })
+        ));
+        assert_eq!(screen.accounts[2].name(), Some("Cold"));
+        assert_eq!(screen.identity_name(), "Main");
+    }
+
+    #[test]
+    fn a_header_rename_reseeds_an_open_accounts_pane() {
+        let mut screen = screen_with_accounts(0, Vec::new());
+        let _ = screen.update(Message::OpenAccountsSettings);
+        let _ = screen.update(Message::BeginRenameAccount);
+        let _ = screen.update(Message::RenameInput("Main".into()));
+        let _ = screen.update(Message::CommitRename);
+        // The pane already knows the stored name: saving it again is a no-op.
+        accounts_pane(
+            &mut screen,
+            accounts_settings::Message::NameChanged(addr(1), "Main".into()),
+        );
+        let outcome = accounts_pane(&mut screen, accounts_settings::Message::SaveName(addr(1)));
+        assert!(outcome.is_none());
+    }
+
+    #[test]
+    fn removing_an_account_bubbles_after_the_confirm_and_never_while_signing() {
+        let mut screen = screen_with_accounts(0, Vec::new());
+        let _ = screen.update(Message::OpenAccountsSettings);
+
+        // A CoW / name write has the signer parked.
+        screen.order_op_in_flight = true;
+        assert!(try_remove_account(&mut screen, addr(3)).is_none());
+        // The refusal unstaged it — a stray confirm can't replay it.
+        assert!(
+            accounts_pane(
+                &mut screen,
+                accounts_settings::Message::RemoveConfirmed(addr(3))
+            )
+            .is_none()
+        );
+
+        // An open clear-sign review counts too.
+        screen.order_op_in_flight = false;
+        screen.sign_review = Some(sign_review::SignReview::pending(
+            "Deposit".into(),
+            None,
+            Vec::new(),
+            None,
+            1,
+            sign_review::SignAction::PrivacyPool {
+                sign: sign_review::PoolSign::Deposit {
+                    chain: Chain::Mainnet,
+                    symbol: "ETH".into(),
+                    to: addr(0x10),
+                    value: U256::from(1u64),
+                    calldata: alloy::primitives::Bytes::new(),
+                    approve: None,
+                },
+            },
+        ));
+        assert!(try_remove_account(&mut screen, addr(3)).is_none());
+
+        screen.sign_review = None;
+        assert!(matches!(
+            try_remove_account(&mut screen, addr(3)),
+            Some(Outcome::RemoveAccount { index: 2, address }) if address == addr(3)
+        ));
+        assert_eq!(screen.accounts.len(), 3, "dropped only when the App acts");
+    }
+
+    #[test]
+    fn accounts_updated_replaces_the_mirrors_and_keeps_the_identity_and_pane() {
+        // Account 1 (not the active one) went: the active account slides
+        // from position 2 to 1. Signer, nav and the open pane all stay.
+        let mut screen = screen_with_accounts(2, Vec::new());
+        let _ = screen.update(Message::OpenAccountsSettings);
+        let _ = screen.update(after_removing_the_first(1, Vec::new()));
+        assert_eq!(screen.accounts.len(), 2);
+        assert_eq!(screen.active_index, 1);
+        assert_eq!(screen.address, addr(3));
+        assert_eq!(screen.identity_name(), "Account 3", "same name as before");
+        assert_eq!(screen.nav, Nav::Settings);
+        assert_eq!(screen.settings_pane.name(), "Accounts");
+
+        // The pane reseeded: account 3 is at position 1 now.
+        assert!(matches!(
+            try_remove_account(&mut screen, addr(3)),
+            Some(Outcome::RemoveAccount { index: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn accounts_updated_leaves_safe_mode_when_the_active_safe_lost_its_last_signer() {
+        // Linked to account 0 only; `addr(3)` co-owns it unlinked.
+        let mut safe = safe_descriptor(0x55, 1); // linked: [0]
+        safe.owners = vec![addr(1).into_array(), addr(3).into_array()];
+        let mut screen = screen_with_accounts(1, vec![safe.clone()]);
+        screen.active_safe = Some(0);
+        screen.history_loaded = true;
+
+        // Account 0 went. The survivors can sign and one owns the Safe, so
+        // only the cleared link can end Safe mode.
+        let ledger_named = |b: u8, name: &str| {
+            let mut a = ledger_acct(addr(b));
+            a.set_name(Some(name.into()));
+            a
+        };
+        let mut unlinked = safe;
+        unlinked.linked_signer_indices.clear();
+        let _ = screen.update(Message::AccountsUpdated {
+            accounts: vec![ledger_named(2, "Account 2"), ledger_named(3, "Account 3")],
+            safes: vec![unlinked],
+            active_index: 0,
+        });
+        assert!(screen.active_safe.is_none());
+        assert_eq!(screen.display_address(), addr(2));
+        assert!(!screen.history_loaded, "the Safe's history was dropped");
+    }
+
+    #[test]
+    fn accounts_updated_keeps_safe_mode_while_another_linked_signer_remains() {
+        let mut safe = safe_descriptor(0x55, 1);
+        safe.linked_signer_indices = vec![0, 2];
+        safe.owners = vec![addr(1).into_array(), addr(3).into_array()];
+        let mut screen = screen_with_accounts(2, vec![safe.clone()]);
+        screen.active_safe = Some(0);
+        screen.history_loaded = true;
+
+        // The remaining linked account must be one that can sign — a
+        // Ledger here (a view-only one wouldn't keep Safe mode).
+        let mut remapped = safe;
+        remapped.linked_signer_indices = vec![1];
+        let ledger_named = |b: u8, name: &str| {
+            let mut a = ledger_acct(addr(b));
+            a.set_name(Some(name.into()));
+            a
+        };
+        let _ = screen.update(Message::AccountsUpdated {
+            accounts: vec![ledger_named(2, "Account 2"), ledger_named(3, "Account 3")],
+            safes: vec![remapped],
+            active_index: 1,
+        });
+        assert_eq!(screen.active_safe, Some(0));
+        assert!(screen.history_loaded, "still the same Safe — feeds kept");
+        assert_eq!(
+            screen
+                .active_safe_descriptor()
+                .unwrap()
+                .linked_signer_indices,
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn an_open_header_rename_follows_the_active_account_to_its_new_position() {
+        let mut screen = screen_with_accounts(2, Vec::new());
+        let _ = screen.update(Message::BeginRenameAccount);
+        let _ = screen.update(Message::RenameInput("Main".into()));
+        let _ = screen.update(after_removing_the_first(1, Vec::new()));
+        assert_eq!(rename_target(&screen), Some(RenameTarget::Account(1)));
+        let (_, outcome) = screen.update(Message::CommitRename);
+        assert!(matches!(outcome, Some(Outcome::RenameActive(Some(ref n))) if n == "Main"));
+        assert_eq!(screen.accounts[1].name(), Some("Main"));
+        assert_eq!(screen.accounts[0].name(), Some("Account 2"), "untouched");
     }
 
     fn local_with_key(seed: u8) -> AccountDescriptor {
@@ -16849,7 +18095,6 @@ mod tests {
         preflight: tx_builder::Preflight,
     ) -> WalletScreen {
         let mut s = screen_for(addr(0xAA), new_cache());
-        s.sign_review_seq = 1;
         s.sign_review = Some(sign_review::SignReview::pending(
             "Batch".into(),
             None,
@@ -17034,7 +18279,6 @@ mod tests {
         // thing that can carry it, and a hand-rolled `mem::replace` didn't.
         let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
         let mut s = screen_for(addr(0xAA), new_cache());
-        s.sign_review_seq = 1;
         s.sign_review = Some(sign_review::SignReview::pending(
             "Batch".into(),
             None,
@@ -17350,7 +18594,6 @@ mod tests {
             queued(2, addr(0xC2), 0, vec![0x02]),
         ];
         let mut s = screen_for(addr(0xAA), new_cache());
-        s.sign_review_seq = 1;
         s.sign_review = Some(sign_review::SignReview::pending(
             "Batch".into(),
             None,
@@ -17480,6 +18723,68 @@ mod tests {
         assert!(review.error.as_deref().unwrap().contains("not deployed"));
         assert!(review.confirm_disabled, "a failed prepare can't be signed");
         assert!(!review.legs_loading);
+    }
+
+    // ── staleness tags survive a dashboard rebuild ───────────────────
+
+    #[test]
+    fn a_prepare_from_a_rebuilt_away_dashboard_cannot_land_on_the_new_review() {
+        // An account switch rebuilds the dashboard, but a prepare the old
+        // screen spawned still routes to the new one. Each screen used to
+        // number its reviews from 0, so both screens' first review was seq 1
+        // and the old prepare's steps were appended to the unrelated review
+        // now open.
+        let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
+        let mut old = screen_with_key();
+        let _ = old.open_txbuilder_review(
+            calls.clone(),
+            tx_builder::QueueMap::default(),
+            PASSED_CLEAN,
+            None,
+            Vec::new(),
+        );
+        let stale = old.sign_review.as_ref().expect("old overlay").seq;
+
+        let mut new = screen_with_key();
+        let _ = new.open_txbuilder_review(
+            calls,
+            tx_builder::QueueMap::default(),
+            PASSED_CLEAN,
+            None,
+            Vec::new(),
+        );
+        new.update(Message::SignReviewPrepared {
+            seq: stale,
+            steps: Ok(vec![safe_exec_step(11, B256::repeat_byte(0xAB))]),
+        });
+
+        let review = new.sign_review.as_ref().expect("overlay stays open");
+        assert!(
+            review.steps.is_empty(),
+            "the old screen's steps were appended"
+        );
+        assert!(review.legs_loading, "still waiting on its own prepare");
+    }
+
+    #[test]
+    fn a_clipboard_clear_from_a_rebuilt_away_dashboard_spares_the_new_copy() {
+        // Same shape for the auto-clear: the old screen's timer matched the new
+        // screen's first copy and wiped it early, under a chip still counting.
+        let mut old = screen_for(addr(0xAA), new_cache());
+        let _ = old.arm_clipboard_clear("0xold".into());
+        let stale = old.clipboard_clear.as_ref().expect("armed").generation;
+
+        let mut new = screen_for(addr(0xBB), new_cache());
+        let _ = new.arm_clipboard_clear("0xnew".into());
+        new.update(Message::ClipboardClearProbe {
+            generation: stale,
+            actual: Some("0xnew".into()),
+        });
+
+        assert!(
+            new.clipboard_clear.is_some(),
+            "the new copy's clear is still pending",
+        );
     }
 
     #[test]

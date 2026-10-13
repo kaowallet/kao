@@ -176,6 +176,9 @@ pub struct ApprovalsApp {
     pinned: Option<Chain>,
     chain: Chain,
     lookback: Lookback,
+    /// Tag every step's reply must echo. Drawn from
+    /// [`super::next_task_seq`], never counted locally: a scan the previous
+    /// dashboard started still answers here after an account switch.
     seq: u64,
     /// The step running for the current `(owner, chain)`, if any.
     phase: Phase,
@@ -209,7 +212,7 @@ impl ApprovalsApp {
         if let Some(c) = pinned {
             self.chain = c;
         }
-        self.seq += 1;
+        self.seq = super::next_task_seq();
         self.error = None;
         self.phase = match self.scan() {
             Some(s) if s.rows.is_some() => Phase::Done,
@@ -255,7 +258,7 @@ impl ApprovalsApp {
     /// do when it already covers the lookback and its rows are current, a
     /// fresh read when rows are stale, the missing windows otherwise.
     fn resume(&mut self) -> Option<Outcome> {
-        self.seq += 1;
+        self.seq = super::next_task_seq();
         self.error = None;
         let floor = self.floor();
         match self.scan() {
@@ -300,7 +303,7 @@ impl ApprovalsApp {
             // but always re-reads the allowances, which can change without
             // an `Approval` log (most tokens spend one down silently).
             Message::Scan => {
-                self.seq += 1;
+                self.seq = super::next_task_seq();
                 self.error = None;
                 let s = self.scan_mut();
                 s.notice = None;
@@ -1058,6 +1061,34 @@ mod tests {
             Some(Outcome::Logs { to, .. }) => assert_eq!(to, from - 1),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// The pane is rebuilt with the dashboard on an account switch, and the
+    /// old pane's scan steps still answer the new one. Counted per pane, both
+    /// scans carried the same seq, so the old account's windows were merged
+    /// into the new account's scan and recorded as searched for it.
+    #[test]
+    fn a_rebuilt_pane_ignores_the_old_panes_scan() {
+        let mut old = app();
+        let Some(Outcome::Head { seq: stale, .. }) = old.on_open() else {
+            panic!()
+        };
+
+        let mut new = ApprovalsApp::new(Address::ZERO);
+        new.set_identity(OTHER, None);
+        let Some(Outcome::Head { seq, .. }) = new.on_open() else {
+            panic!()
+        };
+        assert!(new.on_head(stale, Ok(300_000)).is_none(), "old head taken");
+        let Some(Outcome::Logs { from, to, .. }) = new.on_head(seq, Ok(300_000)) else {
+            panic!()
+        };
+        assert!(
+            new.on_logs(stale, from, to, Ok(vec![FOUND])).is_none(),
+            "old window taken",
+        );
+        let s = new.scan().unwrap();
+        assert!(s.found.is_empty() && s.covered.is_none());
     }
 
     /// A window that fails doesn't sink the scan: what was found is still

@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.kaowallet.kao</id>
+  <name>Kao Wallet</name>
+  <summary>Desktop wallet for Ethereum</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>AGPL-3.0-or-later</project_license>
+  <developer id="com.kaowallet">
+    <name>Kao Wallet</name>
+  </developer>
+  <description>
+    <p>
+      Kao is a desktop wallet for Ethereum Mainnet, Base, and Optimism.
+      It checks RPC data with the Helios light client. Token logos and
+      signature databases are bundled into the app.
+    </p>
+  </description>
+  <launchable type="desktop-id">com.kaowallet.kao.desktop</launchable>
+  <url type="homepage">https://github.com/kaowallet/kao</url>
+  <url type="vcs-browser">https://github.com/kaowallet/kao</url>
+  <url type="bugtracker">https://github.com/kaowallet/kao/issues</url>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.2.2" date="2026-07-01"/>
+  </releases>
+</component>

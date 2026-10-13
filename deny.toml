@@ -49,6 +49,14 @@ ignore = [
     { id = "RUSTSEC-2026-0118", reason = "hickory-proto 0.25.2 NSEC3 closest-encloser proof: unbounded loop on cross-zone responses can OOM the resolver task. Caps at helios losing RPC connectivity; no fix path until helios moves to hickory 0.26." },
     { id = "RUSTSEC-2026-0119", reason = "hickory-proto 0.25.2 O(n²) name compression on encode: CPU DoS via crafted DNS messages. Same DoS-only cap as -0118." },
 
+    # ── helios checkpoint-fallback subtree (helios-ethereum → serde_yaml 0.9
+    #    → unsafe-libyaml) ─────────────────────────────────────────────────
+    # helios-ethereum hard-depends on serde_yaml for CheckpointFallback, which
+    # parses ethpandaops' endpoints.yaml. Unlike the entries above this one is
+    # an in-process memory-safety concern, not a DoS cap — so note exactly when
+    # it's reachable.
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml 0.2.11 unmaintained (archived; no known vuln, no safe upgrade). Only reachable when the initial mainnet sync from our own checkpoint fails: build_eth_backend sets load_external_fallback, so helios then fetches endpoints.yaml from raw.githubusercontent.com over TLS and parses it. Input is a TLS-authenticated, GitHub-hosted community list, not an RPC peer. Revisit when helios drops serde_yaml, or drop load_external_fallback (net::fetch_latest_checkpoint already replaces that discovery) to make the path dead." },
+
     # ── alloy/build-time ──────────────────────────────────────────────────
     { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 unmaintained. Build-time proc-macro used by alloy-primitives via alloy-chains. No known vuln, no runtime surface." },
 

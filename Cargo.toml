@@ -176,6 +176,8 @@ core2 = { git = "https://github.com/bbqsrc/core2", rev = "545e84bcb0f235b12e2135
 # helios-opstack's pinned rev consumes that release.
 op-alloy-network = { path = "vendor/op-alloy-network" }
 
+# Flatpak is not a cargo-packager format. Releases build it from
+# flatpak/com.kaowallet.kao.yml via flatpak/build.sh.
 [package.metadata.packager]
 product-name = "Kao Wallet"
 identifier = "com.kaowallet.kao"

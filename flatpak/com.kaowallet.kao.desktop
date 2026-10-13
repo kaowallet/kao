@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Kao Wallet
+GenericName=Ethereum Wallet
+Comment=Cute+Secure desktop wallet for Ethereum
+Exec=kao
+Icon=com.kaowallet.kao
+Terminal=false
+Categories=Finance;Network;
+Keywords=Ethereum;Wallet;
+StartupWMClass=com.kaowallet.kao

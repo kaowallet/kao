@@ -1,0 +1,41 @@
+# Staged by flatpak/build.sh next to the release binary, the desktop file,
+# the metainfo, and com.kaowallet.kao.png. Source paths are relative to
+# that staging directory, not this checkout.
+id: com.kaowallet.kao
+runtime: org.freedesktop.Platform
+runtime-version: '26.08'
+sdk: org.freedesktop.Sdk
+command: kao
+default-branch: stable
+finish-args:
+  # Wayland, and X11 only when Wayland is unavailable.
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  # wgpu talks to Vulkan/GL through the host GPU.
+  - --device=dri
+  # RPC, the light client, indexers, and a Tor SOCKS proxy on 127.0.0.1.
+  - --share=network
+  # Ledger (vendor 2c97) and Trezor (534c, 1209) are opened with libusb on
+  # /dev/bus/usb. hidapi-rusb does not call the USB portal, so a --usb=
+  # filter would not hand it a device fd. --device=usb is every USB device
+  # node, which is the narrow grant that still lets libusb enumerate.
+  # Flatpak older than 1.15.11 ignores this permission.
+  - --device=usb
+modules:
+  - name: kao
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 kao /app/bin/kao
+      - install -Dm644 com.kaowallet.kao.desktop /app/share/applications/com.kaowallet.kao.desktop
+      - install -Dm644 com.kaowallet.kao.metainfo.xml /app/share/metainfo/com.kaowallet.kao.metainfo.xml
+      - install -Dm644 com.kaowallet.kao.png /app/share/icons/hicolor/512x512/apps/com.kaowallet.kao.png
+    sources:
+      - type: file
+        path: kao
+      - type: file
+        path: com.kaowallet.kao.desktop
+      - type: file
+        path: com.kaowallet.kao.metainfo.xml
+      - type: file
+        path: com.kaowallet.kao.png

@@ -123,6 +123,24 @@ jobs:
             --formats ${{ matrix.packager-formats }} \
             --out-dir dist/installers
 
+      - name: package flatpak
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Ubuntu 24.04's Flatpak is 1.14, which rejects --device=usb.
+          # The Freedesktop 26.08 image has a current Flatpak plus the runtime.
+          # It runs privileged over the checkout, so it is pinned to the
+          # multi-arch index digest of the freedesktop-26.08 tag; bump by
+          # re-resolving that tag.
+          docker run --rm --privileged --user root --entrypoint bash \
+            -e KAO_FLATPAK_VERSION="${GITHUB_REF_NAME#v}" \
+            -e KAO_FLATPAK_OWNER="$(id -u):$(id -g)" \
+            -v "$PWD:/src" \
+            -w /src \
+            ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-26.08@sha256:6ed6921bb5a9e1a916989971844f159b854b7b225880c381fa34f7a158863039 \
+            -lc './flatpak/build.sh "target/${{ matrix.target }}/release/kao" dist/installers'
+
       - name: rename artifacts
         shell: bash
         run: |
@@ -138,6 +156,7 @@ jobs:
               *.dmg)        mv "$f" "dist/out/kao-${{ github.ref_name }}-${{ matrix.target }}.dmg" ;;
               *.AppImage)   mv "$f" "dist/out/kao-${{ github.ref_name }}-${{ matrix.target }}.AppImage" ;;
               *.deb)        mv "$f" "dist/out/kao-${{ github.ref_name }}-${{ matrix.target }}.deb" ;;
+              *.flatpak)    mv "$f" "dist/out/kao-${{ github.ref_name }}-${{ matrix.target }}.flatpak" ;;
               *)            mv "$f" "dist/out/${base}" ;;
             esac
           done
@@ -169,7 +188,7 @@ jobs:
           set -euo pipefail
           cd dist
           shopt -s nullglob
-          for f in *.exe *.dmg *.AppImage *.deb *.pkg.tar.gz SHA256SUMS; do
+          for f in *.exe *.dmg *.AppImage *.deb *.pkg.tar.gz *.flatpak SHA256SUMS; do
             cosign sign-blob --yes "$f" \
               --output-signature "$f.sig" \
               --output-certificate "$f.pem"

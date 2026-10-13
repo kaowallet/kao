@@ -188,8 +188,12 @@ jobs:
           set -euo pipefail
           cd dist
           shopt -s nullglob
+          # The .sigstore.json bundle is what the README verifies against:
+          # cosign 3 deprecates verify-blob's --signature/--certificate and
+          # its next major drops them. .sig/.pem stay for older cosign.
           for f in *.exe *.dmg *.AppImage *.deb *.pkg.tar.gz *.flatpak SHA256SUMS; do
             cosign sign-blob --yes "$f" \
+              --new-bundle-format --bundle "$f.sigstore.json" \
               --output-signature "$f.sig" \
               --output-certificate "$f.pem"
           done

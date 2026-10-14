@@ -692,11 +692,11 @@ impl WcBook {
         fx
     }
 
-    /// The approve failed once the network was involved: the propose response or the settle may
-    /// have reached the dapp, which may then hold a session the crate already forgot. A retry
-    /// would settle a second, different session, so none is offered: the card goes, the user is
-    /// told to reconnect from the dapp, and the proposal is rejected — ignored by a dapp that got
-    /// its response already, it clears the crate's copy. A re-emit of the same id is refused too.
+    /// The approve failed after its answer may have reached the dapp, but before the settle could
+    /// have: the crate has spent the proposal and dropped the session, so the dapp holds none and
+    /// there is nothing to retry. The card goes, the user is told to reconnect from the dapp, and
+    /// the proposal is rejected in case the crate still has it. A re-emit of the same id is
+    /// refused too.
     pub fn approve_abandoned(&mut self, id: u64) -> Effects {
         let mut fx = Effects::default();
         let Some(card) = self.card.take_if(|c| c.proposal.id == id) else {

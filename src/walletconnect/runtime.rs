@@ -914,7 +914,7 @@ impl WcRuntime {
         }
         // While the relay reconnects, the approve's first network step fails before anything is
         // published: not trying is the same outcome, minus the doubt — the card stays for a retry.
-        // A drop after this point is ambiguous and abandons the card below.
+        // A failure after this point is sorted out below by what the crate still holds.
         if !self.inner.client.relay().is_connected() {
             let fx = self.with_book(|b| b.approve_failed(id, RECONNECTING.to_string()));
             self.apply_background(fx);
@@ -941,15 +941,27 @@ impl WcRuntime {
             }
             Err(e) => {
                 debug!(kind = error_kind(&e), "approve failed");
+                // The crate answers a proposal for good once that answer may have reached the
+                // dapp, and keeps (returns `Ok`) any session whose settle may have. So a failure
+                // that leaves the proposal in the client sent the dapp nothing it could act on.
+                let still_held = self
+                    .inner
+                    .client
+                    .proposals()
+                    .iter()
+                    .any(|p| ticket.matches(p));
                 let fx = match e {
                     // Refused before anything reached the dapp: the card stays, with the reason.
                     wallet_connect::Error::NoProposal(_) | wallet_connect::Error::Expired(_) => {
                         self.with_book(|b| b.approve_failed(id, CHANGED.to_string()))
                     }
-                    // Anything else may have failed after the propose response or the settle
-                    // reached the dapp (the crate forgets the half-made session, not the
-                    // proposal), so a retry could settle a second session the dapp never uses.
-                    // The card goes; the dapp is told no, in case it is still waiting.
+                    // The relay refused the answer or never got it: approving again is safe.
+                    _ if still_held => {
+                        self.with_book(|b| b.approve_failed(id, NOTHING_SENT.to_string()))
+                    }
+                    // The answer may have reached the dapp but the settle surely didn't: the dapp
+                    // holds no session, and the proposal is spent, so there is nothing to retry.
+                    // The card goes; the user reconnects from the dapp.
                     _ => self.with_book(|b| b.approve_abandoned(id)),
                 };
                 self.apply_background(fx);
@@ -1278,6 +1290,8 @@ impl WcRuntime {
 const CHANGED: &str = "The request changed — reconnect from the dapp.";
 /// The card's reason when Connect is pressed while the relay reconnects.
 const RECONNECTING: &str = "Kao is reconnecting to the relay — try again in a moment.";
+const NOTHING_SENT: &str =
+    "The relay didn't take the connection — nothing reached the dapp. Try again.";
 
 /// FORWARDER: applies every crate event that needs no wallet context to the book (even while no
 /// dashboard exists) and hands session requests to the dashboard through the stream.
@@ -1394,7 +1408,7 @@ mod tests {
     use crate::sign::broadcast::STILL_WANTED_REFUSAL;
     use crate::walletconnect::book::IDLE_RETIRE_REASON;
     use crate::walletconnect::testkit::{self, RawPeer};
-    use crate::walletconnect::{IDLE_RETIRE_SECS, caip2};
+    use crate::walletconnect::{AckState, IDLE_RETIRE_SECS, caip2};
 
     const ADDR: Address = address!("ab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb");
 
@@ -2379,10 +2393,11 @@ mod tests {
         );
     }
 
-    /// The socket dies after the settle reached the relay: the dapp may hold that session, so the
-    /// card must not offer a retry that would settle a second, different session.
+    /// The socket dies after the settle reached the relay, losing the relay's ack: the dapp holds
+    /// the session, and so does Kao — bound, never offered for a second settle, and confirmed by
+    /// the dapp's acknowledgement once the relay is back.
     #[tokio::test]
-    async fn approve_failing_after_the_network_is_never_retried() {
+    async fn a_settle_whose_relay_ack_is_lost_keeps_the_session_the_dapp_holds() {
         let relay = RelayServer::new();
         let (dapp, _dapp_events) = testkit::dapp_client(&relay, "dapp").await;
         let settle_id: Arc<Mutex<Option<Value>>> = Arc::default();
@@ -2404,15 +2419,119 @@ mod tests {
         let (kao, p, resp) = card_over(connector, &dapp).await;
         let (uri, resp_topic) = (testkit::uri_of(&resp), resp.pairing_topic.clone());
         kao.approve(eoa_ticket(&p)).expect("approve starts");
-        testkit::settle(|| kao.with_book(|b| !b.proposal().is_some_and(|c| c.busy))).await;
         let approval = tokio::time::timeout(Duration::from_secs(3), resp.approval).await;
+        let Ok(Ok(dapp_session)) = approval else {
+            panic!("the dapp settled: {approval:?}");
+        };
+        testkit::settle(|| kao.with_book(|b| b.session(&dapp_session.topic).is_some())).await;
         assert!(
-            matches!(approval, Ok(Ok(_))),
-            "the dapp settled the first attempt"
+            kao.with_book(|b| b.session(&dapp_session.topic).is_some()),
+            "Kao bound the session the dapp holds"
         );
         assert!(
             kao.with_book(|b| b.proposal().is_none()),
-            "no card left to retry from"
+            "the card is done"
+        );
+        testkit::settle_within(Duration::from_secs(10), || {
+            kao.with_book(|b| {
+                b.session(&dapp_session.topic)
+                    .is_some_and(|s| s.ack == AckState::Confirmed)
+            })
+        })
+        .await;
+        assert_eq!(
+            kao.with_book(|b| b.session(&dapp_session.topic).map(|s| s.ack)),
+            Some(AckState::Confirmed),
+            "the dapp's acknowledgement arrives once the relay is back"
+        );
+        let notices = kao.snapshot(now_secs()).notices;
+        assert!(
+            !notices.iter().any(|n| n.error),
+            "nothing went wrong to report: {notices:?}"
+        );
+        assert_eq!(
+            kao.approve(eoa_ticket(&p)),
+            Err(crate::walletconnect::book::APPROVE_GONE),
+            "a second settle for the same proposal is refused"
+        );
+        // The proposal was answered for good: pasting the link again brings no card back.
+        kao.with_book(|b| b.expect_pairing(resp_topic.clone(), now_secs(), None));
+        kao.client().pair(&uri).await.expect("Kao pairs again");
+        assert!(kao.client().proposals().is_empty());
+        assert!(kao.with_book(|b| b.proposal().is_none()));
+        assert_eq!(kao.with_book(|b| b.sessions().len()), 1);
+    }
+
+    /// The relay refuses the answer to the proposal: nothing reached the dapp, so the card stays,
+    /// saying so, and approving again connects the dapp.
+    #[tokio::test]
+    async fn an_approve_whose_answer_the_relay_refused_can_be_retried() {
+        let relay = RelayServer::new();
+        let (dapp, _dapp_events) = testkit::dapp_client(&relay, "dapp").await;
+        let failed = Arc::new(AtomicBool::new(false));
+        let f = failed.clone();
+        let connector = tapped(
+            relay.clone(),
+            move |v| match is_publish(v, 1101) && !f.swap(true, Ordering::SeqCst) {
+                true => Tap::Fail,
+                false => Tap::Pass,
+            },
+            |_| Tap::Pass,
+        );
+        let (kao, p, resp) = card_over(connector, &dapp).await;
+        kao.approve(eoa_ticket(&p)).expect("approve starts");
+        testkit::settle(|| kao.with_book(|b| !b.proposal().is_some_and(|c| c.busy))).await;
+        assert!(
+            failed.load(Ordering::SeqCst),
+            "the relay refused the answer"
+        );
+        let card = kao.with_book(|b| b.proposal().cloned());
+        assert_eq!(
+            card.as_ref().and_then(|c| c.error.as_deref()),
+            Some(NOTHING_SENT),
+            "the card stays, saying why: {card:?}"
+        );
+        assert!(kao.with_book(|b| b.sessions().is_empty()));
+        kao.approve(eoa_ticket(&p)).expect("approving again starts");
+        let session = tokio::time::timeout(Duration::from_secs(5), resp.approval)
+            .await
+            .expect("the dapp hears back")
+            .expect("the dapp is connected");
+        testkit::settle(|| kao.with_book(|b| b.session(&session.topic).is_some())).await;
+        assert_eq!(kao.with_book(|b| b.sessions().len()), 1);
+    }
+
+    /// The relay refuses the settle after the answer went out: the dapp holds no session and the
+    /// proposal is spent, so the card goes and the user is told to reconnect from the dapp.
+    #[tokio::test]
+    async fn an_approve_whose_settle_the_relay_refused_is_abandoned() {
+        let relay = RelayServer::new();
+        let (dapp, _dapp_events) = testkit::dapp_client(&relay, "dapp").await;
+        let failed = Arc::new(AtomicBool::new(false));
+        let f = failed.clone();
+        let connector = tapped(
+            relay.clone(),
+            move |v| match is_publish(v, 1102) && !f.swap(true, Ordering::SeqCst) {
+                true => Tap::Fail,
+                false => Tap::Pass,
+            },
+            |_| Tap::Pass,
+        );
+        let (kao, p, _resp) = card_over(connector, &dapp).await;
+        kao.approve(eoa_ticket(&p)).expect("approve starts");
+        testkit::settle(|| kao.with_book(|b| b.proposal().is_none())).await;
+        assert!(
+            failed.load(Ordering::SeqCst),
+            "the relay refused the settle"
+        );
+        assert!(
+            kao.with_book(|b| b.proposal().is_none()),
+            "no card to retry from"
+        );
+        assert!(kao.with_book(|b| b.sessions().is_empty()));
+        assert!(
+            kao.client().sessions().is_empty(),
+            "the crate dropped it too"
         );
         let notices = kao.snapshot(now_secs()).notices;
         assert!(
@@ -2421,23 +2540,10 @@ mod tests {
                 .any(|n| n.error && n.text.contains("reconnect from the dapp")),
             "{notices:?}"
         );
-        testkit::settle(|| kao.client().relay().is_connected()).await;
         assert_eq!(
             kao.approve(eoa_ticket(&p)),
-            Err(crate::walletconnect::book::APPROVE_GONE),
-            "a second settle for the same proposal is refused"
+            Err(crate::walletconnect::book::APPROVE_GONE)
         );
-        // Pasting the link again re-emits the proposal if the crate still holds it (its reject
-        // went out while the relay was down): it never becomes a card again, and is rejected.
-        kao.with_book(|b| b.expect_pairing(resp_topic.clone(), now_secs(), None));
-        kao.client().pair(&uri).await.expect("Kao pairs again");
-        testkit::settle(|| kao.client().proposals().is_empty()).await;
-        assert!(
-            kao.client().proposals().is_empty(),
-            "the crate's proposal is rejected"
-        );
-        assert!(kao.with_book(|b| b.proposal().is_none()));
-        assert!(kao.with_book(|b| b.sessions().is_empty()));
     }
 
     /// Kao's 60-min TTL never cuts a signing short — only the dapp's own deadline does.

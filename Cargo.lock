@@ -13204,7 +13204,7 @@ dependencies = [
 [[package]]
 name = "wallet-connect"
 version = "0.1.0"
-source = "git+https://github.com/kaowallet/wallet-connect#a1399d505b8371272d309d0e081ce4cb87a14b36"
+source = "git+https://github.com/kaowallet/wallet-connect#8c323e024e554a1335b98ace842d1febf77edb75"
 dependencies = [
  "base64 0.23.1",
  "bs58 0.5.1",

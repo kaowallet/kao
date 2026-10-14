@@ -1471,10 +1471,10 @@ pub fn valid_proxy_address(addr: &str) -> bool {
 // can't quietly send the user to the public relay. The WalletConnect runtime
 // reads them once when it starts; a change applies the next time it starts.
 
-/// Kao's WalletConnect Cloud (Reown) project id. EMPTY until the maintainers
-/// bake one in; while empty, the default relay requires a user override (the
-/// pane prompts and resumes the pairing).
-pub const DEFAULT_WALLETCONNECT_PROJECT_ID: &str = "";
+/// Kao's WalletConnect Cloud (Reown) project id, used with the default relay
+/// unless the user overrides it. Not a secret: every dapp ships its own in its
+/// page source, and the relay only uses it to attribute traffic.
+pub const DEFAULT_WALLETCONNECT_PROJECT_ID: &str = "0f30df242648fb32b28d2a062cc07bf5";
 
 /// Setter refusal copy (shown inline under the field).
 const WALLETCONNECT_PROJECT_ID_INVALID: &str =

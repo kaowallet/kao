@@ -20,13 +20,21 @@ mod trace;
 mod txbuilder;
 mod ui;
 mod wallet;
+mod walletconnect;
 
 use app::App;
 use tracing_subscriber::EnvFilter;
 
+/// The log filter when `RUST_LOG` is unset (see `main`). The WalletConnect protocol crate logs
+/// what a dapp sent — its error text, undecodable messages — verbatim in its warnings, so a dapp
+/// could write lines into Kao's log (a newline, then a forged Kao line). Only its errors pass;
+/// Kao logs WalletConnect itself, shape only.
+const DEFAULT_LOG_FILTER: &str = "kao=info,wallet_connect=error,warn";
+
 pub fn main() -> iced::Result {
     // Default to our own crate at info; everything else (helios, alloy, hyper)
-    // stays at warn so their per-request chatter doesn't spam stderr. Override
+    // stays at warn so their per-request chatter doesn't spam stderr — and the
+    // WalletConnect crate at error, as it echoes dapp text. Override
     // via RUST_LOG, e.g. `RUST_LOG=kao=debug` to see redacted addresses or
     // `RUST_LOG=kao=trace` to see raw addresses and per-token reads.
     //
@@ -36,7 +44,7 @@ pub fn main() -> iced::Result {
     // every update() — the full GUI state machine, secret inputs redacted.
     // This is the stream an AI agent should watch when debugging the GUI.
     let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("kao=info,warn"));
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(true)
@@ -80,6 +88,11 @@ pub fn main() -> iced::Result {
     // session shell associates the window with that desktop entry.
     #[cfg(target_os = "linux")]
     let app = app.window(linux_window());
+    // Closing the window must end WalletConnect sessions before the process
+    // goes: `App` subscribes to close requests, tears the runtime down
+    // (bounded) and exits itself. Set after `.window(..)`, which replaces the
+    // whole window settings and would reset this.
+    let app = app.exit_on_close_request(false);
     app.run()
 }
 

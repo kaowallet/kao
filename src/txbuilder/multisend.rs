@@ -48,6 +48,31 @@ pub const MULTISEND_CALL_ONLY_1_3_0: Address =
     address!("0x40A2aCCbd92BCA938b02010E17A5b8929b49130D");
 pub const MULTISEND_CALL_ONLY_1_4_1: Address =
     address!("0x9641d764fc13c8B624c04430C7356C1C7C8102e2");
+/// The 1.3.0 `eip155` deployment of `MultiSendCallOnly` — the one OP and Base
+/// list first for 1.3.0, so Safe{Wallet} batches from 1.3.0 Safes there use it.
+/// Kao's own batches never target it; it is recognized when reviewing a batch
+/// someone else built.
+pub const MULTISEND_CALL_ONLY_1_3_0_EIP155: Address =
+    address!("0xA1dabEF33b3B82c7814B6D82A79e50F4AC44102B");
+/// The 1.5.0 `MultiSendCallOnly` deployment (canonical only). Recognized when
+/// reviewing a batch someone else built; Kao's own 1.5.x batches use the 1.4.1
+/// library.
+pub const MULTISEND_CALL_ONLY_1_5_0: Address =
+    address!("0xA83c336B20401Af773B6219BA5027174338D1836");
+
+/// Which official `MultiSendCallOnly` deployment `address` is, by its release —
+/// `None` for any other address. A delegatecall to one of these can only make
+/// plain calls, so its `data` is a batch to unpack and review; a delegatecall to
+/// anything else runs unknown code as the Safe.
+pub fn canonical_multisend_call_only(address: Address) -> Option<&'static str> {
+    match address {
+        MULTISEND_CALL_ONLY_1_3_0 => Some("1.3.0"),
+        MULTISEND_CALL_ONLY_1_3_0_EIP155 => Some("1.3.0 (EIP-155)"),
+        MULTISEND_CALL_ONLY_1_4_1 => Some("1.4.1"),
+        MULTISEND_CALL_ONLY_1_5_0 => Some("1.5.0"),
+        _ => None,
+    }
+}
 
 /// The `MultiSendCallOnly` address matching a Safe `version`. Kao only
 /// signs for Safe 1.3.0–1.5.x (`ensure_signable_version`); 1.3.x uses the
@@ -257,6 +282,38 @@ mod tests {
             signature: None,
             decoded_args: Vec::new(),
         }
+    }
+
+    /// Every official `MultiSendCallOnly` deployment on Kao's chains (safe-deployments:
+    /// 1.3.0 canonical and EIP-155, 1.4.1, 1.5.0) is recognized, and nothing else is.
+    #[test]
+    fn canonical_multisend_call_only_knows_every_official_deployment() {
+        for (a, v) in [
+            (
+                address!("0x40A2aCCbd92BCA938b02010E17A5b8929b49130D"),
+                "1.3.0",
+            ),
+            (
+                address!("0xA1dabEF33b3B82c7814B6D82A79e50F4AC44102B"),
+                "1.3.0 (EIP-155)",
+            ),
+            (
+                address!("0x9641d764fc13c8B624c04430C7356C1C7C8102e2"),
+                "1.4.1",
+            ),
+            (
+                address!("0xA83c336B20401Af773B6219BA5027174338D1836"),
+                "1.5.0",
+            ),
+        ] {
+            assert_eq!(canonical_multisend_call_only(a), Some(v), "{a}");
+        }
+        // The plain MultiSend (which can delegatecall) and anything else are not.
+        assert_eq!(
+            canonical_multisend_call_only(address!("0xA238CBeb142c10Ef7Ad8442C6D1f9E89e07e7761")),
+            None
+        );
+        assert_eq!(canonical_multisend_call_only(Address::ZERO), None);
     }
 
     #[test]

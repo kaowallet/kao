@@ -693,6 +693,41 @@ pub fn hint_pill<'a, M: 'a>(t: KaoTheme, label: &'a str) -> Element<'a, M> {
         .into()
 }
 
+/// The bordered monospace box raw bytes — and every string a dapp controls —
+/// are drawn in.
+pub fn mono_box<'a, M: 'a>(t: KaoTheme, content: Element<'a, M>) -> Element<'a, M> {
+    container(content)
+        .padding(Padding::from([8, 10]))
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(t.card)),
+            border: Border {
+                color: t.border,
+                width: 1.0,
+                radius: Radius::from(8),
+            },
+            text_color: Some(t.text),
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// The amber "caution" colour — privacy badges, cautions in the dapp review
+/// and pane, a middling score. The theme has no amber of its own.
+pub fn caution_color() -> Color {
+    Color::from_rgb(0.85, 0.65, 0.0)
+}
+
+/// `0:42`, `59:59`, `1 h 05 min`, `2 d 3 h` — a duration at the precision a
+/// countdown needs.
+pub fn span_label(secs: u64) -> String {
+    match secs {
+        s if s < 3_600 => format!("{}:{:02}", s / 60, s % 60),
+        s if s < 86_400 => format!("{} h {:02} min", s / 3_600, (s % 3_600) / 60),
+        s => format!("{} d {} h", s / 86_400, (s % 86_400) / 3_600),
+    }
+}
+
 // ── Font helpers ───────────────────────────────────────────────────────────
 
 pub fn bold() -> iced::Font {
@@ -1287,11 +1322,7 @@ pub enum BadgeKind {
 pub fn privacy_badge<'a, M: 'a>(t: KaoTheme, kind: BadgeKind, label: &str) -> Element<'a, M> {
     let (prefix, fg, bg) = match kind {
         BadgeKind::Good => ("\u{2713}", t.up, with_alpha(t.up, 0.12)),
-        BadgeKind::Caution => (
-            "!",
-            Color::from_rgb(0.85, 0.65, 0.0),
-            with_alpha(Color::from_rgb(0.85, 0.65, 0.0), 0.12),
-        ),
+        BadgeKind::Caution => ("!", caution_color(), with_alpha(caution_color(), 0.12)),
         BadgeKind::Warning => ("!", t.down, with_alpha(t.down, 0.12)),
         BadgeKind::Info => ("\u{2022}", t.sub, with_alpha(t.sub, 0.10)),
     };

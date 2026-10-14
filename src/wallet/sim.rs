@@ -576,6 +576,44 @@ pub struct BatchSimResult {
 }
 
 impl BatchSimResult {
+    /// One call's [`SimulationResult`] as a 1-step batch (Revert/Halt → step 0;
+    /// block fields 0) — so a single dapp call reuses the batch economics.
+    ///
+    /// The block fields are zero because a single-call preflight doesn't keep
+    /// the header it ran against, and zero reads as "unknown" everywhere they
+    /// are consumed: [`Self::gas_fit`] says nothing and [`Self::gas_floor`]
+    /// refuses to produce a bound, so a missing height can never harden into a
+    /// refusal. Transfers survive only a success, as in [`simulate_batch`] — a
+    /// reverting call performs none.
+    pub fn from_single(sim: &SimulationResult) -> Self {
+        let outcome = match &sim.outcome {
+            SimOutcome::Success { .. } => BatchOutcome::Success,
+            SimOutcome::Revert { reason, .. } => BatchOutcome::Revert {
+                step: 0,
+                reason: reason.clone(),
+            },
+            SimOutcome::Halt { reason } => BatchOutcome::Halt {
+                step: 0,
+                reason: reason.clone(),
+            },
+            SimOutcome::Unavailable => BatchOutcome::Unavailable,
+        };
+        let transfers = if matches!(outcome, BatchOutcome::Success) {
+            sim.transfers.clone()
+        } else {
+            Vec::new()
+        };
+        Self {
+            outcome,
+            gas_used: sim.gas_used,
+            transfers,
+            verified: sim.verified,
+            base_fee_per_gas: sim.base_fee_per_gas,
+            block: 0,
+            block_gas_limit: 0,
+        }
+    }
+
     pub fn unavailable() -> Self {
         Self {
             outcome: BatchOutcome::Unavailable,
@@ -1781,5 +1819,68 @@ mod tests {
         assert!(!r.is_revert());
         assert!(!r.is_unavailable());
         assert!(!r.verified);
+    }
+
+    /// A single call's preflight lifted into the batch shape the economics card
+    /// reads: every outcome maps onto its batch twin at step 0, the metering
+    /// and verification carry over, transfers survive only a success, and the
+    /// block fields read as "unknown" so no block-limit verdict is invented.
+    #[test]
+    fn from_single_maps_outcomes() {
+        let transfer = TokenTransfer {
+            token: address!("0x00000000000000000000000000000000000000aa"),
+            from: address!("0x00000000000000000000000000000000000000bb"),
+            to: address!("0x00000000000000000000000000000000000000cc"),
+            value: U256::from(5u64),
+            is_nft: false,
+        };
+        let single = |outcome: SimOutcome| SimulationResult {
+            outcome,
+            gas_used: 46_000,
+            transfers: vec![transfer.clone()],
+            verified: true,
+            base_fee_per_gas: 7,
+        };
+
+        let ok = BatchSimResult::from_single(&single(SimOutcome::Success {
+            output: Bytes::new(),
+        }));
+        assert!(matches!(ok.outcome, BatchOutcome::Success));
+        assert_eq!(ok.gas_used, 46_000);
+        assert_eq!(ok.transfers.len(), 1);
+        assert_eq!(ok.transfers[0].value, U256::from(5u64));
+        assert!(ok.verified);
+        assert_eq!(ok.base_fee_per_gas, 7);
+        assert_eq!((ok.block, ok.block_gas_limit), (0, 0));
+        assert_eq!(ok.gas_fit(), GasFit::Unknown, "no block was read");
+        assert_eq!(ok.gas_floor(1), None, "an unknown block bounds nothing");
+
+        let reverted = BatchSimResult::from_single(&single(SimOutcome::Revert {
+            reason: "ERC20: transfer amount exceeds balance".into(),
+            raw: Bytes::new(),
+        }));
+        assert!(matches!(
+            &reverted.outcome,
+            BatchOutcome::Revert { step: 0, reason } if reason == "ERC20: transfer amount exceeds balance"
+        ));
+        assert!(reverted.is_revert());
+        assert!(
+            reverted.transfers.is_empty(),
+            "a reverting call moves nothing"
+        );
+
+        let halted = BatchSimResult::from_single(&single(SimOutcome::Halt {
+            reason: "OutOfGas".into(),
+        }));
+        assert!(matches!(
+            &halted.outcome,
+            BatchOutcome::Halt { step: 0, reason } if reason == "OutOfGas"
+        ));
+        assert!(halted.transfers.is_empty());
+
+        let unavailable = BatchSimResult::from_single(&SimulationResult::unavailable());
+        assert!(matches!(unavailable.outcome, BatchOutcome::Unavailable));
+        assert!(!unavailable.verified);
+        assert_eq!(unavailable.gas_used, 0);
     }
 }

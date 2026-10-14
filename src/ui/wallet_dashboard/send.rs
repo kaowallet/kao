@@ -2353,6 +2353,10 @@ pub(crate) fn resolve_safe_amount_display(
             }
             None => (indexer_amount_str, indexer_symbol, false),
         },
+        // A dapp call (WalletConnect). The Send pane never builds one; the arm
+        // exists for exhaustiveness and reports "unverified" so nothing here
+        // vouches for an amount it didn't check.
+        SendToken::Call { .. } => (indexer_amount_str, indexer_symbol, false),
     }
 }
 
@@ -2952,6 +2956,14 @@ impl SafeSendRequest {
                 to: *contract,
                 value: U256::ZERO,
                 data: erc20_transfer_calldata(self.recipient, self.amount_units),
+                operation: Operation::Call,
+            },
+            // Verbatim, like `SendPlan::tx_target`. Always `Call`: Kao never
+            // builds a DelegateCall from a send.
+            SendToken::Call { data } => SafeTxInput {
+                to: self.recipient,
+                value: self.amount_units,
+                data: data.clone(),
                 operation: Operation::Call,
             },
         }

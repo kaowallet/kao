@@ -363,65 +363,125 @@ pub fn assemble_signatures(mut sigs: Vec<(Address, Bytes)>) -> Result<Bytes, Str
     Ok(Bytes::from(out))
 }
 
-/// Sign a `SafeTx` as an owner via EIP-712 and return the
-/// `(signer_address, 65-byte blob)` ready for [`assemble_signatures`].
-/// Routes through [`KaoSigner::sign_eip712`], so software **and**
-/// hardware owners work. `v` is `{27,28}`.
-pub async fn eip712_owner_sig(
-    signer: &KaoSigner,
-    tx: &SafeTx,
-    domain: &Eip712Domain,
-) -> Result<(Address, Bytes), String> {
-    let sig = signer
-        .sign_eip712(tx, domain)
-        .await
-        .map_err(|e| crate::wallet::friendly_signer_error(&e))?;
-    Ok((signer.address(), Bytes::from(sig.as_bytes().to_vec())))
+/// How an owner signs a Safe hash (a `SafeTx`'s, or a `SafeMessage`'s): as
+/// EIP-712 typed data (`v ∈ {27,28}`), or as an EIP-191 personal message over
+/// the 32-byte hash — `eth_sign`, `v ∈ {31,32}`, which Safe's
+/// `checkSignatures` accepts as well.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OwnerSigMode {
+    /// EIP-712, falling back to `eth_sign` on any EIP-712 failure — including
+    /// right after a device showed the EIP-712 prompt and the user declined it.
+    /// How the Safe send, CoW, name-service and Transaction Builder flows sign.
+    #[default]
+    Auto,
+    /// EIP-712, falling back to `eth_sign` only when nothing was shown on a
+    /// device ([`crate::wallet::Eip712Failure::Unavailable`]: a Trezor, an old
+    /// Ledger app). A device that showed the EIP-712 prompt and refused it ends
+    /// the attempt with [`OwnerSigError::eip712_refused`]: a second, different
+    /// prompt for the same hash is for the user to ask for, never automatic.
+    Eip712,
+    /// `eth_sign` only, with no EIP-712 attempt — what the user asks for after
+    /// their device refused EIP-712.
+    EthSign,
 }
 
-/// Sign a `SafeTx` as an owner, preferring EIP-712 and falling back to
-/// `eth_sign` when the device/app rejects typed-data signing (older
-/// Ledger app versions). Returns the `(owner, wire-blob)` pair for
-/// [`assemble_signatures`]. The single entry point the propose / confirm
-/// / reject flows use.
+/// Why an owner signature wasn't produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerSigError {
+    /// What to show the user.
+    pub text: String,
+    /// The owner's device showed the EIP-712 prompt and refused it (declined, or
+    /// Blind signing is off), and — in [`OwnerSigMode::Eip712`] — no `eth_sign`
+    /// prompt followed.
+    pub eip712_refused: bool,
+}
+
+impl OwnerSigError {
+    fn failed(text: String) -> Self {
+        Self {
+            text,
+            eip712_refused: false,
+        }
+    }
+}
+
+impl From<OwnerSigError> for String {
+    fn from(e: OwnerSigError) -> Self {
+        e.text
+    }
+}
+
+impl std::fmt::Display for OwnerSigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+/// One owner's 65-byte Safe signature over `hash`, in `mode`: `eip712` asks for
+/// the EIP-712 signature (`v ∈ {27,28}`), `eth_sign` for the EIP-191
+/// personal-message signature over `hash`, whose `v` is bumped to `{31,32}`.
+/// Each is asked at most once, and `eth_sign` never follows an EIP-712 prompt a
+/// device refused unless `mode` is [`OwnerSigMode::Auto`].
+pub(crate) async fn owner_sig_bytes<E, M>(
+    mode: OwnerSigMode,
+    eip712: impl FnOnce() -> E,
+    eth_sign: impl FnOnce() -> M,
+) -> Result<Bytes, OwnerSigError>
+where
+    E: std::future::Future<Output = Result<Signature, alloy::signers::Error>>,
+    M: std::future::Future<Output = Result<Signature, alloy::signers::Error>>,
+{
+    use crate::wallet::{Eip712Failure, classify_eip712_failure, friendly_signer_error};
+    let eth_sign = || async move {
+        let sig = eth_sign()
+            .await
+            .map_err(|e| OwnerSigError::failed(friendly_signer_error(&e)))?;
+        let mut bytes = sig.as_bytes().to_vec();
+        // 65-byte r‖s‖v; `as_bytes` writes v = 27 + parity. Safe reads
+        // v∈{31,32} as "eth_sign over the hash", so +4.
+        bytes[64] += 4;
+        Ok(Bytes::from(bytes))
+    };
+    if mode == OwnerSigMode::EthSign {
+        return eth_sign().await;
+    }
+    let eip712_err = match eip712().await {
+        Ok(sig) => return Ok(Bytes::from(sig.as_bytes().to_vec())),
+        Err(e) => e,
+    };
+    let class = classify_eip712_failure(&eip712_err);
+    if mode == OwnerSigMode::Auto || class == Eip712Failure::Unavailable {
+        // EIP-712 failing is the expected trigger for the fallback (Trezor, older
+        // Ledger app versions), so its error isn't the actionable one: surface the
+        // eth_sign attempt's (already-friendly) error if that also fails, rather
+        // than a confusing "both failed" carrying the raw status word twice.
+        tracing::debug!(error = %eip712_err, ?mode, "safe owner eip712 sign failed; falling back to eth_sign");
+        return eth_sign().await;
+    }
+    tracing::debug!(error = %eip712_err, ?class, "safe owner eip712 sign failed; no eth_sign fallback");
+    Err(OwnerSigError {
+        text: friendly_signer_error(&eip712_err),
+        eip712_refused: class == Eip712Failure::DeviceRefused,
+    })
+}
+
+/// Sign a `SafeTx` as an owner — EIP-712, with the `eth_sign` fallback `mode`
+/// allows. Returns the `(owner, wire-blob)` pair for [`assemble_signatures`].
+/// The single entry point the execute / propose / confirm / reject flows use.
 pub async fn sign_owner(
     signer: &KaoSigner,
     tx: &SafeTx,
     domain: &Eip712Domain,
     safe_tx_hash: B256,
-) -> Result<(Address, Bytes), String> {
-    match eip712_owner_sig(signer, tx, domain).await {
-        Ok(v) => Ok(v),
-        // EIP-712 failing is the *expected* trigger for the fallback (older Ledger
-        // app versions reject typed data), so its error isn't the actionable one.
-        // Surface the eth_sign attempt's (already-friendly) error if that also
-        // fails, rather than a confusing "both failed" carrying the raw status word
-        // twice — a locked / declined device fails both the same way.
-        Err(eip712_err) => {
-            tracing::debug!(error = %eip712_err, "safe owner eip712 sign failed; falling back to eth_sign");
-            eth_sign_owner_sig(signer, safe_tx_hash).await
-        }
-    }
-}
-
-/// `eth_sign` fallback: sign the safeTxHash as an EIP-191 personal
-/// message and bump `v` by 4 (`{27,28}` → `{31,32}`) so Safe's
-/// `checkSignatures` recovers it against the `"\x19Ethereum Signed
-/// Message:\n32"`-prefixed digest. For devices/app-versions that reject
-/// EIP-712; prefer [`eip712_owner_sig`] when it succeeds.
-pub async fn eth_sign_owner_sig(
-    signer: &KaoSigner,
-    safe_tx_hash: B256,
-) -> Result<(Address, Bytes), String> {
-    let sig = signer
-        .sign_eth_message(safe_tx_hash.as_slice())
-        .await
-        .map_err(|e| crate::wallet::friendly_signer_error(&e))?;
-    let mut bytes = sig.as_bytes().to_vec();
-    // 65-byte r‖s‖v; `as_bytes` writes v = 27 + parity. Safe reads
-    // v∈{31,32} as "eth_sign over the hash", so +4.
-    bytes[64] += 4;
-    Ok((signer.address(), Bytes::from(bytes)))
+    mode: OwnerSigMode,
+) -> Result<(Address, Bytes), OwnerSigError> {
+    let blob = owner_sig_bytes(
+        mode,
+        || signer.sign_eip712(tx, domain),
+        || signer.sign_eth_message(safe_tx_hash.as_slice()),
+    )
+    .await?;
+    Ok((signer.address(), blob))
 }
 
 /// ABI-encode the `execTransaction(...)` calldata for `tx` with the
@@ -470,11 +530,76 @@ pub async fn execute_safe_tx(
     tx: SafeTx,
     signatures: Bytes,
 ) -> Result<TxHash, String> {
+    execute_safe_tx_guarded(provider, executor, safe, chain, tx, signatures, None)
+        .await
+        .map(|sent| sent.hash)
+        .map_err(ExecSendError::into_text)
+}
+
+/// Why [`execute_safe_tx_guarded`] stopped: before the executor's signed
+/// transaction left the wallet, or after it was handed to the node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecSendError {
+    /// Nothing left the wallet — no signatures, a read failed, the executor
+    /// declined, or `before_send` refused. Trying again is a fresh attempt.
+    NotSent(String),
+    /// `eth_sendRawTransaction` was attempted and no hash came back. A reply
+    /// lost on its way back (a dropped Tor circuit, a timeout) looks exactly
+    /// like this, so the node may well have the transaction. `raw` is the
+    /// executor's exact signed envelope, `hash` its hash and `nonce` the
+    /// executor nonce it was signed at. Sending `raw` again is idempotent;
+    /// executing again is not — it signs a second, distinct transaction at the
+    /// executor's next nonce, which reverts once the first is mined.
+    Unconfirmed {
+        hash: TxHash,
+        raw: Bytes,
+        nonce: u64,
+        msg: String,
+    },
+}
+
+/// The executor's transaction the node took: its hash, and the account and the nonce it was
+/// signed at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecSent {
+    pub hash: TxHash,
+    pub from: Address,
+    pub nonce: u64,
+}
+
+impl ExecSendError {
+    /// The user-facing text — exactly what [`execute_safe_tx`] returns for it.
+    pub fn into_text(self) -> String {
+        match self {
+            Self::NotSent(msg) | Self::Unconfirmed { msg, .. } => msg,
+        }
+    }
+}
+
+/// [`execute_safe_tx`] with a liveness hook: `before_send` runs after
+/// `executor.sign_tx` (the executor envelope is signed) and before
+/// `send_raw_transaction`; an `Err` discards the envelope and returns that
+/// text — nothing is broadcast. WalletConnect passes the request's
+/// [`crate::sign::broadcast::BeforeSend`] so a Safe transaction the dapp
+/// stopped waiting for is never executed.
+///
+/// A failure is told apart by whether the executor's transaction was handed
+/// to the node ([`ExecSendError`]); the texts are [`execute_safe_tx`]'s.
+pub async fn execute_safe_tx_guarded(
+    provider: &RootProvider<Ethereum>,
+    executor: &KaoSigner,
+    safe: Address,
+    chain: Chain,
+    tx: SafeTx,
+    signatures: Bytes,
+    before_send: Option<&crate::sign::broadcast::BeforeSend>,
+) -> Result<ExecSent, ExecSendError> {
+    use ExecSendError::NotSent;
     if signatures.is_empty() {
         // Safe reverts GS020 ("Signatures data too short") on empty
         // input — reject upfront so the user sees a clear error
         // instead of an opaque revert after paying gas.
-        return Err("safe-tx: no signatures provided".to_string());
+        return Err(NotSent("safe-tx: no signatures provided".to_string()));
     }
 
     let calldata = encode_exec_transaction(&tx, signatures);
@@ -489,25 +614,27 @@ pub async fn execute_safe_tx(
     // strings flow to warn! logs and the sign-review overlay, so scrub URLs down
     // to the host before they leave here — matching the redaction discipline in
     // `net.rs` and `safe/service.rs`.
-    let gas_limit = provider
-        .estimate_gas(req)
-        .await
-        .map_err(|e| format!("estimate_gas: {}", crate::net::redact_urls(&e.to_string())))?;
+    let gas_limit = provider.estimate_gas(req).await.map_err(|e| {
+        NotSent(format!(
+            "estimate_gas: {}",
+            crate::net::redact_urls(&e.to_string())
+        ))
+    })?;
     let fees = provider.estimate_eip1559_fees().await.map_err(|e| {
-        format!(
+        NotSent(format!(
             "estimate_eip1559_fees: {}",
             crate::net::redact_urls(&e.to_string())
-        )
+        ))
     })?;
     let nonce = provider
         .get_transaction_count(from)
         .pending()
         .await
         .map_err(|e| {
-            format!(
+            NotSent(format!(
                 "get_transaction_count: {}",
                 crate::net::redact_urls(&e.to_string())
-            )
+            ))
         })?;
 
     let mut envelope = TxEip1559 {
@@ -524,15 +651,36 @@ pub async fn execute_safe_tx(
     let sig = executor
         .sign_tx(&mut envelope)
         .await
-        .map_err(|e| crate::wallet::friendly_signer_error(&e))?;
-    let raw = TxEnvelope::from(envelope.into_signed(sig)).encoded_2718();
+        .map_err(|e| NotSent(crate::wallet::friendly_signer_error(&e)))?;
+    if let Some(check) = before_send {
+        check().map_err(NotSent)?;
+    }
+    // The hash is the signed envelope's own, taken before it is encoded: a
+    // failure from here on has to name the transaction that may be on its way.
+    let signed = envelope.into_signed(sig);
+    let hash = *signed.hash();
+    let raw = TxEnvelope::from(signed).encoded_2718();
     let pending = provider.send_raw_transaction(&raw).await.map_err(|e| {
-        format!(
-            "broadcast failed: {}",
-            crate::net::redact_urls(&e.to_string())
-        )
+        let msg = crate::net::redact_urls(&e.to_string());
+        tracing::warn!(
+            error = %msg,
+            hash = %format!("{hash:#x}"),
+            "safe-tx: executor broadcast failed; the node may still have the transaction",
+        );
+        // Whatever the error says, the request was on the wire: from here the
+        // transaction's fate is unknown, never "not sent".
+        ExecSendError::Unconfirmed {
+            hash,
+            raw: Bytes::from(raw.clone()),
+            nonce,
+            msg: format!("{}: {msg}", crate::sign::broadcast::BROADCAST_FAILED),
+        }
     })?;
-    Ok(*pending.tx_hash())
+    Ok(ExecSent {
+        hash: *pending.tx_hash(),
+        from,
+        nonce,
+    })
 }
 
 #[cfg(test)]
@@ -867,7 +1015,10 @@ mod tests {
         let safe = safe_addr();
         let domain = safe_domain(safe, Chain::Mainnet);
         let tx = empty_safe_tx();
-        let (owner, bytes) = eip712_owner_sig(&ks, &tx, &domain).await.unwrap();
+        let hash = safe_tx_hash(&tx, &domain);
+        let (owner, bytes) = sign_owner(&ks, &tx, &domain, hash, OwnerSigMode::Eip712)
+            .await
+            .unwrap();
         assert_eq!(owner, signer.address());
         assert_eq!(bytes.len(), 65);
         assert!(matches!(bytes[64], 27 | 28));
@@ -882,19 +1033,23 @@ mod tests {
 
     #[tokio::test]
     async fn sign_owner_takes_eip712_path_for_software() {
-        // A software signer always succeeds at EIP-712, so `sign_owner`
-        // must return exactly what `eip712_owner_sig` would (the fallback
-        // never fires) — v∈{27,28}.
+        // A software signer always succeeds at EIP-712, so `Auto` must
+        // return exactly what `Eip712` does (the fallback never fires) —
+        // v∈{27,28}.
         let signer = PrivateKeySigner::random();
         let ks = crate::wallet::KaoSigner::Local(signer);
         let safe = safe_addr();
         let domain = safe_domain(safe, Chain::Mainnet);
         let tx = empty_safe_tx();
         let hash = safe_tx_hash(&tx, &domain);
-        let via_combinator = sign_owner(&ks, &tx, &domain, hash).await.unwrap();
-        let via_direct = eip712_owner_sig(&ks, &tx, &domain).await.unwrap();
-        assert_eq!(via_combinator, via_direct);
-        assert!(matches!(via_combinator.1[64], 27 | 28));
+        let via_auto = sign_owner(&ks, &tx, &domain, hash, OwnerSigMode::Auto)
+            .await
+            .unwrap();
+        let via_eip712 = sign_owner(&ks, &tx, &domain, hash, OwnerSigMode::Eip712)
+            .await
+            .unwrap();
+        assert_eq!(via_auto, via_eip712);
+        assert!(matches!(via_auto.1[64], 27 | 28));
     }
 
     #[tokio::test]
@@ -905,7 +1060,9 @@ mod tests {
         let domain = safe_domain(safe, Chain::Mainnet);
         let tx = empty_safe_tx();
         let hash = safe_tx_hash(&tx, &domain);
-        let (owner, bytes) = eth_sign_owner_sig(&ks, hash).await.unwrap();
+        let (owner, bytes) = sign_owner(&ks, &tx, &domain, hash, OwnerSigMode::EthSign)
+            .await
+            .unwrap();
         assert_eq!(bytes.len(), 65);
         assert!(matches!(bytes[64], 31 | 32));
         // Undo the +4 and recover over the EIP-191-prefixed digest.
@@ -916,6 +1073,79 @@ mod tests {
             sig.recover_address_from_msg(hash.as_slice()).unwrap(),
             owner
         );
+    }
+
+    /// When an owner's EIP-712 signature fails, which modes go on to an `eth_sign` prompt for
+    /// the same hash. `Auto` (every flow built before WalletConnect) always does. `Eip712` does
+    /// only when nothing was shown on a device; after a Ledger showed the EIP-712 prompt and
+    /// refused it — a decline looks exactly like Blind signing being off — it stops, and says so,
+    /// so a second, different prompt is the user's explicit choice. `EthSign` never asks for
+    /// EIP-712 at all.
+    #[tokio::test]
+    async fn owner_sig_falls_back_to_eth_sign_only_where_its_mode_allows() {
+        use alloy::signers::ledger::{LedgerError, coins_ledger};
+        use coins_ledger::common::APDUResponseCodes as Sw;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let key = PrivateKeySigner::random();
+        let hash = B256::repeat_byte(0x42);
+        let refused = || {
+            alloy::signers::Error::other(LedgerError::LedgerError(
+                Sw::ConditionsNotSatisfied.into(),
+            ))
+        };
+        let locked =
+            || alloy::signers::Error::other(LedgerError::LedgerError(Sw::UnlockDeviceError.into()));
+        let unsupported = || {
+            alloy::signers::Error::UnsupportedOperation(
+                alloy::signers::UnsupportedSignerOperation::SignHash,
+            )
+        };
+        let run = |mode: OwnerSigMode, err: fn() -> alloy::signers::Error| {
+            let key = key.clone();
+            async move {
+                let (typed_asks, eth_asks) = (AtomicUsize::new(0), AtomicUsize::new(0));
+                let got = owner_sig_bytes(
+                    mode,
+                    || async {
+                        typed_asks.fetch_add(1, Ordering::SeqCst);
+                        Err(err())
+                    },
+                    || async {
+                        eth_asks.fetch_add(1, Ordering::SeqCst);
+                        key.sign_message(hash.as_slice()).await
+                    },
+                )
+                .await;
+                (
+                    got,
+                    typed_asks.load(Ordering::SeqCst),
+                    eth_asks.load(Ordering::SeqCst),
+                )
+            }
+        };
+        // A refused prompt: Eip712 stops without a second prompt, and says why.
+        let (got, typed, eth) = run(OwnerSigMode::Eip712, refused).await;
+        let err = got.unwrap_err();
+        assert!(err.eip712_refused, "{err:?}");
+        assert!(err.text.contains("Blind signing"), "{}", err.text);
+        assert_eq!((typed, eth), (1, 0), "no eth_sign prompt after a refusal");
+        // A locked device: no fallback either, and nothing to offer.
+        let (got, _, eth) = run(OwnerSigMode::Eip712, locked).await;
+        assert!(!got.unwrap_err().eip712_refused);
+        assert_eq!(eth, 0);
+        // Nothing was shown (Trezor, view-only, an old Ledger app): eth_sign, v + 4.
+        let (got, _, eth) = run(OwnerSigMode::Eip712, unsupported).await;
+        let blob = got.expect("the silent fallback");
+        assert_eq!(eth, 1);
+        assert!(matches!(blob[64], 31 | 32));
+        // Auto keeps the flows that predate WalletConnect exactly as they were.
+        let (got, _, eth) = run(OwnerSigMode::Auto, refused).await;
+        assert!(got.is_ok());
+        assert_eq!(eth, 1);
+        // The user's explicit choice: straight to eth_sign.
+        let (got, typed, eth) = run(OwnerSigMode::EthSign, refused).await;
+        assert!(got.is_ok());
+        assert_eq!((typed, eth), (0, 1));
     }
 
     #[test]

@@ -886,7 +886,7 @@ impl NetworkSetupScreen {
         } else if pct >= 55 {
             t.a1
         } else if pct >= 30 {
-            Color::from_rgb(0.85, 0.65, 0.0)
+            crate::ui::kao_widgets::caution_color()
         } else {
             t.down
         }

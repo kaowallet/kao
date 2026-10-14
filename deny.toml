@@ -112,7 +112,12 @@ allow = [
     # permissive license, MIT-equivalent grant with a notice obligation.
     "BlueOak-1.0.0",
 ]
-exceptions = []
+exceptions = [
+    # WalletConnect v2 wallet side. GPLv3 §13 / AGPLv3 §13 permit combining it
+    # with Kao's AGPL-3.0-or-later; scoped to this one crate so no other
+    # GPL-3.0-only dependency can enter silently.
+    { allow = ["GPL-3.0-only"], crate = "wallet-connect" },
+]
 
 # helios-* subcrates omit a `license` field in their per-crate Cargo.toml,
 # but the workspace LICENSE at the repo root is MIT. Clarify each subcrate
@@ -207,6 +212,7 @@ allow-git = [
     "https://github.com/bbqsrc/core2",
     "https://github.com/kaowallet/clear-signing",
     "https://github.com/kaowallet/privacy-pools",
+    "https://github.com/kaowallet/wallet-connect",
 ]
 
 [sources.allow-org]

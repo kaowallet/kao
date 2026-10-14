@@ -28,6 +28,12 @@ pub const EIP712_DIGEST_LABEL: &str = "EIP-712 Digest";
 pub const DOMAIN_HASH_LABEL: &str = "Domain Hash";
 pub const MESSAGE_HASH_LABEL: &str = "Message Hash";
 
+/// Label for an EIP-191 `personal_sign` digest (`keccak256("\x19Ethereum Signed
+/// Message:\n" ‖ len ‖ message)`). Explicitly **not** an ERC-8213 label —
+/// ERC-8213 prescribes no EIP-191 digest — so it is kept apart from the four
+/// above; the review shows it alongside them for WalletConnect messages.
+pub const EIP191_DIGEST_LABEL: &str = "Message Digest (EIP-191)";
+
 /// ERC-8213 **Calldata Digest**: `keccak256( uint256(len(calldata)) ‖ calldata )`.
 ///
 /// The 32-byte big-endian length prefix is part of the pre-image; `chainId` is

@@ -23,7 +23,8 @@
 //!   through `function_panel`; it gets a purpose-built panel spelling out every
 //!   signed field (sell/buy/receiver/min-received/expiry/kind/fee/settlement).
 
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use alloy::primitives::{Address, B256, Bytes, U256};
 use iced::keyboard;
@@ -43,14 +44,39 @@ use crate::sign::typed::{IntoTypedModel, TypedDataModel, TypedRow, TypedValue};
 use crate::ui::kao_theme::KaoTheme;
 use crate::ui::kao_widgets::{
     bold, bullet_wave, colored_address, colored_hash_copyable, kao_scrollable_style, modal_wrapper,
-    mono, mono_bold, primary_button, secondary_button,
+    mono, mono_bold, mono_box, primary_button, secondary_button,
 };
 use crate::wallet::tx::{SendPlan, TxQuote};
+use crate::walletconnect::{
+    CheckedTyped, DappLabel, GasNote, IgnoredTxFields, MessageShape, SiweCheck, UnconfirmedTx,
+    WcIdentity, WcKey,
+};
 
 use super::CowHost;
 
+/// WalletConnect review panels and their ERC-8213 rows. A child module so it
+/// can use this module's private helpers (`kv`, `addr_kv`, `hash_row`,
+/// `card`, `leg_card`, …) without widening them; its typed-data panel is its
+/// own (`typed_panel_wc`).
+mod wc;
+
 const MODAL_WIDTH: f32 = 520.0;
 const FORM_MAX_HEIGHT: f32 = 520.0;
+
+/// Bytes per line of the hex dump raw signed bytes render as.
+const HEX_DUMP_BYTES_PER_LINE: usize = 16;
+
+/// ERC-8213 label for the call a Safe transaction makes — the `SafeTx`'s own `data` — beside the
+/// `execTransaction` calldata digest of the transaction that carries it.
+const INNER_CALLDATA_DIGEST_LABEL: &str = "Calldata Digest (inner call)";
+
+/// A revert reason is whatever string the reverting contract chose — bounded for display.
+const MAX_REVERT_REASON_CHARS: usize = 200;
+
+/// Confirm is inert this long after a WalletConnect review becomes confirmable
+/// (anti-clickjack): a dapp can make a review pop up under the user's cursor, so
+/// a click already on its way must not land on Confirm.
+pub const ARMING_DELAY: Duration = Duration::from_millis(1000);
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -315,6 +341,14 @@ pub struct SafeExecReview {
     /// — which makes it both a disclosure and the reason the execute button
     /// disappears while the queue is occupied.
     pub onchain_nonce: u64,
+    /// The review-time dry run of the call(s) the Safe would make, when the prepare ran one — a
+    /// WalletConnect dapp transaction, which no composer simulated first. `None` where the flow
+    /// simulates elsewhere (the Transaction Builder's own preflight) or not at all.
+    pub preflight: Option<crate::txbuilder::sim::BatchSimResult>,
+    /// The account that sends `execTransaction` and pays its gas if this is executed now — the
+    /// sender the chain shows, and for a dapp's transaction the account whose transaction hash
+    /// the dapp receives. Set once the review knows execution is on offer; `None` while it isn't.
+    pub executor: Option<SigningOwner>,
 }
 
 impl SafeExecReview {
@@ -342,6 +376,105 @@ pub struct SafeMessageReview {
     /// (domain = `safe_domain(safe, chain)`, message = the `SafeMessage` wrapping
     /// `order_digest`). `eip712.digest` equals `message_hash`.
     pub eip712: Eip712Digests,
+}
+
+/// Leads every WalletConnect review: who is asking (the dapp's host, never its
+/// self-declared name), through which session, as which identity, on which
+/// network. Informational — signs nothing, so it has no ERC-8213 rows.
+#[derive(Debug, Clone)]
+pub struct WcOriginCard {
+    pub dapp: DappLabel,
+    pub session_ordinal: u32,
+    pub identity: WcIdentity,
+    pub identity_label: String,
+    /// "Local" | "Ledger" | "Trezor" | "Safe"
+    pub identity_badge: &'static str,
+    pub method: &'static str,
+    pub net: crate::chain::NetworkId,
+    pub unverified_network: bool,
+    pub received_at: u64,
+    /// The dapp's own expiry, uncapped.
+    pub dapp_deadline: Option<u64>,
+    /// Kao's own limit on an unsigned review: past it the request is answered "expired" and the
+    /// review closes, however long the dapp would wait. It never applies once signing.
+    pub kao_deadline: u64,
+    pub waiting_behind: usize,
+}
+
+/// A dapp `personal_sign` (EIP-191) from an EOA: the exact bytes, how they
+/// display, and the digest the key signs.
+#[derive(Debug, Clone)]
+pub struct MessageReview {
+    pub from: Address,
+    pub net: crate::chain::NetworkId,
+    /// Exact signed bytes.
+    pub raw: Bytes,
+    pub shape: MessageShape,
+    pub eip191_hash: B256,
+    pub siwe: Option<SiweCheck>,
+    pub hardware: bool,
+}
+
+/// Dapp EIP-712 typed data: the checked parse (domain, flat rows, kind, the
+/// ERC-8213 triple) of the one object that is hashed and signed.
+#[derive(Debug, Clone)]
+pub struct TypedDataReview {
+    pub from: Address,
+    pub net: crate::chain::NetworkId,
+    pub checked: CheckedTyped,
+    /// Ledger EOA: the device shows only Domain Hash / Message Hash.
+    pub hash_mode_device: bool,
+    /// Kao's name for a SafeTx/SafeMessage `verifyingContract`, if it's one of the user's Safes.
+    pub safe_label: Option<String>,
+    /// A `SafeTx`'s call — the `to` / `value` / `data` this owner confirmation would have the Safe
+    /// make — decoded the way a Safe transaction's inner call is (self-call and owner-action
+    /// banners included). Attached once the prepare lands (`wc_on_prepared`), checked against the
+    /// typed data's own fields; `None` for every other kind.
+    pub inner_leg: Option<Box<ReviewLeg>>,
+}
+
+/// What a Safe is asked to sign as an EIP-1271 message.
+#[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)] // one per open review; not stored in bulk
+pub enum WcSafeMessageInner {
+    Personal(MessageReview),
+    Typed(TypedDataReview),
+}
+
+/// A dapp message signed by a Safe (EIP-1271): the inner message, the
+/// `SafeMessage` hash each local owner signs, and exactly which owners sign.
+#[derive(Debug, Clone)]
+pub struct WcSafeMessageReview {
+    pub inner: WcSafeMessageInner,
+    pub safe: Address,
+    pub chain: Chain,
+    pub threshold: u8,
+    pub owner_count: u8,
+    /// Exactly the local owners that will sign.
+    pub signers: Vec<SigningOwner>,
+    /// eip191(msg) or the dapp's EIP-712 digest.
+    pub data_hash: B256,
+    /// `cow::safe_sig::safe_message_hash(data_hash, safe, chain)` — what owners sign.
+    pub message_hash: B256,
+    /// `cow::safe_sig::safe_message_digests(data_hash, safe, chain)`.
+    pub eip712: Eip712Digests,
+}
+
+/// The fee side of a dapp `eth_sendTransaction` from an EOA: the pinned quote and
+/// how its gas limit was chosen. What the dapp asked for that Kao ignored is the review's note.
+#[derive(Debug, Clone)]
+pub struct WcTxFeesReview {
+    /// Pinned by `wc_on_prepared` into `WcSignPlan::EoaTx.quote` (reviewed == signed).
+    pub quote: crate::wallet::tx::TxQuote,
+    pub gas_note: GasNote,
+    /// value + gas_limit × max_fee_per_gas.
+    pub max_total_wei: U256,
+    pub balance_wei: Option<U256>,
+    pub unverified_network: bool,
+    pub sim_reverted: bool,
+    /// Kao's node couldn't estimate the call — why, sanitized for display — so the quote took the
+    /// dapp's own gas limit. The node expects this transaction to fail.
+    pub estimate_failed: Option<String>,
 }
 
 /// One reviewable step in a signature. A review is an ordered list of these: an
@@ -376,6 +509,16 @@ pub enum SignStep {
     /// snapshotted for the overlay. The `SignAction::SafeSend` alongside it drives
     /// the execute/propose ceremony against the pinned hash.
     SafeSend(super::send::SafeSendReview),
+    /// WalletConnect: who is asking. Leads every WC review; signs nothing.
+    WcOrigin(WcOriginCard),
+    /// WalletConnect `personal_sign` from an EOA.
+    WcMessage(MessageReview),
+    /// WalletConnect EIP-712 typed data from an EOA.
+    WcTyped(TypedDataReview),
+    /// WalletConnect message (personal or typed) signed by a Safe via EIP-1271.
+    WcSafeMessage(WcSafeMessageReview),
+    /// WalletConnect `eth_sendTransaction` fees (the call itself is a `RawTx`).
+    WcTxFees(WcTxFeesReview),
 }
 
 /// Pins the reviewed Safe artifacts so `cow_place_order_safe` signs exactly what
@@ -393,6 +536,56 @@ pub struct CowSafePin {
     pub exec_hash: Option<B256>,
     /// `safe_message_hash` shown for the EIP-1271 order, if any (ERC-20 path).
     pub msg_hash: Option<B256>,
+}
+
+/// What a WalletConnect review signs, pinned so the sign task re-derives and
+/// compares it (reviewed == signed). Message pins are fixed at open; the EOA
+/// quote and the Safe `(nonce, safeTxHash)` are pinned once prepare lands.
+#[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
+pub enum WcSignPlan {
+    Personal {
+        from: Address,
+        message: Bytes,
+        pin: B256,
+    },
+    Typed {
+        from: Address,
+        typed: Arc<alloy::dyn_abi::TypedData>,
+        pin: Eip712Digests,
+    },
+    EoaTx {
+        plan: crate::wallet::tx::SendPlan,
+        dapp_gas: Option<u64>,
+        ignored: IgnoredTxFields,
+        /// None until prepared.
+        quote: Option<crate::wallet::tx::TxQuote>,
+        quoted_at: Option<Instant>,
+        /// The transaction already signed for this request, which left the wallet without an
+        /// acknowledgement (the runtime's record, copied when the review latches onto it). Once
+        /// set, Confirm only ever sends these exact bytes again: nothing is quoted or signed anew.
+        unconfirmed: Option<UnconfirmedTx>,
+    },
+    SafeTx {
+        req: super::tx_builder::SafeBatchRequest,
+        can_execute: bool,
+        /// The executor's transaction already signed to execute this request, which left the
+        /// wallet without an acknowledgement (the runtime's record, copied when the review latches
+        /// onto it). Once set, Confirm only ever sends these exact bytes again: no owner signs
+        /// anything anew, and nothing is proposed.
+        unconfirmed: Option<UnconfirmedTx>,
+    },
+    SafeMessage {
+        safe: Address,
+        chain: Chain,
+        threshold: u32,
+        signable_indices: Vec<u32>,
+        /// The owners the review listed as signing, in order. The ceremony signs with exactly
+        /// these or refuses.
+        owners: Vec<Address>,
+        data_hash: B256,
+        pin: B256,
+    },
 }
 
 /// What the coordinator runs when the user confirms. Holds the fully-prepared
@@ -447,6 +640,12 @@ pub enum SignAction {
         /// whether the confirm button reads as a routine confirmation or as a
         /// deliberate override of a batch that is expected to revert.
         preflight: super::tx_builder::Preflight,
+    },
+    /// A WalletConnect dapp request, keyed `(topic, id)`; answered to the dapp
+    /// exactly once by the coordinator, whatever the outcome.
+    WalletConnect {
+        key: WcKey,
+        plan: WcSignPlan,
     },
 }
 
@@ -520,12 +719,12 @@ pub struct SigningOwner {
 #[derive(Debug, Clone)]
 pub enum SigningKind {
     /// A Safe `execTransaction`: each `owners` entry signs the SafeTx on its own
-    /// device in turn, then the transaction is broadcast — by a separate linked
-    /// gas payer when `separate_gas_payer`, otherwise by re-using the first owner
-    /// (one extra prompt on that device).
+    /// device in turn, then the transaction is broadcast — by `gas_payer`, a
+    /// Local account that pays the gas, or without one by re-using the first
+    /// owner (one extra prompt on that device).
     SafeExecute {
         owners: Vec<SigningOwner>,
-        separate_gas_payer: bool,
+        gas_payer: Option<SigningOwner>,
     },
     /// A Safe proposal: sign once as `owner` and POST to the Transaction Service
     /// for co-signers to finish from their own wallets.
@@ -547,6 +746,13 @@ pub enum SigningKind {
     /// hash is not an outcome — a reverted transaction is broadcast exactly as
     /// successfully as one that succeeds.
     Broadcasting { hash: B256 },
+    /// WalletConnect message signature(s): "Confirm the message on <device>"
+    /// per owner; nothing extra for Local. `hash_mode`: a Ledger shows only the
+    /// typed data's Domain Hash / Message Hash.
+    WcMessage {
+        owners: Vec<SigningOwner>,
+        hash_mode: bool,
+    },
 }
 
 /// Which way a netted balance change runs, relative to the signing account.
@@ -689,6 +895,9 @@ pub struct SignReview {
     /// (the Safe send's "Propose to co-signers", alongside "Sign & execute").
     /// Emits [`Message::Secondary`]. Gated on `!legs_loading` like Confirm.
     pub secondary_label: Option<String>,
+    /// The Secondary action stays live while `confirm_disabled` blocks Confirm. Set only for an
+    /// action that signs nothing (WalletConnect's "Re-check", which re-runs a failed prepare).
+    pub secondary_unblocked: bool,
     /// Expand state for the Send step's "for the paranoid" decoded-calldata block.
     pub show_calldata: bool,
     /// Expand state for the "ERC-8213 fingerprints" section on every reviewed
@@ -714,6 +923,37 @@ pub struct SignReview {
     /// the mempool. Signing again is not a retry; it needs a fresh review
     /// against a fresh nonce, which is what closing this overlay gets you.
     pub broadcast: Option<B256>,
+    /// `Some(t)` ⇒ Confirm / Secondary are inert until `t + ARMING_DELAY`. Set
+    /// only by WalletConnect, when a review becomes confirmable (a review a dapp
+    /// opened can appear under a click already on its way). `pending()` sets
+    /// `None`, so every other flow is unaffected.
+    pub armed_at: Option<Instant>,
+    /// Set by WalletConnect after an owner's device refused the EIP-712 prompt
+    /// for a Safe hash: Confirm then signs that hash as a personal message
+    /// (`eth_sign`) instead, and the review shows what the device will. `None`
+    /// everywhere else.
+    pub owner_eth_sign: Option<OwnerEthSign>,
+}
+
+/// The `eth_sign` fallback a WalletConnect Safe review offers once an owner's
+/// device refused the EIP-712 prompt: each owner signs the same 32-byte Safe
+/// hash as an EIP-191 personal message (Safe accepts it, `v + 4`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnerEthSign {
+    /// The Safe hash signed — the `SafeMessage` hash or the safeTxHash.
+    pub hash: B256,
+    /// Its EIP-191 personal-message digest, which a Ledger shows as the
+    /// message hash: `keccak256("\x19Ethereum Signed Message:\n32" ‖ hash)`.
+    pub eip191: B256,
+}
+
+impl OwnerEthSign {
+    pub fn of(hash: B256) -> Self {
+        Self {
+            hash,
+            eip191: alloy::primitives::eip191_hash_message(hash),
+        }
+    }
 }
 
 impl SignReview {
@@ -754,11 +994,14 @@ impl SignReview {
             confirm_label: None,
             confirm_disabled: false,
             secondary_label: None,
+            secondary_unblocked: false,
             economics: None,
             broadcast: None,
             show_calldata: false,
             show_fingerprints: false,
             signing_progress: None,
+            armed_at: None,
+            owner_eth_sign: None,
         };
         // Coordinator-driven open: every caller assigns this straight into the
         // overlay slot (guarded by an is-already-open early return), so the
@@ -766,6 +1009,72 @@ impl SignReview {
         crate::trace::state("sign_review", "phase", "closed", review.phase());
         review
     }
+
+    /// Whether Confirm / Secondary may act at `now`: always, unless the review
+    /// is armed and [`ARMING_DELAY`] hasn't elapsed since.
+    pub fn confirm_ready(&self, now: Instant) -> bool {
+        self.armed_at
+            .is_none_or(|t| now.saturating_duration_since(t) >= ARMING_DELAY)
+    }
+
+    /// Inside the arming window — the overlay keeps its animation tick running
+    /// so Confirm visibly comes alive when it ends.
+    pub fn arming(&self, now: Instant) -> bool {
+        self.armed_at
+            .is_some_and(|t| now.saturating_duration_since(t) < ARMING_DELAY)
+    }
+
+    /// A WalletConnect review: the dapp is answered by the coordinator, and the
+    /// backdrop never rejects it.
+    pub fn is_walletconnect(&self) -> bool {
+        matches!(self.action, SignAction::WalletConnect { .. })
+    }
+
+    /// A signing attempt ended without a result and the review stays up: leave
+    /// the signing state and say why. `rearm` when Confirm comes back live, so a
+    /// click already on its way can't land on it.
+    pub fn back_to_review(&mut self, error: String, rearm: bool) {
+        self.signing_since = None;
+        self.signing_progress = None;
+        self.error = Some(error);
+        if rearm {
+            self.armed_at = Some(Instant::now());
+        }
+    }
+}
+
+/// What a click on the dimmed backdrop does. Before confirm it cancels — except
+/// for a WalletConnect review, where a stray click must never refuse a dapp
+/// (Cancel / Esc / Reject are the deliberate ways out). While a signature is in
+/// flight nothing can be dismissed (a hardware signature can't be aborted from
+/// here).
+pub(super) fn backdrop_message(review: &SignReview) -> Message {
+    if review.signing_since.is_some() || review.is_walletconnect() {
+        Message::BoxClickIgnored
+    } else {
+        Message::Cancel
+    }
+}
+
+/// Whether Confirm (and the Secondary action) are live at `now`. Disabled while
+/// the legs are still decoding (the user can't approve bytes they haven't been
+/// shown), while a step-level guard blocks it (a Send with too little ETH for
+/// gas), once this review has broadcast, and inside a WalletConnect review's
+/// arming window.
+fn confirm_enabled(review: &SignReview, now: Instant) -> bool {
+    !review.legs_loading
+        && !review.confirm_disabled
+        && review.broadcast.is_none()
+        && review.confirm_ready(now)
+}
+
+/// Whether the Secondary action is live at `now`: as Confirm, except that one marked
+/// `secondary_unblocked` (it signs nothing) stays live while `confirm_disabled` blocks Confirm.
+fn secondary_enabled(review: &SignReview, now: Instant) -> bool {
+    !review.legs_loading
+        && (!review.confirm_disabled || review.secondary_unblocked)
+        && review.broadcast.is_none()
+        && review.confirm_ready(now)
 }
 
 /// Render the overlay. `progress` drives the shared modal open/close ease.
@@ -792,7 +1101,13 @@ pub fn view<'a>(t: KaoTheme, review: &'a SignReview, progress: f32) -> Element<'
     // between raw-tx legs.
     for (i, step) in review.steps.iter().enumerate() {
         if i > 0 {
-            let gap = if matches!(review.steps[i - 1], SignStep::Typed(_)) {
+            let gap = if matches!(
+                review.steps[i - 1],
+                SignStep::Typed(_)
+                    | SignStep::WcTyped(_)
+                    | SignStep::WcMessage(_)
+                    | SignStep::WcSafeMessage(_)
+            ) {
                 12
             } else {
                 10
@@ -804,6 +1119,7 @@ pub fn view<'a>(t: KaoTheme, review: &'a SignReview, progress: f32) -> Element<'
             step,
             review.show_calldata,
             review.show_fingerprints,
+            review.signing_since.is_some(),
         ));
     }
 
@@ -838,6 +1154,18 @@ pub fn view<'a>(t: KaoTheme, review: &'a SignReview, progress: f32) -> Element<'
     if let Some(note) = &review.note {
         body = body.push(Space::new().height(12));
         body = body.push(text(note).size(11).color(t.sub).font(mono()));
+    }
+
+    // Kept up while signing: each owner's device shows this digest as it prompts, and that is when
+    // it has to be checked.
+    if let Some(fallback) = &review.owner_eth_sign {
+        body = body.push(Space::new().height(12));
+        body = body.push(owner_eth_sign_card(
+            t,
+            fallback,
+            review.signing_since.is_some(),
+            review.signing_progress.as_ref(),
+        ));
     }
 
     // A broadcast error surfaced back onto the still-open review (Send retry path).
@@ -879,7 +1207,7 @@ pub fn view<'a>(t: KaoTheme, review: &'a SignReview, progress: f32) -> Element<'
         } else {
             review.confirm_label.as_deref().unwrap_or("Confirm & sign")
         };
-        let enabled = !review.legs_loading && !review.confirm_disabled && !broadcast;
+        let enabled = confirm_enabled(review, Instant::now());
         let confirm = primary_button(t, label, enabled);
         let confirm = if enabled {
             confirm.on_press(Message::Confirm)
@@ -898,8 +1226,10 @@ pub fn view<'a>(t: KaoTheme, review: &'a SignReview, progress: f32) -> Element<'
         .width(Length::Fill);
         body = body.push(actions);
         // Optional second primary action (Safe send: "Propose to co-signers"),
-        // full-width below the Cancel/Confirm row, gated the same as Confirm.
+        // full-width below the Cancel/Confirm row, gated the same as Confirm —
+        // except one that signs nothing (`secondary_unblocked`).
         if let Some(sec) = &review.secondary_label {
+            let enabled = secondary_enabled(review, Instant::now());
             let sec_btn = primary_button(t, sec, enabled);
             let sec_btn = if enabled {
                 sec_btn.on_press(Message::Secondary)
@@ -925,12 +1255,9 @@ pub fn view<'a>(t: KaoTheme, review: &'a SignReview, progress: f32) -> Element<'
 
     // While the signing task is in flight the review can't be dismissed (a
     // hardware signature can't be aborted from here), so a backdrop click is a
-    // no-op; before confirm it cancels as usual.
-    let on_backdrop = if review.signing_since.is_some() {
-        Message::BoxClickIgnored
-    } else {
-        Message::Cancel
-    };
+    // no-op; before confirm it cancels as usual — never for a WalletConnect
+    // review (see `backdrop_message`).
+    let on_backdrop = backdrop_message(review);
     modal_wrapper(
         t,
         MODAL_WIDTH,
@@ -939,6 +1266,58 @@ pub fn view<'a>(t: KaoTheme, review: &'a SignReview, progress: f32) -> Element<'
         Message::BoxClickIgnored,
         bounded.into(),
     )
+}
+
+/// What Confirm signs once an owner's device refused the EIP-712 prompt: the
+/// same Safe hash as a personal message, and the digest the device will show
+/// for it — so the second, different prompt can be checked like the first.
+/// `signing`: the devices are prompting now, so the instruction is for a prompt
+/// already on screen.
+fn owner_eth_sign_card<'a>(
+    t: KaoTheme,
+    fallback: &OwnerEthSign,
+    signing: bool,
+    progress: Option<&SigningKind>,
+) -> Element<'a, Message> {
+    // With no Local gas payer the first owner also signs the executor's transaction: on a
+    // hardware device that is one more prompt, a transaction rather than the message.
+    let executor_prompts = matches!(
+        progress,
+        Some(SigningKind::SafeExecute { owners, gas_payer: None })
+            if owners.first().is_some_and(|o| o.hardware)
+    );
+    let instruction = if signing && executor_prompts {
+        "Signing the Safe hash as a personal message (eth_sign). Each owner's device shows that \
+         message or its message hash — approve those only if they match one below. Then owner \
+         1's device shows the transaction to the Safe that executes it and pays the gas — check \
+         it against the review above."
+    } else if signing {
+        "Signing the Safe hash as a personal message (eth_sign). Your device is asking now, \
+         showing that message or its message hash — approve only if it shows one of these."
+    } else {
+        "An owner's hardware wallet refused the EIP-712 prompt — it was declined, or Blind \
+         signing is off in its Ethereum app. Confirm now signs the same Safe hash as a \
+         personal message (eth_sign), which the Safe accepts too. The device will ask again, \
+         showing that message or its message hash: approve only if it matches one below."
+    };
+    let col = column![
+        text("⚠ SIGN AS A PERSONAL MESSAGE INSTEAD")
+            .size(12)
+            .color(t.down)
+            .font(bold()),
+        Space::new().height(3),
+        text(instruction).size(11).color(t.text),
+        Space::new().height(8),
+        hash_row(t, "Safe hash signed as a message", fallback.hash),
+        hash_row(
+            t,
+            "Message hash the device shows (EIP-191)",
+            fallback.eip191
+        ),
+    ]
+    .spacing(0)
+    .width(Length::Fill);
+    card(t, col.into())
 }
 
 /// The post-confirm "waiting for a signature" panel: a font-safe bouncing-bullet
@@ -957,7 +1336,8 @@ fn waiting_card<'a>(
 ) -> Element<'a, Message> {
     let plural = matches!(
         progress,
-        Some(SigningKind::SafeExecute { owners, .. }) if owners.len() > 1
+        Some(SigningKind::SafeExecute { owners, .. } | SigningKind::WcMessage { owners, .. })
+            if owners.len() > 1
     );
     let title = if plural {
         "Waiting for signatures"
@@ -977,10 +1357,7 @@ fn waiting_card<'a>(
     .width(Length::Fill);
 
     match progress {
-        Some(SigningKind::SafeExecute {
-            owners,
-            separate_gas_payer,
-        }) => {
+        Some(SigningKind::SafeExecute { owners, gas_payer }) => {
             col = col.push(Space::new().height(4));
             col = col.push(
                 text("Approve the Safe transaction on each owner in turn:")
@@ -991,10 +1368,13 @@ fn waiting_card<'a>(
             col = col.push(Space::new().height(8));
             col = col.push(ceremony_owner_list(t, owners));
             col = col.push(Space::new().height(6));
-            let broadcast = if *separate_gas_payer {
-                "Then a linked account broadcasts it and pays the gas."
-            } else {
-                "Then owner 1 re-signs to broadcast it and pay the gas."
+            let broadcast = match gas_payer {
+                Some(p) => format!(
+                    "Then {} ({}) broadcasts it and pays the gas.",
+                    p.label,
+                    crate::wallet::short_address(p.address)
+                ),
+                None => "Then owner 1 re-signs to broadcast it and pay the gas.".to_string(),
             };
             col = col.push(text(broadcast).size(11).color(t.sub).font(mono()));
         }
@@ -1062,6 +1442,9 @@ fn waiting_card<'a>(
                 .font(mono()),
             );
         }
+        Some(SigningKind::WcMessage { owners, hash_mode }) => {
+            col = col.push(wc::waiting_body(t, owners, *hash_mode));
+        }
         None => {
             col = col.push(Space::new().height(4));
             col = col.push(
@@ -1109,11 +1492,14 @@ fn ceremony_owner_list<'a>(t: KaoTheme, owners: &'a [SigningOwner]) -> Element<'
 
 /// Render one reviewed step: its type-specific panel, then the collapsible
 /// ERC-8213 fingerprints section (the signature/calldata digests for this step).
+/// `signing`: the signature is in flight (a WalletConnect origin card's deadline
+/// depends on it).
 fn step_card<'a>(
     t: KaoTheme,
     step: &'a SignStep,
     show_calldata: bool,
     show_fingerprints: bool,
+    signing: bool,
 ) -> Element<'a, Message> {
     let panel = match step {
         SignStep::RawTx(leg) => leg_card(t, leg, show_calldata),
@@ -1125,6 +1511,11 @@ fn step_card<'a>(
             super::send::render_send_review(t, r, show_calldata, Message::ToggleCalldata)
         }
         SignStep::SafeSend(r) => super::send::render_safe_send_review::<Message>(t, r),
+        SignStep::WcOrigin(_)
+        | SignStep::WcMessage(_)
+        | SignStep::WcTyped(_)
+        | SignStep::WcSafeMessage(_)
+        | SignStep::WcTxFees(_) => wc::step_card(t, step, show_calldata, signing),
     };
     let rows = erc8213_rows(step);
     if rows.is_empty() {
@@ -1174,7 +1565,7 @@ pub(crate) fn erc8213_rows(step: &SignStep) -> Vec<(String, B256)> {
         SignStep::Typed(order) => push_eip712(&mut rows, &order.eip712),
         SignStep::SafeExec(x) => {
             push_eip712(&mut rows, &x.eip712);
-            push_calldata(&mut rows, "Calldata Digest (inner call)", &x.inner.calldata);
+            push_calldata(&mut rows, INNER_CALLDATA_DIGEST_LABEL, &x.inner.calldata);
         }
         SignStep::SafeMessage(m) => {
             push_eip712(&mut rows, &m.eip712);
@@ -1188,9 +1579,14 @@ pub(crate) fn erc8213_rows(step: &SignStep) -> Vec<(String, B256)> {
         SignStep::SafeSend(r) => {
             push_eip712(&mut rows, &r.eip712);
             if let Some(cd) = r.inner_calldata_digest {
-                rows.push(("Calldata Digest (inner call)".to_string(), cd));
+                rows.push((INNER_CALLDATA_DIGEST_LABEL.to_string(), cd));
             }
         }
+        SignStep::WcOrigin(_)
+        | SignStep::WcMessage(_)
+        | SignStep::WcTyped(_)
+        | SignStep::WcSafeMessage(_)
+        | SignStep::WcTxFees(_) => rows = wc::erc8213_rows(step),
     }
     rows
 }
@@ -1313,6 +1709,13 @@ fn safe_exec_panel<'a>(
     if let Some(g) = x.guard {
         col = col.push(addr_kv(t, "Transaction guard", g));
     }
+    if let Some(e) = &x.executor {
+        col = col.push(addr_kv(
+            t,
+            format!("If executed now, sent and paid for by {}", e.label),
+            e.address,
+        ));
+    }
     col = col.push(Space::new().height(8));
     if x.operation != 0 {
         col = col.push(operation_banner(t, x.operation, x.inner.to));
@@ -1328,6 +1731,10 @@ fn safe_exec_panel<'a>(
             .size(11)
             .color(t.sub),
         );
+        col = col.push(Space::new().height(8));
+    }
+    if let Some(reason) = x.preflight.as_ref().and_then(preflight_failure) {
+        col = col.push(preflight_banner(t, reason));
         col = col.push(Space::new().height(8));
     }
     if x.queued_ahead() > 0 {
@@ -1362,6 +1769,59 @@ fn safe_exec_panel<'a>(
     card(t, col.into())
 }
 
+/// Why a review-time dry run says the call fails: the revert (or halt) reason, `None` when it
+/// succeeded or couldn't run — a simulator gap is not a verdict.
+fn preflight_failure(sim: &crate::txbuilder::sim::BatchSimResult) -> Option<&str> {
+    use crate::txbuilder::sim::BatchOutcome;
+    match &sim.outcome {
+        BatchOutcome::Revert { reason, .. } | BatchOutcome::Halt { reason, .. } => Some(reason),
+        BatchOutcome::Success | BatchOutcome::Error(_) | BatchOutcome::Unavailable => None,
+    }
+}
+
+/// A simulated revert reason for display. The reverting contract wrote it, so hidden characters
+/// are shown as escapes and its length is clamped.
+pub(super) fn display_revert_reason(reason: &str) -> String {
+    use crate::sanitize::{escape_unsafe_display, sanitize_display};
+    sanitize_display(&escape_unsafe_display(reason), MAX_REVERT_REASON_CHARS).into_owned()
+}
+
+/// A Safe call Kao's dry run saw fail, said where the user decides — before anyone signs, not at
+/// execute time after every owner has.
+fn preflight_banner<'a>(t: KaoTheme, reason: &str) -> Element<'a, Message> {
+    let reason = display_revert_reason(reason);
+    let col = column![
+        text("⚠ SIMULATION REVERTED")
+            .size(12)
+            .color(t.down)
+            .font(bold()),
+        Space::new().height(3),
+        text(format!(
+            "Kao ran this call as the Safe against the chain as it stands, and it reverted: \
+             {reason}. Executed now it would fail; proposed, it asks your co-signers to sign a \
+             call that fails."
+        ))
+        .size(11)
+        .color(t.text)
+        .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
+    ]
+    .spacing(0)
+    .width(Length::Fill);
+    container(col)
+        .padding(10)
+        .width(Length::Fill)
+        .style(move |_: &iced::Theme| container::Style {
+            background: Some(t.card_alt.into()),
+            border: iced::Border {
+                color: t.down,
+                width: 1.0,
+                radius: 8.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
 /// The red banner for a non-CALL `SafeTx.operation`. Deliberately makes the
 /// same claim `safe_tx_detail::operation_warning` makes to a co-signer
 /// reviewing an incoming proposal — arbitrary code running as the Safe, able to
@@ -1375,23 +1835,17 @@ fn safe_exec_panel<'a>(
 /// whose code runs — the canonical `MultiSendCallOnly` libraries are labelled
 /// so the expected case is legible as the expected case.
 fn operation_banner<'a>(t: KaoTheme, operation: u8, to: Address) -> Element<'a, Message> {
-    use crate::txbuilder::multisend::{MULTISEND_CALL_ONLY_1_3_0, MULTISEND_CALL_ONLY_1_4_1};
+    use crate::txbuilder::multisend::canonical_multisend_call_only;
     let (title, msg) = if operation == 1 {
-        let target = match to {
-            MULTISEND_CALL_ONLY_1_3_0 => {
-                "The target is the canonical Safe MultiSendCallOnly 1.3.0 library, which can \
+        let target = match canonical_multisend_call_only(to) {
+            Some(version) => format!(
+                "The target is the canonical Safe MultiSendCallOnly {version} library, which can \
                  only make plain calls — this is the expected shape for a batch."
-                    .to_string()
-            }
-            MULTISEND_CALL_ONLY_1_4_1 => {
-                "The target is the canonical Safe MultiSendCallOnly 1.4.1 library, which can \
-                 only make plain calls — this is the expected shape for a batch."
-                    .to_string()
-            }
-            other => format!(
+            ),
+            None => format!(
                 "The target {} is NOT a canonical Safe MultiSend library. Do not sign unless \
                  you know exactly what code lives there.",
-                crate::wallet::short_address(other)
+                crate::wallet::short_address(to)
             ),
         };
         (
@@ -1625,6 +2079,108 @@ fn hash_row<'a>(t: KaoTheme, label: impl Into<String>, hash: B256) -> Element<'a
     .into()
 }
 
+/// Exact signed bytes as an offset-led hex dump, 16 bytes per line in 4-byte groups, so a long
+/// payload stays scannable and a byte can be found by position.
+fn hex_dump(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 3 + 8);
+    for (i, chunk) in bytes.chunks(HEX_DUMP_BYTES_PER_LINE).enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let _ = write!(out, "{:05x} ", i * HEX_DUMP_BYTES_PER_LINE);
+        for group in chunk.chunks(4) {
+            out.push(' ');
+            out.push_str(&alloy::hex::encode(group));
+        }
+    }
+    out
+}
+
+/// `bytes` as a [`hex_dump`] in a [`mono_box`].
+fn hex_box<'a>(t: KaoTheme, bytes: &[u8]) -> Element<'a, Message> {
+    mono_box(
+        t,
+        text(hex_dump(bytes))
+            .size(11)
+            .color(t.text)
+            .font(mono())
+            .into(),
+    )
+}
+
+/// A show / hide control for raw bytes. Emits the overlay's shared [`Message::ToggleCalldata`] —
+/// the same one-flag disclosure every raw-bytes block and "Show details" fold on the overlay uses.
+fn bytes_toggle<'a>(
+    t: KaoTheme,
+    shown: bool,
+    show: &'static str,
+    hide: &'static str,
+) -> Element<'a, Message> {
+    button(
+        row![
+            text(if shown { "▾" } else { "▸" })
+                .size(11)
+                .color(t.sub)
+                .font(mono()),
+            Space::new().width(6),
+            text(if shown { hide } else { show })
+                .size(11)
+                .color(t.sub)
+                .font(bold()),
+        ]
+        .align_y(Alignment::Center),
+    )
+    .padding(Padding::from([4, 0]))
+    .on_press(Message::ToggleCalldata)
+    .style(move |_theme, _status| button::Style {
+        background: None,
+        text_color: t.sub,
+        ..button::Style::default()
+    })
+    .into()
+}
+
+/// A call no decoder could read — on a custom network there is no verified chain to resolve a
+/// descriptor or an ABI against — still shows what it signs: its selector always, and every byte
+/// of it behind the shared toggle. A fingerprint alone is not a review.
+fn raw_calldata_block<'a>(t: KaoTheme, calldata: &[u8], show: bool) -> Element<'a, Message> {
+    let selector = match calldata.get(..4) {
+        Some(sel) => format!("0x{}", alloy::hex::encode(sel)),
+        None => "none (under 4 bytes)".to_string(),
+    };
+    let mut col = column![
+        text("Not decoded — Kao can't read this call, so these are its exact bytes")
+            .size(11)
+            .color(t.sub)
+            .font(bold()),
+        Space::new().height(4),
+        kv(t, "Function selector", selector),
+        kv(t, "Calldata", format!("{} bytes", calldata.len())),
+        bytes_toggle(
+            t,
+            show,
+            "Show the exact calldata (hex)",
+            "Hide the exact calldata"
+        ),
+    ]
+    .spacing(0)
+    .width(Length::Fill);
+    if show {
+        col = col.push(Space::new().height(4));
+        col = col.push(hex_box(t, calldata));
+    }
+    col.into()
+}
+
+/// [`raw_calldata_block`] is for a leg whose bytes nothing else shows: undecoded, carrying
+/// calldata, and not a batch whose sub-calls already decode it.
+fn shows_raw_calldata(leg: &ReviewLeg) -> bool {
+    matches!(*leg.decoded, DecodeResult::Empty)
+        && !leg.calldata.is_empty()
+        && leg.sub_legs.is_empty()
+}
+
 /// The CoW order review panel. Maps the [`OrderReview`] into a generic
 /// [`TypedDataModel`] and hands it to [`typed_panel`] — so the order and any
 /// future EIP-712 message share one renderer instead of a bespoke panel each.
@@ -1706,6 +2262,10 @@ fn leg_card<'a>(t: KaoTheme, leg: &'a ReviewLeg, show_detail: bool) -> Element<'
         {
             col = col.push(Space::new().height(8));
             col = col.push(panel);
+        }
+        if shows_raw_calldata(leg) {
+            col = col.push(Space::new().height(8));
+            col = col.push(raw_calldata_block(t, &leg.calldata, show_detail));
         }
     }
 
@@ -1802,6 +2362,10 @@ fn sub_leg_card<'a>(t: KaoTheme, leg: &'a ReviewLeg, show_detail: bool) -> Eleme
         {
             col = col.push(Space::new().height(6));
             col = col.push(panel);
+        }
+        if shows_raw_calldata(leg) {
+            col = col.push(Space::new().height(6));
+            col = col.push(raw_calldata_block(t, &leg.calldata, show_detail));
         }
     }
 
@@ -2120,11 +2684,98 @@ mod tests {
         assert_eq!(review.phase(), "prepare");
     }
 
+    /// A review whose legs are ready, so only the arming window can hold
+    /// Confirm back.
+    fn ready(action: SignAction) -> SignReview {
+        let mut r = SignReview::pending("Review".into(), None, Vec::new(), None, 0, action);
+        r.legs_loading = false;
+        r
+    }
+
+    fn wc_action() -> SignAction {
+        SignAction::WalletConnect {
+            key: WcKey {
+                topic: crate::walletconnect::Topic::new("ab".repeat(32)),
+                id: 7,
+            },
+            plan: WcSignPlan::Personal {
+                from: Address::repeat_byte(0x11),
+                message: Bytes::from_static(b"hello"),
+                pin: B256::ZERO,
+            },
+        }
+    }
+
+    fn cow_cancel() -> SignAction {
+        SignAction::CowCancel {
+            host: CowHost::Apps,
+            uid: "0xabc".into(),
+        }
+    }
+
+    #[test]
+    fn confirm_ignored_before_arming_delay() {
+        let t0 = Instant::now();
+        let mut r = ready(wc_action());
+        r.armed_at = Some(t0);
+        assert!(!r.confirm_ready(t0));
+        assert!(r.arming(t0));
+        assert!(!confirm_enabled(&r, t0), "Confirm is inert while arming");
+        let just_before = t0 + ARMING_DELAY - Duration::from_millis(1);
+        assert!(!r.confirm_ready(just_before) && r.arming(just_before));
+        let armed = t0 + ARMING_DELAY;
+        assert!(r.confirm_ready(armed));
+        assert!(!r.arming(armed));
+        assert!(confirm_enabled(&r, armed));
+        // The other gates still apply once armed.
+        r.confirm_disabled = true;
+        assert!(!confirm_enabled(&r, armed));
+    }
+
+    #[test]
+    fn non_wc_reviews_have_no_arming_delay() {
+        let r = ready(cow_cancel());
+        assert!(r.armed_at.is_none(), "`pending` never arms a review");
+        let now = Instant::now();
+        assert!(r.confirm_ready(now));
+        assert!(!r.arming(now));
+        assert!(confirm_enabled(&r, now));
+        // A freshly opened WC review is not armed either until the
+        // coordinator says so.
+        assert!(ready(wc_action()).confirm_ready(now));
+    }
+
+    #[test]
+    fn wc_backdrop_is_ignored() {
+        let mut r = ready(wc_action());
+        assert!(r.is_walletconnect());
+        // Confirming, preparing, and signing: a stray click never refuses a dapp.
+        assert!(matches!(backdrop_message(&r), Message::BoxClickIgnored));
+        r.legs_loading = true;
+        assert!(matches!(backdrop_message(&r), Message::BoxClickIgnored));
+        r.armed_at = Some(Instant::now());
+        assert!(matches!(backdrop_message(&r), Message::BoxClickIgnored));
+        r.signing_since = Some(Instant::now());
+        assert!(matches!(backdrop_message(&r), Message::BoxClickIgnored));
+    }
+
+    #[test]
+    fn non_wc_backdrop_still_cancels() {
+        let mut r = ready(cow_cancel());
+        assert!(!r.is_walletconnect());
+        assert!(matches!(backdrop_message(&r), Message::Cancel));
+        r.legs_loading = true;
+        assert!(matches!(backdrop_message(&r), Message::Cancel));
+        // …but never mid-signature.
+        r.signing_since = Some(Instant::now());
+        assert!(matches!(backdrop_message(&r), Message::BoxClickIgnored));
+    }
+
     #[test]
     fn safe_execute_ceremony_carries_every_owner() {
         // The execute ceremony lists one entry per signing owner (so the waiting
-        // card can spell out each device prompt) and records whether a separate
-        // account pays the gas.
+        // card can spell out each device prompt) and names the account that
+        // pays the gas, when a separate one does.
         let kind = SigningKind::SafeExecute {
             owners: vec![
                 SigningOwner {
@@ -2138,19 +2789,22 @@ mod tests {
                     hardware: false,
                 },
             ],
-            separate_gas_payer: true,
+            gas_payer: Some(SigningOwner {
+                label: "Gas payer".into(),
+                address: Address::repeat_byte(0x33),
+                hardware: false,
+            }),
         };
-        let SigningKind::SafeExecute {
-            owners,
-            separate_gas_payer,
-        } = kind
-        else {
+        let SigningKind::SafeExecute { owners, gas_payer } = kind else {
             panic!("expected SafeExecute");
         };
         assert_eq!(owners.len(), 2);
         assert!(owners[0].hardware);
         assert!(!owners[1].hardware);
-        assert!(separate_gas_payer);
+        assert_eq!(
+            gas_payer.map(|p| p.address),
+            Some(Address::repeat_byte(0x33))
+        );
     }
 
     #[test]
@@ -2340,6 +2994,8 @@ mod tests {
             operation: 1,
             guard: None,
             onchain_nonce: 3,
+            preflight: None,
+            executor: None,
         };
         let rows = erc8213_rows(&SignStep::SafeExec(x));
         assert_eq!(
@@ -2381,6 +3037,33 @@ mod tests {
         );
     }
 
+    /// The CoW `SafeMessage` step keeps exactly its pre-WalletConnect rows: the
+    /// SafeMessage triple plus the wrapped order digest — none of the dapp rows
+    /// the `Wc*` arms delegate to `sign_review::wc`.
+    #[test]
+    fn cow_safe_message_rows_unchanged() {
+        let d = Eip712Digests::from_parts(B256::repeat_byte(0xC1), B256::repeat_byte(0xC2));
+        let order_digest = B256::repeat_byte(0xBB);
+        let step = SignStep::SafeMessage(SafeMessageReview {
+            order: order_with(Eip712Digests::from_parts(B256::ZERO, B256::ZERO)),
+            safe: Address::repeat_byte(0x5A),
+            threshold: 2,
+            owner_count: 3,
+            order_digest,
+            message_hash: d.digest,
+            eip712: d,
+        });
+        assert_eq!(
+            erc8213_rows(&step),
+            vec![
+                (EIP712_DIGEST_LABEL.to_string(), d.digest),
+                (DOMAIN_HASH_LABEL.to_string(), d.domain_hash),
+                (MESSAGE_HASH_LABEL.to_string(), d.message_hash),
+                ("Order Digest (CoW EIP-712)".to_string(), order_digest),
+            ],
+        );
+    }
+
     #[test]
     fn fingerprints_section_defaults_collapsed() {
         let review = SignReview::pending(
@@ -2395,5 +3078,155 @@ mod tests {
             },
         );
         assert!(!review.show_fingerprints);
+    }
+
+    /// After an owner's device refused the EIP-712 prompt, Confirm signs the Safe hash as a
+    /// personal message and every owner's device shows its EIP-191 digest. That digest stays on
+    /// screen while the devices prompt — the moment it has to be checked — with the instruction
+    /// said for a prompt that is already up.
+    #[test]
+    fn eth_sign_fallback_digest_stays_visible_while_signing() {
+        let t = KaoTheme::for_kind(crate::ui::kao_theme::ThemeKind::Mint);
+        let fallback = OwnerEthSign::of(B256::repeat_byte(0x5e));
+        let mut review = SignReview::pending(
+            "eth_sendTransaction".into(),
+            None,
+            Vec::new(),
+            None,
+            0,
+            SignAction::CowCancel {
+                host: CowHost::Apps,
+                uid: "0xabc".into(),
+            },
+        );
+        review.owner_eth_sign = Some(fallback);
+        // The hash rows are copyable widgets, which lay out no text of their own: each is found by
+        // its label.
+        let shows = |review: &SignReview| {
+            let texts = super::super::test_support::texts(view(t, review, 1.0));
+            (
+                texts
+                    .iter()
+                    .any(|s| s == "Message hash the device shows (EIP-191)"),
+                texts.iter().any(|s| s.contains("asking now")),
+            )
+        };
+        assert_eq!(shows(&review), (true, false), "before Confirm");
+        review.signing_since = Some(Instant::now());
+        assert_eq!(shows(&review), (true, true), "while the devices prompt");
+    }
+
+    /// With no Local gas payer, the first owner's device also signs the executor's transaction,
+    /// right after the message prompts. The fallback card says that prompt is coming — told to
+    /// approve only the message, the user would reject it and lose every owner's signature.
+    #[test]
+    fn eth_sign_card_names_the_executor_transaction_that_follows() {
+        let t = KaoTheme::for_kind(crate::ui::kao_theme::ThemeKind::Mint);
+        let mut review = SignReview::pending(
+            "eth_sendTransaction".into(),
+            None,
+            Vec::new(),
+            None,
+            0,
+            SignAction::CowCancel {
+                host: CowHost::Apps,
+                uid: "0xabc".into(),
+            },
+        );
+        review.owner_eth_sign = Some(OwnerEthSign::of(B256::repeat_byte(0x5e)));
+        review.signing_since = Some(Instant::now());
+        let owner = |hardware| SigningOwner {
+            label: "Account 1".into(),
+            address: Address::repeat_byte(0x11),
+            hardware,
+        };
+        let card = |review: &SignReview| {
+            super::super::test_support::texts(view(t, review, 1.0))
+                .into_iter()
+                .find(|s| s.starts_with("Signing the Safe hash as a personal message"))
+                .expect("the eth_sign card's instruction")
+        };
+        review.signing_progress = Some(SigningKind::SafeExecute {
+            owners: vec![owner(true)],
+            gas_payer: None,
+        });
+        let text = card(&review);
+        assert!(text.contains("transaction"), "{text}");
+        assert!(
+            !text.contains("approve only if it shows one of these"),
+            "{text}"
+        );
+        // A Local account pays, or the first owner is a Local key: no device shows a transaction.
+        for (owners, gas_payer) in [
+            (vec![owner(true)], Some(owner(false))),
+            (vec![owner(false), owner(true)], None),
+        ] {
+            review.signing_progress = Some(SigningKind::SafeExecute { owners, gas_payer });
+            assert!(card(&review).contains("approve only if it shows one of these"));
+        }
+    }
+
+    fn rendered(step: &SignStep, show_calldata: bool) -> Vec<String> {
+        let t = KaoTheme::for_kind(crate::ui::kao_theme::ThemeKind::Mint);
+        super::super::test_support::texts(step_card(t, step, show_calldata, true, false))
+    }
+
+    /// A call Kao can't decode (a custom network has no verified chain to resolve it against)
+    /// still shows its bytes: the selector always, the full calldata behind the toggle.
+    #[tokio::test]
+    async fn undecoded_calldata_is_shown_raw() {
+        let network = crate::net::MockFetcher::new();
+        let from = Address::repeat_byte(0x11);
+        let to = Address::repeat_byte(0xC1);
+        // `approve(0x…badbadbadbad, MAX)`.
+        let mut data = vec![0x09, 0x5e, 0xa7, 0xb3];
+        data.extend_from_slice(
+            B256::left_padding_from(&[0xba, 0xdb, 0xad, 0xba, 0xdb, 0xad]).as_slice(),
+        );
+        data.extend_from_slice(&U256::MAX.to_be_bytes::<32>());
+        let data = Bytes::from(data);
+        let net = crate::chain::NetworkId::Custom(31337); // the seeded Anvil row, in memory
+        let decoded = super::super::decode_leg(
+            &network,
+            net,
+            from,
+            to,
+            data.clone(),
+            U256::ZERO,
+            &std::collections::HashMap::new(),
+        )
+        .await;
+        assert!(matches!(decoded, DecodeResult::Empty));
+        let leg = ReviewLeg {
+            title: "Call to 0xC1C1…C1C1".into(),
+            to,
+            value: U256::ZERO,
+            net,
+            self_admin: None,
+            calldata: data,
+            decoded: Box::new(decoded),
+            sub_legs: Vec::new(),
+        };
+        let step = SignStep::RawTx(leg);
+        let folded = rendered(&step, false).join("\n").to_lowercase();
+        assert!(
+            folded.contains("095ea7b3"),
+            "not even the selector is drawn for undecoded calldata: {folded}"
+        );
+        let open = rendered(&step, true).join("\n").to_lowercase();
+        assert!(
+            open.contains("badbad") && open.contains(&"f".repeat(8)),
+            "the full calldata isn't reviewable: {open}"
+        );
+        // The same fallback inside a Safe batch's sub-call.
+        let mut outer = leg_with(Bytes::from(vec![0x8d, 0x80, 0xff, 0x0a]));
+        let SignStep::RawTx(sub) = step else {
+            unreachable!()
+        };
+        outer.sub_legs = vec![sub];
+        let all = rendered(&SignStep::RawTx(outer), true)
+            .join("\n")
+            .to_lowercase();
+        assert!(all.contains("095ea7b3") && all.contains("badbad"), "{all}");
     }
 }

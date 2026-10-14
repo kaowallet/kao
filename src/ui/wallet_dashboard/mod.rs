@@ -40,8 +40,15 @@ mod sidebar;
 mod sign_review;
 mod sim_view;
 mod swap;
+#[cfg(test)]
+mod test_support;
 mod tx_builder;
 mod tx_details;
+mod wc_app;
+mod wc_flow;
+mod wc_sign;
+
+pub use wc_flow::handle_orphan_message;
 
 use account_dropdown::AccountDropdown;
 use accounts_settings::AccountsPane;
@@ -187,9 +194,10 @@ pub enum CowHost {
 
 /// The on-success payload every in-app signing task resolves to — the unified
 /// result carried by [`Message::Signed`]. Heterogeneous per flow, but every flow
-/// lands in exactly one of these three shapes: a broadcast/mined transaction, a
-/// placed CoW order, or nothing (a propose-to-service / off-chain-cancel that
-/// produces no artifact the coordinator needs).
+/// lands in exactly one of these shapes: a broadcast/mined transaction, a placed
+/// CoW order, nothing (a propose-to-service / off-chain-cancel that produces no
+/// artifact the coordinator needs), or — for WalletConnect, which answers the
+/// dapp with it — a signature or a proposed Safe transaction's hash.
 #[derive(Debug, Clone)]
 pub enum SignOutcome {
     /// A broadcast (and, for names, mined) transaction hash — EOA/Safe sends,
@@ -199,6 +207,11 @@ pub enum SignOutcome {
     Order(Box<TrackedOrder>),
     /// No artifact — a Safe propose-to-service, or an off-chain order cancel.
     Unit,
+    /// A 65-byte EOA signature or a Safe's packed EIP-1271 owner blob
+    /// (WalletConnect messages).
+    Signature(Bytes),
+    /// A Safe transaction proposed to the Transaction Service — its safeTxHash.
+    SafeProposed(B256),
 }
 
 impl SignOutcome {
@@ -255,6 +268,24 @@ pub enum SignTag {
     TxBuilderPropose,
     /// Transaction Builder EOA single call — broadcast an ordinary tx.
     TxBuilderEoa,
+    /// A WalletConnect request; the result is answered to the dapp by
+    /// `wc_on_signed` (or, off-screen, `handle_orphan_message`).
+    WalletConnect {
+        key: crate::walletconnect::WcKey,
+        kind: WcSignKind,
+    },
+}
+
+/// Which WalletConnect signing flow produced a [`SignTag::WalletConnect`]
+/// result — decides how its [`SignOutcome`] is answered to the dapp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WcSignKind {
+    Personal,
+    Typed,
+    EoaTx,
+    SafeExecute,
+    SafePropose,
+    SafeMessage,
 }
 
 #[derive(Debug, Clone)]
@@ -309,10 +340,13 @@ pub enum Message {
     /// Result of fetching the active Safe's pending multisig queue from
     /// the Safe Transaction Service. `safe` is the Safe address the fetch
     /// was issued against — dropped on arrival if the user has switched
-    /// identity since (same staleness guard as `PortfolioFetched`).
+    /// identity since (same staleness guard as `PortfolioFetched`). `seq`
+    /// names the read: only the one in flight (`safe_pending_reading`) is
+    /// applied.
     SafePendingFetched {
         safe: Address,
         chain: crate::chain::Chain,
+        seq: u64,
         result: Result<Vec<crate::safe::service::PendingSafeTx>, String>,
     },
     SelectNav(Nav),
@@ -657,6 +691,9 @@ pub enum Message {
         slots: Vec<Option<Address>>,
         result: Result<Vec<LiveToken>, String>,
     },
+    /// WalletConnect stream items (synthetic toasts included) and runtime-start
+    /// results. Debug is shape-only by type.
+    Wc(wc_flow::WcMsg),
 }
 
 /// Outcomes bubbled up to the parent app.
@@ -733,9 +770,20 @@ pub enum Outcome {
     PoolRestoreIdentity(secrecy::SecretString),
     /// Re-load the pool seed and hand its phrase to the backup view.
     PoolRevealBackup,
+    /// A neutral toast for App (`Message::Notice`).
+    Notice(String),
 }
 
 impl Outcome {
+    /// The screen is about to be replaced (App drops `cmd` for these) — the WC
+    /// pump must not open a review.
+    pub fn leaves_dashboard(&self) -> bool {
+        matches!(
+            self,
+            Outcome::Switch(_) | Outcome::Add | Outcome::NeedsHardwareReconnect { .. }
+        )
+    }
+
     /// Variant name for the GUI state trace — never the payload, which can
     /// carry a restored pool mnemonic.
     fn name(&self) -> &'static str {
@@ -753,6 +801,7 @@ impl Outcome {
             Outcome::PoolCreateIdentity => "PoolCreateIdentity",
             Outcome::PoolRestoreIdentity(_) => "PoolRestoreIdentity",
             Outcome::PoolRevealBackup => "PoolRevealBackup",
+            Outcome::Notice(_) => "Notice",
         }
     }
 }
@@ -955,6 +1004,15 @@ pub struct WalletScreen {
     /// flight. Drives a muted "loading" line in the Home pane without
     /// blocking the asset list.
     safe_pending_loading: bool,
+    /// The Safe whose pending-queue read is in flight, if any, and that
+    /// read's `seq`. Reads go out one at a time (`reload_safe_pending`); an
+    /// answer under any other `seq` is from a read since superseded — launched
+    /// before the user left the Safe and came back, say — and is dropped.
+    safe_pending_reading: Option<(crate::wallet::SafeKey, u64)>,
+    /// The queue was asked for again while `safe_pending_reading`'s read was
+    /// in flight — after a proposal or an execution it may not show. Its
+    /// answer is dropped when it lands and a fresh read goes out instead.
+    safe_pending_reread: bool,
     /// Last pending-queue fetch error (service unreachable, decode
     /// failure). Rendered as a muted one-liner; never blocks the rest of
     /// the Home pane.
@@ -995,6 +1053,13 @@ pub struct WalletScreen {
     /// derived by the App from the encrypted `pp` seed and pushed down here so
     /// the pool app can sync/prove. `None` until an identity exists + is loaded.
     pp_account: Option<privacy_pools::Account>,
+    /// True while a Privacy Pools proof runs off-thread behind the proving
+    /// screen: a relayed withdrawal (set in `pool_submit`, cleared by its
+    /// `PoolSubmitted`) or a ragequit (`pool_ragequit` → `PoolRagequitReady`).
+    /// Neither opens an overlay or parks the signer, so without this a dapp
+    /// review would auto-open over the proving screen — and a proved ragequit
+    /// landing under it could not open its own review.
+    pool_proof_in_flight: bool,
     /// Next deposit index implied by deposits **confirmed this session**, keyed
     /// by pool address. Combined with the synced state's index so a second
     /// deposit never reuses one the chain scan hasn't caught up to — the pool
@@ -1020,6 +1085,11 @@ pub struct WalletScreen {
     /// The account-derived key the note cache is encrypted under (see
     /// `pool::sync::notes_cipher_key`); `None` until an identity is loaded.
     pool_notes_key: Option<[u8; 32]>,
+    /// WalletConnect, dashboard half: the App-owned slot (set by
+    /// `set_wc_slot` after every build) plus pump / attention bookkeeping.
+    /// The protocol state itself lives in the slot's runtime and survives
+    /// every rebuild of this screen.
+    wc: wc_flow::WcDashState,
 }
 
 /// Tracks an in-flight clipboard auto-clear: when it lands, what we
@@ -1106,6 +1176,8 @@ impl WalletScreen {
             active_safe: None,
             safe_pending: Vec::new(),
             safe_pending_loading: false,
+            safe_pending_reading: None,
+            safe_pending_reread: false,
             safe_pending_error: None,
             rename_draft: None,
             history: Vec::new(),
@@ -1120,12 +1192,14 @@ impl WalletScreen {
             apps: AppsPane::new(address),
             sign_review: None,
             pp_account: None,
+            pool_proof_in_flight: false,
             pool_session_deposits: std::collections::HashMap::new(),
             pending_pool_deposit: None,
             pool_deposit_in_flight: None,
             pool_scopes: std::collections::HashMap::new(),
             pool_note_cache: std::collections::HashMap::new(),
             pool_notes_key: None,
+            wc: wc_flow::WcDashState::default(),
         }
     }
 
@@ -1238,6 +1312,44 @@ impl WalletScreen {
         ])
     }
 
+    /// Enter Safe mode on `safes[idx]`, in place (the dashboard is not
+    /// rebuilt): re-point the Builder, the portfolio (seeded from cache, then
+    /// refetched), the history and the pending queue at the Safe. The account
+    /// dropdown's `SelectSafe` and WalletConnect's "Switch to ⟨Safe⟩" both land
+    /// here. An out-of-range `idx` changes nothing.
+    fn activate_safe(&mut self, idx: usize) -> Task<Message> {
+        if idx >= self.safes.len() {
+            return Task::none();
+        }
+        // A rename open on the previous identity must not commit onto this one.
+        self.rename_draft = None;
+        self.active_safe = Some(idx);
+        // Activating a Safe never rebuilds the dashboard, so the Builder learns
+        // the new identity here.
+        self.refresh_txbuilder_context();
+        let probe = self.drain_txbuilder_delegation_probe();
+        // Seed the Safe portfolio from cache if we've viewed it before; kick a
+        // fresh fetch either way so on-chain state catches up. History resets
+        // so the Activity tab lazy-loads for the Safe.
+        self.seed_portfolio_from_cache();
+        self.portfolio_loading = self.portfolio.is_empty();
+        self.history.clear();
+        self.history_loaded = false;
+        self.history_errors = PerChain::default();
+        // Reset the pending queue for the newly-active Safe — no cache, so show
+        // the loading line until the service answers. Loading only when the
+        // fetch actually launches, else the spinner would never clear.
+        self.safe_pending.clear();
+        self.safe_pending_error = None;
+        let pending = self.reload_safe_pending(true);
+        Task::batch([
+            self.refresh_verification_task(),
+            self.fetch_portfolio_task(),
+            pending,
+            probe,
+        ])
+    }
+
     /// Replace the Safe mirror with the App's full list (`SafesUpdated`,
     /// `AccountsUpdated`) and re-find the active Safe by key across it.
     /// `active_safe` is a position, and a removal shifts every later Safe
@@ -1277,6 +1389,8 @@ impl WalletScreen {
         self.safe_pending.clear();
         self.safe_pending_error = None;
         self.safe_pending_loading = false;
+        self.safe_pending_reading = None;
+        self.safe_pending_reread = false;
     }
 
     /// Display name for the active identity — the Safe's name with its
@@ -1353,11 +1467,13 @@ impl WalletScreen {
 
     /// Re-sync an open Settings → Accounts pane with the account and Safe
     /// mirrors after either changed (a rename from the header or the pane,
-    /// an ENS auto-name, a Safe edit, an in-place account removal).
+    /// an ENS auto-name, a Safe edit, an in-place account removal) — and the
+    /// WalletConnect pane, which names its sessions' identities the same way.
     fn reseed_accounts_pane(&mut self) {
         if let SettingsPane::Accounts(p) = &mut self.settings_pane {
             p.set_accounts(&self.accounts, &self.safes, self.active_index);
         }
+        self.wc_names_changed();
     }
 
     /// Show Settings → Accounts: from the Settings root, the account
@@ -1740,9 +1856,15 @@ impl WalletScreen {
     /// Surface a CoW placement error. The place overlay is kept open across the
     /// async sign + submit, so put the error on the overlay — clearing the
     /// waiting phase so Confirm re-enables for a retry (e.g. after reconnecting a
-    /// device). Falls back to the host pane if the overlay was already dismissed.
+    /// device). Falls back to the host pane if the overlay was already dismissed
+    /// — or is another flow's (a result landing on a rebuilt dashboard), which
+    /// must not have its signing phase cleared.
     fn resolve_cow_error(&mut self, host: CowHost, msg: String) {
-        if let Some(r) = self.sign_review.as_mut() {
+        if let Some(r) = self
+            .sign_review
+            .as_mut()
+            .filter(|r| matches!(r.action, sign_review::SignAction::Cow { .. }))
+        {
             r.signing_since = None;
             r.error = Some(msg);
         } else {
@@ -2360,14 +2482,16 @@ impl WalletScreen {
                 }
                 return Task::none();
             }
-            let executor_key = first_local_key_of(&self.accounts);
+            let executor = first_local_account_of(&self.accounts);
+            let executor_key = executor.map(|(_, key)| key);
             let owners = signer_pairs
                 .iter()
                 .map(|(i, d)| signing_owner_of(*i, d))
                 .collect();
             let kind = sign_review::SigningKind::SafeExecute {
                 owners,
-                separate_gas_payer: executor_key.is_some(),
+                gas_payer: executor
+                    .and_then(|(idx, _)| self.accounts.get(idx).map(|d| signing_owner_of(idx, d))),
             };
             let signer_owners: Vec<AccountDescriptor> =
                 signer_pairs.into_iter().map(|(_, d)| d).collect();
@@ -3034,6 +3158,71 @@ fn txbuilder_review_copy(
     (title, subtitle, note, can_execute)
 }
 
+/// The Safe execute-or-propose labelling: `(confirm label, secondary label,
+/// confirm disabled)`. The same fork the Safe send offers — with the threshold
+/// covered locally (`can_execute`), Confirm signs and executes and the second
+/// action queues it for co-signers instead; without it, proposing is the only
+/// thing this wallet can do, so it becomes the primary action rather than a
+/// dead Confirm. `soften` (a preflight that reverted, or none) turns each into
+/// an explicit override.
+fn safe_exec_labels(
+    can_execute: bool,
+    no_owner_key: bool,
+    soften: bool,
+) -> (String, Option<String>, bool) {
+    let propose = if soften {
+        "Propose anyway ⚠"
+    } else {
+        "Propose to co-signers"
+    };
+    if can_execute {
+        let execute = if soften {
+            "Execute anyway ⚠"
+        } else {
+            "Sign & execute now"
+        };
+        (execute.to_string(), Some(propose.to_string()), false)
+    } else if no_owner_key {
+        // Proposing still costs one owner signature. With no owner key at all,
+        // offering the button would promise something the dispatch can only
+        // refuse.
+        ("No owner key for this Safe".to_string(), None, true)
+    } else {
+        (propose.to_string(), None, false)
+    }
+}
+
+/// Who pays for and broadcasts a Safe `execTransaction` that this wallet's own
+/// owners execute. The account is the transaction's sender on chain, so it is
+/// tied to the Safe publicly and for good.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutorPolicy {
+    /// The first Local account anywhere in the wallet, or without one the first
+    /// signing owner — the Transaction Builder's and the Safe send's rule.
+    FirstLocal,
+    /// An account already tied to this Safe first: a Local signing owner (it
+    /// signs anyway), then a Local account linked to the Safe; only then
+    /// [`Self::FirstLocal`]'s choice. For a dapp's transaction (WalletConnect),
+    /// where the executor's transaction hash is what the dapp receives.
+    SafeLinkedFirst,
+}
+
+/// Who signs a confirmed Safe batch, from [`WalletScreen::plan_safe_batch_dispatch`]:
+/// the owner that proposes, or the owners that sign (plus the optional Local
+/// gas payer) for an execute. `kind` is the waiting card's ceremony plan.
+#[derive(Debug)]
+enum SafeBatchPlan {
+    Propose {
+        owner_desc: AccountDescriptor,
+        kind: sign_review::SigningKind,
+    },
+    Execute {
+        signer_owners: Vec<AccountDescriptor>,
+        executor_key: Option<B256>,
+        kind: sign_review::SigningKind,
+    },
+}
+
 impl WalletScreen {
     /// Build the sign request: a Safe MultiSend batch (active Safe) or an EOA
     /// single call.
@@ -3044,64 +3233,14 @@ impl WalletScreen {
     ) -> Result<tx_builder::BatchSignRequest, String> {
         match self.active_safe_descriptor() {
             Some(d) => {
-                let chain = Chain::from_chain_id(d.chain_id)
+                // Checked ahead of the MultiSend encoding, as it always was, so
+                // an unsupported chain is the reason reported.
+                Chain::from_chain_id(d.chain_id)
                     .ok_or_else(|| "Safe is on an unsupported chain".to_string())?;
                 let input = crate::txbuilder::multisend::build_multisend_input(calls, &d.version)
                     .map_err(|e| e.to_string())?;
-                // Owners the wallet can actually sign with: a key kind that can
-                // produce a signature (Local / Ledger / Trezor) **and** an
-                // address that is still in the Safe's owner set.
-                //
-                // `linked_signer_indices` is the user's linkage choice, not an
-                // ownership fact — an account stays linked after the owners
-                // remove it. Counting such a key toward the threshold made the
-                // review promise "this wallet holds N of the M owner keys" on
-                // a key the Safe would reject, and sent every device to sign a
-                // transaction that could only revert GS026.
-                let owner_set: std::collections::HashSet<Address> =
-                    d.owners.iter().map(|o| Address::from(*o)).collect();
-                let signable_indices: Vec<u32> = d
-                    .linked_signer_indices
-                    .iter()
-                    .copied()
-                    .filter(|&idx| {
-                        let Some(acct) = self.accounts.get(idx as usize) else {
-                            return false;
-                        };
-                        matches!(
-                            acct,
-                            AccountDescriptor::Local { .. }
-                                | AccountDescriptor::Ledger { .. }
-                                | AccountDescriptor::Trezor { .. }
-                        ) && crate::wallet::account_address(acct)
-                            .is_some_and(|a| owner_set.contains(&a))
-                    })
-                    .collect();
-                Ok(tx_builder::BatchSignRequest::Safe(
-                    tx_builder::SafeBatchRequest {
-                        safe: Address::from(d.address),
-                        chain,
-                        version: d.version.clone(),
-                        trust: d.trust.clone(),
-                        threshold: d.threshold,
-                        owner_count: d.owners.len(),
-                        signable_indices,
-                        input,
-                        queue_map,
-                        call_count: calls.len(),
-                        prepared: None,
-                        // `None` when this wallet has not actually established
-                        // what is in the Safe's queue — the fetch is still in
-                        // flight, it errored, or it was never launched. An
-                        // empty `Vec` used to stand for all four, so "nothing
-                        // is queued" and "I don't know" chose the same nonce,
-                        // and only one of those is a fact.
-                        queued_nonces: (!self.safe_pending_loading
-                            && self.safe_pending_error.is_none())
-                        .then(|| self.safe_pending.iter().map(|p| p.nonce).collect()),
-                        service_base: d.tx_service_base().to_string(),
-                    },
-                ))
+                self.active_safe_batch_request(input, calls.len(), queue_map)
+                    .map(tx_builder::BatchSignRequest::Safe)
             }
             None => {
                 if calls.is_empty() {
@@ -3150,6 +3289,235 @@ impl WalletScreen {
         }
     }
 
+    /// The active Safe's signing request for one `SafeTxInput`: the Safe's
+    /// identity, version and trust, the owners this wallet can actually sign
+    /// with ([`strict_signable_indices`]), and what it knows about the
+    /// Transaction Service queue. The Transaction Builder passes its MultiSend
+    /// wrapper (`DelegateCall`); WalletConnect passes the dapp's single call
+    /// (`Call`). `Err` outside Safe mode or on an unsupported chain.
+    fn active_safe_batch_request(
+        &self,
+        input: crate::safe::tx::SafeTxInput,
+        call_count: usize,
+        queue_map: tx_builder::QueueMap,
+    ) -> Result<tx_builder::SafeBatchRequest, String> {
+        let d = self
+            .active_safe_descriptor()
+            .ok_or_else(|| "no Safe is active".to_string())?;
+        let chain = Chain::from_chain_id(d.chain_id)
+            .ok_or_else(|| "Safe is on an unsupported chain".to_string())?;
+        Ok(tx_builder::SafeBatchRequest {
+            safe: Address::from(d.address),
+            chain,
+            version: d.version.clone(),
+            trust: d.trust.clone(),
+            threshold: d.threshold,
+            owner_count: d.owners.len(),
+            signable_indices: strict_signable_indices(d, &self.accounts),
+            input,
+            queue_map,
+            call_count,
+            prepared: None,
+            // `None` when this wallet has not actually established what is in
+            // the Safe's queue — the fetch is still in flight, it errored, or
+            // it was never launched. An empty `Vec` used to stand for all
+            // four, so "nothing is queued" and "I don't know" chose the same
+            // nonce, and only one of those is a fact.
+            queued_nonces: (!self.safe_pending_loading && self.safe_pending_error.is_none())
+                .then(|| self.safe_pending.iter().map(|p| p.nonce).collect()),
+            service_base: d.tx_service_base().to_string(),
+        })
+    }
+
+    /// Decide who signs a confirmed Safe batch — the `dispatch_txbuilder` Safe
+    /// arm minus its side effects. `execute`: the first `threshold` strict
+    /// signable owners sign and the first Local account (if any) pays the gas;
+    /// otherwise the first signable owner proposes. `Err` carries the
+    /// user-facing refusal the overlay shows.
+    ///
+    /// Does **not** check `sreq.prepared` — callers refuse an unpinned batch
+    /// themselves (the Builder drops it silently).
+    fn plan_safe_batch_dispatch(
+        &self,
+        sreq: &tx_builder::SafeBatchRequest,
+        execute: bool,
+    ) -> Result<SafeBatchPlan, String> {
+        self.plan_safe_batch_dispatch_with(sreq, execute, ExecutorPolicy::FirstLocal)
+    }
+
+    /// The owners an execute of `sreq` signs with — the first `threshold`
+    /// strict signable owners this wallet holds — with their account indices.
+    fn safe_exec_signer_pairs(
+        &self,
+        sreq: &tx_builder::SafeBatchRequest,
+    ) -> Vec<(usize, AccountDescriptor)> {
+        sreq.signable_indices
+            .iter()
+            .filter_map(|&idx| {
+                self.accounts
+                    .get(idx as usize)
+                    .cloned()
+                    .map(|d| (idx as usize, d))
+            })
+            .take(sreq.threshold as usize)
+            .collect()
+    }
+
+    /// Who pays for and broadcasts an execute of `sreq` signed by
+    /// `signer_pairs`, under `policy`: `Some((account index, key))` for a Local
+    /// account, `None` when the first signing owner re-signs to broadcast.
+    fn safe_executor(
+        &self,
+        sreq: &tx_builder::SafeBatchRequest,
+        signer_pairs: &[(usize, AccountDescriptor)],
+        policy: ExecutorPolicy,
+    ) -> Option<(usize, B256)> {
+        let local = |idx: usize| match self.accounts.get(idx) {
+            Some(AccountDescriptor::Local { key_bytes, .. }) => Some((idx, key_bytes.to_b256())),
+            _ => None,
+        };
+        let tied = match policy {
+            ExecutorPolicy::FirstLocal => None,
+            ExecutorPolicy::SafeLinkedFirst => signer_pairs
+                .iter()
+                .find_map(|(i, _)| local(*i))
+                .or_else(|| {
+                    self.safes
+                        .iter()
+                        .find(|d| d.address() == sreq.safe && d.chain_id == sreq.chain.chain_id())
+                        .and_then(|d| {
+                            d.linked_signer_indices
+                                .iter()
+                                .find_map(|&i| local(i as usize))
+                        })
+                }),
+        };
+        tied.or_else(|| first_local_account_of(&self.accounts))
+    }
+
+    /// The account an execute of `sreq` would be paid for and sent from under
+    /// `policy`, as the review names it — `None` when this wallet can't
+    /// execute it (fewer owner keys than the threshold).
+    fn safe_executor_owner(
+        &self,
+        sreq: &tx_builder::SafeBatchRequest,
+        policy: ExecutorPolicy,
+    ) -> Option<sign_review::SigningOwner> {
+        let pairs = self.safe_exec_signer_pairs(sreq);
+        if (pairs.len() as u32) < sreq.threshold {
+            return None;
+        }
+        match self.safe_executor(sreq, &pairs, policy) {
+            Some((idx, _)) => self.accounts.get(idx).map(|d| signing_owner_of(idx, d)),
+            None => pairs.first().map(|(i, d)| signing_owner_of(*i, d)),
+        }
+    }
+
+    /// Name, on the open Safe review's `SafeExec` step, the account that would
+    /// send and pay for executing it: the Transaction Builder's executor
+    /// ([`ExecutorPolicy::FirstLocal`] — its choice unchanged, only shown), or a
+    /// WalletConnect dapp's ([`ExecutorPolicy::SafeLinkedFirst`]). Cleared
+    /// while execution isn't on offer.
+    fn name_safe_executor(&mut self) {
+        let Some(r) = self.sign_review.as_ref() else {
+            return;
+        };
+        let (sreq, can_execute, policy) = match &r.action {
+            sign_review::SignAction::TxBuilder {
+                req: tx_builder::BatchSignRequest::Safe(sreq),
+                can_execute,
+                ..
+            } => (sreq, *can_execute, ExecutorPolicy::FirstLocal),
+            sign_review::SignAction::WalletConnect {
+                plan:
+                    sign_review::WcSignPlan::SafeTx {
+                        req, can_execute, ..
+                    },
+                ..
+            } => (req, *can_execute, ExecutorPolicy::SafeLinkedFirst),
+            _ => return,
+        };
+        let executor = if can_execute {
+            self.safe_executor_owner(sreq, policy)
+        } else {
+            None
+        };
+        if let Some(r) = self.sign_review.as_mut() {
+            for step in &mut r.steps {
+                if let sign_review::SignStep::SafeExec(x) = step {
+                    x.executor = executor.clone();
+                }
+            }
+        }
+    }
+
+    /// [`Self::plan_safe_batch_dispatch`] with the executor chosen by `policy`.
+    fn plan_safe_batch_dispatch_with(
+        &self,
+        sreq: &tx_builder::SafeBatchRequest,
+        execute: bool,
+        policy: ExecutorPolicy,
+    ) -> Result<SafeBatchPlan, String> {
+        if !execute {
+            // Proposing pins a nonce and walks away. If this wallet never
+            // established what is already queued, that pin is a guess, and a
+            // wrong guess files a transaction that is mutually exclusive with a
+            // co-signer's — discovered only when one of them executes and voids
+            // the other, after every owner has signed both.
+            //
+            // Deliberately not applied to execute: `execTransaction` takes the
+            // live nonce and nothing else, so a stale pin there fails loudly at
+            // the broadcast rather than quietly months later.
+            if sreq.queued_nonces.is_none() {
+                return Err(
+                    "Kao couldn't read this Safe's pending queue, so it can't tell which nonce \
+                     is free. Proposing now risks filing a transaction that competes with one \
+                     a co-signer already queued. Reopen the Safe's queue to refresh it, then \
+                     try again."
+                        .to_string(),
+                );
+            }
+            let Some((idx, owner_desc)) = sreq.signable_indices.first().and_then(|&idx| {
+                self.accounts
+                    .get(idx as usize)
+                    .cloned()
+                    .map(|d| (idx as usize, d))
+            }) else {
+                return Err("no signable owner linked to this Safe".to_string());
+            };
+            let kind = sign_review::SigningKind::SafePropose {
+                owner: signing_owner_of(idx, &owner_desc),
+            };
+            return Ok(SafeBatchPlan::Propose { owner_desc, kind });
+        }
+        let signer_pairs = self.safe_exec_signer_pairs(sreq);
+        if (signer_pairs.len() as u32) < sreq.threshold {
+            return Err(
+                "Not enough signable owners linked to this Safe to meet its \
+                 threshold — propose to co-signers instead."
+                    .to_string(),
+            );
+        }
+        let executor = self.safe_executor(sreq, &signer_pairs, policy);
+        let executor_key = executor.map(|(_, key)| key);
+        let owners = signer_pairs
+            .iter()
+            .map(|(i, d)| signing_owner_of(*i, d))
+            .collect();
+        let kind = sign_review::SigningKind::SafeExecute {
+            owners,
+            gas_payer: executor
+                .and_then(|(idx, _)| self.accounts.get(idx).map(|d| signing_owner_of(idx, d))),
+        };
+        let signer_owners: Vec<AccountDescriptor> =
+            signer_pairs.into_iter().map(|(_, d)| d).collect();
+        Ok(SafeBatchPlan::Execute {
+            signer_owners,
+            executor_key,
+            kind,
+        })
+    }
+
     /// User confirmed the batch review — sign + execute (Safe) or broadcast
     /// (EOA). Overlay stays open in its waiting phase.
     fn dispatch_txbuilder(&mut self, execute: bool) -> Task<Message> {
@@ -3177,96 +3545,44 @@ impl WalletScreen {
                 // Not enough locally-held owner keys to meet the threshold (or
                 // the user chose the secondary action): sign with one owner and
                 // queue the batch on the Transaction Service for the rest.
-                if !execute {
-                    // Proposing pins a nonce and walks away. If this wallet
-                    // never established what is already queued, that pin is a
-                    // guess, and a wrong guess files a transaction that is
-                    // mutually exclusive with a co-signer's — discovered only
-                    // when one of them executes and voids the other, after
-                    // every owner has signed both.
-                    //
-                    // Deliberately not applied to execute: `execTransaction`
-                    // takes the live nonce and nothing else, so a stale pin
-                    // there fails loudly at the broadcast rather than quietly
-                    // months later.
-                    if sreq.queued_nonces.is_none() {
+                let plan = match self.plan_safe_batch_dispatch(&sreq, execute) {
+                    Ok(p) => p,
+                    Err(e) => {
                         if let Some(r) = self.sign_review.as_mut() {
-                            r.error = Some(
-                                "Kao couldn't read this Safe's pending queue, so it can't tell \
-                                 which nonce is free. Proposing now risks filing a transaction \
-                                 that competes with one a co-signer already queued. Reopen the \
-                                 Safe's queue to refresh it, then try again."
-                                    .to_string(),
-                            );
+                            r.error = Some(e);
                         }
                         return Task::none();
                     }
-                    let Some((idx, owner_desc)) = sreq.signable_indices.first().and_then(|&idx| {
-                        self.accounts
-                            .get(idx as usize)
-                            .cloned()
-                            .map(|d| (idx as usize, d))
-                    }) else {
-                        if let Some(r) = self.sign_review.as_mut() {
-                            r.error = Some("no signable owner linked to this Safe".to_string());
-                        }
-                        return Task::none();
-                    };
-                    let kind = sign_review::SigningKind::SafePropose {
-                        owner: signing_owner_of(idx, &owner_desc),
-                    };
-                    info!(safe = %sreq.safe, calls = sreq.call_count, "tx-builder: proposing Safe batch to co-signers");
-                    if let Some(r) = self.sign_review.as_mut() {
-                        r.signing_since = Some(Instant::now());
-                        r.signing_progress = Some(kind);
-                        r.error = None;
-                    }
-                    return spawn_txbuilder_propose_task(self.network.clone(), owner_desc, sreq);
-                }
-                let signer_pairs: Vec<(usize, AccountDescriptor)> = sreq
-                    .signable_indices
-                    .iter()
-                    .filter_map(|&idx| {
-                        self.accounts
-                            .get(idx as usize)
-                            .cloned()
-                            .map(|d| (idx as usize, d))
-                    })
-                    .take(sreq.threshold as usize)
-                    .collect();
-                if (signer_pairs.len() as u32) < sreq.threshold {
-                    if let Some(r) = self.sign_review.as_mut() {
-                        r.error = Some(
-                            "Not enough signable owners linked to this Safe to meet its \
-                             threshold — propose to co-signers instead."
-                                .to_string(),
-                        );
-                    }
-                    return Task::none();
-                }
-                let executor_key = first_local_key_of(&self.accounts);
-                let owners = signer_pairs
-                    .iter()
-                    .map(|(i, d)| signing_owner_of(*i, d))
-                    .collect();
-                let kind = sign_review::SigningKind::SafeExecute {
-                    owners,
-                    separate_gas_payer: executor_key.is_some(),
                 };
-                let signer_owners: Vec<AccountDescriptor> =
-                    signer_pairs.into_iter().map(|(_, d)| d).collect();
-                info!(safe = %sreq.safe, calls = sreq.call_count, "tx-builder: dispatching Safe batch execute");
-                if let Some(r) = self.sign_review.as_mut() {
-                    r.signing_since = Some(Instant::now());
-                    r.signing_progress = Some(kind);
-                    r.error = None;
+                match plan {
+                    SafeBatchPlan::Propose { owner_desc, kind } => {
+                        info!(safe = %sreq.safe, calls = sreq.call_count, "tx-builder: proposing Safe batch to co-signers");
+                        if let Some(r) = self.sign_review.as_mut() {
+                            r.signing_since = Some(Instant::now());
+                            r.signing_progress = Some(kind);
+                            r.error = None;
+                        }
+                        spawn_txbuilder_propose_task(self.network.clone(), owner_desc, sreq)
+                    }
+                    SafeBatchPlan::Execute {
+                        signer_owners,
+                        executor_key,
+                        kind,
+                    } => {
+                        info!(safe = %sreq.safe, calls = sreq.call_count, "tx-builder: dispatching Safe batch execute");
+                        if let Some(r) = self.sign_review.as_mut() {
+                            r.signing_since = Some(Instant::now());
+                            r.signing_progress = Some(kind);
+                            r.error = None;
+                        }
+                        spawn_txbuilder_safe_execute(
+                            self.network.clone(),
+                            sreq,
+                            signer_owners,
+                            executor_key,
+                        )
+                    }
                 }
-                spawn_txbuilder_safe_execute(
-                    self.network.clone(),
-                    sreq,
-                    signer_owners,
-                    executor_key,
-                )
             }
             tx_builder::BatchSignRequest::Eoa(ereq) => {
                 // A plain account has no propose path — there are no co-signers
@@ -3356,6 +3672,7 @@ impl WalletScreen {
             .get(&(req.info.chain.chain_id(), req.info.pool))
             .cloned();
         self.apps.pool_pane().set_proving("Private withdrawal");
+        self.pool_proof_in_flight = true;
         spawn_pool_relayed_withdraw(self.network.clone(), account, req, quote, asp, cached)
     }
 
@@ -3382,6 +3699,7 @@ impl WalletScreen {
             return Task::none();
         };
         self.apps.pool_pane().set_proving("Ragequit exit");
+        self.pool_proof_in_flight = true;
         spawn_pool_ragequit_prove(self.network.clone(), pp, info, account)
     }
 
@@ -3735,6 +4053,17 @@ impl WalletScreen {
         {
             return Task::none();
         }
+        // The anti-clickjack arming window (WalletConnect reviews only — every
+        // other review has `armed_at: None`). The view already renders Confirm
+        // dead inside it; this is the boundary behind the presentation.
+        if self
+            .sign_review
+            .as_ref()
+            .is_some_and(|r| !r.confirm_ready(Instant::now()))
+        {
+            debug!("sign review: confirm ignored inside the arming window");
+            return Task::none();
+        }
         // The broadcast-once latch. The view already renders Confirm dead once
         // this review has put a transaction on the wire, but a disabled button
         // is a presentation detail and this is the boundary that matters: the
@@ -3782,6 +4111,18 @@ impl WalletScreen {
             let execute = *can_execute;
             return self.dispatch_txbuilder(execute);
         }
+        // WalletConnect keeps its overlay open across the signature too: the
+        // dapp is answered from the `SignTag::WalletConnect` result arm, and a
+        // retryable failure lands back on this review. For a Safe transaction
+        // Confirm is the primary action (execute when the Safe can, else
+        // propose); `dispatch_wc` re-checks every gate itself.
+        if self
+            .sign_review
+            .as_ref()
+            .is_some_and(sign_review::SignReview::is_walletconnect)
+        {
+            return self.dispatch_wc(true);
+        }
         // CoW placement keeps its overlay open across the sign + submit too (like
         // the EOA send): a slow hardware sign shows the "waiting" card, and a
         // connect/sign failure surfaces on the overlay with a retry instead of the
@@ -3822,13 +4163,25 @@ impl WalletScreen {
             sign_review::SignAction::SafeSend { .. } => Task::none(),
             // Handled by the keep-open early return above.
             sign_review::SignAction::TxBuilder { .. } => Task::none(),
+            // Handled by the keep-open early return above. Unreachable; should
+            // a review ever land here, its request goes back to Waiting so the
+            // pump reopens it rather than leave it in review with no overlay.
+            sign_review::SignAction::WalletConnect { key, .. } => {
+                error!("wc: confirm reached the take-path — request released");
+                if let Some(rt) = self.wc_runtime() {
+                    rt.with_book(|b| b.release(&key));
+                }
+                Task::none()
+            }
         }
     }
 
     /// User cancelled (Cancel button / Esc / backdrop). The panes were never
     /// flipped to a busy phase (that's deferred to confirm), so there's nothing to
-    /// revert — just drop the pending review.
-    fn cancel_sign_review(&mut self) {
+    /// revert — just drop the pending review. Returns a task because a
+    /// WalletConnect cancel answers the dapp and re-runs the queue pump
+    /// (`wc_on_cancel`).
+    fn cancel_sign_review(&mut self) -> Task<Message> {
         // Once a signature is in flight the overlay can't be dismissed — it can't
         // be aborted from here, so keep the "waiting for a signature" notice up
         // until the task resolves and clears it.
@@ -3837,16 +4190,44 @@ impl WalletScreen {
             .as_ref()
             .is_some_and(|r| r.signing_since.is_some())
         {
-            return;
+            return Task::none();
+        }
+        if self
+            .sign_review
+            .as_ref()
+            .is_some_and(sign_review::SignReview::is_walletconnect)
+        {
+            // 4001 (or −32603 after a prepare failure; nothing for a request
+            // that is already gone), then the pump.
+            return self.wc_on_cancel();
         }
         self.sign_review = None;
+        Task::none()
     }
 
     /// A prepare task failed to build/decode the transaction — abandon the review
     /// and surface the error on the originating pane.
-    fn fail_sign_review(&mut self, e: String) {
+    fn fail_sign_review(&mut self, e: String) -> Task<Message> {
+        // WalletConnect keeps its overlay up showing the error (handled inline in
+        // `SignReviewPrepared`), so this is a fallback. A dapp request can't just
+        // be dropped — it would sit in review with no overlay — so it is refused
+        // as a wallet-side failure (−32603), exactly as a Cancel of that
+        // disabled review would.
+        if self
+            .sign_review
+            .as_ref()
+            .is_some_and(sign_review::SignReview::is_walletconnect)
+        {
+            error!(error = %e, "wc: clear-sign review prepare failed");
+            if let Some(r) = self.sign_review.as_mut() {
+                r.error = Some(e);
+                r.legs_loading = false;
+                r.confirm_disabled = true;
+            }
+            return self.wc_on_cancel();
+        }
         let Some(review) = self.sign_review.take() else {
-            return;
+            return Task::none();
         };
         match review.action {
             sign_review::SignAction::Cow { host, .. } => match host {
@@ -3879,7 +4260,10 @@ impl WalletScreen {
             sign_review::SignAction::TxBuilder { .. } => {
                 error!(error = %e, "tx-builder: clear-sign review prepare failed");
             }
+            // Answered above, before the review is taken.
+            sign_review::SignAction::WalletConnect { .. } => {}
         }
+        Task::none()
     }
 
     /// Dispatch a confirmed name write to the existing (unchanged) sign+broadcast
@@ -4371,7 +4755,7 @@ impl WalletScreen {
     /// clone the shared fetcher into the task, log timing, tag the result
     /// with the `(safe, chain)` it was issued against so a late landing
     /// can't pollute another identity.
-    pub fn fetch_safe_pending_task(&self) -> Option<Task<Message>> {
+    pub fn fetch_safe_pending_task(&self, seq: u64) -> Option<Task<Message>> {
         let safe = self.active_safe_descriptor()?;
         let chain = crate::chain::Chain::from_chain_id(safe.chain_id)?;
         if settings::rpcs(chain).is_empty() {
@@ -4405,12 +4789,42 @@ impl WalletScreen {
                 );
                 (address, chain, result)
             },
-            |(safe, chain, result)| Message::SafePendingFetched {
+            move |(safe, chain, result)| Message::SafePendingFetched {
                 safe,
                 chain,
+                seq,
                 result,
             },
         ))
+    }
+
+    /// Read the active Safe's pending queue again, one read at a time. A read
+    /// already in flight for this Safe may predate whatever asks again (a
+    /// proposal, an execution): rather than race a second read against it —
+    /// whichever lands last would win, possibly the older — it is marked
+    /// stale, dropped when it lands, and a fresh read goes out in its place
+    /// (`SafePendingFetched`). The queue a nonce is pinned against is then
+    /// never older than the last change Kao made to it.
+    ///
+    /// `loading` marks the queue loading until that read lands — the Home
+    /// pane's line, and the gate a Safe transaction's nonce pin waits on — or
+    /// clears it when no read can launch (EOA mode, unknown chain, no RPCs).
+    /// Without it the loading flag is left as it is.
+    fn reload_safe_pending(&mut self, loading: bool) -> Task<Message> {
+        let key = self.active_safe_descriptor().map(SafeDescriptor::key);
+        if key.is_some() && self.safe_pending_reading.map(|(k, _)| k) == key {
+            self.safe_pending_reread = true;
+            self.safe_pending_loading |= loading;
+            return Task::none();
+        }
+        let seq = next_task_seq();
+        let pending = self.fetch_safe_pending_task(seq);
+        self.safe_pending_reading = key.filter(|_| pending.is_some()).map(|k| (k, seq));
+        self.safe_pending_reread = false;
+        if loading {
+            self.safe_pending_loading = pending.is_some();
+        }
+        pending.unwrap_or_else(Task::none)
     }
 
     /// Reverse-resolve the active address against ENS (forward-verified)
@@ -4498,8 +4912,48 @@ impl WalletScreen {
         let pane_before = self.settings_pane.name();
         let review_before = self.sign_review.is_some();
         let rename_before = self.rename_draft.is_some();
+        let wc_identity_before = self.wc_active_identity();
 
-        let (task, outcome) = self.update_inner(message);
+        let (mut task, outcome) = self.update_inner(message);
+
+        // A WalletConnect runtime that retired itself left its reason in the
+        // slot: iced may have cancelled its stream before delivering it.
+        // Shown once, when no other outcome is going out.
+        let outcome = match outcome {
+            None => self.wc_take_retired(),
+            some => some,
+        };
+
+        // WalletConnect, after every dispatch. An in-place identity change
+        // (Safe ⇄ EOA, a Safe or account update) releases an open review that
+        // no longer belongs to the active identity. Then the pump — the only
+        // opener of WC reviews — runs, except when the outcome is about to
+        // replace this dashboard: App drops `task` for those, and a review
+        // opened here would die with the screen.
+        let wc_identity_after = self.wc_active_identity();
+        if wc_identity_after != wc_identity_before {
+            let shape = |i: Option<crate::walletconnect::WcIdentity>| match i {
+                Some(crate::walletconnect::WcIdentity::Eoa { .. }) => "eoa",
+                Some(crate::walletconnect::WcIdentity::Safe { .. }) => "safe",
+                None => "none",
+            };
+            crate::trace::state(
+                "dashboard",
+                "wc_identity",
+                shape(wc_identity_before),
+                shape(wc_identity_after),
+            );
+            task = Task::batch([task, self.wc_on_identity_changed()]);
+        }
+        if !outcome.as_ref().is_some_and(Outcome::leaves_dashboard) {
+            // Batched only when it did something: this runs on every update,
+            // the 16 ms animation tick included.
+            let pump = self.pump_wc_queue();
+            if pump.units() > 0 {
+                task = Task::batch([task, pump]);
+            }
+        }
+        self.wc_trace_latches();
 
         let nav_after = nav_name(self.nav);
         if nav_before != nav_after {
@@ -4558,13 +5012,12 @@ impl WalletScreen {
                 // The loading flag tracks whether a fetch was actually
                 // issued — `None` (EOA mode, unknown chain, no RPCs)
                 // means no `SafePendingFetched` will arrive to clear it.
-                let pending = self.fetch_safe_pending_task();
-                self.safe_pending_loading = pending.is_some();
+                let pending = self.reload_safe_pending(true);
                 return (
                     Task::batch([
                         self.refresh_verification_task(),
                         self.fetch_portfolio_task(),
-                        pending.unwrap_or_else(Task::none),
+                        pending,
                     ]),
                     None,
                 );
@@ -4643,14 +5096,13 @@ impl WalletScreen {
                 // range. The write path still refuses correctly; this is so the
                 // screen says so before the user composes a batch for it.
                 self.refresh_txbuilder_context();
-                let pending = self.fetch_safe_pending_task();
-                self.safe_pending_loading = pending.is_some();
+                let pending = self.reload_safe_pending(true);
+                // A removed Safe (or one no key here can sign for any more)
+                // ends its WalletConnect sessions: the dapp hears 6000 rather
+                // than waiting on an identity that's gone.
+                let wc = self.wc_reconcile();
                 return (
-                    Task::batch([
-                        exit,
-                        pending.unwrap_or_else(Task::none),
-                        self.drain_txbuilder_delegation_probe(),
-                    ]),
+                    Task::batch([exit, pending, self.drain_txbuilder_delegation_probe(), wc]),
                     None,
                 );
             }
@@ -4699,8 +5151,11 @@ impl WalletScreen {
                 // Which owners can sign for the active Safe moved with the
                 // accounts — the Builder reads that from its context.
                 self.refresh_txbuilder_context();
+                // …and WalletConnect: a removed account's sessions, and those
+                // of a Safe it was the last signing key for, are disconnected.
+                let wc = self.wc_reconcile();
                 return (
-                    Task::batch([exit, self.drain_txbuilder_delegation_probe()]),
+                    Task::batch([exit, self.drain_txbuilder_delegation_probe(), wc]),
                     None,
                 );
             }
@@ -4773,6 +5228,7 @@ impl WalletScreen {
             Message::SafePendingFetched {
                 safe,
                 chain,
+                seq,
                 result,
             } => {
                 // Staleness guard: drop if the user has left this Safe
@@ -4784,6 +5240,32 @@ impl WalletScreen {
                     .is_some_and(|s| s.address() == safe && s.chain_id == chain.chain_id());
                 if !still_active {
                     return (Task::none(), None);
+                }
+                let key = (safe.into_array(), chain.chain_id());
+                // Only the read in flight is an answer: any other was launched
+                // before this one (the user left the Safe and came back) and
+                // may predate what Kao has done to the queue since.
+                if self.safe_pending_reading != Some((key, seq)) {
+                    debug!(
+                        safe = %short_address(safe),
+                        "safe pending queue read superseded — dropped",
+                    );
+                    return (Task::none(), None);
+                }
+                self.safe_pending_reading = None;
+                if std::mem::take(&mut self.safe_pending_reread) {
+                    // Asked for again since this read went out: its answer
+                    // may not show what changed. Read again; until that
+                    // lands, the queue (and its loading flag) stays as is.
+                    debug!(
+                        safe = %short_address(safe),
+                        "safe pending queue read predates a change — reading again",
+                    );
+                    let seq = next_task_seq();
+                    if let Some(again) = self.fetch_safe_pending_task(seq) {
+                        self.safe_pending_reading = Some((key, seq));
+                        return (again, None);
+                    }
                 }
                 self.safe_pending_loading = false;
                 match result {
@@ -5195,10 +5677,7 @@ impl WalletScreen {
                                     if let Modal::Send(p) = &mut self.modal {
                                         let _ = p.update(send::Message::ProposeDone(Ok(())));
                                     }
-                                    return (
-                                        self.fetch_safe_pending_task().unwrap_or_else(Task::none),
-                                        None,
-                                    );
+                                    return (self.reload_safe_pending(false), None);
                                 }
                             }
                         }
@@ -5206,7 +5685,7 @@ impl WalletScreen {
                             let success = result.is_ok();
                             let (task, _outcome) = p.update(send::Message::ProposeDone(result));
                             let refresh = if success {
-                                self.fetch_safe_pending_task().unwrap_or_else(Task::none)
+                                self.reload_safe_pending(false)
                             } else {
                                 Task::none()
                             };
@@ -5252,10 +5731,7 @@ impl WalletScreen {
                                     };
                                     self.sign_review = None;
                                     self.apps.txbuilder_pane().on_proposed(nonce);
-                                    return (
-                                        self.fetch_safe_pending_task().unwrap_or_else(Task::none),
-                                        None,
-                                    );
+                                    return (self.reload_safe_pending(false), None);
                                 }
                             }
                         }
@@ -5335,7 +5811,13 @@ impl WalletScreen {
                             Ok(order) => {
                                 // Close the overlay kept open across placement, then
                                 // drive the host pane to its tracking / done state.
-                                self.sign_review = None;
+                                // Only that overlay: a result landing on a rebuilt
+                                // dashboard must not close another flow's review.
+                                if self.sign_review.as_ref().is_some_and(|r| {
+                                    matches!(r.action, sign_review::SignAction::Cow { .. })
+                                }) {
+                                    self.sign_review = None;
+                                }
                                 let order = *order;
                                 let uid = order.uid.clone();
                                 let chain = order.chain;
@@ -5403,6 +5885,12 @@ impl WalletScreen {
                         self.apps
                             .names_pane()
                             .on_set_recipient(result.map(|_| name));
+                    }
+                    // Answered to the dapp whether or not its overlay is still
+                    // open (it may have died with a rebuild); the parked signer
+                    // was reclaimed by the shared tail above either way.
+                    SignTag::WalletConnect { key, kind } => {
+                        return (self.wc_on_signed(key, kind, result), None);
                     }
                 }
             }
@@ -5582,6 +6070,7 @@ impl WalletScreen {
                     Some(apps::Outcome::Pool(o)) => self.handle_pool_outcome(o),
                     Some(apps::Outcome::TxBuilder(o)) => (self.handle_txbuilder_outcome(o), None),
                     Some(apps::Outcome::Approvals(o)) => (self.handle_approvals_outcome(o), None),
+                    Some(apps::Outcome::Wc(o)) => self.handle_wc_outcome(o),
                     None => (Task::none(), None),
                 };
                 return (
@@ -5717,7 +6206,7 @@ impl WalletScreen {
                     key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
                     ..
                 }) => {
-                    self.cancel_sign_review();
+                    return (self.cancel_sign_review(), None);
                 }
                 sign_review::Message::BoxClickIgnored | sign_review::Message::Key(_) => {}
                 // Copy-toast kick — the widget already copied + marked the toast;
@@ -5736,19 +6225,38 @@ impl WalletScreen {
                 }
                 // The overlay's optional second action ("Propose to co-signers",
                 // on a Safe send or a Transaction Builder batch). Ignore once a
-                // signature is already in flight.
+                // signature is already in flight, and inside a review's arming
+                // window (gated like Confirm).
                 sign_review::Message::Secondary => {
-                    if self
-                        .sign_review
-                        .as_ref()
-                        .is_some_and(|r| r.signing_since.is_none())
-                    {
+                    if self.sign_review.as_ref().is_some_and(|r| {
+                        r.signing_since.is_none() && r.confirm_ready(Instant::now())
+                    }) {
                         match self.sign_review.as_ref().map(|r| &r.action) {
                             Some(sign_review::SignAction::SafeSend { .. }) => {
                                 return (self.dispatch_safe_send(false), None);
                             }
                             Some(sign_review::SignAction::TxBuilder { .. }) => {
                                 return (self.dispatch_txbuilder(false), None);
+                            }
+                            // A dapp's transaction whose prepare failed — or a Safe one
+                            // reopened on its execution already sent: "Re-check".
+                            Some(sign_review::SignAction::WalletConnect {
+                                plan:
+                                    sign_review::WcSignPlan::EoaTx { .. }
+                                    | sign_review::WcSignPlan::SafeTx {
+                                        unconfirmed: Some(_),
+                                        ..
+                                    },
+                                ..
+                            }) => {
+                                return (self.wc_recheck(), None);
+                            }
+                            // A dapp's Safe transaction: "Propose to co-signers".
+                            Some(sign_review::SignAction::WalletConnect {
+                                plan: sign_review::WcSignPlan::SafeTx { .. },
+                                ..
+                            }) => {
+                                return (self.dispatch_wc(false), None);
                             }
                             _ => {}
                         }
@@ -5917,65 +6425,54 @@ impl WalletScreen {
                             // user watched revert must not offer a button that
                             // reads like routine confirmation.
                             let soften = preflight.softens_confirm();
-                            // Same execute-or-propose fork the Safe send offers:
-                            // with the threshold covered locally, Confirm signs
-                            // and executes and the second action queues it for
-                            // co-signers instead; without it, proposing is the
-                            // only thing this wallet can do, so it becomes the
-                            // primary action rather than a dead Confirm.
-                            if *can_execute {
-                                review.confirm_label = Some(
-                                    if soften {
-                                        "Execute anyway ⚠"
-                                    } else {
-                                        "Sign & execute now"
-                                    }
-                                    .to_string(),
-                                );
-                                review.secondary_label = Some(
-                                    if soften {
-                                        "Propose anyway ⚠"
-                                    } else {
-                                        "Propose to co-signers"
-                                    }
-                                    .to_string(),
-                                );
-                            } else if sreq.signable_indices.is_empty() {
-                                // Proposing still costs one owner signature. With
-                                // no owner key at all, offering the button would
-                                // promise something the dispatch can only refuse.
-                                review.confirm_label =
-                                    Some("No owner key for this Safe".to_string());
+                            let (confirm, secondary, disabled) = safe_exec_labels(
+                                *can_execute,
+                                sreq.signable_indices.is_empty(),
+                                soften,
+                            );
+                            review.confirm_label = Some(confirm);
+                            if secondary.is_some() {
+                                review.secondary_label = secondary;
+                            }
+                            if disabled {
                                 review.confirm_disabled = true;
-                            } else {
-                                review.confirm_label = Some(
-                                    if soften {
-                                        "Propose anyway ⚠"
-                                    } else {
-                                        "Propose to co-signers"
-                                    }
-                                    .to_string(),
-                                );
                             }
                         }
+                        // WalletConnect: pin the reviewed quote / `(nonce,
+                        // safeTxHash)` into the plan, set the labels, and start
+                        // the anti-clickjack arming window.
+                        if review.is_walletconnect() {
+                            self.wc_on_prepared();
+                        }
+                        // Whoever would send and pay for a Safe execution is
+                        // named before Confirm, in both flows that execute one.
+                        self.name_safe_executor();
                     }
                     Err(e) => {
                         // A Send / SafeSend keeps its overlay up showing the failure
                         // (there's no inline review to fall back to) so the user can
-                        // cancel back to the amount step; other flows drive the error
-                        // onto their originating pane and drop the review.
+                        // cancel back to the amount step — and so do the Builder and
+                        // WalletConnect, whose dapp is still waiting for an answer;
+                        // other flows drive the error onto their originating pane and
+                        // drop the review.
                         let keeps_overlay = matches!(
                             review.action,
                             sign_review::SignAction::Send { .. }
                                 | sign_review::SignAction::SafeSend { .. }
                                 | sign_review::SignAction::TxBuilder { .. }
+                                | sign_review::SignAction::WalletConnect { .. }
                         );
                         if keeps_overlay {
+                            // A WalletConnect review that can't be confirmed
+                            // and says why: Cancel answers −32603, not 4001.
                             review.error = Some(e);
                             review.legs_loading = false;
                             review.confirm_disabled = true;
+                            if review.is_walletconnect() {
+                                self.wc_on_prepare_failed();
+                            }
                         } else {
-                            self.fail_sign_review(e);
+                            return (self.fail_sign_review(e), None);
                         }
                     }
                 }
@@ -6150,8 +6647,20 @@ impl WalletScreen {
             } => {
                 // The signing task resolved — drop the "waiting for a signature"
                 // overlay that was kept open across the whole sign + broadcast.
-                // Relayed withdrawals carry no overlay, so this is a no-op there.
-                self.sign_review = None;
+                // Only the pool's own: a relayed withdrawal (`signer: None`)
+                // never had one, and whatever review is up when it finishes —
+                // a dapp's, say — isn't this flow's to close.
+                if signer.is_some()
+                    && self.sign_review.as_ref().is_some_and(|r| {
+                        matches!(r.action, sign_review::SignAction::PrivacyPool { .. })
+                    })
+                {
+                    self.sign_review = None;
+                }
+                if signer.is_none() {
+                    // The relayed withdrawal's proof is over, one way or the other.
+                    self.pool_proof_in_flight = false;
+                }
                 if let Some(s) = &signer {
                     self.install_reclaimed_signer(s);
                     // The parked EOA signer is back — clear the in-flight flag,
@@ -6229,8 +6738,21 @@ impl WalletScreen {
                 return (Task::none(), None);
             }
             Message::PoolRagequitReady { result } => {
+                self.pool_proof_in_flight = false;
                 self.apps.pool_pane().reset_to_overview();
                 match result {
+                    // Another review got the overlay while the proof ran:
+                    // `open_pool_review` would drop the proved exit without a
+                    // word, so say so rather than leave the user waiting.
+                    Ok(_) if self.sign_review.is_some() => {
+                        warn!(
+                            "privacy pools: ragequit proved under another open review — not opened"
+                        );
+                        self.apps.pool_pane().set_error(Some(
+                            "Another review is open — finish it, then start the exit again.".into(),
+                        ));
+                        return (Task::none(), None);
+                    }
                     Ok(sign) => return (self.open_pool_review(sign), None),
                     Err(e) => {
                         error!(error = %e, "privacy pools: ragequit proof failed");
@@ -6399,6 +6921,7 @@ impl WalletScreen {
                 );
                 sort_portfolio_rows(&mut self.portfolio);
             }
+            Message::Wc(m) => return self.handle_wc_msg(m),
             Message::OpenAccountDropdown => {
                 // Picking from the dropdown changes the identity under the
                 // header, so an open rename is abandoned up front.
@@ -6466,36 +6989,7 @@ impl WalletScreen {
                         self.modal = Modal::None;
                         self.rename_draft = None;
                         if idx < self.safes.len() {
-                            self.active_safe = Some(idx);
-                            // Activating a Safe never rebuilds the dashboard,
-                            // so the Builder learns the new identity here.
-                            self.refresh_txbuilder_context();
-                            let probe = self.drain_txbuilder_delegation_probe();
-                            // Seed the Safe portfolio from cache if
-                            // we've viewed it before; kick a fresh
-                            // fetch either way so on-chain state
-                            // catches up. History resets so the
-                            // Activity tab lazy-loads for the Safe.
-                            self.seed_portfolio_from_cache();
-                            self.portfolio_loading = self.portfolio.is_empty();
-                            self.history.clear();
-                            self.history_loaded = false;
-                            self.history_errors = PerChain::default();
-                            // Reset the pending queue for the newly-active
-                            // Safe — no cache, so show the loading line
-                            // until the service answers. Loading only
-                            // when the fetch actually launches, else the
-                            // spinner would never clear.
-                            self.safe_pending.clear();
-                            self.safe_pending_error = None;
-                            let pending = self.fetch_safe_pending_task();
-                            self.safe_pending_loading = pending.is_some();
-                            let refresh = Task::batch([
-                                self.refresh_verification_task(),
-                                self.fetch_portfolio_task(),
-                                pending.unwrap_or_else(Task::none),
-                                probe,
-                            ]);
+                            let refresh = self.activate_safe(idx);
                             return (Task::batch([task, refresh]), None);
                         }
                         return (task, None);
@@ -6678,7 +7172,7 @@ impl WalletScreen {
                     threshold,
                     /* delayed */ true,
                 );
-                let refresh = self.fetch_safe_pending_task().unwrap_or_else(Task::none);
+                let refresh = self.reload_safe_pending(false);
                 return (Task::batch([reload, delayed_reload, refresh]), None);
             }
             Message::SafeTxDetail(child) => {
@@ -7185,6 +7679,12 @@ impl WalletScreen {
 
     pub fn subscription(&self) -> Subscription<Message> {
         let mut subs: Vec<Subscription<Message>> = Vec::new();
+        // WalletConnect's event stream comes first, before the review early
+        // return: iced keeps a subscription running only while every
+        // evaluation still yields it, so pushing it here keeps one stream alive
+        // across every review, modal and nav change (a restart is harmless —
+        // its `recv` is cancel-safe — but pointless churn).
+        subs.extend(self.wc_subscriptions());
         // The clear-signing overlay owns the keyboard while it's open (Esc =
         // Cancel) and suppresses the layers beneath it, so Esc can't
         // simultaneously close the modal/step back in the Apps pane underneath.
@@ -7192,13 +7692,17 @@ impl WalletScreen {
             subs.push(
                 iced::keyboard::listen().map(|e| Message::SignReview(sign_review::Message::Key(e))),
             );
+            // The arming window rides the same tick, so a WalletConnect
+            // review's Confirm visibly comes alive the moment it ends rather
+            // than on the next unrelated event.
+            let now = Instant::now();
             if self.chrome.is_animating()
                 || self.clipboard_clear.is_some()
                 || copy_toast_progress().is_some()
                 || self
                     .sign_review
                     .as_ref()
-                    .is_some_and(|r| r.signing_since.is_some())
+                    .is_some_and(|r| r.signing_since.is_some() || r.arming(now))
             {
                 subs.push(iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick));
             }
@@ -7288,6 +7792,7 @@ impl WalletScreen {
             self.network_short_name(),
             self.verification,
             self.checkpoint_refreshing,
+            self.wc_badge(),
         );
         let app = row![sidebar, self.main_pane(t)]
             .width(Length::Fill)
@@ -8307,6 +8812,9 @@ async fn build_txbuilder_steps(
     };
     match req {
         tx_builder::BatchSignRequest::Safe(s) => {
+            // A single `Call` (a WalletConnect transaction) executes `input`
+            // directly; everything else here is a MultiSend `DelegateCall`.
+            let single_call = s.input.operation == crate::safe::tx::Operation::Call;
             let build = async {
                 if let Some(reason) = s.trust.signing_block_reason() {
                     return Err(reason.to_string());
@@ -8314,15 +8822,18 @@ async fn build_txbuilder_steps(
                 ensure_signable_version(&s.version)?;
                 // A delegatecall to a code-less address silently succeeds
                 // and burns the Safe's nonce — refuse if the MultiSend
-                // library isn't actually deployed on this chain.
-                let ms = s.input.to;
-                let code = network.get_code(ms, s.chain).await?.value;
-                if code.is_empty() {
-                    return Err(format!(
-                        "MultiSend contract {} is not deployed on {} — cannot batch",
-                        short_address(ms),
-                        s.chain.label(),
-                    ));
+                // library isn't actually deployed on this chain. (A plain
+                // `Call` delegates nothing, so there is no library to check.)
+                if !single_call {
+                    let ms = s.input.to;
+                    let code = network.get_code(ms, s.chain).await?.value;
+                    if code.is_empty() {
+                        return Err(format!(
+                            "MultiSend contract {} is not deployed on {} — cannot batch",
+                            short_address(ms),
+                            s.chain.label(),
+                        ));
+                    }
                 }
                 let onchain = current_safe_nonce(network, s.safe, s.chain).await?;
                 // Pin past anything already queued for this Safe. `execTransaction`
@@ -8359,36 +8870,64 @@ async fn build_txbuilder_steps(
             let tx = build_safe_tx_with_nonce(s.input.clone(), nonce);
             let domain = safe_domain(s.safe, s.chain);
             let eip712 = crate::sign::digest::Eip712Digests::of(&tx, &domain);
-            // Clear-sign the batch by unpacking the blob the Safe will
-            // delegatecall and decoding each sub-call. Recovered from
-            // `s.input.data` — the signed bytes — not from the queue it was
-            // packed from, so a desync between the two can't hide a call.
-            // The outer `multiSend(bytes)` itself stays undecoded: its own
-            // decode ("1 argument, N bytes") tells the user nothing.
-            let sub_legs = decode_batch_sub_legs(
-                network,
-                s.chain.into(),
-                s.safe,
-                true,
-                &s.input.data,
-                &local_names,
-            )
-            .await?;
-            let inner = sign_review::ReviewLeg {
-                title: format!(
-                    "MultiSend · {} call{}",
-                    s.call_count,
-                    if s.call_count == 1 { "" } else { "s" }
-                ),
-                to: s.input.to,
-                value: s.input.value,
-                net: s.chain.into(),
-                calldata: s.input.data.clone(),
-                decoded: Box::new(crate::decode::clear_sign::DecodeResult::Empty),
-                sub_legs,
-                // The outer MultiSend leg is addressed to the library, not to
-                // the Safe — the self-calls it can carry are on its sub-legs.
-                self_admin: None,
+            let inner = if single_call {
+                // One call, executed as the Safe: clear-sign it directly, the
+                // way the EOA single-call leg is. A call to the Safe itself is
+                // the multisig reconfiguring itself — flagged exactly as a
+                // batch sub-leg would be.
+                let decoded = decode_leg(
+                    network,
+                    s.chain.into(),
+                    s.safe,
+                    s.input.to,
+                    s.input.data.clone(),
+                    s.input.value,
+                    &local_names,
+                )
+                .await;
+                sign_review::ReviewLeg {
+                    title: format!("Call to {}", short_address(s.input.to)),
+                    to: s.input.to,
+                    value: s.input.value,
+                    net: s.chain.into(),
+                    calldata: s.input.data.clone(),
+                    decoded: Box::new(decoded),
+                    sub_legs: Vec::new(),
+                    self_admin: self_admin_warning(s.safe, true, s.input.to, &s.input.data),
+                }
+            } else {
+                // Clear-sign the batch by unpacking the blob the Safe will
+                // delegatecall and decoding each sub-call. Recovered from
+                // `s.input.data` — the signed bytes — not from the queue it was
+                // packed from, so a desync between the two can't hide a call.
+                // The outer `multiSend(bytes)` itself stays undecoded: its own
+                // decode ("1 argument, N bytes") tells the user nothing.
+                let sub_legs = decode_batch_sub_legs(
+                    network,
+                    s.chain.into(),
+                    s.safe,
+                    true,
+                    &s.input.data,
+                    &local_names,
+                )
+                .await?;
+                sign_review::ReviewLeg {
+                    title: format!(
+                        "MultiSend · {} call{}",
+                        s.call_count,
+                        if s.call_count == 1 { "" } else { "s" }
+                    ),
+                    to: s.input.to,
+                    value: s.input.value,
+                    net: s.chain.into(),
+                    calldata: s.input.data.clone(),
+                    decoded: Box::new(crate::decode::clear_sign::DecodeResult::Empty),
+                    sub_legs,
+                    // The outer MultiSend leg is addressed to the library, not
+                    // to the Safe — the self-calls it can carry are on its
+                    // sub-legs.
+                    self_admin: None,
+                }
             };
             let review = sign_review::SafeExecReview {
                 safe: s.safe,
@@ -8402,7 +8941,7 @@ async fn build_txbuilder_steps(
                 // DELEGATECALL — that is what makes the Safe, rather than the
                 // library, the `msg.sender` of every sub-call — and the review
                 // has to say so out loud rather than let the user meet it for
-                // the first time on a Ledger screen.
+                // the first time on a Ledger screen. A single call is CALL (0).
                 operation: s.input.operation as u8,
                 guard,
                 // Equal on an empty queue. Higher means this batch is being
@@ -8410,6 +8949,8 @@ async fn build_txbuilder_steps(
                 // overlay has to say — and which rules out executing it now,
                 // since the Safe will only accept `onchain_nonce`.
                 onchain_nonce,
+                preflight: None,
+                executor: None,
             };
             Ok(vec![sign_review::SignStep::SafeExec(review)])
         }
@@ -8628,7 +9169,7 @@ fn spawn_txbuilder_safe_execute(
     local_executor_key: Option<B256>,
 ) -> Task<Message> {
     Task::perform(
-        execute_txbuilder_safe_batch(network, sreq, signer_owners, local_executor_key),
+        execute_txbuilder_safe_batch(network, sreq, signer_owners, local_executor_key, None),
         |result| Message::Signed {
             tag: SignTag::TxBuilderExecute,
             signer: None,
@@ -8642,18 +9183,230 @@ fn spawn_txbuilder_safe_execute(
 /// `build_txbuilder_steps` was: the ordering here — that the reviewed==signed
 /// gate runs *before* any owner is prompted — is the property worth pinning,
 /// and it isn't observable through a `Task`.
+///
+/// Also executes a single `Operation::Call` request (WalletConnect): the
+/// preflight then dry-runs that one call (see [`safe_batch_inner_calls`]).
+/// `before_send` (WalletConnect's liveness hook) runs before the first owner
+/// is prompted and again after the executor signs, immediately before the
+/// broadcast ([`crate::safe::tx::execute_safe_tx_guarded`]); `None` for the
+/// Builder.
+///
+/// Errors in the Builder's words; [`execute_safe_batch`] is the same body with
+/// the preflight's verdict left typed, for a flow that words it differently.
 async fn execute_txbuilder_safe_batch(
     network: Arc<dyn BalanceFetcher>,
     sreq: tx_builder::SafeBatchRequest,
     signer_owners: Vec<AccountDescriptor>,
     local_executor_key: Option<B256>,
+    before_send: Option<crate::sign::broadcast::BeforeSend>,
 ) -> Result<TxHash, String> {
-    use crate::safe::tx::{assemble_signatures, execute_safe_tx, sign_owner};
+    let queue_map = sreq.queue_map;
+    execute_safe_batch(
+        network,
+        sreq,
+        signer_owners,
+        local_executor_key,
+        before_send,
+        OwnerSignOpts::default(),
+    )
+    .await
+    .map(|sent| sent.hash)
+    .map_err(|e| match e {
+        SafeExecError::Preflight(p) => p.builder_text(queue_map),
+        SafeExecError::Eip712Refused(text)
+        | SafeExecError::Unconfirmed(_, text)
+        | SafeExecError::Other(text) => text,
+    })
+}
+
+/// Why [`execute_safe_batch`] stopped: the execute-time preflight's verdict,
+/// kept typed so each flow words it for its own user, or anything else as the
+/// text to show.
+#[derive(Debug)]
+enum SafeExecError {
+    Preflight(PreflightError),
+    /// An owner's device showed the EIP-712 prompt and refused it, and
+    /// [`OwnerSigMode::Eip712`](crate::safe::tx::OwnerSigMode::Eip712) asked
+    /// for no `eth_sign` prompt after it. Nothing was broadcast.
+    Eip712Refused(String),
+    /// The executor's signed `execTransaction` was handed to the node and no
+    /// hash came back ([`crate::safe::tx::ExecSendError::Unconfirmed`]): it may
+    /// be on its way. Carries those exact bytes and the text to show.
+    Unconfirmed(crate::walletconnect::UnconfirmedTx, String),
+    Other(String),
+}
+
+impl From<String> for SafeExecError {
+    fn from(text: String) -> Self {
+        Self::Other(text)
+    }
+}
+
+impl From<crate::safe::tx::OwnerSigError> for SafeExecError {
+    fn from(e: crate::safe::tx::OwnerSigError) -> Self {
+        if e.eip712_refused {
+            Self::Eip712Refused(e.text)
+        } else {
+            Self::Other(e.text)
+        }
+    }
+}
+
+/// How a Safe ceremony opens an owner's device for signing ([`OwnerSignOpts::connect`]).
+type ConnectOwner =
+    for<'a> fn(&'a AccountDescriptor) -> futures::future::BoxFuture<'a, Result<KaoSigner, String>>;
+
+/// [`crate::wallet::build_owner_signer`]: a fresh connection to `desc`'s device, its address
+/// re-derived and checked.
+fn connect_owner_device(
+    desc: &AccountDescriptor,
+) -> futures::future::BoxFuture<'_, Result<KaoSigner, String>> {
+    Box::pin(crate::wallet::build_owner_signer(desc))
+}
+
+/// How the owners in a shared Safe ceremony ([`execute_safe_batch`],
+/// [`propose_txbuilder_safe_batch`]) sign. The default — `Auto`, nothing parked
+/// — is how the Transaction Builder has always signed.
+#[derive(Debug, Clone)]
+struct OwnerSignOpts {
+    /// When an owner may fall back from EIP-712 to `eth_sign`.
+    mode: crate::safe::tx::OwnerSigMode,
+    /// The active account's live signer, parked for this ceremony. An owner
+    /// that is that account signs with it — taken for each use and put back
+    /// right after — rather than opening its device a second time: a Ledger
+    /// refuses a second connection while the dashboard holds the first.
+    parked: Option<SignerHandoff>,
+    /// The parked account itself — parked too when it is a Ledger that isn't an owner, so the
+    /// ceremony can let go of it while an owner's Ledger signs ([`let_go_of_parked_ledger`]).
+    active: Option<AccountDescriptor>,
+    /// Opens an owner's device that isn't parked: [`connect_owner_device`].
+    connect: ConnectOwner,
+}
+
+impl Default for OwnerSignOpts {
+    fn default() -> Self {
+        Self {
+            mode: crate::safe::tx::OwnerSigMode::default(),
+            parked: None,
+            active: None,
+            connect: connect_owner_device,
+        }
+    }
+}
+
+/// A live signer for Safe owner `desc`, and whether it is the parked active
+/// signer (which [`release_owner_signer`] puts back). A parked signer is
+/// probed and reconnected if its device dropped ([`take_live_signer`]); any
+/// other is opened afresh (`opts.connect`) and returned as opened.
+async fn owner_signer(
+    opts: &OwnerSignOpts,
+    desc: &AccountDescriptor,
+) -> Result<(KaoSigner, bool), String> {
+    let want = account_address(desc);
+    if let Some(handoff) = &opts.parked {
+        let holds_owner = match handoff.lock() {
+            Ok(cell) => cell
+                .as_ref()
+                .is_some_and(|s| s.can_sign() && Some(s.address()) == want),
+            Err(_) => false,
+        };
+        if holds_owner {
+            return take_live_signer(handoff, desc).await.map(|s| (s, true));
+        }
+    }
+    Ok(((opts.connect)(desc).await?, false))
+}
+
+/// Hand a signer from [`owner_signer`] back: the parked one to its handoff
+/// (poisoned lock or not — losing it would strand the wallet as view-only),
+/// anything else dropped, closing its device.
+fn release_owner_signer(parked: Option<&SignerHandoff>, signer: KaoSigner, from_parked: bool) {
+    match parked {
+        Some(handoff) if from_parked => match handoff.lock() {
+            Ok(mut cell) => *cell = Some(signer),
+            Err(poisoned) => *poisoned.into_inner() = Some(signer),
+        },
+        _ => drop(signer),
+    }
+}
+
+/// Let go of the parked active signer when this ceremony opens another Ledger
+/// owner (`opened`, the owners whose devices it opens): its connection would
+/// otherwise still be held while the other one is opened — possibly to the
+/// same device, which locks up once either handle closes. The handoff keeps a
+/// view-only stand-in, so that owner (if it is one) is opened afresh like any
+/// other, one at a time. Returns the parked account (found among `owners`, or
+/// `opts.active` when it isn't one) for [`reconnect_parked`] once every device
+/// is closed again; `None` when nothing was let go.
+fn let_go_of_parked_ledger(
+    opts: &OwnerSignOpts,
+    owners: &[AccountDescriptor],
+    opened: &[&AccountDescriptor],
+) -> Option<AccountDescriptor> {
+    let is_ledger = |d: &AccountDescriptor| matches!(d, AccountDescriptor::Ledger { .. });
+    let mut cell = match opts.parked.as_ref()?.lock() {
+        Ok(cell) => cell,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let held = cell.as_ref().filter(|s| s.can_sign())?.address();
+    let desc = owners
+        .iter()
+        .chain(opts.active.as_ref())
+        .find(|d| is_ledger(d) && account_address(d) == Some(held))?;
+    let another = opened
+        .iter()
+        .any(|d| is_ledger(d) && account_address(d) != Some(held));
+    if !another {
+        return None;
+    }
+    debug!("safe ceremony: closing the active Ledger while another Ledger owner signs");
+    *cell = Some(KaoSigner::ViewOnly(held));
+    Some(desc.clone())
+}
+
+/// Put a live signer for `desc` — the account [`let_go_of_parked_ledger`] let
+/// go of — back into the handoff, after the ceremony closed every device it
+/// opened. Nothing when the handoff already holds one; if the device can't be
+/// reached, the view-only stand-in stays and the wallet asks for the device
+/// again when it next needs it, as for any device that dropped.
+async fn reconnect_parked(opts: &OwnerSignOpts, desc: &AccountDescriptor) {
+    let Some(handoff) = opts.parked.as_ref() else {
+        return;
+    };
+    let live = |h: &SignerHandoff| match h.lock() {
+        Ok(cell) => cell.as_ref().is_some_and(KaoSigner::can_sign),
+        Err(poisoned) => poisoned
+            .into_inner()
+            .as_ref()
+            .is_some_and(KaoSigner::can_sign),
+    };
+    if live(handoff) {
+        return;
+    }
+    match (opts.connect)(desc).await {
+        Ok(signer) if !live(handoff) => release_owner_signer(Some(handoff), signer, true),
+        Ok(_) => {}
+        Err(e) => warn!(error = %e, "safe ceremony: couldn't reconnect the active Ledger"),
+    }
+}
+
+/// The body of [`execute_txbuilder_safe_batch`], its preflight verdict typed.
+async fn execute_safe_batch(
+    network: Arc<dyn BalanceFetcher>,
+    sreq: tx_builder::SafeBatchRequest,
+    signer_owners: Vec<AccountDescriptor>,
+    local_executor_key: Option<B256>,
+    before_send: Option<crate::sign::broadcast::BeforeSend>,
+    opts: OwnerSignOpts,
+) -> Result<crate::safe::tx::ExecSent, SafeExecError> {
+    use crate::safe::tx::{
+        ExecSendError, assemble_signatures, execute_safe_tx_guarded, sign_owner,
+    };
     {
         {
             let chain = sreq.chain;
             let Some((nonce, pinned_hash)) = sreq.prepared else {
-                return Err::<TxHash, String>("batch not prepared".into());
+                return Err(SafeExecError::Other("batch not prepared".into()));
             };
             // Re-read the live nonce, rebuild at the pin, and re-run the
             // on-chain cross-checks before any owner is asked to sign — the
@@ -8690,28 +9443,26 @@ async fn execute_txbuilder_safe_batch(
             // without this read the drift stays invisible until
             // `execTransaction` reverts, with every device already prompted and
             // the gas already spent. Also ahead of the provider lookup.
-            check_safe_owner_drift(network.as_ref(), &sreq, &signer_owners).await?;
+            check_safe_owner_drift(
+                network.as_ref(),
+                chain,
+                sreq.safe,
+                sreq.threshold,
+                &signer_owners,
+            )
+            .await?;
             // The sub-calls are recovered from the blob about to be signed, not
             // from the queue it was packed from — the same discipline the review
             // uses, so what gets dry-run is what gets executed.
-            let inner = crate::txbuilder::multisend::decode_multisend_calldata(&sreq.input.data)
-                .map_err(|e| e.to_string())?
-                .into_iter()
-                .map(|c| crate::txbuilder::QueuedCall {
-                    id: 0,
-                    to: c.to,
-                    value: c.value,
-                    data: c.data,
-                    title: String::new(),
-                    detail: String::new(),
-                    signature: None,
-                    decoded_args: Vec::new(),
-                })
-                .collect::<Vec<_>>();
-            preflight_before_signing(&network, chain, sreq.safe, &inner, sreq.queue_map).await?;
+            let inner = safe_batch_inner_calls(&sreq)?;
+            preflight_check(&network, chain, sreq.safe, &inner)
+                .await
+                .map_err(SafeExecError::Preflight)?;
             let provider = match network.provider(chain).await {
                 Some(p) => p,
-                None => return Err("no execution RPCs configured".into()),
+                None => {
+                    return Err(SafeExecError::Other("no execution RPCs configured".into()));
+                }
             };
             // Whoever pays for `execTransaction` has to be able to pay for it,
             // and that was never checked on this path — so a 3-of-5 Safe could
@@ -8735,43 +9486,149 @@ async fn execute_txbuilder_safe_batch(
                     .ok_or_else(|| "no owner signer available to execute".to_string())?,
             };
             check_executor_funding(&provider, executor_addr).await?;
+            // Last cheap moment to stop before any device is prompted: a
+            // request that has already died must not walk the owners through a
+            // ceremony whose result would be discarded.
+            if let Some(check) = &before_send {
+                check()?;
+            }
             let needed = sreq.threshold as usize;
-            let mut sigs = Vec::with_capacity(needed);
-            let mut live_owners = Vec::with_capacity(needed);
-            for desc in signer_owners.iter().take(needed) {
-                let signer = crate::wallet::build_owner_signer(desc).await?;
-                let signer = crate::wallet::ensure_connected(signer, desc)
-                    .await
-                    .map_err(|(_, e)| e)?;
-                let pair = sign_owner(&signer, &tx, &domain, local_hash).await?;
-                sigs.push(pair);
-                live_owners.push(signer);
-            }
-            if (sigs.len() as u32) < sreq.threshold {
-                return Err("not enough signable owners to meet the Safe threshold".into());
-            }
-            let packed = assemble_signatures(sigs)?;
-            let local_executor;
-            let executor: &KaoSigner = match local_executor_key {
-                Some(key) => {
-                    let s = crate::wallet::signer_from_bytes(&key)
-                        .map_err(|e| format!("derive executor: {e}"))?;
-                    local_executor = KaoSigner::Local(s);
-                    &local_executor
+            let owners: Vec<&AccountDescriptor> = signer_owners.iter().take(needed).collect();
+            let parked = opts.parked.as_ref();
+            let is_ledger = |d: &AccountDescriptor| matches!(d, AccountDescriptor::Ledger { .. });
+            // Each owner's device is let go as soon as it has signed, so two
+            // owners on one Ledger never hold it at once — the parked active
+            // account's included, which is closed for the ceremony when
+            // another owner is a Ledger too, and reconnected after it. The
+            // first owner pays the gas when no Local executor does; it stays
+            // open for that unless a later owner is a Ledger too (possibly the
+            // same device), in which case it is reconnected after the loop
+            // instead.
+            let let_go = let_go_of_parked_ledger(&opts, &signer_owners, &owners);
+            let keep_first = local_executor_key.is_none()
+                && !(owners.first().is_some_and(|d| is_ledger(d))
+                    && owners.iter().skip(1).any(|d| is_ledger(d)));
+            let sent: Result<crate::safe::tx::ExecSent, SafeExecError> = async {
+                let mut sigs = Vec::with_capacity(needed);
+                let mut kept_first: Option<KaoSigner> = None;
+                for (i, desc) in owners.iter().enumerate() {
+                    let (signer, from_parked) = owner_signer(&opts, desc).await?;
+                    let signer = if from_parked {
+                        signer
+                    } else {
+                        crate::wallet::ensure_connected(signer, desc)
+                            .await
+                            .map_err(|(_, e)| e)?
+                    };
+                    let signed = sign_owner(&signer, &tx, &domain, local_hash, opts.mode).await;
+                    if i == 0 && keep_first && !from_parked && signed.is_ok() {
+                        kept_first = Some(signer);
+                    } else {
+                        release_owner_signer(parked, signer, from_parked);
+                    }
+                    sigs.push(signed?);
                 }
-                None => {
-                    let first = live_owners
-                        .into_iter()
-                        .next()
-                        .ok_or_else(|| "no owner signer available to execute".to_string())?;
-                    local_executor = crate::wallet::ensure_connected(first, &signer_owners[0])
-                        .await
-                        .map_err(|(_, e)| e)?;
-                    &local_executor
+                if (sigs.len() as u32) < sreq.threshold {
+                    return Err(SafeExecError::Other(
+                        "not enough signable owners to meet the Safe threshold".into(),
+                    ));
                 }
-            };
-            execute_safe_tx(&provider, executor, sreq.safe, chain, tx, packed).await
+                let packed = assemble_signatures(sigs)?;
+                let (executor, executor_parked) = match (local_executor_key, kept_first) {
+                    (Some(key), _) => {
+                        let s = crate::wallet::signer_from_bytes(&key)
+                            .map_err(|e| format!("derive executor: {e}"))?;
+                        (KaoSigner::Local(s), false)
+                    }
+                    (None, Some(first)) => (
+                        crate::wallet::ensure_connected(first, &signer_owners[0])
+                            .await
+                            .map_err(|(_, e)| e)?,
+                        false,
+                    ),
+                    (None, None) => {
+                        let first = owners
+                            .first()
+                            .ok_or_else(|| "no owner signer available to execute".to_string())?;
+                        let (signer, from_parked) = owner_signer(&opts, first).await?;
+                        if from_parked {
+                            (signer, true)
+                        } else {
+                            let signer = crate::wallet::ensure_connected(signer, first)
+                                .await
+                                .map_err(|(_, e)| e)?;
+                            // The let-go active account, opened afresh to pay:
+                            // it goes back into the handoff rather than closing.
+                            let returns = let_go
+                                .as_ref()
+                                .is_some_and(|d| account_address(d) == Some(signer.address()));
+                            (signer, returns)
+                        }
+                    }
+                };
+                let sent = execute_safe_tx_guarded(
+                    &provider,
+                    &executor,
+                    sreq.safe,
+                    chain,
+                    tx,
+                    packed,
+                    before_send.as_ref(),
+                )
+                .await;
+                release_owner_signer(parked, executor, executor_parked);
+                sent.map_err(|e| match e {
+                    ExecSendError::NotSent(text) => SafeExecError::Other(text),
+                    ExecSendError::Unconfirmed {
+                        hash,
+                        raw,
+                        nonce,
+                        msg,
+                    } => SafeExecError::Unconfirmed(
+                        crate::walletconnect::UnconfirmedTx { hash, raw, nonce },
+                        msg,
+                    ),
+                })
+            }
+            .await;
+            if let Some(desc) = &let_go {
+                reconnect_parked(&opts, desc).await;
+            }
+            sent
         }
+    }
+}
+
+/// The calls a Safe request executes, as the execute-time preflight dry-runs
+/// them — recovered from the bytes about to be signed. `DelegateCall` (a
+/// Builder batch): the MultiSend blob's sub-calls. `Call` (a WalletConnect
+/// transaction): the one call itself.
+fn safe_batch_inner_calls(
+    sreq: &tx_builder::SafeBatchRequest,
+) -> Result<Vec<crate::txbuilder::QueuedCall>, String> {
+    let call = |to, value, data| crate::txbuilder::QueuedCall {
+        id: 0,
+        to,
+        value,
+        data,
+        title: String::new(),
+        detail: String::new(),
+        signature: None,
+        decoded_args: Vec::new(),
+    };
+    match sreq.input.operation {
+        crate::safe::tx::Operation::Call => Ok(vec![call(
+            sreq.input.to,
+            sreq.input.value,
+            sreq.input.data.clone(),
+        )]),
+        crate::safe::tx::Operation::DelegateCall => Ok(
+            crate::txbuilder::multisend::decode_multisend_calldata(&sreq.input.data)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(|c| call(c.to, c.value, c.data))
+                .collect(),
+        ),
     }
 }
 
@@ -8796,6 +9653,9 @@ async fn execute_txbuilder_safe_batch(
 /// This models the inner calls only; the `execTransaction` wrapper and any
 /// transaction guard are not simulated (see `txbuilder::sim::to_steps`), which
 /// is why the review names the guard separately.
+///
+/// Errors in the Builder's words, the revert named in the queue's numbering
+/// (`queue_map`); [`preflight_check`] is the typed verdict.
 async fn preflight_before_signing(
     network: &Arc<dyn BalanceFetcher>,
     chain: Chain,
@@ -8803,6 +9663,52 @@ async fn preflight_before_signing(
     calls: &[crate::txbuilder::QueuedCall],
     queue_map: tx_builder::QueueMap,
 ) -> Result<(), String> {
+    preflight_check(network, chain, from, calls)
+        .await
+        .map_err(|e| e.builder_text(queue_map))
+}
+
+/// Why [`preflight_check`] refuses a batch before any signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PreflightError {
+    /// Effective step `step` (0-based, the simulator's numbering) reverts — or
+    /// halts — against the chain as it stands.
+    Reverts { step: usize, reason: String },
+    /// Even the lowest honest gas reading is over the block gas limit: no block
+    /// can include it.
+    Unmineable { floor: u64, limit: u64 },
+}
+
+impl PreflightError {
+    /// The Transaction Builder's wording. The revert is named in the *queue's*
+    /// numbering, not the simulator's: the two differ whenever flash approval
+    /// wrapped the batch, whose prepended resets shift every position — a bare
+    /// `step + 1` pointed at a call the user cannot see, inspect or remove.
+    fn builder_text(&self, queue_map: tx_builder::QueueMap) -> String {
+        match self {
+            Self::Reverts { step, reason } => format!(
+                "This batch reverts against the chain as it stands right now, at {}: \
+                 {reason}. Nothing has been signed. Go back and re-simulate — the state it was \
+                 composed against has moved.",
+                tx_builder::describe_effective_step(*step, queue_map),
+            ),
+            Self::Unmineable { floor, limit } => format!(
+                "This batch needs at least {floor} gas, and the block gas limit on this chain \
+                 is {limit} — no block can include it, and the real figure is higher still. \
+                 Nothing has been signed. Split it into smaller batches."
+            ),
+        }
+    }
+}
+
+/// The verdict behind [`preflight_before_signing`]: `Ok` when the batch
+/// succeeds against current state — or when the simulator couldn't say.
+async fn preflight_check(
+    network: &Arc<dyn BalanceFetcher>,
+    chain: Chain,
+    from: Address,
+    calls: &[crate::txbuilder::QueuedCall],
+) -> Result<(), PreflightError> {
     use crate::wallet::sim::BatchOutcome;
     if calls.is_empty() {
         return Ok(());
@@ -8819,16 +9725,7 @@ async fn preflight_before_signing(
     match result.outcome {
         BatchOutcome::Revert { step, reason } | BatchOutcome::Halt { step, reason } => {
             warn!(step, reason = %reason, "tx-builder: execute-time preflight failed — aborting before any signature");
-            // Named in the *queue's* numbering, not the simulator's. The two
-            // differ whenever flash approval wrapped the batch: its prepended
-            // resets shift every position, so a bare `step + 1` pointed at a
-            // call the user cannot see, inspect or remove.
-            Err(format!(
-                "This batch reverts against the chain as it stands right now, at {}: \
-                 {reason}. Nothing has been signed. Go back and re-simulate — the state it was \
-                 composed against has moved.",
-                tx_builder::describe_effective_step(step, queue_map),
-            ))
+            Err(PreflightError::Reverts { step, reason })
         }
         BatchOutcome::Error(reason) => {
             warn!(reason = %reason, "tx-builder: execute-time preflight couldn't run — continuing");
@@ -8858,11 +9755,7 @@ async fn preflight_before_signing(
                     floor,
                     limit, "tx-builder: batch cannot be mined — aborting before any signature"
                 );
-                Err(format!(
-                    "This batch needs at least {floor} gas, and the block gas limit on this chain \
-                     is {limit} — no block can include it, and the real figure is higher still. \
-                     Nothing has been signed. Split it into smaller batches."
-                ))
+                Err(PreflightError::Unmineable { floor, limit })
             }
             None => Ok(()),
         },
@@ -8887,17 +9780,22 @@ async fn preflight_before_signing(
 ///
 /// The reviewed `(nonce, safeTxHash)` pin says nothing about any of this — the
 /// owner set is not part of the signed payload — so it has to be read.
+///
+/// Takes the Safe's `(chain, safe, threshold)` rather than a batch request so
+/// every Safe ceremony that signs against a reviewed threshold can run it —
+/// a Transaction Builder batch, a WalletConnect transaction or message.
 async fn check_safe_owner_drift(
     network: &dyn BalanceFetcher,
-    sreq: &tx_builder::SafeBatchRequest,
+    chain: Chain,
+    safe: Address,
+    threshold: u32,
     signer_owners: &[AccountDescriptor],
 ) -> Result<(), String> {
-    let (owners, threshold) = crate::safe::read_owner_set(network, sreq.chain, sreq.safe).await?;
-    if threshold != sreq.threshold {
+    let (owners, live_threshold) = crate::safe::read_owner_set(network, chain, safe).await?;
+    if live_threshold != threshold {
         return Err(format!(
-            "This Safe's threshold changed since you reviewed ({} → {threshold}) — go back and \
-             review again",
-            sreq.threshold,
+            "This Safe's threshold changed since you reviewed ({threshold} → {live_threshold}) \
+             — go back and review again",
         ));
     }
     let owner_set: std::collections::HashSet<Address> = owners.into_iter().collect();
@@ -8906,7 +9804,7 @@ async fn check_safe_owner_drift(
         .filter_map(crate::wallet::account_address)
         .find(|a| !owner_set.contains(a))
     {
-        warn!(key = %gone, safe = %sreq.safe, "tx-builder: signing key is no longer a Safe owner");
+        warn!(key = %gone, safe = %safe, "tx-builder: signing key is no longer a Safe owner");
         return Err(format!(
             "{} is no longer an owner of this Safe — go back and review again",
             short_address(gone),
@@ -8995,8 +9893,8 @@ async fn check_executor_funding(
     if balance < floor {
         return Err(format!(
             "{} is the account that would pay the gas for this execution, and it holds {} ETH — \
-             not even the minimum {} ETH this transaction needs. Fund it, or set a different gas \
-             payer. Nothing has been signed.",
+             not even the minimum {} ETH this transaction needs. Fund it, then try again. Nothing \
+             has been signed.",
             short_address(executor),
             crate::portfolio::format_token_balance(balance, 18).0,
             crate::portfolio::format_token_balance(floor, 18).0,
@@ -9993,6 +10891,8 @@ fn spawn_cow_prepare(
                             sub_legs: Vec::new(),
                             self_admin: None,
                         }),
+                        preflight: None,
+                        executor: None,
                     },
                 ));
             } else {
@@ -10052,6 +10952,8 @@ fn spawn_cow_prepare(
                                 sub_legs: Vec::new(),
                                 self_admin: None,
                             }),
+                            preflight: None,
+                            executor: None,
                         },
                     ));
                 }
@@ -10125,6 +11027,35 @@ fn signable_owners_of(
         .collect()
 }
 
+/// Indices into `accounts` of the owners this wallet can actually sign a Safe
+/// transaction with: a key kind that can produce a signature (Local / Ledger /
+/// Trezor) **and** an address that is still in the Safe's cached owner set.
+///
+/// `linked_signer_indices` is the user's linkage choice, not an ownership fact
+/// — an account stays linked after the owners remove it. Counting such a key
+/// toward the threshold made the review promise "this wallet holds N of the M
+/// owner keys" on a key the Safe would reject, and sent every device to sign a
+/// transaction that could only revert GS026.
+fn strict_signable_indices(d: &SafeDescriptor, accounts: &[AccountDescriptor]) -> Vec<u32> {
+    let owner_set: std::collections::HashSet<Address> =
+        d.owners.iter().map(|o| Address::from(*o)).collect();
+    d.linked_signer_indices
+        .iter()
+        .copied()
+        .filter(|&idx| {
+            let Some(acct) = accounts.get(idx as usize) else {
+                return false;
+            };
+            matches!(
+                acct,
+                AccountDescriptor::Local { .. }
+                    | AccountDescriptor::Ledger { .. }
+                    | AccountDescriptor::Trezor { .. }
+            ) && crate::wallet::account_address(acct).is_some_and(|a| owner_set.contains(&a))
+        })
+        .collect()
+}
+
 /// Build the display-only [`sign_review::SigningOwner`] for account `idx`: its
 /// label, address, and whether signing prompts its hardware device. Feeds the
 /// waiting card's Safe-ceremony breakdown so the user knows the device prompts
@@ -10154,8 +11085,13 @@ fn owner_desc_by_address(
 /// First Local account's private key — the gas-paying executor for
 /// execute-from-queue. `None` if the wallet is hardware/view-only only.
 fn first_local_key_of(accounts: &[AccountDescriptor]) -> Option<B256> {
-    accounts.iter().find_map(|a| match a {
-        AccountDescriptor::Local { key_bytes, .. } => Some(key_bytes.to_b256()),
+    first_local_account_of(accounts).map(|(_, key)| key)
+}
+
+/// [`first_local_key_of`] with the account's index, so it can be named.
+fn first_local_account_of(accounts: &[AccountDescriptor]) -> Option<(usize, B256)> {
+    accounts.iter().enumerate().find_map(|(i, a)| match a {
+        AccountDescriptor::Local { key_bytes, .. } => Some((i, key_bytes.to_b256())),
         _ => None,
     })
 }
@@ -10348,7 +11284,14 @@ fn spawn_safe_broadcast_task(
                 let signer = crate::wallet::ensure_connected(signer, desc)
                     .await
                     .map_err(|(_, e)| e)?;
-                let pair = sign_owner(&signer, &safe_tx, &domain, local_hash).await?;
+                let pair = sign_owner(
+                    &signer,
+                    &safe_tx,
+                    &domain,
+                    local_hash,
+                    crate::safe::tx::OwnerSigMode::Auto,
+                )
+                .await?;
                 sigs.push(pair);
                 live_owners.push(signer);
             }
@@ -10416,7 +11359,14 @@ fn spawn_safe_propose_task(
             // for a device to drop across (unlike the execute loop, which builds
             // every owner up front), so no separate `ensure_connected` re-probe.
             let signer = crate::wallet::build_owner_signer(&owner_desc).await?;
-            let owner_sig = sign_owner(&signer, &tx, &domain, local).await?;
+            let owner_sig = sign_owner(
+                &signer,
+                &tx,
+                &domain,
+                local,
+                crate::safe::tx::OwnerSigMode::Auto,
+            )
+            .await?;
             crate::safe::service::propose(
                 &req.service_base,
                 req.safe_address,
@@ -10450,11 +11400,13 @@ fn spawn_txbuilder_propose_task(
     sreq: tx_builder::SafeBatchRequest,
 ) -> Task<Message> {
     Task::perform(
-        propose_txbuilder_safe_batch(network, owner_desc, sreq),
-        |result: Result<(), String>| Message::Signed {
+        propose_txbuilder_safe_batch(network, owner_desc, sreq, "Kao", None),
+        // The Builder's result handler needs no artifact: the nonce it reports
+        // is the one pinned on the open review.
+        |result: Result<B256, String>| Message::Signed {
             tag: SignTag::TxBuilderPropose,
             signer: None,
-            result: result.map(|()| SignOutcome::Unit),
+            result: result.map(|_| SignOutcome::Unit),
         },
     )
 }
@@ -10462,14 +11414,56 @@ fn spawn_txbuilder_propose_task(
 /// The body of [`spawn_txbuilder_propose_task`], named for the same reason as
 /// [`execute_txbuilder_safe_batch`]: the gate must run before the owner signs,
 /// and that ordering is only testable outside a `Task`.
+///
+/// Returns the pinned safeTxHash the proposal was filed under (what a
+/// WalletConnect dapp is answered with). `origin` is the Transaction Service's
+/// free-text origin co-signers see — a constant per flow, never dapp-supplied.
+/// `before_send` (WalletConnect's liveness hook) runs before the owner is
+/// prompted and again, signature in hand, immediately before the POST; `None`
+/// for the Builder.
+///
+/// Errors as text; [`propose_safe_batch`] is the same body with an owner's
+/// refused EIP-712 prompt kept typed and the owner's signing options chosen by
+/// the caller.
 async fn propose_txbuilder_safe_batch(
     network: Arc<dyn BalanceFetcher>,
     owner_desc: AccountDescriptor,
     sreq: tx_builder::SafeBatchRequest,
-) -> Result<(), String> {
+    origin: &'static str,
+    before_send: Option<crate::sign::broadcast::BeforeSend>,
+) -> Result<B256, String> {
+    let queue_map = sreq.queue_map;
+    propose_safe_batch(
+        network,
+        owner_desc,
+        sreq,
+        origin,
+        before_send,
+        OwnerSignOpts::default(),
+    )
+    .await
+    .map_err(|e| match e {
+        SafeExecError::Preflight(p) => p.builder_text(queue_map),
+        SafeExecError::Eip712Refused(text)
+        | SafeExecError::Unconfirmed(_, text)
+        | SafeExecError::Other(text) => text,
+    })
+}
+
+/// The body of [`propose_txbuilder_safe_batch`]; never fails with
+/// `SafeExecError::Preflight` (a proposal runs no preflight) or
+/// `SafeExecError::Unconfirmed` (it broadcasts nothing).
+async fn propose_safe_batch(
+    network: Arc<dyn BalanceFetcher>,
+    owner_desc: AccountDescriptor,
+    sreq: tx_builder::SafeBatchRequest,
+    origin: &'static str,
+    before_send: Option<crate::sign::broadcast::BeforeSend>,
+    opts: OwnerSignOpts,
+) -> Result<B256, SafeExecError> {
     use crate::safe::tx::sign_owner;
     let Some((nonce, pinned_hash)) = sreq.prepared else {
-        return Err("batch not prepared".into());
+        return Err("batch not prepared".to_string().into());
     };
     let (tx, domain, local_hash) = rebuild_pinned_safe_tx(
         network.as_ref(),
@@ -10491,10 +11485,37 @@ async fn propose_txbuilder_safe_batch(
     // Transaction Service rejects a confirmation from a non-owner, so without
     // this the user is prompted on their device only to have the proposal
     // bounce. Ahead of `build_owner_signer` so no device is touched.
-    check_safe_owner_drift(network.as_ref(), &sreq, std::slice::from_ref(&owner_desc)).await?;
-    let signer = crate::wallet::build_owner_signer(&owner_desc).await?;
-
-    let owner_sig = sign_owner(&signer, &tx, &domain, local_hash).await?;
+    check_safe_owner_drift(
+        network.as_ref(),
+        sreq.chain,
+        sreq.safe,
+        sreq.threshold,
+        std::slice::from_ref(&owner_desc),
+    )
+    .await?;
+    if let Some(check) = &before_send {
+        check()?;
+    }
+    // The parked active account, when it is a Ledger that isn't this owner, is let go while the
+    // owner's Ledger signs, and reconnected once it is closed again.
+    let parked = opts.parked.as_ref();
+    let let_go = let_go_of_parked_ledger(&opts, std::slice::from_ref(&owner_desc), &[&owner_desc]);
+    let signed = async {
+        let (signer, from_parked) = owner_signer(&opts, &owner_desc).await?;
+        let signed = sign_owner(&signer, &tx, &domain, local_hash, opts.mode).await;
+        release_owner_signer(parked, signer, from_parked);
+        signed.map_err(SafeExecError::from)
+    }
+    .await;
+    if let Some(desc) = &let_go {
+        reconnect_parked(&opts, desc).await;
+    }
+    let owner_sig = signed?;
+    // Signed but not filed: a proposal for a request that died meanwhile must
+    // not reach co-signers.
+    if let Some(check) = &before_send {
+        check()?;
+    }
     crate::safe::service::propose(
         &sreq.service_base,
         sreq.safe,
@@ -10502,10 +11523,10 @@ async fn propose_txbuilder_safe_batch(
         &tx,
         local_hash,
         &owner_sig,
-        Some("Kao"),
+        Some(origin),
     )
     .await?;
-    Ok(())
+    Ok(local_hash)
 }
 
 /// Load full detail (reconstructed `SafeTx` + per-owner signatures) for
@@ -10668,7 +11689,14 @@ fn spawn_safe_confirm_task(
             }
             verify_safe_tx_before_signing(network.as_ref(), &tx, safe, chain, local).await?;
             let signer = crate::wallet::build_owner_signer(&owner_desc).await?;
-            let (_, sig) = sign_owner(&signer, &tx, &domain, safe_tx_hash).await?;
+            let (_, sig) = sign_owner(
+                &signer,
+                &tx,
+                &domain,
+                safe_tx_hash,
+                crate::safe::tx::OwnerSigMode::Auto,
+            )
+            .await?;
             crate::safe::service::confirm(&service_base, safe_tx_hash, chain, &sig).await?;
             Ok("Signature added".to_string())
         },
@@ -10729,7 +11757,14 @@ fn spawn_safe_reject_task(
             let local = compute_hash(&tx, &domain);
             verify_safe_tx_before_signing(network.as_ref(), &tx, safe, chain, local).await?;
             let signer = crate::wallet::build_owner_signer(&owner_desc).await?;
-            let owner_sig = sign_owner(&signer, &tx, &domain, local).await?;
+            let owner_sig = sign_owner(
+                &signer,
+                &tx,
+                &domain,
+                local,
+                crate::safe::tx::OwnerSigMode::Auto,
+            )
+            .await?;
             crate::safe::service::propose(
                 &service_base,
                 safe,
@@ -11921,7 +12956,16 @@ async fn execute_call_as_safe_tx(
     verify_safe_tx_before_signing(network.as_ref(), &tx, safe, chain, local_hash).await?;
     let mut sigs = Vec::with_capacity(owners.len());
     for owner in owners {
-        sigs.push(sign_owner(owner, &tx, &domain, local_hash).await?);
+        sigs.push(
+            sign_owner(
+                owner,
+                &tx,
+                &domain,
+                local_hash,
+                crate::safe::tx::OwnerSigMode::Auto,
+            )
+            .await?,
+        );
     }
     let packed = assemble_signatures(sigs)?;
     execute_safe_tx(provider, executor, safe, chain, tx, packed).await
@@ -12195,7 +13239,12 @@ fn cow_pin_from_steps(steps: &[sign_review::SignStep]) -> Option<sign_review::Co
             | sign_review::SignStep::Delegation(_)
             | sign_review::SignStep::Typed(_)
             | sign_review::SignStep::Send(_)
-            | sign_review::SignStep::SafeSend(_) => {}
+            | sign_review::SignStep::SafeSend(_)
+            | sign_review::SignStep::WcOrigin(_)
+            | sign_review::SignStep::WcMessage(_)
+            | sign_review::SignStep::WcTyped(_)
+            | sign_review::SignStep::WcSafeMessage(_)
+            | sign_review::SignStep::WcTxFees(_) => {}
         }
     }
     saw_safe.then_some(pin)
@@ -12320,7 +13369,16 @@ async fn cow_place_order_safe(
         verify_safe_tx_before_signing(network.as_ref(), &tx, safe, chain, local_hash).await?;
         let mut sigs = Vec::with_capacity(owners.len());
         for owner in owners {
-            sigs.push(sign_owner(owner, &tx, &domain, local_hash).await?);
+            sigs.push(
+                sign_owner(
+                    owner,
+                    &tx,
+                    &domain,
+                    local_hash,
+                    crate::safe::tx::OwnerSigMode::Auto,
+                )
+                .await?,
+            );
         }
         let packed = assemble_signatures(sigs)?;
         let hash = execute_safe_tx(provider, executor, safe, chain, tx, packed).await?;
@@ -12384,7 +13442,16 @@ async fn cow_place_order_safe(
             .await?;
         let mut sigs = Vec::with_capacity(owners.len());
         for owner in owners {
-            sigs.push(sign_owner(owner, &approve_tx, &domain, local_hash).await?);
+            sigs.push(
+                sign_owner(
+                    owner,
+                    &approve_tx,
+                    &domain,
+                    local_hash,
+                    crate::safe::tx::OwnerSigMode::Auto,
+                )
+                .await?,
+            );
         }
         let packed = assemble_signatures(sigs)?;
         let hash = execute_safe_tx(provider, executor, safe, chain, approve_tx, packed).await?;
@@ -12410,7 +13477,14 @@ async fn cow_place_order_safe(
         cow::safe_sig::safe_message_hash(order_digest, safe, chain),
         pin.msg_hash,
     )?;
-    let signature = cow::safe_sig::sign_eip1271_digest(owners, order_digest, safe, chain).await?;
+    let signature = cow::safe_sig::sign_eip1271_digest(
+        owners,
+        order_digest,
+        safe,
+        chain,
+        crate::safe::tx::OwnerSigMode::Auto,
+    )
+    .await?;
     cow::safe_sig::verify_eip1271_on_chain(network.as_ref(), safe, chain, order_digest, &signature)
         .await?;
 
@@ -12579,7 +13653,14 @@ async fn cow_cancel_safe(
     let bytes = parse_order_uid(uid)?;
     let domain = cow::order::cow_domain(chain);
     let digest = cow::order::cancellations_digest(&[bytes], &domain);
-    let signature = cow::safe_sig::sign_eip1271_digest(owners, digest, safe, chain).await?;
+    let signature = cow::safe_sig::sign_eip1271_digest(
+        owners,
+        digest,
+        safe,
+        chain,
+        crate::safe::tx::OwnerSigMode::Auto,
+    )
+    .await?;
     cow::safe_sig::verify_eip1271_on_chain(network.as_ref(), safe, chain, digest, &signature)
         .await?;
     let body = cow::api::CancellationBody {
@@ -14258,6 +15339,8 @@ mod tests {
                 operation: 0,
                 guard: None,
                 onchain_nonce: 9,
+                preflight: None,
+                executor: None,
             }),
             sign_review::SignStep::SafeMessage(sign_review::SafeMessageReview {
                 order: sign_review::OrderReview {
@@ -14326,7 +15409,12 @@ mod tests {
                 | sign_review::SignStep::SafeExec(_)
                 | sign_review::SignStep::SafeMessage(_)
                 | sign_review::SignStep::Send(_)
-                | sign_review::SignStep::SafeSend(_) => None,
+                | sign_review::SignStep::SafeSend(_)
+                | sign_review::SignStep::WcOrigin(_)
+                | sign_review::SignStep::WcMessage(_)
+                | sign_review::SignStep::WcTyped(_)
+                | sign_review::SignStep::WcSafeMessage(_)
+                | sign_review::SignStep::WcTxFees(_) => None,
             })
             .expect("swap review shows the order panel");
         assert_eq!(order.receiver, me, "receiver is the active account");
@@ -15504,10 +16592,15 @@ mod tests {
         }
     }
 
+    /// The `seq` of the queue read in flight.
+    fn read_in_flight(s: &WalletScreen) -> u64 {
+        s.safe_pending_reading.expect("a queue read in flight").1
+    }
+
     #[test]
     fn fetch_safe_pending_task_is_none_in_eoa_mode() {
         let s = screen_for(addr(0xAA), new_cache());
-        assert!(s.fetch_safe_pending_task().is_none());
+        assert!(s.fetch_safe_pending_task(1).is_none());
     }
 
     #[test]
@@ -15515,7 +16608,7 @@ mod tests {
         // Mainnet always has the seeded default RPC, so an active
         // Mainnet Safe must produce a real task.
         let s = safe_screen(1, addr(0xCC));
-        assert!(s.fetch_safe_pending_task().is_some());
+        assert!(s.fetch_safe_pending_task(1).is_some());
     }
 
     #[test]
@@ -15524,7 +16617,7 @@ mod tests {
         // can't run, so no task may launch (and therefore no loading
         // flag may be set by callers).
         let s = safe_screen(42161, addr(0xCC));
-        assert!(s.fetch_safe_pending_task().is_none());
+        assert!(s.fetch_safe_pending_task(1).is_none());
     }
 
     #[test]
@@ -15549,10 +16642,12 @@ mod tests {
     fn safe_pending_fetched_for_active_safe_applies_and_clears_loading() {
         let safe = addr(0xCC);
         let mut s = safe_screen(1, safe);
-        s.safe_pending_loading = true;
+        s.update(Message::RefreshPortfolio);
+        assert!(s.safe_pending_loading);
         s.update(Message::SafePendingFetched {
             safe,
             chain: Chain::Mainnet,
+            seq: read_in_flight(&s),
             result: Ok(vec![pending_tx(5)]),
         });
         assert_eq!(s.safe_pending.len(), 1);
@@ -15561,15 +16656,114 @@ mod tests {
         assert!(!s.safe_pending_loading);
     }
 
+    /// The queue asked for again while a read is in flight (a refresh, a
+    /// proposal) doesn't race a second read against it — whichever landed
+    /// last would win, possibly the older. The first read's answer is
+    /// dropped and a fresh read goes out; the queue stays loading until that
+    /// one lands.
+    #[test]
+    fn safe_pending_read_asked_for_again_in_flight_is_read_afresh() {
+        let safe = addr(0xCC);
+        let mut s = safe_screen(1, safe);
+        s.update(Message::RefreshPortfolio);
+        assert!(s.safe_pending_loading, "read #1 in flight");
+        let first = read_in_flight(&s);
+        s.update(Message::RefreshPortfolio);
+        assert!(s.safe_pending_reread, "no second read races read #1");
+        assert_eq!(read_in_flight(&s), first);
+        s.update(Message::SafePendingFetched {
+            safe,
+            chain: Chain::Mainnet,
+            seq: first,
+            result: Ok(vec![pending_tx(5)]),
+        });
+        assert!(s.safe_pending.is_empty(), "read #1's answer is dropped");
+        assert!(s.safe_pending_loading, "loading until read #2 lands");
+        assert!(!s.safe_pending_reread);
+        let second = read_in_flight(&s);
+        assert_ne!(second, first);
+        s.update(Message::SafePendingFetched {
+            safe,
+            chain: Chain::Mainnet,
+            seq: second,
+            result: Ok(vec![pending_tx(6)]),
+        });
+        assert_eq!(s.safe_pending.len(), 1);
+        assert_eq!(s.safe_pending[0].nonce, 6);
+        assert!(!s.safe_pending_loading);
+        // Leaving the Safe forgets the read in flight: the next one launches.
+        s.update(Message::RefreshPortfolio);
+        s.clear_safe_feeds();
+        assert!(!s.safe_pending_loading && !s.safe_pending_reread);
+        assert_eq!(s.safe_pending_reading, None);
+    }
+
+    /// A read launched before the user left the Safe and came back is not the
+    /// read in flight now: landing first, it is dropped. And the read launched
+    /// on coming back, landing after the queue was asked for again (a
+    /// proposal), is dropped too — only the read launched after the proposal
+    /// releases the queue a nonce is pinned against.
+    #[test]
+    fn a_queue_read_from_before_leaving_the_safe_is_never_taken_for_a_later_one() {
+        let safe = addr(0xCC);
+        let mut s = safe_screen(1, safe);
+        s.update(Message::RefreshPortfolio);
+        let first = read_in_flight(&s);
+        s.exit_safe_mode();
+        s.activate_safe(0);
+        assert!(s.safe_pending_loading, "read #2 in flight");
+        let second = read_in_flight(&s);
+        // Read #1, from before leaving, lands.
+        s.update(Message::SafePendingFetched {
+            safe,
+            chain: Chain::Mainnet,
+            seq: first,
+            result: Ok(vec![pending_tx(4)]),
+        });
+        assert!(s.safe_pending.is_empty(), "read #1 is not read #2");
+        assert!(s.safe_pending_loading);
+        // A proposal asks again while read #2 is out.
+        s.reload_safe_pending(true);
+        s.update(Message::SafePendingFetched {
+            safe,
+            chain: Chain::Mainnet,
+            seq: second,
+            result: Ok(Vec::new()),
+        });
+        assert!(
+            s.safe_pending_loading,
+            "read #2 predates the proposal: the queue stays loading"
+        );
+        // Read #1 again, however late: still not an answer.
+        s.update(Message::SafePendingFetched {
+            safe,
+            chain: Chain::Mainnet,
+            seq: first,
+            result: Ok(Vec::new()),
+        });
+        assert!(s.safe_pending_loading);
+        s.update(Message::SafePendingFetched {
+            safe,
+            chain: Chain::Mainnet,
+            seq: read_in_flight(&s),
+            result: Ok(vec![pending_tx(5)]),
+        });
+        assert!(!s.safe_pending_loading);
+        assert_eq!(s.safe_pending.len(), 1);
+        assert_eq!(s.safe_pending[0].nonce, 5);
+    }
+
     #[test]
     fn safe_pending_fetched_for_other_safe_is_dropped() {
         // A fetch issued before the user switched Safes must not land in
         // the new identity's queue — same staleness rule as
         // PortfolioFetched/HistoryFetched.
         let mut s = safe_screen(1, addr(0xCC));
+        s.update(Message::RefreshPortfolio);
         s.update(Message::SafePendingFetched {
             safe: addr(0xEE), // not the active Safe
             chain: Chain::Mainnet,
+            seq: read_in_flight(&s),
             result: Ok(vec![pending_tx(5)]),
         });
         assert!(s.safe_pending.is_empty());
@@ -15582,9 +16776,11 @@ mod tests {
         // another chain must not apply.
         let safe = addr(0xCC);
         let mut s = safe_screen(1, safe);
+        s.update(Message::RefreshPortfolio);
         s.update(Message::SafePendingFetched {
             safe,
             chain: Chain::Base,
+            seq: read_in_flight(&s),
             result: Ok(vec![pending_tx(5)]),
         });
         assert!(s.safe_pending.is_empty());
@@ -15594,10 +16790,11 @@ mod tests {
     fn safe_pending_fetched_error_is_surfaced_not_swallowed() {
         let safe = addr(0xCC);
         let mut s = safe_screen(1, safe);
-        s.safe_pending_loading = true;
+        s.update(Message::RefreshPortfolio);
         s.update(Message::SafePendingFetched {
             safe,
             chain: Chain::Mainnet,
+            seq: read_in_flight(&s),
             result: Err("safe-service queue: HTTP 503".into()),
         });
         assert!(!s.safe_pending_loading);
@@ -15606,9 +16803,11 @@ mod tests {
             Some("safe-service queue: HTTP 503"),
         );
         // A later successful refresh clears the error.
+        s.update(Message::RefreshPortfolio);
         s.update(Message::SafePendingFetched {
             safe,
             chain: Chain::Mainnet,
+            seq: read_in_flight(&s),
             result: Ok(Vec::new()),
         });
         assert!(s.safe_pending_error.is_none());
@@ -16546,7 +17745,7 @@ mod tests {
         plant_safe_nonce(&mock, req.safe, 4);
         // The owners raised it to 2 after the review was built.
         plant_safe_owner_set(&mock, req.safe, &[addr(0x01), addr(0x02)], 2);
-        let err = execute_txbuilder_safe_batch(Arc::new(mock), req, Vec::new(), None)
+        let err = execute_txbuilder_safe_batch(Arc::new(mock), req, Vec::new(), None, None)
             .await
             .unwrap_err();
         assert!(
@@ -16570,7 +17769,7 @@ mod tests {
         plant_safe_nonce(&mock, req.safe, 4);
         // 0xDE is gone from the owner set.
         plant_safe_owner_set(&mock, req.safe, &[addr(0x01)], 1);
-        let err = execute_txbuilder_safe_batch(Arc::new(mock), req, vec![removed], None)
+        let err = execute_txbuilder_safe_batch(Arc::new(mock), req, vec![removed], None, None)
             .await
             .unwrap_err();
         assert!(
@@ -17556,7 +18755,7 @@ mod tests {
         let mock = CallMock::new();
         plant_safe_agreement(&mock, req.safe, &tx, hash);
         plant_safe_nonce(&mock, req.safe, 1); // a co-signer executed meanwhile
-        let err = execute_txbuilder_safe_batch(Arc::new(mock), req, Vec::new(), None)
+        let err = execute_txbuilder_safe_batch(Arc::new(mock), req, Vec::new(), None, None)
             .await
             .unwrap_err();
         assert!(
@@ -17579,7 +18778,7 @@ mod tests {
         plant_safe_agreement(&mock, req.safe, &tx, hash);
         plant_safe_nonce(&mock, req.safe, 4);
         plant_safe_owner_set(&mock, req.safe, &[addr(0x01)], req.threshold);
-        let err = execute_txbuilder_safe_batch(Arc::new(mock), req, Vec::new(), None)
+        let err = execute_txbuilder_safe_batch(Arc::new(mock), req, Vec::new(), None, None)
             .await
             .unwrap_err();
         assert!(
@@ -17610,6 +18809,8 @@ mod tests {
                 address: addr(0x0B).into(),
             },
             req,
+            "Kao",
+            None,
         )
         .await
         .unwrap_err();
@@ -17637,6 +18838,8 @@ mod tests {
                 address: addr(0x0B).into(),
             },
             req,
+            "Kao",
+            None,
         )
         .await
         .unwrap_err();
@@ -17667,6 +18870,7 @@ mod tests {
                 name: None,
                 address: addr(0x0B).into(),
             }],
+            None,
             None,
         )
         .await
@@ -17902,9 +19106,10 @@ mod tests {
     async fn batch_execute_refuses_before_the_gate_when_nothing_was_pinned() {
         let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
         let req = safe_batch_req(&calls, 1, vec![0]); // `prepared` still None
-        let err = execute_txbuilder_safe_batch(Arc::new(CallMock::new()), req, Vec::new(), None)
-            .await
-            .unwrap_err();
+        let err =
+            execute_txbuilder_safe_batch(Arc::new(CallMock::new()), req, Vec::new(), None, None)
+                .await
+                .unwrap_err();
         assert!(err.contains("not prepared"), "{err}");
     }
 
@@ -18552,6 +19757,8 @@ mod tests {
             }),
             operation: 1,
             guard: None,
+            preflight: None,
+            executor: None,
         })
     }
 
@@ -18580,6 +19787,73 @@ mod tests {
             Some((11, hash)),
             "the owners sign exactly the artifact the overlay displayed",
         );
+    }
+
+    /// The Builder's Safe review names the account that would send `execTransaction` and pay
+    /// its gas — the wallet's first Local account, the Builder's unchanged choice — before
+    /// Confirm, and names none when the batch can only be proposed.
+    #[test]
+    fn txbuilder_safe_review_names_its_executor() {
+        let key = crate::wallet::SecretKeyBytes::new([0x7e; 32]);
+        let payer = crate::wallet::signer_from_bytes(&key.to_b256()).expect("test key");
+        let payer_addr = payer.address();
+        let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
+        for can_execute in [true, false] {
+            let mut s = WalletScreen::new(
+                KaoSigner::Local(payer.clone()),
+                vec![
+                    crate::wallet::AccountDescriptor::Local {
+                        name: Some("Spending".into()),
+                        key_bytes: key.clone(),
+                    },
+                    crate::wallet::view_only_account(addr(0xAA)),
+                ],
+                Vec::new(),
+                0,
+                Arc::new(MockFetcher::new()),
+                new_cache(),
+                Arc::new(RwLock::new(ContactsBook::new())),
+                None,
+            );
+            s.sign_review = Some(sign_review::SignReview::pending(
+                "Batch".into(),
+                None,
+                Vec::new(),
+                None,
+                1,
+                sign_review::SignAction::TxBuilder {
+                    req: tx_builder::BatchSignRequest::Safe(safe_batch_req(&calls, 1, vec![1])),
+                    can_execute,
+                    preflight: PASSED_CLEAN,
+                },
+            ));
+            s.update(Message::SignReviewPrepared {
+                seq: 1,
+                steps: Ok(vec![safe_exec_step(11, B256::repeat_byte(0xAB))]),
+            });
+            let review = s.sign_review.as_ref().expect("overlay stays open");
+            let named = review.steps.iter().find_map(|st| match st {
+                sign_review::SignStep::SafeExec(x) => Some(x.executor.clone()),
+                _ => None,
+            });
+            match named {
+                Some(Some(e)) if can_execute => {
+                    assert_eq!((e.label.as_str(), e.address), ("Spending", payer_addr));
+                }
+                Some(None) if !can_execute => {}
+                other => panic!("can_execute {can_execute}: {other:?}"),
+            }
+            // The waiting card names the same account.
+            if can_execute {
+                match s.plan_safe_batch_dispatch(&safe_batch_req(&calls, 1, vec![1]), true) {
+                    Ok(SafeBatchPlan::Execute {
+                        kind: sign_review::SigningKind::SafeExecute { gas_payer, .. },
+                        ..
+                    }) => assert_eq!(gas_payer.map(|p| p.address), Some(payer_addr)),
+                    other => panic!("{other:?}"),
+                }
+            }
+        }
     }
 
     /// The EOA mirror of the pin above. The delegation decision used to be
@@ -18819,6 +20093,548 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .contains("Not enough signable owners"),
+        );
+    }
+
+    // ── WalletConnect: behaviour-preserving extractions ─────────────────────
+
+    /// A WalletConnect-shaped Safe request: one `Operation::Call` to `to`, not
+    /// a MultiSend delegatecall. Everything else as [`safe_batch_req`].
+    fn safe_call_req(
+        to: Address,
+        value: u64,
+        data: Vec<u8>,
+        threshold: u32,
+        signable: Vec<u32>,
+    ) -> tx_builder::SafeBatchRequest {
+        tx_builder::SafeBatchRequest {
+            input: crate::safe::tx::SafeTxInput {
+                to,
+                value: U256::from(value),
+                data: Bytes::from(data),
+                operation: crate::safe::tx::Operation::Call,
+            },
+            queue_map: tx_builder::QueueMap {
+                prepends: 0,
+                queued: 1,
+            },
+            call_count: 1,
+            ..safe_batch_req(&[queued(1, to, value, vec![0x01])], threshold, signable)
+        }
+    }
+
+    #[test]
+    fn strict_signable_indices_excludes_non_owners() {
+        let local_owner = local_with_key(0x31);
+        let local_owner_addr = crate::wallet::account_address(&local_owner).unwrap();
+        let accounts = vec![
+            local_owner,
+            // Linked, but the owners removed it.
+            local_with_key(0x32),
+            ledger_acct(addr(0x33)),
+            // An owner, but a watch-only key can't sign.
+            view_only_account(addr(0x34)),
+        ];
+        let mut d = safe_desc(1, addr(0x5A));
+        d.owners = vec![
+            local_owner_addr.into(),
+            addr(0x33).into(),
+            addr(0x34).into(),
+        ];
+        // 9 dangles: no such account.
+        d.linked_signer_indices = vec![0, 1, 2, 3, 9];
+        assert_eq!(strict_signable_indices(&d, &accounts), vec![0, 2]);
+        d.linked_signer_indices = Vec::new();
+        assert!(strict_signable_indices(&d, &accounts).is_empty());
+    }
+
+    /// The Safe arm of the Builder request now goes through
+    /// `active_safe_batch_request` — same fields as before, for any input.
+    #[test]
+    fn active_safe_batch_request_matches_the_builder_request() {
+        let owner = local_with_key(0x35);
+        let owner_addr = crate::wallet::account_address(&owner).unwrap();
+        let mut safe = safe_desc(1, addr(0x5A));
+        safe.owners = vec![owner_addr.into()];
+        safe.threshold = 1;
+        safe.linked_signer_indices = vec![0, 1];
+        let mut s = WalletScreen::new(
+            KaoSigner::ViewOnly(owner_addr),
+            vec![owner, local_with_key(0x36)],
+            vec![safe],
+            0,
+            Arc::new(MockFetcher::new()),
+            new_cache(),
+            Arc::new(RwLock::new(ContactsBook::new())),
+            None,
+        );
+        let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
+        assert!(
+            s.active_safe_batch_request(
+                safe_call_req(addr(0xC1), 0, vec![0x01], 1, vec![0]).input,
+                1,
+                tx_builder::QueueMap::default(),
+            )
+            .is_err(),
+            "no Safe is active yet",
+        );
+        s.active_safe = Some(0);
+        s.safe_pending = vec![pending_tx(7)];
+        let tx_builder::BatchSignRequest::Safe(b) = s
+            .build_txbuilder_request(
+                &calls,
+                tx_builder::QueueMap {
+                    prepends: 0,
+                    queued: 1,
+                },
+            )
+            .unwrap()
+        else {
+            panic!("a Safe request in Safe mode");
+        };
+        assert_eq!(b.safe, addr(0x5A));
+        assert_eq!(b.chain, Chain::Mainnet);
+        assert_eq!(b.threshold, 1);
+        assert_eq!(b.owner_count, 1);
+        assert_eq!(b.signable_indices, vec![0], "account 1 isn't an owner");
+        assert_eq!(b.call_count, 1);
+        let expected = multisend::build_multisend_input(&calls, "1.4.1").unwrap();
+        assert_eq!(b.input.operation, crate::safe::tx::Operation::DelegateCall);
+        assert_eq!(
+            (b.input.to, b.input.value, &b.input.data),
+            (expected.to, expected.value, &expected.data)
+        );
+        assert_eq!(b.queued_nonces, Some(vec![7]));
+        assert!(b.prepared.is_none());
+
+        // A single call (WalletConnect) passes straight through.
+        let call = safe_call_req(addr(0xC1), 9, vec![0xab], 1, vec![0]).input;
+        let w = s
+            .active_safe_batch_request(call.clone(), 1, tx_builder::QueueMap::default())
+            .unwrap();
+        assert_eq!(
+            (w.input.to, w.input.value, &w.input.data, w.input.operation),
+            (call.to, call.value, &call.data, call.operation)
+        );
+        assert_eq!(w.signable_indices, b.signable_indices);
+        // An unread queue stays unknown — not "empty".
+        s.safe_pending_loading = true;
+        let w = s
+            .active_safe_batch_request(call, 1, tx_builder::QueueMap::default())
+            .unwrap();
+        assert_eq!(w.queued_nonces, None);
+    }
+
+    #[test]
+    fn plan_safe_batch_dispatch_matches_previous_strings() {
+        // One view-only account at index 0 — the plan only reads indices.
+        let s = screen_for(addr(0xAA), new_cache());
+        let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
+
+        let mut unread = safe_batch_req(&calls, 2, vec![0]);
+        unread.queued_nonces = None;
+        assert_eq!(
+            s.plan_safe_batch_dispatch(&unread, false).unwrap_err(),
+            "Kao couldn't read this Safe's pending queue, so it can't tell which nonce is free. \
+             Proposing now risks filing a transaction that competes with one a co-signer \
+             already queued. Reopen the Safe's queue to refresh it, then try again."
+        );
+        // Execute doesn't care whether the queue was read.
+        assert!(s.plan_safe_batch_dispatch(&unread, true).is_err());
+        assert_eq!(
+            s.plan_safe_batch_dispatch(&safe_batch_req(&calls, 2, vec![]), false)
+                .unwrap_err(),
+            "no signable owner linked to this Safe"
+        );
+        assert_eq!(
+            s.plan_safe_batch_dispatch(&safe_batch_req(&calls, 2, vec![0, 9]), true)
+                .unwrap_err(),
+            "Not enough signable owners linked to this Safe to meet its threshold — propose \
+             to co-signers instead."
+        );
+
+        let req = safe_batch_req(&calls, 1, vec![0]);
+        match s.plan_safe_batch_dispatch(&req, false) {
+            Ok(SafeBatchPlan::Propose {
+                owner_desc,
+                kind: sign_review::SigningKind::SafePropose { owner },
+            }) => {
+                assert_eq!(
+                    crate::wallet::account_address(&owner_desc),
+                    Some(addr(0xAA))
+                );
+                assert_eq!(owner.address, addr(0xAA));
+            }
+            other => panic!("expected a propose plan, got {other:?}"),
+        }
+        match s.plan_safe_batch_dispatch(&req, true) {
+            Ok(SafeBatchPlan::Execute {
+                signer_owners,
+                executor_key: None,
+                kind:
+                    sign_review::SigningKind::SafeExecute {
+                        owners,
+                        gas_payer: None,
+                    },
+            }) => {
+                assert_eq!(signer_owners.len(), 1);
+                assert_eq!(owners.len(), 1);
+            }
+            other => panic!("expected an execute plan, got {other:?}"),
+        }
+        // A Local key in the wallet pays the gas.
+        let keyed = screen_with_key();
+        match keyed.plan_safe_batch_dispatch(&req, true) {
+            Ok(SafeBatchPlan::Execute {
+                executor_key: Some(_),
+                kind:
+                    sign_review::SigningKind::SafeExecute {
+                        gas_payer: Some(_), ..
+                    },
+                ..
+            }) => {}
+            other => panic!("expected a separate gas payer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn safe_exec_labels_table() {
+        let row = |confirm: &str, secondary: Option<&str>, disabled: bool| {
+            (confirm.to_string(), secondary.map(str::to_string), disabled)
+        };
+        assert_eq!(
+            safe_exec_labels(true, false, false),
+            row("Sign & execute now", Some("Propose to co-signers"), false)
+        );
+        assert_eq!(
+            safe_exec_labels(true, false, true),
+            row("Execute anyway ⚠", Some("Propose anyway ⚠"), false)
+        );
+        for soften in [false, true] {
+            assert_eq!(
+                safe_exec_labels(false, true, soften),
+                row("No owner key for this Safe", None, true)
+            );
+        }
+        assert_eq!(
+            safe_exec_labels(false, false, false),
+            row("Propose to co-signers", None, false)
+        );
+        assert_eq!(
+            safe_exec_labels(false, false, true),
+            row("Propose anyway ⚠", None, false)
+        );
+    }
+
+    #[tokio::test]
+    async fn build_txbuilder_steps_single_call_safe_is_operation_zero() {
+        let data = approve_data(addr(0xBE), 7);
+        let req = safe_call_req(addr(0xC1), 3, data.clone(), 1, vec![0]);
+        let (tx, hash) = expected_batch_tx(&req, 5);
+        assert_eq!(tx.operation, 0);
+        // Nothing has code: a plain CALL delegates to no library, so there is
+        // no MultiSend deployment to require.
+        let mock = CallMock::new();
+        plant_safe_nonce(&mock, req.safe, 5);
+        plant_safe_agreement(&mock, req.safe, &tx, hash);
+        let steps = prepared_steps(&mock, tx_builder::BatchSignRequest::Safe(req))
+            .await
+            .expect("a single call prepares without a MultiSend deployment");
+        let [sign_review::SignStep::SafeExec(x)] = steps.as_slice() else {
+            panic!("expected one SafeExec step, got {steps:?}");
+        };
+        assert_eq!(x.operation, 0, "CALL, never DELEGATECALL");
+        assert_eq!(x.nonce, 5);
+        assert_eq!(x.safe_tx_hash, hash);
+        assert_eq!(
+            x.inner.title,
+            format!("Call to {}", short_address(addr(0xC1)))
+        );
+        assert_eq!(x.inner.to, addr(0xC1));
+        assert_eq!(x.inner.value, U256::from(3));
+        assert_eq!(x.inner.calldata, Bytes::from(data));
+        assert!(x.inner.sub_legs.is_empty(), "no MultiSend blob to unpack");
+        assert!(x.inner.self_admin.is_none());
+        let rows = sign_review::erc8213_rows(&steps[0]);
+        assert!(
+            rows.iter()
+                .any(|(l, _)| l == "Calldata Digest (inner call)"),
+            "{rows:?}"
+        );
+
+        // A call to the Safe itself is the multisig reconfiguring itself.
+        let req = safe_call_req(addr(0x5A), 0, add_owner_data(addr(0xEE), 1), 1, vec![0]);
+        let (tx, hash) = expected_batch_tx(&req, 5);
+        let mock = CallMock::new();
+        plant_safe_nonce(&mock, req.safe, 5);
+        plant_safe_agreement(&mock, req.safe, &tx, hash);
+        let steps = prepared_steps(&mock, tx_builder::BatchSignRequest::Safe(req))
+            .await
+            .unwrap();
+        let [sign_review::SignStep::SafeExec(x)] = steps.as_slice() else {
+            panic!("expected one SafeExec step");
+        };
+        assert!(x.inner.self_admin.is_some(), "a self-call is flagged");
+    }
+
+    #[tokio::test]
+    async fn execute_single_call_preflights_the_call() {
+        // The calls a single-call request dry-runs are the call itself…
+        let req = safe_call_req(addr(0xC1), 2, vec![0x01, 0x02], 1, vec![0]);
+        let inner = safe_batch_inner_calls(&req).unwrap();
+        assert_eq!(inner.len(), 1);
+        assert_eq!(
+            (inner[0].to, inner[0].value, inner[0].data.clone()),
+            (addr(0xC1), U256::from(2), Bytes::from(vec![0x01, 0x02]))
+        );
+        // …while a MultiSend batch still unpacks its blob.
+        let calls = vec![
+            queued(1, addr(0xC1), 0, vec![0x01]),
+            queued(2, addr(0xC2), 5, vec![0x02]),
+        ];
+        let unpacked = safe_batch_inner_calls(&safe_batch_req(&calls, 1, vec![0])).unwrap();
+        assert_eq!(
+            unpacked
+                .iter()
+                .map(|c| (c.to, c.value, c.data.clone()))
+                .collect::<Vec<_>>(),
+            calls
+                .iter()
+                .map(|c| (c.to, c.value, c.data.clone()))
+                .collect::<Vec<_>>()
+        );
+
+        // End to end: a call that reverts now stops before any owner is
+        // prompted. (A MultiSend decode of this calldata would fail instead.)
+        let mut req = safe_call_req(addr(0xC1), 0, vec![0x01], 1, vec![0]);
+        let (tx, hash) = expected_batch_tx(&req, 4);
+        req.prepared = Some((4, hash));
+        let owner = local_with_key(0x41);
+        let owner_addr = crate::wallet::account_address(&owner).unwrap();
+        let mock = CallMock::new();
+        plant_safe_agreement(&mock, req.safe, &tx, hash);
+        plant_safe_nonce(&mock, req.safe, 4);
+        plant_safe_owner_set(&mock, req.safe, &[owner_addr], 1);
+        // `PUSH1 0x00 PUSH1 0x00 REVERT`.
+        mock.set_code(
+            addr(0xC1),
+            Bytes::from(vec![0x60, 0x00, 0x60, 0x00, 0xfd]),
+            true,
+        );
+        let err = execute_txbuilder_safe_batch(Arc::new(mock), req, vec![owner], None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("reverts against the chain as it stands"),
+            "{err}"
+        );
+    }
+
+    /// A one-shot loopback stand-in for the Safe Transaction Service: accepts
+    /// one request, answers `status`, and hands back the raw request text.
+    async fn one_shot_service(status: &'static str) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let served = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf).into_owned();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let len = text[..end]
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= end + 4 + len {
+                        break;
+                    }
+                }
+            }
+            sock.write_all(
+                format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+            String::from_utf8_lossy(&buf).into_owned()
+        });
+        (base, served)
+    }
+
+    #[tokio::test]
+    async fn propose_txbuilder_returns_pinned_hash() {
+        let owner = local_with_key(0x42);
+        let owner_addr = crate::wallet::account_address(&owner).unwrap();
+        let mut req = safe_call_req(addr(0xC1), 0, vec![0x01], 1, vec![0]);
+        let (tx, hash) = expected_batch_tx(&req, 4);
+        req.prepared = Some((4, hash));
+        let (base, served) = one_shot_service("201 Created").await;
+        req.service_base = base;
+        let mock = CallMock::new();
+        plant_safe_agreement(&mock, req.safe, &tx, hash);
+        plant_safe_nonce(&mock, req.safe, 4);
+        plant_safe_owner_set(&mock, req.safe, &[owner_addr], 1);
+        let got = propose_txbuilder_safe_batch(Arc::new(mock), owner, req, "Kao:test-origin", None)
+            .await
+            .expect("proposed");
+        assert_eq!(got, hash, "filed under the reviewed safeTxHash");
+        let request = served.await.unwrap();
+        assert!(request.contains(&format!("{hash:#x}")), "{request}");
+        assert!(
+            request.contains(r#""origin":"Kao:test-origin""#),
+            "the caller's constant origin is what co-signers see: {request}"
+        );
+        assert!(request.contains(r#""operation":0"#), "{request}");
+    }
+
+    /// The liveness hook stops a proposal both before the owner is prompted and
+    /// — signature in hand — before anything is filed.
+    #[tokio::test]
+    async fn propose_txbuilder_files_nothing_once_no_longer_wanted() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for allow_first in [false, true] {
+            let owner = local_with_key(0x43);
+            let owner_addr = crate::wallet::account_address(&owner).unwrap();
+            let mut req = safe_call_req(addr(0xC1), 0, vec![0x01], 1, vec![0]);
+            let (tx, hash) = expected_batch_tx(&req, 4);
+            req.prepared = Some((4, hash));
+            // Nothing listens here: reaching the service would be a connection
+            // error, not the refusal.
+            req.service_base = "http://127.0.0.1:1".into();
+            let mock = CallMock::new();
+            plant_safe_agreement(&mock, req.safe, &tx, hash);
+            plant_safe_nonce(&mock, req.safe, 4);
+            plant_safe_owner_set(&mock, req.safe, &[owner_addr], 1);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let seen = calls.clone();
+            let hook: crate::sign::broadcast::BeforeSend = Arc::new(move || {
+                if allow_first && seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(())
+                } else {
+                    Err(crate::sign::broadcast::STILL_WANTED_REFUSAL.to_string())
+                }
+            });
+            let err = propose_txbuilder_safe_batch(Arc::new(mock), owner, req, "Kao", Some(hook))
+                .await
+                .unwrap_err();
+            assert_eq!(err, crate::sign::broadcast::STILL_WANTED_REFUSAL);
+        }
+    }
+
+    #[test]
+    fn activate_safe_enters_safe_mode_in_place() {
+        let mut s = screen_with_safes(addr(1), vec![safe_descriptor(0x55, 1)]);
+        let _ = s.activate_safe(7);
+        assert!(s.active_safe.is_none(), "out of range changes nothing");
+        s.rename_draft = Some(RenameDraft {
+            target: RenameTarget::Account(0),
+            text: "x".into(),
+        });
+        let _ = s.activate_safe(0);
+        assert_eq!(s.active_safe, Some(0));
+        assert_eq!(s.display_address(), Address::from([0x55; 20]));
+        assert!(s.rename_draft.is_none(), "a rename of the EOA is abandoned");
+        assert!(!s.history_loaded);
+    }
+
+    #[test]
+    fn outcome_leaves_dashboard_only_for_rebuilds() {
+        assert!(Outcome::Switch(1).leaves_dashboard());
+        assert!(Outcome::Add.leaves_dashboard());
+        assert!(Outcome::NeedsHardwareReconnect { open_send: false }.leaves_dashboard());
+        assert!(!Outcome::Notice("hi".into()).leaves_dashboard());
+        assert!(!Outcome::RenameActive(None).leaves_dashboard());
+        assert_eq!(Outcome::Notice("secret".into()).name(), "Notice");
+    }
+
+    /// Confirm is inert inside a WalletConnect review's arming window — at the
+    /// coordinator, not just in the view — and what the backdrop sends for a
+    /// WalletConnect review never closes it. No runtime is installed, so a
+    /// Confirm that got through would land in dispatch's "WalletConnect is
+    /// off" branch and leave an error on the review; the armed control at the
+    /// end shows that error does appear once the gate opens.
+    #[test]
+    fn confirm_sign_review_ignored_before_arming_delay() {
+        let mut s = screen_for(addr(0xAA), new_cache());
+        let mut review = sign_review::SignReview::pending(
+            "Sign message".into(),
+            None,
+            Vec::new(),
+            None,
+            1,
+            sign_review::SignAction::WalletConnect {
+                key: crate::walletconnect::WcKey {
+                    topic: crate::walletconnect::Topic::new("ab".repeat(32)),
+                    id: 1,
+                },
+                plan: sign_review::WcSignPlan::Personal {
+                    from: addr(0xAA),
+                    message: Bytes::from_static(b"hi"),
+                    pin: B256::ZERO,
+                },
+            },
+        );
+        review.legs_loading = false;
+        review.armed_at = Some(Instant::now());
+        s.sign_review = Some(review);
+        let _ = s.update(Message::SignReview(sign_review::Message::Confirm));
+        let review = s.sign_review.as_ref().expect("still open");
+        assert!(
+            review.signing_since.is_none() && review.error.is_none() && !review.confirm_disabled,
+            "Confirm never reached dispatch"
+        );
+        assert!(!s.order_op_in_flight);
+        // A backdrop click sends what the view wires it to; for a WalletConnect
+        // review that never closes (and so never refuses) it.
+        let backdrop = sign_review::backdrop_message(s.sign_review.as_ref().expect("open"));
+        let _ = s.update(Message::SignReview(backdrop));
+        assert!(s.sign_review.is_some(), "the backdrop never rejects a dapp");
+        // Control: armed, the same Confirm reaches dispatch.
+        if let Some(r) = s.sign_review.as_mut() {
+            r.armed_at = Instant::now().checked_sub(sign_review::ARMING_DELAY * 2);
+        }
+        let _ = s.update(Message::SignReview(sign_review::Message::Confirm));
+        assert!(
+            s.sign_review.as_ref().is_some_and(|r| r.error.is_some()),
+            "armed, Confirm reaches dispatch, which finds WalletConnect off"
+        );
+    }
+
+    /// The Secondary action ("Propose to co-signers") obeys the same arming
+    /// window as Confirm. Only WalletConnect ever arms a review; a Builder
+    /// review stands in here because its Secondary is live today.
+    #[test]
+    fn secondary_ignored_before_arming_delay() {
+        let calls = vec![queued(1, addr(0xC1), 0, vec![0x01])];
+        let mut req = safe_batch_req(&calls, 1, vec![0]);
+        req.prepared = Some((3, B256::repeat_byte(0xCD)));
+        let mut s = screen_with_txbuilder_review(req, true);
+        s.sign_review.as_mut().unwrap().armed_at = Some(Instant::now());
+        let _ = s.update(Message::SignReview(sign_review::Message::Secondary));
+        assert!(
+            s.sign_review.as_ref().unwrap().signing_since.is_none(),
+            "nothing dispatched while arming"
+        );
+        s.sign_review.as_mut().unwrap().armed_at =
+            Instant::now().checked_sub(sign_review::ARMING_DELAY * 2);
+        let _ = s.update(Message::SignReview(sign_review::Message::Secondary));
+        assert!(
+            matches!(
+                s.sign_review.as_ref().unwrap().signing_progress,
+                Some(sign_review::SigningKind::SafePropose { .. })
+            ),
+            "armed: the propose ceremony starts"
         );
     }
 }

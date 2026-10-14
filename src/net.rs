@@ -1359,11 +1359,15 @@ fn provider_for_url(u: url::Url) -> RootProvider<Ethereum> {
 
 /// True for the hosts that must never be proxied: `localhost`, the whole IPv4
 /// loopback block (`127.0.0.0/8`, via [`IpAddr::is_loopback`]), and IPv6 `::1`.
-/// Matching is on the host as written in the URL (`url` strips the `[]` from an
-/// IPv6 literal in `host_str`, but we strip defensively in case a caller passes
-/// a bracketed form). Deliberately loopback-only: LAN/RFC1918 hosts stay
-/// proxied so a wallet never reveals itself to the local network unprompted.
-fn is_loopback_host(host: Option<&str>) -> bool {
+/// Matching is on the host as written in the URL; `url`'s `host_str` keeps the
+/// `[]` around an IPv6 literal, so they are stripped here. Deliberately
+/// loopback-only: LAN/RFC1918 hosts stay proxied so a wallet never reveals
+/// itself to the local network unprompted.
+///
+/// The one loopback predicate for proxy bypasses: local RPC providers here, and
+/// the WalletConnect relay route (`walletconnect::transport::route_for`) plus
+/// the `ws://`-only-to-loopback rule of its relay setting.
+pub(crate) fn is_loopback_host(host: Option<&str>) -> bool {
     match host {
         Some(h) => {
             let h = h

@@ -113,6 +113,13 @@ iced = { version = "0.14.0", features = ["tokio", "image", "qr_code", "svg", "ad
 # and pulls arkworks 0.5 + circom-witnesscalc (new ark-*/witnesscalc crates
 # need supply-chain exemptions).
 privacy-pools = { git = "https://github.com/kaowallet/privacy-pools", features = ["wallet"] }
+# WalletConnect v2 (pairing, relay protocol, Sign API) in pure Rust — Kao acts
+# as the wallet side. GPL-3.0-only, which is compatible with Kao's
+# AGPL-3.0-or-later (GPLv3 §13 / AGPLv3 §13 explicitly permit combining the
+# two). `default-features = false` drops the crate's bundled `ws` transport
+# (tokio-tungstenite::connect_async), which dials the relay directly and would
+# bypass the user's SOCKS5 proxy; Kao supplies its own proxy-aware connector.
+wallet-connect = { git = "https://github.com/kaowallet/wallet-connect", default-features = false }
 rand = "0.8"
 redb = "4.2.0"
 # Local EVM for transaction preflight. Pinned to the same version helios
@@ -141,7 +148,27 @@ http = "1"
 secrecy = "0.10.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt", "sync"] }
+# `net` / `io-util` / `time` / `macros`: the WalletConnect relay transport
+# (SOCKS5h handshake over a `TcpStream`, the WebSocket pump's `select!` with
+# ping/idle timers). All four were already on in the graph through feature
+# unification; declared here because Kao uses them directly.
+tokio = { version = "1", features = ["rt", "sync", "net", "io-util", "time", "macros"] }
+# WalletConnect relay socket. Kao builds the WebSocket over its own stream
+# (direct only for a loopback relay, otherwise a SOCKS5h tunnel) via
+# `client_async_tls_with_config` — NEVER `connect_async*`, which resolves and
+# dials directly and would bypass the proxy. Same 0.29 build and features
+# alloy's `provider-ws` already pulls in, so nothing new enters the tree.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake", "stream", "rustls-tls-webpki-roots"] }
+# The relay's TLS config is built explicitly on the ring provider (the one
+# Kao's reqwest 0.12 uses). `default-features = false` matters: rustls'
+# defaults add `logging` + `prefer-post-quantum`, which no crate enables
+# today and which would change every rustls user in the process (reqwest
+# included). Never `ClientConfig::builder()` / `install_default()` — with
+# both ring and aws-lc-rs compiled in, the former panics and the latter
+# would silently re-point reqwest's provider.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+# Mozilla roots for the relay's TLS (the same set reqwest/hyper-rustls bundle).
+webpki-roots = "1"
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

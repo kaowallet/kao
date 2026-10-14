@@ -2935,16 +2935,7 @@ impl TxBuilderApp {
     fn fee_caveats(&self) -> Vec<String> {
         let mut out =
             vec!["excludes the priority tip, which every transaction also pays".to_string()];
-        // On the OP stack the L1 data fee is frequently the larger half of the
-        // total, so omitting it silently would understate the cost by more than
-        // the figure itself.
-        if matches!(self.net.builtin(), Some(Chain::Base | Chain::Optimism)) {
-            out.push(
-                "excludes the L1 data fee, which on this chain is often the larger half of the \
-                 total"
-                    .to_string(),
-            );
-        }
+        out.extend(l1_data_fee_caveat(self.net).map(str::to_string));
         if self.ctx.is_safe {
             out.push(
                 "excludes the execTransaction wrapper and its per-owner signature checks"
@@ -3525,6 +3516,11 @@ pub enum BatchSignRequest {
 /// (delegatecall to `MultiSendCallOnly`); `prepared` pins the reviewed
 /// `(nonce, safeTxHash)` once the prepare task lands, so the owners sign
 /// exactly what was shown.
+///
+/// WalletConnect reuses the same request — and the same prepare / execute /
+/// propose pipeline — for a dapp's single transaction: `input` is then the
+/// dapp's call itself with `operation == Call` (`call_count` 1), never a
+/// delegatecall.
 #[derive(Debug, Clone)]
 pub struct SafeBatchRequest {
     /// Queue numbering for the calls packed into `input`. See [`QueueMap`].
@@ -3778,6 +3774,17 @@ fn decode_read_rows(m: &AbiMethod, bytes: &[u8]) -> Vec<ReadRow> {
 
 // The view is large; split into its own module for readability.
 mod view;
+
+/// The fee caveat the OP stack needs, or `None` elsewhere: an L2 transaction there also pays an
+/// L1 data fee that no gas figure — a simulated estimate or a `gas × maxFeePerGas` cap — includes,
+/// and it is frequently the larger half of the total, so leaving it unsaid understates the cost by
+/// more than the figure itself. Phrased to follow "the fee …" in a sentence. Shared by the
+/// Transaction Builder's fee caveats and the WalletConnect fee card.
+pub(super) fn l1_data_fee_caveat(net: NetworkId) -> Option<&'static str> {
+    matches!(net.builtin(), Some(Chain::Base | Chain::Optimism)).then_some(
+        "excludes the L1 data fee, which on this chain is often the larger half of the total",
+    )
+}
 
 #[cfg(test)]
 mod tests {

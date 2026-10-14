@@ -16,12 +16,16 @@ use tracing::{debug, info, warn};
 
 use crate::chain::NetworkId;
 use crate::net::BalanceFetcher;
-use crate::sign::broadcast::{BroadcastCall, Fees, Guards, LiveSigners, broadcast};
+use crate::sign::broadcast::{
+    BroadcastCall, BroadcastError, Fees, Guards, LiveSigners, broadcast_detailed,
+};
 use crate::wallet::KaoSigner;
 use crate::wallet::sim::{self, SimulationResult};
 
 /// `transfer(address,uint256)` — first 4 bytes of keccak256.
 const TRANSFER_SELECTOR: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb];
+/// Bound on a failed estimate's reason as logged.
+const MAX_LOGGED_ESTIMATE_ERROR_CHARS: usize = 500;
 
 /// Encode an ERC-20 `transfer(to, amount)` call.
 ///
@@ -61,7 +65,17 @@ pub fn parse_amount_units(amount: &str, decimals: u8) -> Result<U256, String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SendToken {
     Native,
-    Erc20 { contract: Address },
+    Erc20 {
+        contract: Address,
+    },
+    /// An arbitrary call a dapp asked for (WalletConnect `eth_sendTransaction`):
+    /// `recipient` is the call's `to`, `amount_units` its native value, `data`
+    /// the calldata — verbatim through [`SendPlan::tx_target`], so
+    /// `build_quote` / `simulate_tx` / `sign_and_send` work unchanged. The Send
+    /// pane never builds it.
+    Call {
+        data: Bytes,
+    },
 }
 
 /// All inputs the send flow needs to produce a fully-formed transaction.
@@ -96,6 +110,7 @@ impl SendPlan {
                 U256::ZERO,
                 erc20_transfer_calldata(self.recipient, self.amount_units),
             ),
+            SendToken::Call { data } => (self.recipient, self.amount_units, data.clone()),
         }
     }
 
@@ -154,11 +169,28 @@ pub async fn build_quote(
     network: Arc<dyn BalanceFetcher>,
     plan: &SendPlan,
 ) -> Result<TxQuote, String> {
+    build_quote_with(provider, network, plan, None)
+        .await
+        .map(|(quote, _)| quote)
+}
+
+/// [`build_quote`], except that when `estimate_gas` fails and `fallback_gas` is given, the quote
+/// is taken at that gas limit instead of failing — the fees, nonce and preflight are read exactly
+/// as usual. The second value is then the (URL-redacted) estimate error, which the caller must
+/// disclose: the node expects this transaction to fail. With `fallback_gas = None` this is
+/// `build_quote`.
+pub async fn build_quote_with(
+    provider: &RootProvider<Ethereum>,
+    network: Arc<dyn BalanceFetcher>,
+    plan: &SendPlan,
+    fallback_gas: Option<u64>,
+) -> Result<(TxQuote, Option<String>), String> {
     let req = plan.to_request();
     let (target, value, input) = plan.tx_target();
     let token_kind = match &plan.token {
         SendToken::Native => "native",
         SendToken::Erc20 { .. } => "erc20",
+        SendToken::Call { .. } => "call",
     };
     info!(
         chain_id = plan.chain.chain_id(),
@@ -171,10 +203,10 @@ pub async fn build_quote(
         "quote: starting",
     );
 
-    let gas_limit = match provider.estimate_gas(req).await {
+    let (gas_limit, estimate_failed) = match provider.estimate_gas(req).await {
         Ok(g) => {
             debug!(gas_limit = g, "quote: estimate_gas ok");
-            g
+            (g, None)
         }
         Err(e) => {
             // Alloy transport errors `Display` the full request URL, which for
@@ -182,8 +214,20 @@ pub async fn build_quote(
             // reaches both the warn log and the sign-review overlay error, so
             // scrub URLs to the host first (see `net::redact_urls`).
             let e = crate::net::redact_urls(&e.to_string());
-            warn!(error = %e, "quote: estimate_gas failed");
-            return Err(format!("estimate_gas: {e}"));
+            // The node's reason can quote the contract's revert string, which whoever wrote the
+            // contract chooses: escaped and bounded for the log, so a newline in it can't start a
+            // forged log line.
+            warn!(
+                error = %crate::sanitize::escape_and_clamp(&e, MAX_LOGGED_ESTIMATE_ERROR_CHARS),
+                "quote: estimate_gas failed"
+            );
+            match fallback_gas {
+                Some(g) => {
+                    info!(gas_limit = g, "quote: using the caller's gas limit instead");
+                    (g, Some(e))
+                }
+                None => return Err(format!("estimate_gas: {e}")),
+            }
         }
     };
 
@@ -256,15 +300,18 @@ pub async fn build_quote(
         "quote: ready",
     );
 
-    Ok(TxQuote {
-        plan: plan.clone(),
-        gas_limit,
-        max_fee_per_gas: fees.max_fee_per_gas,
-        max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
-        nonce,
-        eth_cost_wei,
-        sim,
-    })
+    Ok((
+        TxQuote {
+            plan: plan.clone(),
+            gas_limit,
+            max_fee_per_gas: fees.max_fee_per_gas,
+            max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
+            nonce,
+            eth_cost_wei,
+            sim,
+        },
+        estimate_failed,
+    ))
 }
 
 /// Sign the reviewed `SendPlan`/`TxQuote` and broadcast it.
@@ -283,6 +330,35 @@ pub async fn sign_and_send(
     plan: SendPlan,
     quote: TxQuote,
 ) -> Result<TxHash, String> {
+    sign_and_send_with(provider, signer, plan, quote, None).await
+}
+
+/// [`sign_and_send`] with a liveness hook: `before_send` rides in
+/// [`Guards::before_send`], so the primitive runs it after the `from == signer`
+/// wall and before `send_raw_transaction`. Everything else — the stale-quote
+/// guard, `Fees::Quoted`, the zero-recipient guard — is identical.
+pub async fn sign_and_send_with(
+    provider: &RootProvider<Ethereum>,
+    signer: &KaoSigner,
+    plan: SendPlan,
+    quote: TxQuote,
+    before_send: Option<crate::sign::broadcast::BeforeSend>,
+) -> Result<TxHash, String> {
+    sign_and_send_detailed(provider, signer, plan, quote, before_send)
+        .await
+        .map_err(BroadcastError::into_text)
+}
+
+/// [`sign_and_send_with`], telling a failure before anything left the wallet
+/// apart from one after the transaction was handed to the node (whose signed
+/// bytes then come back, for an idempotent re-send) — see [`BroadcastError`].
+pub async fn sign_and_send_detailed(
+    provider: &RootProvider<Ethereum>,
+    signer: &KaoSigner,
+    plan: SendPlan,
+    quote: TxQuote,
+    before_send: Option<crate::sign::broadcast::BeforeSend>,
+) -> Result<TxHash, BroadcastError> {
     // Send-specific stale-quote guard: the reviewed quote must still describe
     // the exact plan being signed. Kept here (rather than the primitive's
     // hash-based `stale_terms`) so the message and full-struct equality are
@@ -296,7 +372,9 @@ pub async fn sign_and_send(
             quoted_amount_units = %quote.plan.amount_units,
             "sign+send: refusing stale quote",
         );
-        return Err("quote no longer matches the reviewed send — review again".to_string());
+        return Err(BroadcastError::NotSent(
+            "quote no longer matches the reviewed send — review again".to_string(),
+        ));
     }
     let (to, value, input) = plan.tx_target();
     info!(
@@ -305,13 +383,14 @@ pub async fn sign_and_send(
         token = match &plan.token {
             SendToken::Native => "native",
             SendToken::Erc20 { .. } => "erc20",
+            SendToken::Call { .. } => "call",
         },
         from = %plan.from,
         to = %to,
         "sign+send: dispatching via unified broadcast",
     );
 
-    broadcast(
+    broadcast_detailed(
         provider,
         LiveSigners::One(signer),
         plan.from,
@@ -329,6 +408,7 @@ pub async fn sign_and_send(
         },
         Guards {
             zero_recipient: Some(plan.recipient),
+            before_send,
             ..Default::default()
         },
     )
@@ -421,6 +501,66 @@ mod tests {
         assert_eq!(target, usdc, "contract is the call target for ERC-20");
         assert_eq!(value, U256::ZERO);
         assert_eq!(input.len(), 68);
+    }
+
+    /// A dapp call goes out exactly as asked: `to` = the plan's recipient,
+    /// `value` = its native amount, calldata verbatim (no ERC-20 re-encoding).
+    #[test]
+    fn call_plan_tx_target_is_verbatim() {
+        let from: Address = address!("000000000000000000000000000000000000beEF");
+        let to: Address = address!("000000000000000000000000000000000000dEaD");
+        let data = Bytes::from(vec![0x12, 0x34, 0x56, 0x78, 0x9a]);
+        let plan = SendPlan {
+            from,
+            recipient: to,
+            token: SendToken::Call { data: data.clone() },
+            amount_units: U256::from(7u64),
+            chain: NetworkId::Builtin(Chain::Mainnet),
+        };
+        let (target, value, input) = plan.tx_target();
+        assert_eq!(target, to);
+        assert_eq!(value, U256::from(7u64));
+        assert_eq!(input, data);
+
+        let req = plan.to_request();
+        assert_eq!(req.from, Some(from));
+        assert_eq!(req.input.input().cloned(), Some(data));
+    }
+
+    /// `matches_plan` compares the calldata too: a quote for one call can't be
+    /// paired with a plan whose data (or value) changed after review.
+    #[test]
+    fn call_quote_matches_plan_structurally() {
+        let to: Address = address!("000000000000000000000000000000000000dEaD");
+        let plan = SendPlan {
+            from: address!("000000000000000000000000000000000000beEF"),
+            recipient: to,
+            token: SendToken::Call {
+                data: Bytes::from(vec![0xaa, 0xbb]),
+            },
+            amount_units: U256::ZERO,
+            chain: NetworkId::Builtin(Chain::Base),
+        };
+        let quote = dummy_quote(&plan);
+        assert!(quote.matches_plan(&plan));
+
+        let other_data = SendPlan {
+            token: SendToken::Call {
+                data: Bytes::from(vec![0xaa, 0xbc]),
+            },
+            ..plan.clone()
+        };
+        assert!(!quote.matches_plan(&other_data));
+        let other_value = SendPlan {
+            amount_units: U256::from(1u64),
+            ..plan.clone()
+        };
+        assert!(!quote.matches_plan(&other_value));
+        let native = SendPlan {
+            token: SendToken::Native,
+            ..plan
+        };
+        assert!(!quote.matches_plan(&native));
     }
 
     #[test]

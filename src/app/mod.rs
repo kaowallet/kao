@@ -59,6 +59,7 @@ use crate::ui::wallet_dashboard::{
 use crate::wallet::{
     self, AccountDescriptor, Contact, ContactsBook, KaoSigner, SafeUpsert, WalletDescriptor,
 };
+use crate::walletconnect::runtime::WcSlot;
 use alloy::signers::local::PrivateKeySigner;
 
 // ── Messages ─────────────────────────────────────────────────────────────────
@@ -113,6 +114,14 @@ pub enum Message {
     DismissToast {
         generation: u64,
     },
+    /// The window's close button / the OS asked to quit: end WalletConnect
+    /// sessions (bounded) first, then exit. A second request quits at once.
+    CloseRequested(iced::window::Id),
+    /// A WalletConnect teardown (lock) finished. Ack only — the runtime it
+    /// tore down is already out of the slot.
+    WcTornDown,
+    /// The quit-time WalletConnect teardown finished (or ran out of time).
+    Exit,
 }
 
 // ── Screens ──────────────────────────────────────────────────────────────────
@@ -278,6 +287,15 @@ pub struct App {
     /// nothing has saved it yet. Saved by the Safe-refresh completion, or
     /// by any earlier `persist_wallet`.
     safes_dirty: bool,
+    /// Where the WalletConnect runtime lives (sessions, request queue,
+    /// answers). App-owned so it outlives every dashboard rebuild; each
+    /// dashboard gets a clone (`set_wc_slot`). Empty until the user first
+    /// presses Connect. Closed and replaced by a fresh slot on lock, so the
+    /// next unlock starts with no sessions and a new relay identity.
+    wc_slot: WcSlot,
+    /// A quit is in progress (WalletConnect teardown running): a second
+    /// close request exits immediately.
+    closing: bool,
 }
 
 /// Off-thread work on `wallet.redb`, one op at a time.
@@ -424,6 +442,8 @@ impl App {
                 pending_add_signer: Vec::new(),
                 db: DbGate::default(),
                 safes_dirty: false,
+                wc_slot: WcSlot::new(),
+                closing: false,
             };
             let task = focus_widget(crate::ui::unlock::PASSWORD_INPUT_ID).map(Message::Unlock);
             (app, task)
@@ -451,6 +471,8 @@ impl App {
                 pending_add_signer: Vec::new(),
                 db: DbGate::default(),
                 safes_dirty: false,
+                wc_slot: WcSlot::new(),
+                closing: false,
             };
             let task = focus_widget(crate::ui::create_password::PASSWORD_INPUT_ID)
                 .map(Message::CreatePassword);
@@ -685,6 +707,16 @@ impl App {
         // named, so account switches don't pile up redundant lookups.
         let ens_task = screen.fetch_ens_name_task().map(Message::WalletDashboard);
         self.screen = Screen::Wallet(Box::new(screen));
+        // Hand the fresh dashboard the WalletConnect slot: it re-mirrors any
+        // live sessions, puts reviews the old dashboard had open back in the
+        // queue, re-sends answers stranded while no dashboard existed, and
+        // pumps the queue.
+        let wc_task = match &mut self.screen {
+            Screen::Wallet(ws) => ws
+                .set_wc_slot(self.wc_slot.clone())
+                .map(Message::WalletDashboard),
+            _ => iced::Task::none(),
+        };
         // Load the Privacy Pools identity (once per session) and push it into
         // the fresh dashboard so the pool app can sync/prove immediately.
         self.load_pp_identity();
@@ -694,7 +726,7 @@ impl App {
             built_in = ?started.elapsed(),
             "entered dashboard; verify+portfolio+ens fetch queued",
         );
-        iced::Task::batch(vec![verify_task, portfolio_task, ens_task])
+        iced::Task::batch(vec![verify_task, portfolio_task, ens_task, wc_task])
     }
 
     // ── Privacy Pools identity plumbing ──────────────────────────────────────
@@ -934,16 +966,47 @@ impl App {
             self.reconnect_open_send = false;
             return self.enter_active_from_wallet(Some(nav));
         }
-        self.screen = if wallet::wallet_exists() {
-            self.passphrase = None;
-            self.wallet = None;
-            self.pp_seed = None;
-            self.pp_loaded = false;
-            Screen::Unlock(UnlockScreen::default())
-        } else {
-            Screen::SelectHardwareWallet(SelectHardwareWalletScreen::default())
-        };
+        if wallet::wallet_exists() {
+            return self.lock_wallet();
+        }
+        self.screen = Screen::SelectHardwareWallet(SelectHardwareWalletScreen::default());
         iced::Task::none()
+    }
+
+    /// Lock: forget the passphrase, the decrypted wallet and the pool seed,
+    /// and land on the unlock screen.
+    fn lock_wallet(&mut self) -> iced::Task<Message> {
+        self.passphrase = None;
+        self.wallet = None;
+        self.pp_seed = None;
+        self.pp_loaded = false;
+        self.screen = Screen::Unlock(UnlockScreen::default());
+        // Locking ends every WalletConnect session: dapps are told, and
+        // nothing signed for them survives into the next unlock.
+        self.teardown_wc()
+    }
+
+    /// Lock path: replace the slot, close the old one, and tear its runtime
+    /// down — waiting/in-review requests are answered 4900, every session is
+    /// disconnected (dapps hear 6000), then the relay socket closes. The
+    /// next unlock gets a fresh, empty slot.
+    ///
+    /// The teardown runs on the runtime's own tokio handle, not inside the
+    /// returned task, and the fresh slot keeps count of it: a quit right
+    /// after the lock (iced then never polls this task again) waits for it.
+    fn teardown_wc(&mut self) -> iced::Task<Message> {
+        let next = self.wc_slot.successor();
+        let old = std::mem::replace(&mut self.wc_slot, next);
+        match old.close() {
+            Some(rt) => {
+                // `spawn_teardown` marks it closed synchronously, before any
+                // task runs: from here `before_send` refuses, so a signature
+                // still in flight broadcasts nothing.
+                let running = old.spawn_teardown(rt);
+                iced::Task::perform(running, |_| Message::WcTornDown)
+            }
+            None => iced::Task::none(),
+        }
     }
 
     /// Drop back to the dashboard without going through setup again, using
@@ -2172,6 +2235,12 @@ impl App {
             // ── Wallet ──────────────────────────────────────────────
             Message::WalletDashboard(msg) => {
                 let Screen::Wallet(screen) = &mut self.screen else {
+                    // A dashboard message landing off-screen (locked, or in a
+                    // hardware reconnect / add-account flow). Only a finished
+                    // WalletConnect signature needs anything: its dapp is
+                    // answered from here, so it never waits on a dashboard
+                    // that may not come back.
+                    crate::ui::wallet_dashboard::handle_orphan_message(msg, &self.wc_slot);
                     return iced::Task::none();
                 };
                 let (cmd, outcome) = screen.update(msg);
@@ -2256,6 +2325,10 @@ impl App {
                         let t = self.pool_reveal_backup();
                         iced::Task::batch(vec![cmd.map(Message::WalletDashboard), t])
                     }
+                    Some(WalletDashboardOutcome::Notice(s)) => iced::Task::batch(vec![
+                        cmd.map(Message::WalletDashboard),
+                        iced::Task::done(Message::Notice(s)),
+                    ]),
                     None => cmd.map(Message::WalletDashboard),
                 }
             }
@@ -2343,6 +2416,32 @@ impl App {
                 }
                 iced::Task::none()
             }
+
+            // ── Quit ────────────────────────────────────────────────
+            Message::CloseRequested(window) => {
+                // A second close while the teardown runs means "now".
+                if self.closing {
+                    info!(?window, "second close request — quitting now");
+                    return iced::exit();
+                }
+                self.closing = true;
+                // Ends the slot's runtime, and waits — bounded by
+                // QUIT_TEARDOWN_BUDGET, so a dead relay can't trap the window
+                // open — for every teardown still running, a lock's or a
+                // retire's included: exiting would cut their session deletes.
+                match self.wc_slot.quit() {
+                    None => iced::exit(),
+                    Some(wait) => {
+                        info!(
+                            ?window,
+                            "quit requested — ending WalletConnect sessions first"
+                        );
+                        iced::Task::perform(wait, |()| Message::Exit)
+                    }
+                }
+            }
+            Message::WcTornDown => iced::Task::none(),
+            Message::Exit => iced::exit(),
         }
     }
 
@@ -2399,6 +2498,15 @@ impl App {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
+        // On every screen: `main` turns off iced's exit-on-close, so this is
+        // the only way the window's close button quits.
+        Subscription::batch([
+            self.screen_subscription(),
+            iced::window::close_requests().map(Message::CloseRequested),
+        ])
+    }
+
+    fn screen_subscription(&self) -> Subscription<Message> {
         match &self.screen {
             Screen::CreatePassword(screen) => screen.subscription().map(Message::CreatePassword),
             Screen::Unlock(_) => Subscription::none(),
@@ -2670,6 +2778,9 @@ mod tests {
     use super::*;
     use crate::net::MockFetcher;
     use crate::ui::create_password::CreatePasswordScreen;
+    use crate::ui::wallet_dashboard::{SignTag, WcSignKind};
+    use crate::walletconnect::runtime::WcRuntime;
+    use crate::walletconnect::{WcKey, codes as wc_codes, testkit};
     use alloy::primitives::B256;
 
     fn build_app(screen: Screen) -> App {
@@ -2693,6 +2804,8 @@ mod tests {
             pending_add_signer: Vec::new(),
             db: DbGate::default(),
             safes_dirty: false,
+            wc_slot: WcSlot::new(),
+            closing: false,
         }
     }
 
@@ -3944,5 +4057,150 @@ mod tests {
             "no key in Kao signs for the active Safe any more"
         );
         assert_eq!(screen.test_address(), k2, "same account, now at 1");
+    }
+
+    // ── WalletConnect: lock, quit, off-screen answers ───────────────────
+
+    const WC_ADDR: alloy::primitives::Address =
+        alloy::primitives::address!("ab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb");
+
+    /// A session with one `personal_sign` Kao is already signing — the dashboard's half of
+    /// admission and review done by hand, as the runtime tests do.
+    async fn wc_signing_request(
+        rt: &WcRuntime,
+        dapp: &wallet_connect::sign::SignClient,
+    ) -> (WcKey, testkit::DappCall) {
+        let topic = testkit::connect_raw(rt, dapp, WC_ADDR, &[1]).await;
+        let params = testkit::personal_sign_params("hi", WC_ADDR);
+        let call = testkit::dapp_request(dapp, &topic, 1, "personal_sign", params);
+        let (req, at) = testkit::next_request(&rt.events()).await;
+        let key = WcKey {
+            topic: req.topic.clone(),
+            id: req.id,
+        };
+        rt.admit(&req, at, Ok(testkit::admitted_personal(WC_ADDR, 1, "hi")));
+        rt.with_book(|b| {
+            assert!(b.mark_in_review(&key, 1));
+            assert!(b.mark_signing(&key, 1));
+        });
+        (key, call)
+    }
+
+    #[tokio::test]
+    async fn lock_closes_and_replaces_the_slot() {
+        let (_relay, dapp, _events, rt, slot) = testkit::harness().await;
+        let (key, _call) = wc_signing_request(&rt, &dapp).await;
+        let mut app = build_app(placeholder_screen());
+        app.wc_slot = slot.clone();
+        app.passphrase = Some(SecretString::new("pw".to_string().into_boxed_str()));
+        app.pp_seed = Some(SecretString::new("seed".to_string().into_boxed_str()));
+        app.pp_loaded = true;
+        assert!(rt.is_live(&key));
+
+        // The lock itself — what Back on a connect screen runs when a wallet exists.
+        let task = app.lock_wallet();
+        assert!(matches!(app.screen, Screen::Unlock(_)));
+        assert!(app.passphrase.is_none() && app.pp_seed.is_none() && !app.pp_loaded);
+        assert!(task.units() > 0, "the bounded teardown runs as a task");
+        // Closed synchronously, before that task ever runs: the signature in flight can no
+        // longer be broadcast or answered.
+        assert!(rt.is_closed());
+        assert!(!rt.is_live(&key));
+        // The old slot is empty and closed for good — a start racing the lock can't install.
+        assert!(slot.is_closed() && slot.get().is_none());
+        assert!(!slot.begin_start());
+        // The next unlock starts from a fresh, empty slot.
+        assert!(!app.wc_slot.is_closed() && app.wc_slot.get().is_none());
+        // With nothing running there is nothing to tear down.
+        assert_eq!(app.teardown_wc().units(), 0);
+        assert!(!app.wc_slot.is_closed());
+    }
+
+    #[tokio::test]
+    async fn close_request_ends_walletconnect_before_exiting() {
+        let (_relay, dapp, _events, rt, slot) = testkit::harness().await;
+        let (key, _call) = wc_signing_request(&rt, &dapp).await;
+        let mut app = build_app(placeholder_screen());
+        app.wc_slot = slot.clone();
+        let window = iced::window::Id::unique();
+
+        let task = app.update(Message::CloseRequested(window));
+        assert!(app.closing);
+        assert!(task.units() > 0, "the teardown runs, then `Exit`");
+        assert!(slot.is_closed() && slot.get().is_none());
+        assert!(rt.is_closed() && !rt.is_live(&key));
+        // A second close while that runs quits at once.
+        let _ = app.update(Message::CloseRequested(window));
+        assert!(app.closing);
+        assert_eq!(app.update(Message::WcTornDown).units(), 0);
+    }
+
+    #[test]
+    fn close_request_without_walletconnect_exits_at_once() {
+        let mut app = build_app(placeholder_screen());
+        let _ = app.update(Message::CloseRequested(iced::window::Id::unique()));
+        assert!(app.closing);
+        assert!(app.wc_slot.is_closed(), "nothing can start while quitting");
+    }
+
+    /// A lock's teardown is still running when the window closes: iced exits as soon as the quit
+    /// task resolves and never polls the lock's task again, so the teardown must run on its own
+    /// and the quit must wait for it — the dapp still hears 6000.
+    #[tokio::test]
+    async fn quit_waits_for_a_lock_teardown_still_running() {
+        let (_relay, dapp, _events, rt, slot) = testkit::harness().await;
+        let topic = testkit::connect_raw(&rt, &dapp, WC_ADDR, &[1]).await;
+        let mut app = build_app(placeholder_screen());
+        app.wc_slot = slot.clone();
+        // What process exit does to the lock's pending task.
+        drop(app.teardown_wc());
+        assert_eq!(
+            app.wc_slot.teardowns_running(),
+            1,
+            "the fresh slot counts the lock's teardown, so the quit below waits for it"
+        );
+        let quit = app.update(Message::CloseRequested(iced::window::Id::unique()));
+        assert!(app.closing && app.wc_slot.is_closed());
+        assert!(quit.units() > 0);
+        testkit::settle(|| !dapp.sessions().iter().any(|s| s.topic == topic)).await;
+        assert!(
+            !dapp.sessions().iter().any(|s| s.topic == topic),
+            "the dapp heard 6000"
+        );
+        testkit::settle(|| app.wc_slot.teardowns_running() == 0).await;
+        assert_eq!(
+            app.wc_slot.teardowns_running(),
+            0,
+            "done: the quit's wait ends"
+        );
+    }
+
+    /// A WalletConnect signature finishing while no dashboard is on screen (a lock, a hardware
+    /// reconnect, the add-account flow) still answers its dapp, from the App.
+    #[tokio::test]
+    async fn off_screen_signing_result_is_answered() {
+        let (_relay, dapp, _events, rt, slot) = testkit::harness().await;
+        let (key, call) = wc_signing_request(&rt, &dapp).await;
+        let mut app = build_app(placeholder_screen());
+        app.wc_slot = slot.clone();
+
+        let task = app.update(Message::WalletDashboard(WalletDashboardMessage::Signed {
+            tag: SignTag::WalletConnect {
+                key: key.clone(),
+                kind: WcSignKind::Personal,
+            },
+            signer: None,
+            result: Err("the Ledger was unplugged".into()),
+        }));
+        assert_eq!(task.units(), 0);
+        let Err(wallet_connect::Error::Peer(e)) = testkit::dapp_result(call).await else {
+            panic!("the dapp hears a failure");
+        };
+        assert_eq!(e.code, wc_codes::INTERNAL);
+        assert!(
+            !e.message.contains("Ledger"),
+            "the detail stays with the user"
+        );
+        assert_eq!(rt.with_book(|b| b.state_of(&key)), None, "answered once");
     }
 }

@@ -447,7 +447,7 @@ fn amount_parts(tx: &IndexedTx, direction: TxDirection) -> AmountParts {
 /// Short-hash form for the modal's Hash field: `0x1111…1111`. The full
 /// hash is still copyable via the field's Copy affordance and the
 /// "Copy hash" action button.
-fn short_hash(hash: &alloy::primitives::B256) -> String {
+pub(super) fn short_hash(hash: &alloy::primitives::B256) -> String {
     let full = format!("{hash:#x}");
     if full.len() <= 12 {
         return full;

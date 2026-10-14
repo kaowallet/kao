@@ -273,14 +273,14 @@ impl SafeTxDetailPane {
         &self,
     ) -> Option<Result<Vec<crate::txbuilder::multisend::PackedCall>, String>> {
         use crate::txbuilder::multisend::{
-            MULTISEND_CALL_ONLY_1_3_0, MULTISEND_CALL_ONLY_1_4_1, decode_multisend_calldata,
+            canonical_multisend_call_only, decode_multisend_calldata,
         };
         let to = self
             .detail
             .as_ref()
             .map(|d| d.tx.to)
             .unwrap_or(self.pending.to);
-        let is_multisend = matches!(to, MULTISEND_CALL_ONLY_1_3_0 | MULTISEND_CALL_ONLY_1_4_1);
+        let is_multisend = canonical_multisend_call_only(to).is_some();
         if !is_multisend || self.effective_operation() != 1 {
             return None;
         }
@@ -1490,6 +1490,26 @@ mod tests {
         assert_eq!(calls[0].data.as_ref(), &[0x01, 0x02, 0x03, 0x04]);
         assert_eq!(calls[1].to, owner(0xC2));
         assert_eq!(calls[1].value, alloy::primitives::U256::from(5u64));
+    }
+
+    /// Safe{Wallet} batches from 1.5.0 Safes, and from 1.3.0 Safes on OP / Base (whose
+    /// MultiSendCallOnly is the EIP-155 deployment), are batches too — not delegatecalls to an
+    /// unknown library.
+    #[test]
+    fn batches_through_the_other_official_multisend_deployments_unpack() {
+        use crate::txbuilder::multisend::{
+            MULTISEND_CALL_ONLY_1_3_0_EIP155, MULTISEND_CALL_ONLY_1_5_0,
+        };
+        for lib in [MULTISEND_CALL_ONLY_1_3_0_EIP155, MULTISEND_CALL_ONLY_1_5_0] {
+            let blob =
+                multisend_blob(&[(owner(0xC1), 0, vec![0x01]), (owner(0xC2), 5, Vec::new())]);
+            let p = pane_with_batch(owner(0x5A), lib, blob, 1);
+            let calls = p
+                .batch_contents()
+                .expect("recognised as a batch")
+                .expect("and decodes");
+            assert_eq!(calls.len(), 2, "{lib}");
+        }
     }
 
     #[test]

@@ -27,7 +27,7 @@ For too long we've been relying on slow and vulnerable JavaScript for building u
 
 # ‧₊˚♪ 𝄞₊˚⊹ Roadmap ▶︎ •၊၊||၊|။||||| 0:10
 
-- [ ] WalletConnect
+- [x] WalletConnect
 - [x] ERC-7730 clear signing support
 - Kohaku-aligned integrations:
     - [ ] Stealth Addresses

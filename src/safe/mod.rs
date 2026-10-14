@@ -126,7 +126,7 @@ const GUARD_STORAGE_SLOT: B256 =
 /// `keccak256("fallback_manager.handler.address")` — slot for the
 /// fallback handler. Same shape as `GUARD_STORAGE_SLOT`: no getter,
 /// keccak-derived, verified by a test.
-const FALLBACK_HANDLER_STORAGE_SLOT: B256 =
+pub(crate) const FALLBACK_HANDLER_STORAGE_SLOT: B256 =
     b256!("0x6c9a6c4a39284e37ed1cf53d337577d14212a4870fb976a4366c693b939918d5");
 
 /// Safe's proxy stores the singleton (implementation) address at the
@@ -285,6 +285,24 @@ const KNOWN_MODULES: &[(Address, &str)] = &[
         "Safe CompatibilityFallbackHandler 1.3.0 (EIP-155)",
     ),
 ];
+
+/// The `CompatibilityFallbackHandler` deployments in [`KNOWN_MODULES`]: the
+/// fallback handlers that implement EIP-1271 `isValidSignature` for a Safe.
+const EIP1271_HANDLERS: [Address; 4] = [
+    address!("0x3EfCBb83A4A7AfcB4F68D501E2c2203a38be77f4"),
+    address!("0xfd0732Dc9E303f09fCEf3a7388Ad10A83459Ec99"),
+    address!("0xf48f2B2d2a534e402487b3ee7C18c33Aec0Fe5e4"),
+    address!("0x017062a1dE2FE6b99BE3d9d37841FeD19F573804"),
+];
+
+/// Whether a Safe whose fallback handler is `handler` can have a message
+/// signature validated (EIP-1271): only Safe's own `CompatibilityFallbackHandler`
+/// is known to answer `isValidSignature`. With any other handler — an unknown
+/// contract, a handler without EIP-1271, an EOA — the call answers nothing or
+/// reverts, so owners asked to sign a message would sign for nothing.
+pub fn is_eip1271_handler(handler: Address) -> bool {
+    EIP1271_HANDLERS.contains(&handler)
+}
 
 /// Human-readable label for a known module / guard / handler address,
 /// or `None` if Kao doesn't recognize it. UI surfaces `None` with the
@@ -858,7 +876,7 @@ async fn read_guard(
     Ok(non_zero_address(b256_to_address(slot.value)))
 }
 
-async fn read_fallback_handler(
+pub(crate) async fn read_fallback_handler(
     net: &dyn BalanceFetcher,
     chain: Chain,
     addr: Address,
@@ -1164,6 +1182,29 @@ mod tests {
             classify_module(address!("0x017062a1dE2FE6b99BE3d9d37841FeD19F573804")),
             Some("Safe CompatibilityFallbackHandler 1.3.0 (EIP-155)"),
         );
+    }
+
+    /// Exactly the known CompatibilityFallbackHandlers validate EIP-1271 signatures — nothing
+    /// else Kao labels (the Allowance Module), and no unknown address.
+    #[test]
+    fn eip1271_handlers_are_the_known_compatibility_fallback_handlers() {
+        for h in EIP1271_HANDLERS {
+            assert!(is_eip1271_handler(h));
+            assert!(
+                classify_module(h).is_some_and(|l| l.contains("CompatibilityFallbackHandler")),
+                "{h}"
+            );
+        }
+        let labelled = KNOWN_MODULES
+            .iter()
+            .filter(|(_, l)| l.contains("CompatibilityFallbackHandler"))
+            .count();
+        assert_eq!(labelled, EIP1271_HANDLERS.len());
+        assert!(!is_eip1271_handler(address!(
+            "0xCFbFaC74C26F8647cBDb8c5caf80BB5b32E43134"
+        )));
+        assert!(!is_eip1271_handler(Address::ZERO));
+        assert!(!is_eip1271_handler(Address::repeat_byte(0xfa)));
     }
 
     #[test]

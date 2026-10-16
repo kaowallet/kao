@@ -8885,6 +8885,8 @@ fn delegate_label(delegate: Address, chain: Chain) -> String {
     use crate::txbuilder::eip7702;
     if delegate == eip7702::EF_SIMPLE_7702_ACCOUNT {
         "Ethereum Foundation · Simple7702Account".to_string()
+    } else if let Some(name) = eip7702::third_party_delegate_name(delegate) {
+        format!("{name} · not a delegate this wallet installs")
     } else {
         match crate::txbuilder::abi::known_by_address(chain, delegate) {
             Some(c) => format!("{} · not a delegate this wallet installs", c.name),
@@ -18466,6 +18468,24 @@ mod tests {
         assert!(label.contains("UNRECOGNISED"), "{label}");
         let ef = delegate_label(eip7702::EF_SIMPLE_7702_ACCOUNT, Chain::Mainnet);
         assert_eq!(ef, "Ethereum Foundation · Simple7702Account");
+        let ambire = delegate_label(eip7702::AMBIRE_7702_DELEGATE, Chain::Base);
+        assert_eq!(ambire, "Ambire · not a delegate this wallet installs");
+        for (delegate, name) in [
+            (eip7702::UNISWAP_CALIBUR_DELEGATE, "Uniswap Calibur"),
+            (
+                eip7702::ALCHEMY_MODULAR_ACCOUNT_DELEGATE,
+                "Alchemy Modular Account",
+            ),
+            (
+                eip7702::METAMASK_STATELESS_DELEGATOR,
+                "MetaMask Stateless DeleGator",
+            ),
+        ] {
+            assert_eq!(
+                delegate_label(delegate, Chain::Mainnet),
+                format!("{name} · not a delegate this wallet installs"),
+            );
+        }
     }
 
     #[tokio::test]

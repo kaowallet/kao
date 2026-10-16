@@ -41,6 +41,42 @@ use super::QueuedCall;
 /// account), mirroring the MultiSend deployment check.
 pub const EF_SIMPLE_7702_ACCOUNT: Address = address!("0x4Cd241E8d1510e30b2076397afc7508Ae59C66c9");
 
+// Third-party EIP-7702 delegates. None is ever installed by this wallet; they
+// are listed only so an account another wallet already delegated is named
+// rather than flagged as unrecognised. Addresses from the "Known
+// implementations" table at ethereum.org/roadmap/pectra/7702; each is a
+// deterministic deployment, the same on every chain.
+
+/// Ambire `AmbireAccount7702` (AmbireTech/ambire-common).
+pub const AMBIRE_7702_DELEGATE: Address = address!("0x5A7FC11397E9a8AD41BF10bf13F22B0a63f96f6d");
+
+/// Uniswap Calibur (Uniswap/calibur).
+pub const UNISWAP_CALIBUR_DELEGATE: Address =
+    address!("0x000000009B1D0aF20D8C6d0A44e162d11F9b8f00");
+
+/// Alchemy Modular Account (alchemyplatform/modular-account).
+pub const ALCHEMY_MODULAR_ACCOUNT_DELEGATE: Address =
+    address!("0x69007702764179f14F51cdce752f4f775d74E139");
+
+/// MetaMask `EIP7702StatelessDeleGator` (MetaMask/delegation-framework).
+pub const METAMASK_STATELESS_DELEGATOR: Address =
+    address!("0x63c0c19a282a1b52b07dd5a65b58948a07dae32b");
+
+/// The name of a third-party 7702 delegate this wallet recognises but does not
+/// install, or `None`. Recognising one only changes its label on the review —
+/// it is still disclosed on every transaction the account sends.
+/// [`EF_SIMPLE_7702_ACCOUNT`] is deliberately absent: it is this wallet's own
+/// delegate and is labelled as such by the caller.
+pub fn third_party_delegate_name(delegate: Address) -> Option<&'static str> {
+    match delegate {
+        AMBIRE_7702_DELEGATE => Some("Ambire"),
+        UNISWAP_CALIBUR_DELEGATE => Some("Uniswap Calibur"),
+        ALCHEMY_MODULAR_ACCOUNT_DELEGATE => Some("Alchemy Modular Account"),
+        METAMASK_STATELESS_DELEGATOR => Some("MetaMask Stateless DeleGator"),
+        _ => None,
+    }
+}
+
 /// `keccak256("executeBatch((address,uint256,bytes)[])")[..4]`.
 pub const EXECUTE_BATCH_SELECTOR: [u8; 4] = [0x34, 0xfc, 0xd5, 0xbe];
 

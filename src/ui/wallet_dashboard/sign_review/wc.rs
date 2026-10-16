@@ -53,6 +53,7 @@ pub(super) fn step_card<'a>(
     t: KaoTheme,
     step: &'a SignStep,
     show_calldata: bool,
+    show_fee_details: bool,
     signing: bool,
 ) -> Element<'a, Message> {
     match step {
@@ -60,7 +61,7 @@ pub(super) fn step_card<'a>(
         SignStep::WcMessage(m) => card(t, message_body(t, m, show_calldata).into()),
         SignStep::WcTyped(r) => typed_panel_wc(t, r, show_calldata),
         SignStep::WcSafeMessage(m) => safe_message_panel_wc(t, m, show_calldata),
-        SignStep::WcTxFees(f) => fees_card(t, f),
+        SignStep::WcTxFees(f) => fees_card(t, f, show_fee_details),
         // The parent routes only the `Wc*` arms here.
         SignStep::RawTx(_)
         | SignStep::Delegation(_)
@@ -1237,17 +1238,29 @@ fn safe_message_panel_wc<'a>(
 /// The fee side of a dapp `eth_sendTransaction` from an EOA: the pinned quote (the numbers the
 /// broadcast uses), how the gas limit was chosen, and the worst case against the balance. What the
 /// dapp asked for that Kao ignored is the review's note, shown once above every step.
-fn fees_card<'a>(t: KaoTheme, f: &'a WcTxFeesReview) -> Element<'a, Message> {
+///
+/// Folded (`show_details` false) it keeps the maximum fee in its header, every warning banner and
+/// the shortfall line; the nonce, gas and fee-cap breakdown unfolds under the header's toggle.
+fn fees_card<'a>(t: KaoTheme, f: &'a WcTxFeesReview, show_details: bool) -> Element<'a, Message> {
     use crate::ui::wallet_dashboard::sim_view::format_gas;
     let q = &f.quote;
     let sym = crate::walletconnect::native_symbol(q.plan.chain.chain_id());
-    let mut col = column![
-        text("Network fee").size(11).color(t.sub).font(bold()),
-        Space::new().height(6),
-    ]
-    .spacing(0)
-    .width(Length::Fill);
+    // On the OP stack the cap isn't the whole cost: the L1 data fee is charged on top (the
+    // Transaction Builder's caveat, word for word). The folded summary says so in brief.
+    let l1_caveat = super::super::tx_builder::l1_data_fee_caveat(q.plan.chain);
+    let summary = format!(
+        "max {} {sym}{}",
+        format_eth(q.eth_cost_wei),
+        if l1_caveat.is_some() { " + L1 fee" } else { "" }
+    );
+    let summary = text(summary).size(12).color(t.text).font(mono_bold());
+    let header = super::fee_details_toggle(t, "Network fee", summary.into(), show_details);
+    let mut col = column![header].spacing(0).width(Length::Fill);
+    // The space before the next block, after whatever was pushed last. Each block pushes its own
+    // leading gap, so a folded card with nothing under its header ends at the header.
+    let mut gap = 6.0;
     if f.sim_reverted {
+        col = col.push(Space::new().height(gap));
         col = col.push(banner(
             t,
             Tone::Danger,
@@ -1255,65 +1268,71 @@ fn fees_card<'a>(t: KaoTheme, f: &'a WcTxFeesReview) -> Element<'a, Message> {
             "Kao's simulation of this transaction reverted. It will most likely fail on-chain and \
              still cost the gas it burns.",
         ));
-        col = col.push(Space::new().height(8));
+        gap = 8.0;
     }
     if let Some(why) = &f.estimate_failed {
+        col = col.push(Space::new().height(gap));
         col = col.push(banner(
             t,
             Tone::Danger,
             "⚠ KAO'S NODE EXPECTS THIS TO FAIL",
             format!(
-                "Kao's node couldn't estimate this transaction's gas: {why}. The gas limit below \
-                 is the dapp's own. If the transaction fails on-chain it still costs the gas it \
-                 burns."
+                "Kao's node couldn't estimate this transaction's gas: {why}. The gas limit is the \
+                 dapp's own. If the transaction fails on-chain it still costs the gas it burns."
             ),
         ));
-        col = col.push(Space::new().height(8));
+        gap = 8.0;
     }
     // `unverified_network` is the coordinator's verdict; the quote's own chain is the fallback
     // proof, so neither alone can hide the banner.
     if f.unverified_network || q.plan.chain.is_custom() {
+        col = col.push(Space::new().height(gap));
         col = col.push(network_caution(t, q.plan.chain));
-        col = col.push(Space::new().height(8));
+        gap = 8.0;
     }
-    col = col.push(kv(t, "Nonce", q.nonce.to_string()));
-    col = col.push(kv(t, "Gas limit", format_gas(q.gas_limit)));
-    col = col.push(
-        text(gas_note_text(f.gas_note))
-            .size(11)
-            .color(t.sub)
-            .font(mono()),
-    );
-    col = col.push(kv(
-        t,
-        "Max fee per gas",
-        format!("{} gwei", format_gwei(q.max_fee_per_gas)),
-    ));
-    col = col.push(kv(
-        t,
-        "Priority tip",
-        format!("{} gwei", format_gwei(q.max_priority_fee_per_gas)),
-    ));
-    col = col.push(kv(
-        t,
-        "Max network fee",
-        format!("{} {sym}", format_eth(q.eth_cost_wei)),
-    ));
-    col = col.push(kv(
-        t,
-        "Max total (value + fee)",
-        format!("{} {sym}", format_eth(f.max_total_wei)),
-    ));
-    col = col.push(kv(
-        t,
-        "Your balance",
-        match f.balance_wei {
-            Some(b) => format!("{} {sym}", format_eth(b)),
-            None => "unknown".to_string(),
-        },
-    ));
+    if show_details {
+        col = col.push(Space::new().height(gap));
+        col = col.push(kv(t, "Nonce", q.nonce.to_string()));
+        col = col.push(kv(t, "Gas limit", format_gas(q.gas_limit)));
+        col = col.push(
+            text(gas_note_text(f.gas_note))
+                .size(11)
+                .color(t.sub)
+                .font(mono()),
+        );
+        col = col.push(kv(
+            t,
+            "Max fee per gas",
+            format!("{} gwei", format_gwei(q.max_fee_per_gas)),
+        ));
+        col = col.push(kv(
+            t,
+            "Priority tip",
+            format!("{} gwei", format_gwei(q.max_priority_fee_per_gas)),
+        ));
+        col = col.push(kv(
+            t,
+            "Max network fee",
+            format!("{} {sym}", format_eth(q.eth_cost_wei)),
+        ));
+        col = col.push(kv(
+            t,
+            "Max total (value + fee)",
+            format!("{} {sym}", format_eth(f.max_total_wei)),
+        ));
+        col = col.push(kv(
+            t,
+            "Your balance",
+            match f.balance_wei {
+                Some(b) => format!("{} {sym}", format_eth(b)),
+                None => "unknown".to_string(),
+            },
+        ));
+        gap = 4.0;
+    }
+    // A shortfall is a warning, not detail: it stays up while the breakdown is folded.
     if f.balance_wei.is_some_and(|b| b < f.max_total_wei) {
-        col = col.push(Space::new().height(4));
+        col = col.push(Space::new().height(gap));
         col = col.push(
             text(format!(
                 "Not enough {sym} to cover the value plus the maximum network fee."
@@ -1323,17 +1342,17 @@ fn fees_card<'a>(t: KaoTheme, f: &'a WcTxFeesReview) -> Element<'a, Message> {
             .font(bold()),
         );
     }
-    col = col.push(Space::new().height(6));
-    // On the OP stack the cap isn't the whole cost: the L1 data fee is charged on top (the
-    // Transaction Builder's caveat, word for word).
-    let cost_note = match super::super::tx_builder::l1_data_fee_caveat(q.plan.chain) {
-        Some(caveat) => format!(
-            "Unused gas is refunded, but the maximum network fee {caveat} — it is charged on top \
-             of the figures above."
-        ),
-        None => "Unused gas is refunded — you pay at most the maximum network fee.".to_string(),
-    };
-    col = col.push(text(cost_note).size(11).color(t.sub));
+    if show_details {
+        col = col.push(Space::new().height(6));
+        let cost_note = match l1_caveat {
+            Some(caveat) => format!(
+                "Unused gas is refunded, but the maximum network fee {caveat} — it is charged on \
+                 top of the figures above."
+            ),
+            None => "Unused gas is refunded — you pay at most the maximum network fee.".to_string(),
+        };
+        col = col.push(text(cost_note).size(11).color(t.sub));
+    }
     card(t, col.into())
 }
 
@@ -1855,6 +1874,7 @@ mod tests {
             step,
             true,
             true,
+            true,
             false,
         ))
     }
@@ -1928,6 +1948,7 @@ mod tests {
         let folded = super::super::super::test_support::texts(super::super::step_card(
             theme(),
             &step,
+            false,
             false,
             false,
             false,
@@ -2115,6 +2136,75 @@ mod tests {
             "{all}"
         );
         assert!(!all.contains("L1 data fee"), "{all}");
+    }
+
+    /// Folded, the fee card is its header and its warnings: the maximum fee (flagged when the L1
+    /// data fee comes on top), the banners and the shortfall stay up; the breakdown waits for the
+    /// toggle.
+    #[test]
+    fn wc_fee_card_folds_the_breakdown_but_not_the_warnings() {
+        use crate::wallet::sim::SimulationResult;
+        use crate::wallet::tx::{SendPlan, SendToken, TxQuote};
+        let step = |chain: Chain| {
+            SignStep::WcTxFees(WcTxFeesReview {
+                quote: TxQuote {
+                    plan: SendPlan {
+                        from: OWNER,
+                        recipient: Address::repeat_byte(0x40),
+                        token: SendToken::Call {
+                            data: Bytes::from(vec![0xde, 0xad, 0xbe, 0xef]),
+                        },
+                        amount_units: U256::ZERO,
+                        chain: NetworkId::Builtin(chain),
+                    },
+                    gas_limit: 50_000,
+                    max_fee_per_gas: 2_000_000_000,
+                    max_priority_fee_per_gas: 1_000_000,
+                    nonce: 3,
+                    eth_cost_wei: U256::from(100_000_000_000_000u64),
+                    sim: SimulationResult::unavailable(),
+                },
+                gas_note: GasNote::Estimated,
+                max_total_wei: U256::from(100_000_000_000_000u64),
+                balance_wei: Some(U256::from(1u64)),
+                unverified_network: false,
+                sim_reverted: true,
+                estimate_failed: None,
+            })
+        };
+        let folded = |step: &SignStep| {
+            super::super::super::test_support::texts(super::super::step_card(
+                theme(),
+                step,
+                false,
+                false,
+                false,
+                false,
+            ))
+            .join("\n")
+        };
+        const DETAILS: [&str; 5] = [
+            "Nonce",
+            "Gas limit",
+            "Priority tip",
+            "Your balance",
+            "refunded",
+        ];
+        let all = folded(&step(Chain::Mainnet));
+        assert!(all.contains("max 0.0001 ETH"), "{all}");
+        assert!(!all.contains("L1 fee"), "{all}");
+        assert!(all.contains("SIMULATION REVERTED"), "{all}");
+        assert!(all.contains("Not enough ETH"), "{all}");
+        for detail in DETAILS {
+            assert!(!all.contains(detail), "{detail} folded away: {all}");
+        }
+        let all = folded(&step(Chain::Base));
+        assert!(all.contains("max 0.0001 ETH + L1 fee"), "{all}");
+        // Unfolded, the breakdown is back.
+        let all = rendered(&step(Chain::Mainnet)).join("\n");
+        for detail in DETAILS {
+            assert!(all.contains(detail), "{detail} unfolded: {all}");
+        }
     }
 
     /// A quote that took the dapp's gas because Kao's node couldn't estimate the call says so in

@@ -89,6 +89,10 @@ pub enum Message {
     /// Expand/collapse the "ERC-8213 fingerprints" section (Calldata Digest /
     /// EIP-712 Digest + Domain + Message hashes) shown on every reviewed step.
     ToggleFingerprints,
+    /// Expand/collapse the breakdown under the "Network fee" and "Cost" cards
+    /// (gas limit, fee caps, balance, how each figure is wrong). Warnings and
+    /// the headline figures stay visible either way.
+    ToggleFeeDetails,
     /// The overlay's optional secondary action (Safe send: "Propose to
     /// co-signers", alongside the primary "Sign & execute"). Only emitted when a
     /// `secondary_label` is set.
@@ -899,6 +903,9 @@ pub struct SignReview {
     /// Expand state for the "ERC-8213 fingerprints" section on every reviewed
     /// step (the signature/calldata digests). One flag toggles them all together.
     pub show_fingerprints: bool,
+    /// Expand state for the fee breakdown under the "Network fee" and "Cost"
+    /// cards. One flag unfolds both: they sit together and answer one question.
+    pub show_fee_details: bool,
     /// The ceremony the waiting card describes once signing is in flight. Set at
     /// dispatch for a multi-device Safe send (execute or propose) so the "waiting
     /// for a signature" card lays out the per-owner device prompts; `None` for a
@@ -995,6 +1002,7 @@ impl SignReview {
             broadcast: None,
             show_calldata: false,
             show_fingerprints: false,
+            show_fee_details: false,
             signing_progress: None,
             armed_at: None,
             owner_eth_sign: None,
@@ -1115,6 +1123,7 @@ pub fn view<'a>(t: KaoTheme, review: &'a SignReview, progress: f32) -> Element<'
             step,
             review.show_calldata,
             review.show_fingerprints,
+            review.show_fee_details,
             review.signing_since.is_some(),
         ));
     }
@@ -1144,7 +1153,7 @@ pub fn view<'a>(t: KaoTheme, review: &'a SignReview, progress: f32) -> Element<'
     // does → what it costs you → what to watch out for.
     if let Some(e) = review.economics.as_ref().filter(|e| !e.is_empty()) {
         body = body.push(Space::new().height(12));
-        body = body.push(economics_card(t, e));
+        body = body.push(economics_card(t, e, review.show_fee_details));
     }
 
     if let Some(note) = &review.note {
@@ -1495,6 +1504,7 @@ fn step_card<'a>(
     step: &'a SignStep,
     show_calldata: bool,
     show_fingerprints: bool,
+    show_fee_details: bool,
     signing: bool,
 ) -> Element<'a, Message> {
     let panel = match step {
@@ -1511,7 +1521,7 @@ fn step_card<'a>(
         | SignStep::WcMessage(_)
         | SignStep::WcTyped(_)
         | SignStep::WcSafeMessage(_)
-        | SignStep::WcTxFees(_) => wc::step_card(t, step, show_calldata, signing),
+        | SignStep::WcTxFees(_) => wc::step_card(t, step, show_calldata, show_fee_details, signing),
     };
     let rows = erc8213_rows(step);
     if rows.is_empty() {
@@ -2431,42 +2441,46 @@ fn addr_kv<'a>(t: KaoTheme, label: impl Into<String>, addr: Address) -> Element<
 /// is hedged in the copy rather than in a footnote — the fee leads with `≈`,
 /// and `fee_caveats` names how the number is wrong, because a fee figure with
 /// no stated error bars is one users treat as a quote.
-fn economics_card<'a>(t: KaoTheme, e: &'a BatchEconomics) -> Element<'a, Message> {
+///
+/// Folded (`show_details` false) it keeps the header, its simulation badge,
+/// the movements and the `≈` fee; the gas basis, the caveats and the tracking
+/// note unfold under the header's toggle.
+fn economics_card<'a>(
+    t: KaoTheme,
+    e: &'a BatchEconomics,
+    show_details: bool,
+) -> Element<'a, Message> {
     let mut col = column![].spacing(4).width(Length::Fill);
 
-    let header = row![
-        text(if e.moves.is_empty() {
+    // Freshness is checked before verification: a Helios-verified read of a
+    // balance that has since moved is precisely verified and no longer true,
+    // so the badge must not lead with the tick.
+    let badge = text(if !e.simulated {
+        "not simulated"
+    } else if e.stale {
+        "⚠ Simulated a while ago"
+    } else if e.verified {
+        "✓ Verified by Helios"
+    } else {
+        "⚠ Unverified simulation"
+    })
+    .size(11)
+    .color(if e.simulated && e.verified && !e.stale {
+        t.up
+    } else {
+        t.sub
+    })
+    .font(bold());
+    col = col.push(fee_details_toggle(
+        t,
+        if e.moves.is_empty() {
             "Cost"
         } else {
             "This transaction moves"
-        })
-        .size(12)
-        .color(t.sub)
-        .font(mono_bold()),
-        Space::new().width(Length::Fill),
-        // Freshness is checked before verification: a Helios-verified read of
-        // a balance that has since moved is precisely verified and no longer
-        // true, so the badge must not lead with the tick.
-        text(if !e.simulated {
-            "not simulated"
-        } else if e.stale {
-            "⚠ Simulated a while ago"
-        } else if e.verified {
-            "✓ Verified by Helios"
-        } else {
-            "⚠ Unverified simulation"
-        })
-        .size(11)
-        .color(if e.simulated && e.verified && !e.stale {
-            t.up
-        } else {
-            t.sub
-        })
-        .font(bold()),
-    ]
-    .align_y(Alignment::Center)
-    .width(Length::Fill);
-    col = col.push(header);
+        },
+        badge.into(),
+        show_details,
+    ));
 
     for m in &e.moves {
         col = col.push(
@@ -2480,62 +2494,50 @@ fn economics_card<'a>(t: KaoTheme, e: &'a BatchEconomics) -> Element<'a, Message
         );
     }
 
-    // Absence of token rows is only evidence of "moves no tokens" when a
-    // simulation actually ran. Without one, say so where the rows would be —
-    // an empty list under a "this transaction moves" header otherwise reads as
-    // a positive finding.
-    if !e.simulated {
-        col = col.push(
-            text(
-                "Token movement wasn't simulated for this batch, so this list covers only the \
-                 native value the calls carry — run the preflight to see ERC-20 and NFT \
-                 movement.",
-            )
-            .size(11)
-            .color(t.sub)
-            .font(mono()),
-        );
-    } else {
-        // The one hole a successful simulation still leaves. Balance changes
-        // are recovered from `Transfer` logs, and native ETH *arriving* emits
-        // none — an unwrap or a refund lands in the account with nothing here
-        // to show for it. The outgoing side is exact (it is the calls' own
-        // `value`), so the gap is one-directional and worth naming as such.
-        col = col.push(
-            text(
-                "ETH arriving back in the account isn't tracked here — native transfers emit no \
-                 event. The ETH these calls send is exact.",
-            )
-            .size(11)
-            .color(t.sub)
-            .font(mono()),
-        );
+    if show_details {
+        // Absence of token rows is only evidence of "moves no tokens" when a
+        // simulation actually ran. Without one, say so where the rows would be
+        // — the header's "not simulated" badge says it while this is folded.
+        let note = if !e.simulated {
+            "Token movement wasn't simulated for this batch, so this list covers only the native \
+             value the calls carry — run the preflight to see ERC-20 and NFT movement."
+        } else {
+            // The one hole a successful simulation still leaves. Balance
+            // changes are recovered from `Transfer` logs, and native ETH
+            // *arriving* emits none — an unwrap or a refund lands in the
+            // account with nothing here to show for it. The outgoing side is
+            // exact (it is the calls' own `value`), so the gap is
+            // one-directional and worth naming as such.
+            "ETH arriving back in the account isn't tracked here — native transfers emit no \
+             event. The ETH these calls send is exact."
+        };
+        col = col.push(text(note).size(11).color(t.sub).font(mono()));
     }
 
     if let Some(fee) = e.fee_eth() {
-        let basis = match crate::ui::wallet_dashboard::sim_view::format_gwei(e.base_fee_per_gas) {
-            Some(g) => format!(
-                "{} gas at {g} gwei base fee",
-                crate::ui::wallet_dashboard::sim_view::format_gas(e.gas_used)
-            ),
-            None => format!(
-                "{} gas",
-                crate::ui::wallet_dashboard::sim_view::format_gas(e.gas_used)
-            ),
-        };
+        let mut fee_row = row![
+            text(format!("≈ {fee} ETH fee"))
+                .size(13)
+                .color(t.text)
+                .font(bold()),
+        ]
+        .align_y(Alignment::Center)
+        .width(Length::Fill);
+        if show_details {
+            use super::sim_view::{format_gas, format_gwei};
+            let gas = format_gas(e.gas_used);
+            let basis = match format_gwei(e.base_fee_per_gas) {
+                Some(g) => format!("{gas} gas at {g} gwei base fee"),
+                None => format!("{gas} gas"),
+            };
+            fee_row = fee_row
+                .push(Space::new().width(8))
+                .push(text(basis).size(11).color(t.sub).font(mono()));
+        }
         col = col.push(Space::new().height(4));
-        col = col.push(
-            row![
-                text(format!("≈ {fee} ETH fee"))
-                    .size(13)
-                    .color(t.text)
-                    .font(bold()),
-                Space::new().width(8),
-                text(basis).size(11).color(t.sub).font(mono()),
-            ]
-            .align_y(Alignment::Center)
-            .width(Length::Fill),
-        );
+        col = col.push(fee_row);
+    }
+    if show_details {
         for caveat in &e.fee_caveats {
             col = col.push(
                 text(format!("· {caveat}"))
@@ -2547,6 +2549,39 @@ fn economics_card<'a>(t: KaoTheme, e: &'a BatchEconomics) -> Element<'a, Message
     }
 
     card(t, col.into())
+}
+
+/// The click-to-toggle title row of a fee card ("Network fee", "Cost"): a
+/// caret, the title, and a right-aligned summary that stays readable while the
+/// card is folded. Emits [`Message::ToggleFeeDetails`].
+fn fee_details_toggle<'a>(
+    t: KaoTheme,
+    title: &'a str,
+    summary: Element<'a, Message>,
+    show: bool,
+) -> Element<'a, Message> {
+    let header = row![
+        text(if show { "▾" } else { "▸" })
+            .size(12)
+            .color(t.sub)
+            .font(mono()),
+        Space::new().width(6),
+        text(title).size(12).color(t.sub).font(mono_bold()),
+        Space::new().width(Length::Fill),
+        summary,
+    ]
+    .align_y(Alignment::Center)
+    .width(Length::Fill);
+    button(header)
+        .width(Length::Fill)
+        .padding(0)
+        .on_press(Message::ToggleFeeDetails)
+        .style(move |_theme, _status| button::Style {
+            background: Some(iced::Background::Color(iced::Color::TRANSPARENT)),
+            text_color: t.text,
+            ..button::Style::default()
+        })
+        .into()
 }
 
 fn card<'a>(t: KaoTheme, content: Element<'a, Message>) -> Element<'a, Message> {
@@ -2660,6 +2695,39 @@ mod tests {
     #[test]
     fn format_iso_utc_epoch() {
         assert_eq!(format_iso_utc(0), "1970-01-01 00:00 UTC");
+    }
+
+    /// Folded, the economics card keeps what moves, the `≈` fee and the
+    /// simulation badge; the gas basis, the caveats and the tracking note wait
+    /// for the toggle.
+    #[test]
+    fn economics_card_folds_the_basis_and_caveats() {
+        let e = BatchEconomics {
+            moves: vec![MovedAmount {
+                amount: "1,250.5 USDC".into(),
+                direction: MoveDirection::Out,
+            }],
+            simulated: true,
+            verified: false,
+            stale: false,
+            gas_used: 55_785,
+            base_fee_per_gas: 5_000_000,
+            fee_caveats: vec!["excludes the L1 data fee".into()],
+        };
+        let t = KaoTheme::for_kind(crate::ui::kao_theme::ThemeKind::Mint);
+        let render =
+            |show| super::super::test_support::texts(economics_card(t, &e, show)).join("\n");
+        let folded = render(false);
+        assert!(folded.contains("1,250.5 USDC"), "{folded}");
+        assert!(folded.contains("ETH fee"), "{folded}");
+        assert!(folded.contains("Unverified simulation"), "{folded}");
+        for detail in ["arriving back", "55,785 gas", "L1 data fee"] {
+            assert!(!folded.contains(detail), "{detail} folded away: {folded}");
+        }
+        let open = render(true);
+        for detail in ["arriving back", "55,785 gas", "L1 data fee"] {
+            assert!(open.contains(detail), "{detail} unfolded: {open}");
+        }
     }
 
     #[test]
@@ -3166,7 +3234,7 @@ mod tests {
 
     fn rendered(step: &SignStep, show_calldata: bool) -> Vec<String> {
         let t = KaoTheme::for_kind(crate::ui::kao_theme::ThemeKind::Mint);
-        super::super::test_support::texts(step_card(t, step, show_calldata, true, false))
+        super::super::test_support::texts(step_card(t, step, show_calldata, true, true, false))
     }
 
     /// A call Kao can't decode (a custom network has no verified chain to resolve it against)

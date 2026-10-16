@@ -87,8 +87,10 @@ pub fn view<'a>(
 }
 
 fn balance_hero<'a>(t: KaoTheme, portfolio: &[LiveToken]) -> Element<'a, Message> {
-    let total: f64 = portfolio.iter().map(|tk| tk.usd_value).sum();
-    let balance_text = format!("${}", format_usd(total));
+    let balance_text = format!(
+        "${}",
+        format_usd(display_total(portfolio.iter().map(|tk| tk.usd_value)))
+    );
 
     let left = column![
         text("TOTAL BALANCE").size(12).color(t.sub).font(bold()),
@@ -458,6 +460,15 @@ fn token_row<'a>(t: KaoTheme, tk: &'a LiveToken, idx: usize) -> Element<'a, Mess
         .into()
 }
 
+/// Hero total as the sum of each row's *displayed* (cent-rounded) value, so
+/// the visible rows always add up to the visible total. Summing raw values
+/// instead lets $24.996 + $0.006 render as rows "$25.00" + "$0.01" but a
+/// total of "$25.00".
+fn display_total(values: impl Iterator<Item = f64>) -> f64 {
+    let cents: i64 = values.map(|v| (v * 100.0).round() as i64).sum();
+    cents as f64 / 100.0
+}
+
 /// Group thousands, 2 decimals. Used by both the hero total and per-token
 /// USD values; co-located here because the home view is the only consumer.
 pub(super) fn format_usd(n: f64) -> String {
@@ -536,6 +547,14 @@ mod tests {
         assert_eq!(format_usd(24.996), "25.00");
         assert_eq!(format_usd(999.999), "1,000.00");
         assert_eq!(format_usd(0.999), "1.00");
+    }
+
+    #[test]
+    fn total_is_sum_of_displayed_rows() {
+        // Rows render "$25.00" + "$0.01" + "$0.00"; the total must say $25.01,
+        // not the raw-sum $25.00.
+        let total = display_total([24.996, 0.006, 0.0004].into_iter());
+        assert_eq!(format_usd(total), "25.01");
     }
 
     #[test]

@@ -344,6 +344,16 @@ struct State {
     /// or remove them and add their own. Persisted as a TOML array of tables;
     /// remembered across restarts.
     custom_networks: Vec<CustomNetwork>,
+    // ── WalletConnect ────────────────────────────────────────────────
+    /// The user's WalletConnect Cloud (Reown) project id; `None` → the
+    /// baked-in [`DEFAULT_WALLETCONNECT_PROJECT_ID`] (when that is valid).
+    /// Always 16–64 ASCII alphanumerics: validated by the setter and again on
+    /// load.
+    walletconnect_project_id: Option<String>,
+    /// The user's WalletConnect relay (`wss://…`, or `ws://` to this machine),
+    /// as normalized by [`parse_walletconnect_relay_input`]; `None` → the public
+    /// relay (`wallet_connect::relay::rpc::DEFAULT_RELAY_URL`).
+    walletconnect_relay_url: Option<String>,
 }
 
 impl std::fmt::Debug for State {
@@ -377,6 +387,15 @@ impl std::fmt::Debug for State {
             .field("proxy_type", &self.proxy_type)
             .field("proxy_address", &self.proxy_address)
             .field("custom_networks", &self.custom_networks)
+            .field(
+                "walletconnect_project_id",
+                &redact(&self.walletconnect_project_id),
+            )
+            // A private relay host can identify the user's setup — presence only, like its trace.
+            .field(
+                "walletconnect_relay_url",
+                &redact(&self.walletconnect_relay_url),
+            )
             .finish()
     }
 }
@@ -426,6 +445,8 @@ fn default_state() -> State {
         proxy_type: ProxyType::default(),
         proxy_address: "127.0.0.1:9050".to_string(),
         custom_networks: seeded_custom_networks(),
+        walletconnect_project_id: None,
+        walletconnect_relay_url: None,
     }
 }
 
@@ -514,6 +535,12 @@ struct OnDisk {
     /// an empty list (backward compatible).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     custom_networks: Option<Vec<CustomNetworkOnDisk>>,
+    /// WalletConnect overrides; absent unless the user set them, so a stock
+    /// config never mentions WalletConnect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    walletconnect_project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    walletconnect_relay_url: Option<String>,
 }
 
 /// On-disk form of a [`CustomNetwork`]. Separate from the runtime type so the
@@ -696,6 +723,28 @@ fn parse(text: &str) -> State {
         state.custom_networks = normalize_custom_networks(parsed);
     }
 
+    // ── WalletConnect ────────────────────────────────────────────────
+    // Re-validated like every URL above, through the setters' own rules: a
+    // hand-edited value they would refuse is dropped rather than trusted. Each
+    // drop is logged (never the value) because for the relay it means falling
+    // back to the public one.
+    if let Some(raw) = on_disk.walletconnect_project_id.as_deref() {
+        state.walletconnect_project_id =
+            clean_walletconnect_project_id(Some(raw)).unwrap_or_else(|_| {
+                tracing::warn!("settings.toml: invalid walletconnect_project_id ignored");
+                None
+            });
+    }
+    if let Some(raw) = on_disk.walletconnect_relay_url.as_deref() {
+        state.walletconnect_relay_url = clean_walletconnect_relay_url(Some(raw))
+            .unwrap_or_else(|_| {
+                tracing::warn!(
+                    "settings.toml: invalid walletconnect_relay_url ignored; using the default relay"
+                );
+                None
+            });
+    }
+
     state
 }
 
@@ -798,6 +847,8 @@ fn serialize(state: &State) -> String {
                     .collect(),
             )
         },
+        walletconnect_project_id: state.walletconnect_project_id.clone(),
+        walletconnect_relay_url: state.walletconnect_relay_url.clone(),
     };
     toml::to_string(&on_disk).expect("serializing settings cannot fail")
 }
@@ -1410,6 +1461,209 @@ pub fn valid_proxy_address(addr: &str) -> bool {
         Some(auth) => auth.as_str() == addr && auth.port_u16().is_some(),
         None => false,
     }
+}
+
+// ── WalletConnect ───────────────────────────────────────────────────────
+//
+// Two optional overrides: the WalletConnect Cloud (Reown) project id and the
+// relay URL. Neither is ever logged (presence only) and neither silently falls
+// back: an invalid value is refused by the setter — nothing stored — so a typo
+// can't quietly send the user to the public relay. The WalletConnect runtime
+// reads them once when it starts; a change applies the next time it starts.
+
+/// Kao's WalletConnect Cloud (Reown) project id, used with the default relay
+/// unless the user overrides it. Not a secret: every dapp ships its own in its
+/// page source, and the relay only uses it to attribute traffic.
+pub const DEFAULT_WALLETCONNECT_PROJECT_ID: &str = "0f30df242648fb32b28d2a062cc07bf5";
+
+/// Setter refusal copy (shown inline under the field).
+const WALLETCONNECT_PROJECT_ID_INVALID: &str =
+    "A WalletConnect project ID is 16 to 64 letters and digits.";
+const WALLETCONNECT_RELAY_URL_INVALID: &str =
+    "Use wss:// (ws:// only for a relay on this computer), without a login, query or fragment.";
+
+/// The user's project-id override, if any.
+pub fn walletconnect_project_id() -> Option<String> {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .walletconnect_project_id
+        .clone()
+}
+
+/// The user's relay override, if any (normalized, no trailing `/`).
+pub fn walletconnect_relay_url() -> Option<String> {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .walletconnect_relay_url
+        .clone()
+}
+
+/// Override → baked-in constant if valid → None.
+pub fn effective_walletconnect_project_id() -> Option<String> {
+    walletconnect_project_id().or_else(builtin_walletconnect_project_id)
+}
+
+/// The baked-in id, when there is a usable one.
+fn builtin_walletconnect_project_id() -> Option<String> {
+    let id = DEFAULT_WALLETCONNECT_PROJECT_ID.trim();
+    valid_walletconnect_project_id(id).then(|| id.to_string())
+}
+
+/// Override → `wallet_connect::relay::rpc::DEFAULT_RELAY_URL`.
+pub fn effective_walletconnect_relay_url() -> String {
+    walletconnect_relay_url()
+        .unwrap_or_else(|| wallet_connect::relay::rpc::DEFAULT_RELAY_URL.to_string())
+}
+
+/// Where the effective project id comes from — what the settings form says
+/// ("Using your project ID" / "Using Kao's" / "required for the default relay").
+pub fn walletconnect_project_source() -> crate::walletconnect::ProjectIdSource {
+    project_source(
+        walletconnect_project_id().is_some(),
+        builtin_walletconnect_project_id().is_some(),
+    )
+}
+
+fn project_source(has_override: bool, has_builtin: bool) -> crate::walletconnect::ProjectIdSource {
+    use crate::walletconnect::ProjectIdSource;
+    match (has_override, has_builtin) {
+        (true, _) => ProjectIdSource::Override,
+        (false, true) => ProjectIdSource::BuiltIn,
+        (false, false) => ProjectIdSource::Missing,
+    }
+}
+
+/// `None`/empty clears; invalid → `Err` and NOTHING stored. Trace: presence
+/// only.
+pub fn set_walletconnect_project_id(value: Option<&str>) -> Result<(), &'static str> {
+    let cleaned = clean_walletconnect_project_id(value)?;
+    let to = presence(cleaned.is_some());
+    let from = {
+        let mut state = ensure().lock().expect("settings mutex poisoned");
+        let from = presence(state.walletconnect_project_id.is_some());
+        state.walletconnect_project_id = cleaned;
+        from
+    };
+    // Identifies the user's Reown account — presence only.
+    crate::trace::state("settings", "walletconnect_project_id", from, to);
+    write_all();
+    Ok(())
+}
+
+/// `None`/empty (or Kao's default relay itself) clears; invalid → `Err` and
+/// NOTHING stored. Trace: presence only.
+pub fn set_walletconnect_relay_url(value: Option<&str>) -> Result<(), &'static str> {
+    let cleaned = clean_walletconnect_relay_url(value)?;
+    let to = presence(cleaned.is_some());
+    let from = {
+        let mut state = ensure().lock().expect("settings mutex poisoned");
+        let from = presence(state.walletconnect_relay_url.is_some());
+        state.walletconnect_relay_url = cleaned;
+        from
+    };
+    // A private relay host can identify the user's setup — presence only
+    // (cf. `set_proxy_address`).
+    crate::trace::state("settings", "walletconnect_relay_url", from, to);
+    write_all();
+    Ok(())
+}
+
+/// The project-id setter's rule, pure: `Ok(None)` clears, `Ok(Some(v))`
+/// stores `v` (trimmed), `Err` stores nothing. `parse` applies the same rule.
+fn clean_walletconnect_project_id(value: Option<&str>) -> Result<Option<String>, &'static str> {
+    let Some(v) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    check_walletconnect_project_id(v).map(Some)
+}
+
+/// The relay setter's rule, pure: `Ok(None)` clears (typing Kao's default
+/// relay is the same as using it), `Ok(Some(v))` stores the normalized `v`,
+/// `Err` stores nothing. `parse` applies the same rule.
+fn clean_walletconnect_relay_url(value: Option<&str>) -> Result<Option<String>, &'static str> {
+    let Some(v) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let normalized = check_walletconnect_relay_url(v)?;
+    Ok((normalized != wallet_connect::relay::rpc::DEFAULT_RELAY_URL).then_some(normalized))
+}
+
+/// A non-empty project-id draft as the setter would store it (trimmed), or
+/// the copy the settings form shows for it. The one place that copy lives, so
+/// the form, the coordinator and the setter can't word the rule differently.
+pub fn check_walletconnect_project_id(value: &str) -> Result<String, &'static str> {
+    let v = value.trim();
+    if valid_walletconnect_project_id(v) {
+        Ok(v.to_string())
+    } else {
+        Err(WALLETCONNECT_PROJECT_ID_INVALID)
+    }
+}
+
+/// A non-empty relay draft normalized as the setter would store it, or the
+/// copy the settings form shows for it (see [`check_walletconnect_project_id`]).
+pub fn check_walletconnect_relay_url(value: &str) -> Result<String, &'static str> {
+    parse_walletconnect_relay_input(value).ok_or(WALLETCONNECT_RELAY_URL_INVALID)
+}
+
+/// 16..=64 ASCII alphanumerics.
+///
+/// Deliberately looser than today's 32-hex Reown ids so a format change can't
+/// lock users out; the value only ever travels percent-encoded in the relay
+/// URL's query. Surrounding whitespace is ignored (the setter trims it), so
+/// the form and the setter agree on what's valid.
+pub fn valid_walletconnect_project_id(s: &str) -> bool {
+    let s = s.trim();
+    (16..=64).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// `wss://` to a plausible host or loopback; `ws://` loopback only; no
+/// userinfo/query/fragment; trailing '/' trimmed.
+///
+/// Returns the value to store: the `url` crate's normalization (lowercased
+/// host, IDN → punycode, default port dropped) with trailing slashes removed —
+/// and only if feeding that back in yields the same string, so what's stored
+/// always survives the next load. No query or fragment because the connector
+/// appends `auth`/`ua`/`projectId` itself and signs the query-less URL as the
+/// JWT audience; no userinfo because nothing would ever use it. Plain `ws://`
+/// only to loopback (a local relay for development/tests): anywhere else it
+/// would put the connect token and project id on the wire in the clear. The
+/// loopback test is `net::is_loopback_host`, the same predicate the relay
+/// route uses.
+pub fn parse_walletconnect_relay_input(s: &str) -> Option<String> {
+    let normalized = normalize_walletconnect_relay(s)?;
+    (normalize_walletconnect_relay(&normalized).as_deref() == Some(normalized.as_str()))
+        .then_some(normalized)
+}
+
+fn normalize_walletconnect_relay(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let url = url::Url::parse(s).ok()?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let loopback = crate::net::is_loopback_host(url.host_str());
+    let host_ok = match url.host()? {
+        url::Host::Domain(name) => loopback || is_plausible_host(name),
+        // A literal address of either family (`wss://[2001:db8::1]` included,
+        // which the bracket-blind `is_plausible_host` would refuse).
+        url::Host::Ipv4(_) | url::Host::Ipv6(_) => true,
+    };
+    let scheme_ok = match url.scheme() {
+        "wss" => true,
+        "ws" => loopback,
+        _ => false,
+    };
+    (host_ok && scheme_ok).then(|| url.as_str().trim_end_matches('/').to_string())
 }
 
 // ── URL generation helpers ──────────────────────────────────────────────
@@ -2811,5 +3065,287 @@ enabled = true
         let s = parse("indexer_provider = \"drpc\"\ndrpc_api_key = \"testkey\"\n");
         assert_eq!(s.api_provider, ApiProvider::Drpc);
         assert_eq!(s.api_key.as_deref(), Some("testkey"));
+    }
+
+    // ── WalletConnect ────────────────────────────────────────────────
+    // Pure parse/serialize/validators and default-state getters only: no test
+    // calls a WalletConnect setter (they write the real settings file).
+
+    const WC_PROJECT_ID: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn walletconnect_overrides_round_trip() {
+        let state = State {
+            walletconnect_project_id: Some(WC_PROJECT_ID.into()),
+            walletconnect_relay_url: Some("wss://relay.example.org".into()),
+            ..default_state()
+        };
+        let text = serialize(&state);
+        assert!(text.contains("walletconnect_project_id"));
+        let back = parse(&text);
+        assert_eq!(
+            back.walletconnect_project_id,
+            state.walletconnect_project_id
+        );
+        assert_eq!(back.walletconnect_relay_url, state.walletconnect_relay_url);
+        // A loopback ws:// relay and a path survive too.
+        let state = State {
+            walletconnect_relay_url: Some("ws://127.0.0.1:8080/relay".into()),
+            ..default_state()
+        };
+        assert_eq!(
+            parse(&serialize(&state)).walletconnect_relay_url.as_deref(),
+            Some("ws://127.0.0.1:8080/relay")
+        );
+    }
+
+    #[test]
+    fn stock_config_omits_walletconnect_keys() {
+        let text = serialize(&default_state());
+        assert!(!text.contains("walletconnect"), "{text}");
+        let back = parse(&text);
+        assert_eq!(back.walletconnect_project_id, None);
+        assert_eq!(back.walletconnect_relay_url, None);
+    }
+
+    #[test]
+    fn parse_drops_invalid_walletconnect_overrides() {
+        for (project, relay) in [
+            ("zz", "ws://relay.example.org"),
+            ("0123456789abcde", "https://relay.example.org"),
+            (
+                "0123456789abcdef-0123456789abcdef",
+                "wss://relay.example.org/?projectId=x",
+            ),
+            (&"a".repeat(65)[..], "wss://user:pass@relay.example.org"),
+            (
+                "0123456789abcdef 0123456789abcdef",
+                "wss://relay.example.org#frag",
+            ),
+            ("", "relay.example.org"),
+            (
+                "ｆｕｌｌｗｉｄｔｈ０１２３４５６７８９",
+                "wss://singlelabel",
+            ),
+        ] {
+            let text = format!(
+                "walletconnect_project_id = {project:?}\nwalletconnect_relay_url = {relay:?}\n"
+            );
+            let s = parse(&text);
+            assert_eq!(s.walletconnect_project_id, None, "{project:?}");
+            assert_eq!(s.walletconnect_relay_url, None, "{relay:?}");
+        }
+        // Valid values are kept — normalized the way the setters would store them.
+        let s = parse(&format!(
+            "walletconnect_project_id = \"  {WC_PROJECT_ID}  \"\nwalletconnect_relay_url = \"WSS://Relay.Example.ORG:443/\"\n"
+        ));
+        assert_eq!(s.walletconnect_project_id.as_deref(), Some(WC_PROJECT_ID));
+        assert_eq!(
+            s.walletconnect_relay_url.as_deref(),
+            Some("wss://relay.example.org")
+        );
+        // Kao's own default relay written out by hand is the same as no override.
+        let s = parse("walletconnect_relay_url = \"wss://relay.walletconnect.org/\"\n");
+        assert_eq!(s.walletconnect_relay_url, None);
+        // A non-string value is a malformed document: everything falls back to defaults.
+        let s = parse("walletconnect_relay_url = 42\n");
+        assert_eq!(s.walletconnect_relay_url, None);
+    }
+
+    #[test]
+    fn relay_input_wss_anywhere_ws_loopback_only() {
+        for (input, stored) in [
+            (
+                "wss://relay.walletconnect.org",
+                "wss://relay.walletconnect.org",
+            ),
+            ("wss://relay.example.org/", "wss://relay.example.org"),
+            (
+                "  wss://relay.example.org/ws/  ",
+                "wss://relay.example.org/ws",
+            ),
+            (
+                "wss://relay.example.org:8443",
+                "wss://relay.example.org:8443",
+            ),
+            ("wss://203.0.113.7", "wss://203.0.113.7"),
+            ("wss://[2001:db8::1]:9000", "wss://[2001:db8::1]:9000"),
+            ("wss://localhost", "wss://localhost"),
+            ("ws://127.0.0.1:8080", "ws://127.0.0.1:8080"),
+            ("ws://127.9.9.9", "ws://127.9.9.9"),
+            ("ws://[::1]:8080", "ws://[::1]:8080"),
+            ("ws://localhost:9000/", "ws://localhost:9000"),
+            ("WS://LocalHost:9000", "ws://localhost:9000"),
+        ] {
+            assert_eq!(
+                parse_walletconnect_relay_input(input).as_deref(),
+                Some(stored),
+                "{input:?}"
+            );
+            // Idempotent: what's stored re-validates to itself on the next load.
+            assert_eq!(
+                parse_walletconnect_relay_input(stored).as_deref(),
+                Some(stored)
+            );
+            assert!(url::Url::parse(stored).is_ok());
+        }
+        for input in [
+            "",
+            "   ",
+            "relay.example.org",
+            "ws://relay.example.org", // plaintext to a public host
+            "ws://192.168.1.10:8080", // …or to the LAN
+            "ws://[2001:db8::1]",
+            "https://relay.example.org", // not a WebSocket
+            "http://127.0.0.1:8080",
+            "wss://relay.example.org/?projectId=x", // the connector owns the query
+            "wss://relay.example.org/?",
+            "wss://relay.example.org/#frag",
+            "wss://u:p@relay.example.org", // no credentials
+            "wss://user@relay.example.org",
+            "wss://singlelabel",
+            "wss://bad_host.example.org",
+            "wss://",
+            "localhost:8080",
+        ] {
+            assert_eq!(parse_walletconnect_relay_input(input), None, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn project_id_validator_bounds() {
+        assert!(!valid_walletconnect_project_id(&"a".repeat(15)));
+        assert!(valid_walletconnect_project_id(&"a".repeat(16)));
+        assert!(valid_walletconnect_project_id(&"Z9".repeat(32)));
+        assert!(!valid_walletconnect_project_id(&"a".repeat(65)));
+        assert!(valid_walletconnect_project_id(WC_PROJECT_ID));
+        // Surrounding whitespace is ignored (the setter trims), inner never is.
+        assert!(valid_walletconnect_project_id(&format!(
+            " {WC_PROJECT_ID}\n"
+        )));
+        for bad in [
+            "",
+            "0123456789abcdef-0123456789abcd",
+            "0123456789abcdef_0123456789abcd",
+            "0123456789abcdef 0123456789abcd",
+            "0123456789abcdef&projectId=evil",
+            "0123456789abcdéf0123456789abcdef",
+            "١٢٣٤٥٦٧٨٩٠١٢٣٤٥٦٧", // non-ASCII digits
+        ] {
+            assert!(!valid_walletconnect_project_id(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn default_project_id_is_empty_or_valid() {
+        assert!(
+            DEFAULT_WALLETCONNECT_PROJECT_ID.is_empty()
+                || valid_walletconnect_project_id(DEFAULT_WALLETCONNECT_PROJECT_ID),
+            "a baked-in project id must pass the same validator as a user's"
+        );
+        // Untrimmed constants would be sent as-is; keep it clean.
+        assert_eq!(
+            DEFAULT_WALLETCONNECT_PROJECT_ID,
+            DEFAULT_WALLETCONNECT_PROJECT_ID.trim()
+        );
+        assert_eq!(
+            builtin_walletconnect_project_id().is_some(),
+            !DEFAULT_WALLETCONNECT_PROJECT_ID.is_empty()
+        );
+    }
+
+    #[test]
+    fn walletconnect_setter_rules_store_nothing_invalid() {
+        // The setters' own validation, minus the disk write.
+        assert_eq!(clean_walletconnect_project_id(None), Ok(None));
+        assert_eq!(clean_walletconnect_project_id(Some("   ")), Ok(None));
+        assert_eq!(
+            clean_walletconnect_project_id(Some(&format!(" {WC_PROJECT_ID} "))),
+            Ok(Some(WC_PROJECT_ID.to_string()))
+        );
+        assert_eq!(
+            clean_walletconnect_project_id(Some("short")),
+            Err(WALLETCONNECT_PROJECT_ID_INVALID)
+        );
+        assert_eq!(clean_walletconnect_relay_url(None), Ok(None));
+        assert_eq!(clean_walletconnect_relay_url(Some("")), Ok(None));
+        assert_eq!(
+            clean_walletconnect_relay_url(Some("wss://relay.walletconnect.org/")),
+            Ok(None)
+        );
+        assert_eq!(
+            clean_walletconnect_relay_url(Some("wss://relay.example.org/")),
+            Ok(Some("wss://relay.example.org".to_string()))
+        );
+        // A typo is refused, never turned into "use the public relay".
+        for typo in [
+            "ws://relay.example.org",
+            "wss//relay.example.org",
+            "relay.example.org",
+        ] {
+            assert_eq!(
+                clean_walletconnect_relay_url(Some(typo)),
+                Err(WALLETCONNECT_RELAY_URL_INVALID),
+                "{typo:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn walletconnect_project_source_matrix() {
+        use crate::walletconnect::ProjectIdSource;
+        assert_eq!(project_source(true, true), ProjectIdSource::Override);
+        assert_eq!(project_source(true, false), ProjectIdSource::Override);
+        assert_eq!(project_source(false, true), ProjectIdSource::BuiltIn);
+        assert_eq!(project_source(false, false), ProjectIdSource::Missing);
+    }
+
+    /// Getters on the global state, which no test mutates: no override, so the
+    /// public relay and the baked-in id (if any) are what WalletConnect would use.
+    #[test]
+    fn walletconnect_getters_reflect_default_state() {
+        assert_eq!(walletconnect_project_id(), None);
+        assert_eq!(walletconnect_relay_url(), None);
+        assert_eq!(
+            effective_walletconnect_relay_url(),
+            wallet_connect::relay::rpc::DEFAULT_RELAY_URL
+        );
+        assert_eq!(
+            effective_walletconnect_project_id(),
+            builtin_walletconnect_project_id()
+        );
+        let expected = if DEFAULT_WALLETCONNECT_PROJECT_ID.is_empty() {
+            crate::walletconnect::ProjectIdSource::Missing
+        } else {
+            crate::walletconnect::ProjectIdSource::BuiltIn
+        };
+        assert_eq!(walletconnect_project_source(), expected);
+        // The default relay is itself a valid relay input that stores as "no override".
+        assert_eq!(
+            parse_walletconnect_relay_input(wallet_connect::relay::rpc::DEFAULT_RELAY_URL)
+                .as_deref(),
+            Some(wallet_connect::relay::rpc::DEFAULT_RELAY_URL)
+        );
+    }
+
+    #[test]
+    fn debug_redacts_walletconnect_project_id() {
+        let state = State {
+            walletconnect_project_id: Some(WC_PROJECT_ID.into()),
+            walletconnect_relay_url: Some("wss://relay.private.example".into()),
+            ..default_state()
+        };
+        let dump = format!("{state:?}");
+        assert!(!dump.contains(WC_PROJECT_ID), "{dump}");
+        assert!(
+            dump.contains("walletconnect_project_id: Some(\"<redacted>\")"),
+            "{dump}"
+        );
+        // The relay override is presence only too.
+        assert!(!dump.contains("relay.private.example"), "{dump}");
+        assert!(
+            dump.contains("walletconnect_relay_url: Some(\"<redacted>\")"),
+            "{dump}"
+        );
     }
 }

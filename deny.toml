@@ -21,17 +21,17 @@ yanked = "deny"
 #
 # Entries are grouped by the helios subtree they live in. Revisit each group
 # when helios upgrades the upstream dep that pins it (jsonrpsee 0.19,
-# libp2p 0.51, reqwest's hickory-dns feature, alloy 1.x), or when any
+# libp2p 0.51, reqwest's hickory-dns feature), or when any
 # non-helios direct dep starts pulling the affected crate — that would be a
 # new attack surface worth fixing at the source.
 ignore = [
-    # ── helios TLS subtree (jsonrpsee 0.19.0 → rustls 0.21, rustls-webpki
-    #    0.101.7, rustls-pemfile 1.0.4, webpki-roots 0.24) ────────────────
-    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained. No known vuln; archived in favor of rustls-pki-types' PemObject, which jsonrpsee 0.19's rustls 0.21 predates. No keys on this path." },
-    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.101.7 URI name-constraint bypass. Requires a misissued cert to exploit. Worst case: an attacker MITMs RPC responses; the light client rejects them as inconsistent with the verified header chain — liveness loss, not confidentiality." },
-    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.101.7 wildcard name-constraint bypass. Same misissuance precondition and same blast-radius cap as -0098." },
-    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.101.7 CRL-parse panic, reachable pre-verification. rustls doesn't fetch CRLs by default and we never pass any in; worst-case failure mode is a helios task panic, not key compromise." },
-    { id = "RUSTSEC-2026-0258", reason = "h2 unbounded empty DATA frames (memory DoS / panic). Patched in h2 ≥0.4.16; the 0.4 line is on 0.4.19. h2 0.3.27 remains, pinned by jsonrpsee 0.19 → hyper 0.14 (no 0.3 patch). Low severity, HTTP/2 frame-queue DoS on RPC connections — an attacker can stall helios, not reach keys. Revisit when helios moves off jsonrpsee 0.19." },
+    # ── helios jsonrpsee-server subtree (jsonrpsee 0.19.0 server → hyper 0.14
+    #    → h2 0.3.27) ───────────────────────────────────────────────────────
+    # Since helios 43a8c9f (#804) jsonrpsee is built with server/macros/
+    # client-core only, so its rustls 0.21 client stack (rustls-webpki 0.101,
+    # rustls-pemfile 1, webpki-roots 0.24) is gone from the build. What remains
+    # serves helios's optional local JSON-RPC server.
+    { id = "RUSTSEC-2026-0258", reason = "h2 unbounded empty DATA frames (memory DoS / panic). Patched in h2 ≥0.4.16; the 0.4 line is on 0.4.19. h2 0.3.27 remains, pinned by jsonrpsee-server 0.19 → hyper 0.14 (http2 feature; no 0.3 patch). Only reachable through helios's local JSON-RPC server, which starts only when rpc_address/rpc_socket is set — Kao sets neither (net::build_eth_backend / build_op_backend), so no h2 connection is made. Revisit when helios moves off jsonrpsee 0.19." },
 
     # ── helios libp2p subtree (helios-opstack → libp2p 0.51 and friends) ─
     # libp2p here is op-stack peer transport. Its noise/identity keys are
@@ -112,7 +112,12 @@ allow = [
     # permissive license, MIT-equivalent grant with a notice obligation.
     "BlueOak-1.0.0",
 ]
-exceptions = []
+exceptions = [
+    # WalletConnect v2 wallet side. GPLv3 §13 / AGPLv3 §13 permit combining it
+    # with Kao's AGPL-3.0-or-later; scoped to this one crate so no other
+    # GPL-3.0-only dependency can enter silently.
+    { allow = ["GPL-3.0-only"], crate = "wallet-connect" },
+]
 
 # helios-* subcrates omit a `license` field in their per-crate Cargo.toml,
 # but the workspace LICENSE at the repo root is MIT. Clarify each subcrate
@@ -207,6 +212,7 @@ allow-git = [
     "https://github.com/bbqsrc/core2",
     "https://github.com/kaowallet/clear-signing",
     "https://github.com/kaowallet/privacy-pools",
+    "https://github.com/kaowallet/wallet-connect",
 ]
 
 [sources.allow-org]

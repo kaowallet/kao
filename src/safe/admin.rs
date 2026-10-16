@@ -21,8 +21,9 @@
 use alloy::primitives::keccak256;
 
 /// The `authorized`-gated methods, paired with what each one does in the terms
-/// a user reasons about. Sourced from the Safe v1.3.0 / v1.4.1 singleton
-/// (`OwnerManager`, `ModuleManager`, `GuardManager`, `FallbackManager`).
+/// a user reasons about. Sourced from the Safe v1.3.0 / v1.4.1 / v1.5.0
+/// singletons (`OwnerManager`, `ModuleManager`, `GuardManager`,
+/// `FallbackManager`). 1.5.0 added exactly one: `setModuleGuard`.
 ///
 /// `setup` is included even though it can only run once: a batch containing it
 /// against an already-initialised Safe is either a bug or an attempt at one,
@@ -48,6 +49,11 @@ const AUTHORIZED_METHODS: &[(&str, &str)] = &[
         "setGuard(address)",
         "replaces this Safe's transaction guard — the contract that can veto \
          every future transaction",
+    ),
+    (
+        "setModuleGuard(address)",
+        "replaces this Safe's module guard — the contract that can veto every \
+         transaction its modules make (Safe 1.5.0 and later)",
     ),
     (
         "enableModule(address)",
@@ -125,6 +131,7 @@ mod tests {
             ("swapOwner(address,address,address)", "0xe318b52b"),
             ("changeThreshold(uint256)", "0x694e80c3"),
             ("setGuard(address)", "0xe19a9dd9"),
+            ("setModuleGuard(address)", "0xe068df37"),
             ("enableModule(address)", "0x610b5925"),
             ("disableModule(address,address)", "0xe009cfde"),
             ("setFallbackHandler(address)", "0xf08a0323"),

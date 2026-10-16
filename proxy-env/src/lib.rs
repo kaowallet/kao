@@ -20,11 +20,17 @@
 //! nothing else, lets the main wallet keep its blanket `forbid(unsafe_code)`
 //! and confines the audit surface to this one function.
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Set once by [`set_all_proxy`] to record that a process-wide proxy was
 /// actually installed for this session. See [`installed`].
 static INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// The exact URL [`set_all_proxy`] put in `ALL_PROXY`, recorded alongside
+/// [`INSTALLED`]. Safe code only: a `OnceLock` write, no environment access.
+/// See [`installed_url`].
+static INSTALLED_URL: OnceLock<String> = OnceLock::new();
 
 /// Install `proxy_url` as the process-wide proxy for every reqwest-based
 /// client (sets `ALL_PROXY` / `all_proxy`). `proxy_url` is a full proxy URL,
@@ -50,6 +56,8 @@ pub fn set_all_proxy(proxy_url: &str) {
         std::env::set_var("ALL_PROXY", proxy_url);
         std::env::set_var("all_proxy", proxy_url);
     }
+    // First write wins; the precondition above means there is only one.
+    let _ = INSTALLED_URL.set(proxy_url.to_owned());
     INSTALLED.store(true, Ordering::Relaxed);
 }
 
@@ -68,6 +76,21 @@ pub fn installed() -> bool {
     INSTALLED.load(Ordering::Relaxed)
 }
 
+/// The proxy URL actually installed this launch (`socks5h://host:port`), if
+/// any — never the stored setting. WalletConnect's relay transport dials its
+/// own SOCKS5h tunnel to exactly this address, so it routes wherever reqwest's
+/// `ALL_PROXY` does.
+///
+/// Like [`installed`], this is deliberately not the persisted setting: the
+/// stored address can be invalid (startup then installs the Tor default
+/// instead) or changed mid-session (which only takes effect on the next
+/// launch). Reading it back from `ALL_PROXY` instead would also pick up a value
+/// the user's shell exported, which Kao never chose. `None` until
+/// [`set_all_proxy`] has run.
+pub fn installed_url() -> Option<&'static str> {
+    INSTALLED_URL.get().map(String::as_str)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,5 +102,14 @@ mod tests {
     #[test]
     fn installed_defaults_false() {
         assert!(!installed());
+    }
+
+    /// Likewise there is no installed URL to route through until startup
+    /// installs one — so nothing can mistake "no proxy" for a proxy.
+    #[test]
+    fn installed_url_none_by_default() {
+        assert_eq!(installed_url(), None);
+        // The flag and the URL agree.
+        assert_eq!(installed(), installed_url().is_some());
     }
 }

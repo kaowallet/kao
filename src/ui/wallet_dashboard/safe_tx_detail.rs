@@ -269,22 +269,23 @@ impl SafeTxDetailPane {
     /// unpack it was already in the tree — [`decode_multisend_calldata`] is the
     /// inverse the Builder's own review has used since it started clear-signing
     /// batches — and only the proposing side was ever calling it.
+    ///
+    /// Decoded against the library it targets, so a 1.5.0 sub-call addressed
+    /// to `0x0` comes back addressed to this Safe, which is where it runs.
     fn batch_contents(
         &self,
     ) -> Option<Result<Vec<crate::txbuilder::multisend::PackedCall>, String>> {
-        use crate::txbuilder::multisend::{
-            MULTISEND_CALL_ONLY_1_3_0, MULTISEND_CALL_ONLY_1_4_1, decode_multisend_calldata,
-        };
+        use crate::txbuilder::multisend::{canonical_multisend_call_only, decode_batch};
         let to = self
             .detail
             .as_ref()
             .map(|d| d.tx.to)
             .unwrap_or(self.pending.to);
-        let is_multisend = matches!(to, MULTISEND_CALL_ONLY_1_3_0 | MULTISEND_CALL_ONLY_1_4_1);
+        let is_multisend = canonical_multisend_call_only(to).is_some();
         if !is_multisend || self.effective_operation() != 1 {
             return None;
         }
-        Some(decode_multisend_calldata(self.effective_data()).map_err(|e| e.to_string()))
+        Some(decode_batch(to, self.safe, self.effective_data()).map_err(|e| e.to_string()))
     }
 
     /// Owner addresses that this wallet controls and that have **not** yet
@@ -1134,6 +1135,18 @@ fn sub_call_row<'a>(
     }
 
     col = col.push(field(t, "To", colored_address(t, call.to)));
+    if call.redirected_to_self {
+        // Another wallet reading the same bytes may show `0x0` here. Say why
+        // this one shows the Safe, so the two can be reconciled.
+        col = col.push(
+            text(
+                "Encoded as the zero address. MultiSendCallOnly 1.5.0 sends a call addressed \
+                 there to the Safe itself.",
+            )
+            .size(11)
+            .color(t.sub),
+        );
+    }
     if !call.value.is_zero() {
         col = col.push(simple_field(
             t,
@@ -1490,6 +1503,59 @@ mod tests {
         assert_eq!(calls[0].data.as_ref(), &[0x01, 0x02, 0x03, 0x04]);
         assert_eq!(calls[1].to, owner(0xC2));
         assert_eq!(calls[1].value, alloy::primitives::U256::from(5u64));
+    }
+
+    /// Safe{Wallet} batches from 1.5.0 Safes, and from 1.3.0 Safes on OP / Base (whose
+    /// MultiSendCallOnly is the EIP-155 deployment), are batches too — not delegatecalls to an
+    /// unknown library.
+    #[test]
+    fn batches_through_the_other_official_multisend_deployments_unpack() {
+        use crate::txbuilder::multisend::{
+            MULTISEND_CALL_ONLY_1_3_0_EIP155, MULTISEND_CALL_ONLY_1_5_0,
+        };
+        for lib in [MULTISEND_CALL_ONLY_1_3_0_EIP155, MULTISEND_CALL_ONLY_1_5_0] {
+            let blob =
+                multisend_blob(&[(owner(0xC1), 0, vec![0x01]), (owner(0xC2), 5, Vec::new())]);
+            let p = pane_with_batch(owner(0x5A), lib, blob, 1);
+            let calls = p
+                .batch_contents()
+                .expect("recognised as a batch")
+                .expect("and decodes");
+            assert_eq!(calls.len(), 2, "{lib}");
+        }
+    }
+
+    /// The 1.5.0 library sends a sub-call addressed to `0x0` to the Safe. A
+    /// proposal that hides `addOwnerWithThreshold` behind a zero target has to
+    /// reach the co-signer as a call to this Safe, with its effect named, not
+    /// as a call to nobody.
+    #[test]
+    fn a_zero_target_in_a_1_5_0_batch_is_shown_as_the_safe_itself() {
+        use crate::txbuilder::multisend::{MULTISEND_CALL_ONLY_1_4_1, MULTISEND_CALL_ONLY_1_5_0};
+        let safe = owner(0x5A);
+        let mut add_owner =
+            alloy::primitives::keccak256(b"addOwnerWithThreshold(address,uint256)")[..4].to_vec();
+        add_owner.extend_from_slice(B256::left_padding_from(owner(0xBB).as_slice()).as_slice());
+        add_owner.extend_from_slice(&alloy::primitives::U256::from(1u64).to_be_bytes::<32>());
+        let blob = multisend_blob(&[
+            (owner(0xC1), 0, vec![0x01, 0x02, 0x03, 0x04]),
+            (Address::ZERO, 0, add_owner),
+        ]);
+
+        let p = pane_with_batch(safe, MULTISEND_CALL_ONLY_1_5_0, blob.clone(), 1);
+        let calls = p.batch_contents().unwrap().unwrap();
+        assert_eq!(calls[1].to, safe, "1.5.0 runs the zero target as the Safe");
+        assert!(calls[1].redirected_to_self);
+        assert!(
+            crate::safe::admin::authorized_effect(&calls[1].data)
+                .is_some_and(|e| e.contains("adds an owner")),
+        );
+
+        // The same bytes through 1.4.1 really do call the zero address.
+        let p = pane_with_batch(safe, MULTISEND_CALL_ONLY_1_4_1, blob, 1);
+        let calls = p.batch_contents().unwrap().unwrap();
+        assert_eq!(calls[1].to, Address::ZERO);
+        assert!(!calls[1].redirected_to_self);
     }
 
     #[test]

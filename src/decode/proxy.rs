@@ -21,8 +21,7 @@
 //!   beacon proxies store a beacon address in the slot, and you
 //!   resolve the implementation by calling `implementation()` on the
 //!   beacon. That requires an `eth_call`, which Phase 1 deliberately
-//!   skipped (alloy v1/v2 type wrangling on the Helios boundary). Not
-//!   followed, but [`is_beacon_proxy`] recognises the shape so the UI can
+//!   skipped. Not followed, but [`is_beacon_proxy`] recognises the shape so the UI can
 //!   say which limitation it hit rather than showing an empty ABI.
 //! - **EIP-1967 admin** — used for upgrade governance, not call routing.
 //!

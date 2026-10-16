@@ -31,6 +31,7 @@ use crate::chain::Chain;
 pub mod api;
 pub mod composer;
 pub mod ethflow;
+pub mod history;
 pub mod onchain;
 pub mod order;
 pub mod safe_sig;

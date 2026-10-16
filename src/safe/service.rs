@@ -194,6 +194,11 @@ fn de_opt_num_string<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<St
 struct MultisigPage {
     #[serde(default)]
     results: Vec<RawMultisigTx>,
+    /// Set when the service holds more rows than this page carried. Only its
+    /// presence is used: the next page's URL is built here, never followed from
+    /// the response, so a page can't point the next request at another host.
+    #[serde(default)]
+    next: Option<String>,
 }
 
 /// The live service (v6.x) returns `nonce`/`safeTxGas`/`baseGas` as JSON
@@ -432,13 +437,22 @@ async fn check_status(context: &str, resp: reqwest::Response) -> Result<reqwest:
     }
 }
 
-/// Safe Transaction Service queue endpoint for `safe` on `chain`.
-/// `executed=false` returns only the live queue (proposed + replaced);
-/// `ordering=nonce` so rows arrive lowest-nonce-first. The Safe address
-/// is checksummed in the path — the API 422s on a lowercase address.
-fn queue_url(base: &str, safe: Address, chain: Chain) -> String {
+/// Rows per queue page — the Transaction Service's maximum `limit`.
+const QUEUE_PAGE_ROWS: usize = 200;
+/// Pages [`fetch_pending`] reads before it gives up on knowing the whole queue.
+const QUEUE_MAX_PAGES: usize = 5;
+
+/// One page of the Safe Transaction Service queue for `safe` on `chain`:
+/// `executed=false` rows at nonces from `min_nonce` up (a row below the Safe's
+/// live nonce can never execute — replaced or rejected proposals stay
+/// `executed=false` forever, and enough of them would otherwise fill the first
+/// page and hide the live queue), `ordering=nonce` so they arrive
+/// lowest-nonce-first, `offset` rows in. The Safe address is checksummed in
+/// the path — the API 422s on a lowercase address.
+fn queue_url(base: &str, safe: Address, chain: Chain, min_nonce: u64, offset: usize) -> String {
     format!(
-        "{base}/tx-service/{}/api/v1/safes/{}/multisig-transactions/?executed=false&ordering=nonce",
+        "{base}/tx-service/{}/api/v1/safes/{}/multisig-transactions/?executed=false&ordering=nonce\
+         &nonce__gte={min_nonce}&limit={QUEUE_PAGE_ROWS}&offset={offset}",
         chain.safe_tx_service_shortname(),
         safe.to_checksum(None),
     )
@@ -448,11 +462,14 @@ fn queue_url(base: &str, safe: Address, chain: Chain) -> String {
 /// lifecycle state.
 ///
 /// Reads the Safe's authoritative on-chain nonce first (via
-/// `BalanceFetcher`), then GETs the queue keyless and maps each record
-/// through [`derive_state`]. `threshold` is the cached
-/// `SafeDescriptor.threshold`, used only as a fallback when the service
-/// omits `confirmationsRequired`. Returns rows sorted by nonce ascending;
-/// an empty queue yields `Ok(vec![])`.
+/// `BalanceFetcher`), then GETs the queue keyless from that nonce up — every
+/// page of it, up to [`QUEUE_MAX_PAGES`] — and maps each record through
+/// [`derive_state`]. `threshold` is the cached `SafeDescriptor.threshold`,
+/// used only as a fallback when the service omits `confirmationsRequired`.
+/// Returns rows sorted by nonce ascending; an empty queue yields `Ok(vec![])`.
+///
+/// A queue longer than the pages read is an `Err`, never a partial `Ok`:
+/// callers take an `Ok` as the whole queue, and pin new transactions past it.
 pub async fn fetch_pending(
     net: &dyn BalanceFetcher,
     base: &str,
@@ -461,29 +478,55 @@ pub async fn fetch_pending(
     threshold: u32,
 ) -> Result<Vec<PendingSafeTx>, String> {
     let current_nonce = current_safe_nonce(net, safe, chain).await?;
-    let url = queue_url(base, safe, chain);
-    let resp = crate::indexer::http_client_or_err()?
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("safe-service GET: {}", crate::indexer::redact_url_in_err(e)))?;
-    let page: MultisigPage = check_status("safe-service queue", resp)
-        .await?
-        .json()
-        .await
-        .map_err(|e| {
-            format!(
-                "safe-service decode: {}",
-                crate::indexer::redact_url_in_err(e)
-            )
-        })?;
-    let mut out: Vec<PendingSafeTx> = page
-        .results
-        .into_iter()
-        .filter_map(|raw| map_raw(raw, threshold, current_nonce))
-        .collect();
-    out.sort_by_key(|t| t.nonce);
-    Ok(out)
+    let client = crate::indexer::http_client_or_err()?;
+    let mut out: Vec<PendingSafeTx> = Vec::new();
+    let mut offset = 0usize;
+    for _ in 0..QUEUE_MAX_PAGES {
+        let url = queue_url(base, safe, chain, current_nonce, offset);
+        let resp =
+            client.get(&url).send().await.map_err(|e| {
+                format!("safe-service GET: {}", crate::indexer::redact_url_in_err(e))
+            })?;
+        let page: MultisigPage = check_status("safe-service queue", resp)
+            .await?
+            .json()
+            .await
+            .map_err(|e| {
+                format!(
+                    "safe-service decode: {}",
+                    crate::indexer::redact_url_in_err(e)
+                )
+            })?;
+        let rows = page.results.len();
+        out.extend(
+            page.results
+                .into_iter()
+                .filter_map(|raw| map_raw(raw, threshold, current_nonce)),
+        );
+        if page.next.is_none() {
+            // Offsets shift if the queue changes between pages, which can
+            // deliver a row twice; it is still one transaction.
+            let mut seen = std::collections::HashSet::new();
+            out.retain(|t| seen.insert(t.safe_tx_hash));
+            out.sort_by_key(|t| t.nonce);
+            return Ok(out);
+        }
+        if rows == 0 {
+            // More is claimed but none was sent: asking again at the same
+            // offset would get the same nothing.
+            return Err(
+                "the Safe Transaction Service returned an incomplete queue, so Kao can't tell \
+                 which nonce is free"
+                    .to_string(),
+            );
+        }
+        offset = offset.saturating_add(rows);
+    }
+    Err(format!(
+        "this Safe's pending queue is longer than Kao reads ({} transactions or more), so Kao \
+         can't tell which nonce is free",
+        QUEUE_MAX_PAGES * QUEUE_PAGE_ROWS
+    ))
 }
 
 // ── Detail (full tx + per-owner signatures) ──────────────────────────────────
@@ -1103,7 +1146,7 @@ mod tests {
         let hash = B256::repeat_byte(0x22);
         let base = "https://txs.example-dao.org";
         for url in [
-            queue_url(base, safe, Chain::Base),
+            queue_url(base, safe, Chain::Base, 0, 0),
             detail_url(base, hash, Chain::Base),
             confirmations_url(base, hash, Chain::Base),
             propose_url(base, safe, Chain::Base),
@@ -1181,14 +1224,216 @@ mod tests {
         assert!(page.results.is_empty());
     }
 
+    // ── fetch_pending against a loopback Transaction Service ──────────
+
+    /// A loopback stand-in for the Transaction Service: answers each GET with the JSON body
+    /// `page` returns for its request line, up to `max` requests, and hands back every request
+    /// line it saw.
+    async fn queue_service(
+        page: impl Fn(&str) -> serde_json::Value + Send + 'static,
+        max: usize,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let served = tokio::spawn(async move {
+            let mut lines = Vec::new();
+            for _ in 0..max {
+                let accepted =
+                    tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept())
+                        .await;
+                let Ok(Ok((mut sock, _))) = accepted else {
+                    break;
+                };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = sock.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let line = String::from_utf8_lossy(&buf)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                let body = page(&line).to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+                lines.push(line);
+            }
+            lines
+        });
+        (base, served)
+    }
+
+    fn queue_row(nonce: u64) -> serde_json::Value {
+        serde_json::json!({
+            "safeTxHash": format!("0x{:064x}", nonce + 1),
+            "to": "0x000000000000000000000000000000000000dEaD",
+            "value": "0",
+            "data": null,
+            "nonce": nonce,
+            "operation": 0,
+            "isExecuted": false,
+            "confirmationsRequired": 2,
+            "confirmations": []
+        })
+    }
+
+    fn nonce_mock(safe: Address, nonce: u64) -> crate::net::CallMock {
+        use alloy::sol_types::{SolCall, SolValue};
+        let mock = crate::net::CallMock::new();
+        mock.set_call(
+            safe,
+            Bytes::from(crate::safe::nonceCall {}.abi_encode()),
+            Bytes::from(U256::from(nonce).abi_encode()),
+            true,
+        );
+        mock
+    }
+
+    /// 100 or more never-executed proposals below the live nonce (replaced or rejected ones stay
+    /// `executed=false` forever) must not fill the first page and hide the live queue: a page of
+    /// stale rows read as the whole queue makes it look known and empty, and a dapp transaction
+    /// would then pin the nonce a co-signer's proposal already holds.
+    #[tokio::test]
+    async fn fetch_pending_reads_the_live_queue_past_stale_rows() {
+        let safe = Address::repeat_byte(0x5a);
+        let (base, served) = queue_service(
+            |line| {
+                if line.contains("nonce__gte=120") {
+                    serde_json::json!({"count": 1, "next": null, "results": [queue_row(120)]})
+                } else if line.contains("offset=100") {
+                    serde_json::json!({"count": 101, "next": null, "results": [queue_row(120)]})
+                } else {
+                    let rows: Vec<_> = (0..100).map(queue_row).collect();
+                    serde_json::json!({
+                        "count": 101,
+                        "next": "http://elsewhere.example/page2?limit=100&offset=100",
+                        "results": rows
+                    })
+                }
+            },
+            4,
+        )
+        .await;
+        let got = fetch_pending(&nonce_mock(safe, 120), &base, safe, Chain::Mainnet, 2).await;
+        let lines = served.await.unwrap();
+        let live: Result<Vec<u64>, String> = got
+            .as_ref()
+            .map(|v| v.iter().map(|p| p.nonce).filter(|n| *n >= 120).collect())
+            .map_err(Clone::clone);
+        assert_eq!(
+            live,
+            Ok(vec![120]),
+            "the co-signer's proposal at the live nonce is missing: {lines:?}"
+        );
+    }
+
+    /// A queue spanning pages is read to its end — through offsets Kao builds itself against the
+    /// service it was configured with, never through the `next` URL a response names.
+    #[tokio::test]
+    async fn fetch_pending_reads_every_page_from_its_own_offsets() {
+        let safe = Address::repeat_byte(0x5a);
+        let (base, served) = queue_service(
+            |line| {
+                if line.contains("offset=0") {
+                    let rows: Vec<_> = (10..10 + QUEUE_PAGE_ROWS as u64).map(queue_row).collect();
+                    serde_json::json!({
+                        "count": QUEUE_PAGE_ROWS + 1,
+                        "next": "http://elsewhere.example/?offset=200",
+                        "results": rows
+                    })
+                } else {
+                    serde_json::json!({"count": 201, "next": null, "results": [queue_row(500)]})
+                }
+            },
+            4,
+        )
+        .await;
+        let got = fetch_pending(&nonce_mock(safe, 10), &base, safe, Chain::Mainnet, 2)
+            .await
+            .expect("the whole queue");
+        let lines = served.await.unwrap();
+        assert_eq!(got.len(), QUEUE_PAGE_ROWS + 1);
+        assert_eq!(got.last().map(|p| p.nonce), Some(500));
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[1].contains(&format!("offset={QUEUE_PAGE_ROWS}"))
+                && lines[1].contains("/tx-service/eth/"),
+            "{lines:?}"
+        );
+    }
+
+    /// A page that claims more rows but sends none, or a row delivered on two pages (offsets
+    /// shift when the queue changes mid-read): neither is mistaken for the queue as it stands.
+    #[tokio::test]
+    async fn fetch_pending_refuses_an_empty_page_that_claims_more_and_dedups_rows() {
+        let safe = Address::repeat_byte(0x5a);
+        let (base, _served) = queue_service(
+            |_| serde_json::json!({"count": 5, "next": "more", "results": []}),
+            2,
+        )
+        .await;
+        let got = fetch_pending(&nonce_mock(safe, 7), &base, safe, Chain::Mainnet, 2).await;
+        assert!(
+            got.as_ref().is_err_and(|e| e.contains("incomplete")),
+            "{got:?}"
+        );
+
+        let (base, _served) = queue_service(
+            |line| {
+                if line.contains("offset=0") {
+                    serde_json::json!({"count": 3, "next": "more", "results": [queue_row(7), queue_row(8)]})
+                } else {
+                    serde_json::json!({"count": 3, "next": null, "results": [queue_row(8), queue_row(9)]})
+                }
+            },
+            3,
+        )
+        .await;
+        let got = fetch_pending(&nonce_mock(safe, 7), &base, safe, Chain::Mainnet, 2)
+            .await
+            .expect("the queue");
+        assert_eq!(
+            got.iter().map(|p| p.nonce).collect::<Vec<_>>(),
+            vec![7, 8, 9]
+        );
+    }
+
+    /// A queue longer than Kao reads is not "the queue": an error, so the caller knows it doesn't
+    /// know which nonce is free.
+    #[tokio::test]
+    async fn fetch_pending_refuses_a_queue_longer_than_it_reads() {
+        let safe = Address::repeat_byte(0x5a);
+        let (base, served) = queue_service(
+            |_| serde_json::json!({"count": 100_000, "next": "more", "results": [queue_row(7)]}),
+            QUEUE_MAX_PAGES + 2,
+        )
+        .await;
+        let got = fetch_pending(&nonce_mock(safe, 7), &base, safe, Chain::Mainnet, 2).await;
+        assert!(got.as_ref().is_err_and(|e| e.contains("longer")), "{got:?}");
+        assert_eq!(served.await.unwrap().len(), QUEUE_MAX_PAGES);
+    }
+
     #[test]
     fn queue_url_uses_checksum_and_shortname() {
         let safe = "0x000000000000000000000000000000000000dead"
             .parse::<Address>()
             .unwrap();
-        let url = queue_url(DEFAULT_TX_SERVICE_BASE, safe, Chain::Optimism);
+        let url = queue_url(DEFAULT_TX_SERVICE_BASE, safe, Chain::Optimism, 7, 200);
         assert!(url.contains("/tx-service/oeth/"));
         assert!(url.contains("executed=false"));
+        assert!(url.contains("nonce__gte=7"), "{url}");
+        assert!(url.contains("limit=200&offset=200"), "{url}");
         // Checksummed address in the path (mixed case), not the lowercase input.
         assert!(url.contains(&safe.to_checksum(None)));
     }

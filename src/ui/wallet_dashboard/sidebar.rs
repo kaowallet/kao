@@ -39,7 +39,16 @@ pub fn view<'a>(
     network_name: &'a str,
     verification: VerificationStatus,
     checkpoint_refreshing: bool,
+    wc_badge: usize,
 ) -> Element<'a, Message> {
+    // Dapp requests (and a connection request) waiting in WalletConnect take
+    // over the Apps row's sub-label, so a request that couldn't open by itself
+    // (a modal was up, or it's for another identity) stays visible.
+    let apps_sub = match wc_badge {
+        0 => NavSub::Plain("on-chain apps"),
+        1 => NavSub::Attention("1 dapp request".to_string()),
+        n => NavSub::Attention(format!("{n} dapp requests")),
+    };
     let mut body = column![
         brand_header(t),
         Space::new().height(18),
@@ -47,7 +56,14 @@ pub fn view<'a>(
         Space::new().height(14),
         divider(t),
         Space::new().height(14),
-        nav_item(t, nav, Nav::Home, "(◕‿◕)", "Portfolio", "this account"),
+        nav_item(
+            t,
+            nav,
+            Nav::Home,
+            "(◕‿◕)",
+            "Portfolio",
+            NavSub::Plain("this account"),
+        ),
         Space::new().height(8),
         // Apps is unconditional. It used to be hidden whenever the identity
         // couldn't place a CoW swap, which was written when Swap was the only
@@ -57,7 +73,7 @@ pub fn view<'a>(
         // Safe on a chain CoW never deployed to, and every watch-only account.
         // Reading, composing and simulating need no key; the write actions
         // inside each app refuse on their own, naming the reason.
-        nav_item(t, nav, Nav::Apps, "(ᵔᴥᵔ)", "Apps", "on-chain apps"),
+        nav_item(t, nav, Nav::Apps, "(ᵔᴥᵔ)", "Apps", apps_sub),
     ]
     .width(Length::Fill);
 
@@ -68,7 +84,7 @@ pub fn view<'a>(
         Nav::Activity,
         "(˘ᵕ˘)",
         "Activity",
-        "history",
+        NavSub::Plain("history"),
     ));
     body = body.push(Space::new().height(8));
     body = body.push(nav_item(
@@ -77,7 +93,7 @@ pub fn view<'a>(
         Nav::Settings,
         "(・ω・)",
         "Settings",
-        "network · privacy",
+        NavSub::Plain("network · privacy"),
     ));
     body = body.push(Space::new().height(Length::Fill));
     // Hardware-device card sits just above the network footer, both pinned
@@ -229,6 +245,13 @@ fn account_card<'a>(
         .into()
 }
 
+/// A nav row's sub-label: the usual muted description, or something waiting
+/// for the user (drawn bold in body colour so it reads as a count, not a hint).
+enum NavSub<'a> {
+    Plain(&'a str),
+    Attention(String),
+}
+
 /// One nav row: a tinted icon chip with a kaomoji, a bold title, and a
 /// muted sub-label. The active row fills with the accent tint and gains a
 /// dark outline ring; idle rows are transparent with the canonical hover tint.
@@ -238,7 +261,7 @@ fn nav_item<'a>(
     id: Nav,
     kao: &'a str,
     title: &'a str,
-    sub: &'a str,
+    sub: NavSub<'a>,
 ) -> Element<'a, Message> {
     let active = active_nav == id;
 
@@ -263,11 +286,11 @@ fn nav_item<'a>(
             ..container::Style::default()
         });
 
-    let info = column![
-        text(title).size(14).color(t.text).font(bold()),
-        text(sub).size(11).color(t.sub),
-    ]
-    .spacing(1);
+    let sub = match sub {
+        NavSub::Plain(s) => text(s).size(11).color(t.sub),
+        NavSub::Attention(s) => text(s).size(11).color(t.text).font(bold()),
+    };
+    let info = column![text(title).size(14).color(t.text).font(bold()), sub].spacing(1);
 
     let inner = row![
         icon,

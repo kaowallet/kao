@@ -14,8 +14,15 @@
 //! set / threshold) fails closed with a clear error instead of POSTing an order
 //! the orderbook would reject anyway.
 //!
-//! Owners sign through [`KaoSigner::sign_eip712`], so software **and** hardware
-//! (Ledger / Trezor) owners work — the same path the Safe-TX send flow uses.
+//! Owners sign through [`KaoSigner::sign_eip712`] — the same path the Safe-TX
+//! send flow uses — so software and Ledger owners sign the `SafeMessage` as
+//! EIP-712 (`v ∈ {27,28}`). A Trezor owner has no EIP-712 path (see
+//! `sign_eip712`): it works **only** through [`sign_eip1271_digest`]'s `eth_sign`
+//! fallback, a personal message over the Safe message hash (`v ∈ {31,32}`),
+//! which is also where a Ledger lands when its app is too old for EIP-712. In
+//! [`OwnerSigMode::Auto`] (CoW) a Ledger whose user declines the EIP-712 prompt
+//! lands there too; [`OwnerSigMode::Eip712`] stops instead, so the second prompt
+//! is the user's explicit choice.
 
 use alloy::primitives::{Address, B256, Bytes, FixedBytes};
 use alloy::sol;
@@ -23,7 +30,9 @@ use alloy::sol_types::{SolCall, SolStruct};
 
 use crate::chain::Chain;
 use crate::net::BalanceFetcher;
-use crate::safe::tx::{assemble_signatures, safe_domain};
+use crate::safe::tx::{
+    OwnerSigError, OwnerSigMode, assemble_signatures, owner_sig_bytes, safe_domain,
+};
 use crate::wallet::KaoSigner;
 
 sol! {
@@ -75,10 +84,9 @@ pub fn safe_message_digests(
 
 /// Build the EIP-1271 `signature` blob for an arbitrary EIP-712 `data_hash`
 /// (a CoW order digest when placing, an `OrderCancellations` digest when
-/// cancelling): each owner signs the Safe message hash via EIP-712
-/// (`SafeMessage`), with an `eth_sign` fallback for hardware/app-versions that
-/// reject typed-data; the per-owner blobs are then assembled Safe-style
-/// (ascending by signer address). Mirrors the v-byte conventions of
+/// cancelling): each owner signs the Safe message hash
+/// ([`sign_eip1271_owner`]), and the per-owner blobs are then assembled
+/// Safe-style (ascending by signer address). Mirrors the v-byte conventions of
 /// [`crate::safe::tx::sign_owner`]: `{27,28}` for EIP-712, `{31,32}` for
 /// `eth_sign`.
 pub async fn sign_eip1271_digest(
@@ -86,10 +94,38 @@ pub async fn sign_eip1271_digest(
     data_hash: B256,
     safe: Address,
     chain: Chain,
-) -> Result<Bytes, String> {
+    mode: OwnerSigMode,
+) -> Result<Bytes, OwnerSigError> {
     if owners.is_empty() {
-        return Err("eip1271: no owners to sign with".to_string());
+        return Err(OwnerSigError {
+            text: "eip1271: no owners to sign with".to_string(),
+            eip712_refused: false,
+        });
     }
+    let mut sigs = Vec::with_capacity(owners.len());
+    for owner in owners {
+        sigs.push(sign_eip1271_owner(owner, data_hash, safe, chain, mode).await?);
+    }
+    assemble_signatures(sigs).map_err(|text| OwnerSigError {
+        text,
+        eip712_refused: false,
+    })
+}
+
+/// One owner's EIP-1271 signature over `data_hash`: the `SafeMessage` wrapping
+/// it, signed via EIP-712 (`SafeMessage`) with the `eth_sign` fallback `mode`
+/// allows — `eth_sign` signs the Safe message hash as an EIP-191 personal
+/// message and bumps `v` by 4, matching Safe's eth_sign branch in
+/// `checkSignatures`. Returns the `(owner, 65-byte blob)` pair for
+/// [`assemble_signatures`], so a caller can sign one owner at a time and let
+/// each device go before the next is opened.
+pub async fn sign_eip1271_owner(
+    owner: &KaoSigner,
+    data_hash: B256,
+    safe: Address,
+    chain: Chain,
+    mode: OwnerSigMode,
+) -> Result<(Address, Bytes), OwnerSigError> {
     let domain = safe_domain(safe, chain);
     let msg = SafeMessage {
         message: Bytes::from(data_hash.as_slice().to_vec()),
@@ -98,30 +134,13 @@ pub async fn sign_eip1271_digest(
     // helper so the two stay in lockstep and the `eth_sign` fallback signs the
     // same digest the EIP-712 path commits to.
     let message_hash = safe_message_hash(data_hash, safe, chain);
-    let mut sigs = Vec::with_capacity(owners.len());
-    for owner in owners {
-        let blob = match owner.sign_eip712(&msg, &domain).await {
-            Ok(sig) => Bytes::from(sig.as_bytes().to_vec()),
-            Err(eip712_err) => {
-                // eth_sign fallback: sign the message hash as an EIP-191
-                // personal message and bump v by 4 (`{27,28}` → `{31,32}`),
-                // matching Safe's eth_sign branch in `checkSignatures`. EIP-712
-                // failing is the expected fallback trigger (older Ledger apps), so
-                // surface the eth_sign attempt's (already-friendly) error if that
-                // also fails rather than leaking both raw status words.
-                tracing::debug!(error = %eip712_err, "eip1271 owner eip712 sign failed; falling back to eth_sign");
-                let sig = owner
-                    .sign_eth_message(message_hash.as_slice())
-                    .await
-                    .map_err(|eth_err| crate::wallet::friendly_signer_error(&eth_err))?;
-                let mut b = sig.as_bytes().to_vec();
-                b[64] += 4;
-                Bytes::from(b)
-            }
-        };
-        sigs.push((owner.address(), blob));
-    }
-    assemble_signatures(sigs)
+    let blob = owner_sig_bytes(
+        mode,
+        || owner.sign_eip712(&msg, &domain),
+        || owner.sign_eth_message(message_hash.as_slice()),
+    )
+    .await?;
+    Ok((owner.address(), blob))
 }
 
 /// Verify, against the live Safe, that `signature` makes
@@ -139,21 +158,52 @@ pub async fn verify_eip1271_on_chain(
     data_hash: B256,
     signature: &Bytes,
 ) -> Result<(), String> {
+    check_eip1271_on_chain(net, safe, chain, data_hash, signature)
+        .await
+        .map_err(|e| match e {
+            Eip1271Check::Rejected(text) | Eip1271Check::Unreachable(text) => text,
+        })
+}
+
+/// Why [`check_eip1271_on_chain`] didn't confirm a signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Eip1271Check {
+    /// The Safe answered, and not with the magic value: another `bytes4`, or a
+    /// return that isn't one at all (a fallback handler without EIP-1271
+    /// answers nothing). Asking again gets the same answer.
+    Rejected(String),
+    /// The call couldn't be made or answered (RPC failure, or a revert the node
+    /// reports as an error): nothing was learned about the signature.
+    Unreachable(String),
+}
+
+/// [`verify_eip1271_on_chain`] with its failure kept typed, for a flow that
+/// treats "the Safe said no" differently from "the Safe couldn't be asked".
+pub async fn check_eip1271_on_chain(
+    net: &dyn BalanceFetcher,
+    safe: Address,
+    chain: Chain,
+    data_hash: B256,
+    signature: &Bytes,
+) -> Result<(), Eip1271Check> {
     let calldata = isValidSignatureCall {
         _dataHash: data_hash,
         _signature: signature.clone(),
     }
     .abi_encode();
-    let ret = net.call_raw(safe, Bytes::from(calldata), chain).await?;
+    let ret = net
+        .call_raw(safe, Bytes::from(calldata), chain)
+        .await
+        .map_err(Eip1271Check::Unreachable)?;
     let magic = isValidSignatureCall::abi_decode_returns(&ret.value)
-        .map_err(|e| format!("isValidSignature decode: {e}"))?;
+        .map_err(|e| Eip1271Check::Rejected(format!("isValidSignature decode: {e}")))?;
     if magic == EIP1271_MAGIC {
         Ok(())
     } else {
-        Err(format!(
+        Err(Eip1271Check::Rejected(format!(
             "Safe rejected the EIP-1271 order signature (isValidSignature returned \
              {magic:#x}, not the 0x1626ba7e magic) — refusing to submit the order",
-        ))
+        )))
     }
 }
 
@@ -242,7 +292,7 @@ mod tests {
         let chain = Chain::Mainnet;
         let digest = B256::repeat_byte(0x42);
 
-        let blob = sign_eip1271_digest(&[ks], digest, safe, chain)
+        let blob = sign_eip1271_digest(&[ks], digest, safe, chain, OwnerSigMode::Auto)
             .await
             .unwrap();
         assert_eq!(blob.len(), 65, "one owner → one 65-byte signature");
@@ -270,7 +320,7 @@ mod tests {
         let chain = Chain::Mainnet;
         let digest = B256::repeat_byte(0x7e);
 
-        let blob = sign_eip1271_digest(&owners, digest, safe, chain)
+        let blob = sign_eip1271_digest(&owners, digest, safe, chain, OwnerSigMode::Auto)
             .await
             .unwrap();
         assert_eq!(blob.len(), 130);
@@ -303,9 +353,15 @@ mod tests {
 
     #[tokio::test]
     async fn no_owners_is_an_error() {
-        let err = sign_eip1271_digest(&[], B256::ZERO, safe_addr(), Chain::Mainnet)
-            .await
-            .unwrap_err();
-        assert!(err.contains("no owners"), "got: {err}");
+        let err = sign_eip1271_digest(
+            &[],
+            B256::ZERO,
+            safe_addr(),
+            Chain::Mainnet,
+            OwnerSigMode::Auto,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.text.contains("no owners"), "got: {err}");
     }
 }

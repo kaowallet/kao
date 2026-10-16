@@ -54,11 +54,14 @@ use crate::ui::verify_seed::{
     Message as VerifySeedMessage, Outcome as VerifySeedOutcome, VerifySeedScreen,
 };
 use crate::ui::wallet_dashboard::{
-    Message as WalletDashboardMessage, Outcome as WalletDashboardOutcome, WalletScreen,
+    Message as WalletDashboardMessage, Outcome as WalletDashboardOutcome,
+    POOL_IDENTITY_STILL_UNREAD, POOL_IDENTITY_UNREAD, WalletScreen,
 };
+use crate::vault::{Vault, VaultFlush};
 use crate::wallet::{
     self, AccountDescriptor, Contact, ContactsBook, KaoSigner, SafeUpsert, WalletDescriptor,
 };
+use crate::walletconnect::runtime::WcSlot;
 use alloy::signers::local::PrivateKeySigner;
 
 // ── Messages ─────────────────────────────────────────────────────────────────
@@ -81,10 +84,16 @@ pub enum Message {
     Unlock(UnlockMessage),
     VerifySeed(VerifySeedMessage),
     WalletDashboard(WalletDashboardMessage),
-    /// Result of an off-thread `wallet::save_descriptor`. Frees the wallet
-    /// file for whatever queued behind it (see `DbGate`); an error surfaces
-    /// as a toast.
-    WalletSaved(Result<(), String>),
+    /// Result of an off-thread `wallet::save_descriptor`: the wallet's data
+    /// key on success, and whether that save minted it — or `None` when the
+    /// descriptor saved but its key couldn't be settled (the vault is left
+    /// alone). Frees the wallet file for whatever queued behind it (see
+    /// `DbGate`); an error surfaces as a toast.
+    WalletSaved(Result<Option<(wallet::DataKey, wallet::KeyOrigin)>, String>),
+    /// Result of an off-thread `wallet::reset_sealed` the user asked for (the saved history and
+    /// connections couldn't be read): the fresh data key it minted, which the vault adopts, or
+    /// why it failed (a toast).
+    SealedReset(Result<(wallet::DataKey, wallet::KeyOrigin), String>),
     /// Result of the post-unlock Safe refresh batch. Carries one entry
     /// per Safe in the unlock-time snapshot. Each entry is
     /// `Ok((new_descriptor, diff))` on a successful refresh, or
@@ -113,6 +122,16 @@ pub enum Message {
     DismissToast {
         generation: u64,
     },
+    /// The window's close button / the OS asked to quit: suspend WalletConnect
+    /// (its state saved for the next start; the full teardown without a data
+    /// key) and wait for that and every other teardown or vault drain still
+    /// running (bounded), then exit. A second request quits at once.
+    CloseRequested(iced::window::Id),
+    /// A lock's WalletConnect suspend (or teardown) finished. Ack only — the
+    /// runtime it ended is already out of the slot.
+    WcTornDown,
+    /// The quit-time WalletConnect wait finished (or ran out of time).
+    Exit,
 }
 
 // ── Screens ──────────────────────────────────────────────────────────────────
@@ -198,7 +217,8 @@ pub struct App {
     screen: Screen,
     /// Passphrase held for the duration of the unlocked session so we can
     /// re-save the wallet file when accounts are added or switched. Zeroized
-    /// on Drop via `SecretString`. Cleared on lock (not yet implemented).
+    /// on Drop via `SecretString`. Cleared on lock (`lock_wallet`) and when
+    /// the network wizard backs out to create-password.
     passphrase: Option<SecretString>,
     /// The currently-loaded wallet descriptor. Populated after unlock or
     /// fresh-setup completion. Carries the full account list and active
@@ -208,7 +228,11 @@ pub struct App {
     /// The dedicated Privacy Pools mnemonic, held for the session (like
     /// `passphrase`) so the pool app can derive its account and re-show the
     /// backup phrase without a second Argon2 pass. Loaded lazily on first
-    /// dashboard entry; `pp_loaded` records that the (possibly-absent) load ran.
+    /// dashboard entry; `pp_loaded` records that the (possibly-absent) load
+    /// succeeded. A load that failed leaves it `false` — retried at the next
+    /// dashboard entry or from the pool app's "Try again" — and the pool app
+    /// offers no "Create identity" meanwhile: a seed that couldn't be read is
+    /// not a seed that doesn't exist.
     pp_seed: Option<SecretString>,
     pp_loaded: bool,
     /// Why the setup screens are on screen, if at all.
@@ -278,7 +302,37 @@ pub struct App {
     /// nothing has saved it yet. Saved by the Safe-refresh completion, or
     /// by any earlier `persist_wallet`.
     safes_dirty: bool,
+    /// Where the WalletConnect runtime lives (sessions, request queue,
+    /// answers). App-owned so it outlives every dashboard rebuild; each
+    /// dashboard gets a clone (`set_wc_slot`). Empty until the user presses
+    /// Connect, or until the dashboard entry restores sessions saved at the
+    /// last lock or quit. Closed and replaced by a fresh slot on lock: the old
+    /// runtime is suspended (its state saved, dapps not told) and the next
+    /// unlock restores it.
+    wc_slot: WcSlot,
+    /// The encrypted store of WalletConnect state and history (App-owned,
+    /// shared with `wc_slot` and every successor). Unlocked with the wallet
+    /// (each unlock is a new epoch), locked with it.
+    vault: Vault,
+    /// A quit is in progress (WalletConnect teardown running): a second
+    /// close request exits immediately.
+    closing: bool,
+    /// A `wallet::reset_sealed` the user asked for is running: a second one
+    /// now would mint another key under the first, and the vault would adopt
+    /// whichever landed first — not the one on disk. Cleared when it lands.
+    sealed_reset_running: bool,
+    /// How creating a wallet takes the process-wide instance lock:
+    /// `wallet::acquire_instance_lock` (what `App::new` installs), or a
+    /// test's stand-in that leaves the real lock alone.
+    create_acquire: crate::ui::unlock::AcquireInstanceLock,
 }
+
+/// How the App reads the pool seed: `wallet::load_pp_seed`, or a test's stand-in.
+type PpSeedLoad = fn(&SecretString) -> Result<Option<SecretString>, wallet::WalletError>;
+
+/// How the App resets the sealed tables: `wallet::reset_sealed`, or a test's stand-in.
+type SealedResetFn =
+    fn(&SecretString) -> Result<(wallet::DataKey, wallet::KeyOrigin), wallet::WalletError>;
 
 /// Off-thread work on `wallet.redb`, one op at a time.
 ///
@@ -296,18 +350,32 @@ pub struct App {
 /// Every completion (`WalletSaved`, `ContactsLoaded`, `ContactsSaved`)
 /// frees the gate, error or not, so no failure leaves it stuck.
 ///
-/// Not gated, because they run synchronously on the UI thread — no gated
-/// op can *start* while one of them runs, but one already running can
-/// collide with them:
+/// Serialization itself is the store's job: every `wallet.redb` open in
+/// `wallet::store` holds a process-wide per-path lock, and the passphrase-
+/// and data-key-keyed ops wait for it rather than fail. What the gate adds
+/// is coalescing (one save of the latest wallet, the latest contacts book)
+/// and ordering (neither kind starves the other), and it keeps a pile of
+/// Argon2 passes from queueing behind the store lock.
 ///
-/// * the Privacy Pools seed. `load_pp_seed` runs once, at the first
-///   dashboard entry, in the same `update` that dispatches unlock's
-///   contacts load and before it starts, so the file is free then.
-///   `save_pp_seed` (create / restore identity) refuses while the gate is
-///   busy (`App::pool_seed_write_blocked`) rather than racing it.
+/// Not gated:
+///
+/// * the vault's writer thread (`crate::vault`): WalletConnect state and
+///   history, sealed under the data key — no Argon2, short batches, and it
+///   waits for the store lock like the gated ops do.
+/// * the Privacy Pools seed, synchronously on the UI thread. `load_pp_seed`
+///   runs at a dashboard entry until it has succeeded once; it waits for the
+///   store lock (a running gated op or vault batch delays it, never fails
+///   it), and a load that fails anyway is retried, never read as "no seed".
+///   `save_pp_seed` (restore identity) and `create_pp_seed` (create, which
+///   never overwrites an existing seed) refuse while the gate is busy
+///   (`App::pool_seed_write_blocked`) rather than stall the UI thread
+///   behind a save.
 /// * the pool note cache (`save_pp_notes` and friends, in the dashboard).
-///   It is advisory — a failed write only costs a re-scan — and a
-///   collision there just logs.
+///   It is advisory — a failed write only costs a re-scan — and it never
+///   waits: a busy store just logs.
+/// * the user's reset of the sealed tables (`wallet::reset_sealed`, see
+///   `App::request_sealed_reset_with`): rare, one at a time, and off the UI
+///   thread; it waits for the store lock like the vault's writer does.
 #[derive(Debug, Default)]
 struct DbGate {
     /// The op holding the file right now.
@@ -318,6 +386,13 @@ struct DbGate {
     contacts_load_queued: bool,
     /// A contacts save waits, with the latest book to write.
     contacts_save_queued: Option<Vec<Contact>>,
+}
+
+/// What a close request does (`App::close_requested`): exit at once, or once `F` — what must
+/// finish before the process may exit — has.
+enum QuitStep<F> {
+    Now,
+    After(F),
 }
 
 /// One kind of gated `wallet.redb` op (see `DbGate`).
@@ -391,10 +466,16 @@ impl App {
     pub fn new() -> (Self, iced::Task<Message>) {
         crate::settings::load();
         let network: Arc<dyn BalanceFetcher> = Arc::new(NetworkClient::new());
+        Self::with_network(network, wallet::wallet_exists())
+    }
+
+    /// [`Self::new`] past the settings load, over `network`: the unlock screen when a wallet file
+    /// `exists`, else create-password — with the production store, lock and save wiring.
+    fn with_network(network: Arc<dyn BalanceFetcher>, exists: bool) -> (Self, iced::Task<Message>) {
         let portfolio_cache = portfolio::new_cache();
 
         let contacts = Arc::new(RwLock::new(ContactsBook::new()));
-        let exists = wallet::wallet_exists();
+        let vault = Vault::new();
         crate::trace::state(
             "app",
             "screen",
@@ -402,8 +483,9 @@ impl App {
             if exists { "Unlock" } else { "CreatePassword" },
         );
         if exists {
+            let wc_slot = WcSlot::with_vault(vault.clone());
             let app = App {
-                screen: Screen::Unlock(UnlockScreen::default()),
+                screen: Screen::Unlock(UnlockScreen::new(wc_slot.clone())),
                 passphrase: None,
                 wallet: None,
                 pp_seed: None,
@@ -424,6 +506,11 @@ impl App {
                 pending_add_signer: Vec::new(),
                 db: DbGate::default(),
                 safes_dirty: false,
+                wc_slot,
+                vault,
+                closing: false,
+                sealed_reset_running: false,
+                create_acquire: wallet::acquire_instance_lock,
             };
             let task = focus_widget(crate::ui::unlock::PASSWORD_INPUT_ID).map(Message::Unlock);
             (app, task)
@@ -451,6 +538,11 @@ impl App {
                 pending_add_signer: Vec::new(),
                 db: DbGate::default(),
                 safes_dirty: false,
+                wc_slot: WcSlot::with_vault(vault.clone()),
+                vault,
+                closing: false,
+                sealed_reset_running: false,
+                create_acquire: wallet::acquire_instance_lock,
             };
             let task = focus_widget(crate::ui::create_password::PASSWORD_INPUT_ID)
                 .map(Message::CreatePassword);
@@ -685,6 +777,16 @@ impl App {
         // named, so account switches don't pile up redundant lookups.
         let ens_task = screen.fetch_ens_name_task().map(Message::WalletDashboard);
         self.screen = Screen::Wallet(Box::new(screen));
+        // Hand the fresh dashboard the WalletConnect slot: it re-mirrors any
+        // live sessions, puts reviews the old dashboard had open back in the
+        // queue, re-sends answers stranded while no dashboard existed, and
+        // pumps the queue.
+        let wc_task = match &mut self.screen {
+            Screen::Wallet(ws) => ws
+                .set_wc_slot(self.wc_slot.clone())
+                .map(Message::WalletDashboard),
+            _ => iced::Task::none(),
+        };
         // Load the Privacy Pools identity (once per session) and push it into
         // the fresh dashboard so the pool app can sync/prove immediately.
         self.load_pp_identity();
@@ -694,7 +796,7 @@ impl App {
             built_in = ?started.elapsed(),
             "entered dashboard; verify+portfolio+ens fetch queued",
         );
-        iced::Task::batch(vec![verify_task, portfolio_task, ens_task])
+        iced::Task::batch(vec![verify_task, portfolio_task, ens_task, wc_task])
     }
 
     // ── Privacy Pools identity plumbing ──────────────────────────────────────
@@ -702,23 +804,39 @@ impl App {
     // the App owns it (like `passphrase`) and pushes the derived account into the
     // dashboard. Load is Argon2-gated, so it runs at most once per session.
 
-    /// Load the pool seed (once) and push the derived account into the dashboard.
+    /// Load the pool seed (until a load succeeds) and push the derived account
+    /// into the dashboard.
     ///
-    /// Opens `wallet.redb` synchronously, outside the `DbGate`. The one load
-    /// happens at the first dashboard entry, inside the `update` that
-    /// dispatches unlock's contacts load (or a fresh wallet's first save),
-    /// before that task starts — so the file is free then.
+    /// Opens `wallet.redb` synchronously, outside the `DbGate`; the store's
+    /// path lock makes it wait for whatever holds the file (a gated op, a
+    /// vault batch) instead of failing on it. A load that fails anyway leaves
+    /// `pp_loaded` false: the next dashboard entry (or the pool app's "Try
+    /// again") loads again, and until then the pool app says it couldn't read
+    /// the identity instead of offering to create one over it.
     fn load_pp_identity(&mut self) {
+        self.load_pp_identity_with(wallet::load_pp_seed);
+    }
+
+    /// [`Self::load_pp_identity`] reading the seed with `load` (a test's stand-in for the store).
+    fn load_pp_identity_with(&mut self, load: PpSeedLoad) {
         if !self.pp_loaded {
-            if let Some(pw) = self.passphrase.as_ref() {
-                match wallet::load_pp_seed(pw) {
-                    Ok(seed) => self.pp_seed = seed,
-                    Err(e) => {
-                        warn!(error = %e, "privacy pools: loading the saved pool seed failed")
-                    }
+            match self.passphrase.as_ref().map(load) {
+                Some(Ok(seed)) => {
+                    self.pp_seed = seed;
+                    self.pp_loaded = true;
                 }
+                // No wallet file yet — a fresh wallet whose first save hasn't
+                // landed — so no seed in it either.
+                Some(Err(wallet::WalletError::NotFound)) => self.pp_loaded = true,
+                Some(Err(e)) => warn!(
+                    error = %e,
+                    "privacy pools: loading the saved pool seed failed — retried at the next \
+                     dashboard entry"
+                ),
+                // Nothing to load with (only before a passphrase exists): no
+                // seed this session can be read either way.
+                None => self.pp_loaded = true,
             }
-            self.pp_loaded = true;
         }
         let account = self.pp_seed.as_ref().and_then(|p| {
             match crate::pool::account::account_from_phrase(p) {
@@ -729,9 +847,27 @@ impl App {
                 }
             }
         });
+        let unreadable = !self.pp_loaded;
         if let Screen::Wallet(ws) = &mut self.screen {
             ws.set_pp_account(account);
+            ws.set_pp_identity_unreadable(unreadable);
         }
+    }
+
+    /// The pool app's "Try again" after a failed seed load: load again now,
+    /// and say so when it fails again (the card alone wouldn't change).
+    fn retry_pp_identity(&mut self) -> iced::Task<Message> {
+        self.retry_pp_identity_with(wallet::load_pp_seed)
+    }
+
+    fn retry_pp_identity_with(&mut self, load: PpSeedLoad) -> iced::Task<Message> {
+        if !self.pp_loaded {
+            self.load_pp_identity_with(load);
+            if !self.pp_loaded {
+                self.pool_error(POOL_IDENTITY_STILL_UNREAD.to_string());
+            }
+        }
+        iced::Task::none()
     }
 
     /// Persist + adopt a pool mnemonic: derive the account, push it into the
@@ -747,6 +883,8 @@ impl App {
         self.pp_seed = Some(phrase.clone());
         self.pp_loaded = true;
         if let Screen::Wallet(ws) = &mut self.screen {
+            // A restore over an identity this session couldn't read replaced it.
+            ws.set_pp_identity_unreadable(false);
             ws.set_pp_account(account);
             if show_backup {
                 ws.show_pool_backup(phrase);
@@ -774,11 +912,20 @@ impl App {
     }
 
     /// Generate a fresh pool identity, persist it, and show its backup phrase.
+    ///
+    /// Never over an existing one: refused while this session's seed load
+    /// hasn't succeeded (the seed may be there, unread), and the store's
+    /// `create_pp_seed` refuses a row that exists anyway.
     fn pool_create_identity(&mut self) -> iced::Task<Message> {
         let Some(pw) = self.passphrase.clone() else {
             self.pool_error("wallet is locked".into());
             return iced::Task::none();
         };
+        if !self.pp_loaded {
+            warn!("privacy pools: create refused — this session's seed load hasn't succeeded");
+            self.pool_error(POOL_IDENTITY_UNREAD.to_string());
+            return iced::Task::none();
+        }
         if let Some(why) = self.pool_seed_write_blocked() {
             self.pool_error(why);
             return iced::Task::none();
@@ -790,7 +937,7 @@ impl App {
                 return iced::Task::none();
             }
         };
-        if let Err(e) = wallet::save_pp_seed(&phrase, &pw) {
+        if let Err(e) = wallet::create_pp_seed(&phrase, &pw) {
             self.pool_error(e.to_string());
             return iced::Task::none();
         }
@@ -823,6 +970,75 @@ impl App {
             ws.show_pool_backup(seed);
         }
         iced::Task::none()
+    }
+
+    /// The toast for a wallet save that failed with `e`. It never points to the sealed-state
+    /// reset: wallet saves don't depend on the data key (`save_descriptor` settles it after the
+    /// commit), so an unreadable saved history can't be why a save failed, and the reset wouldn't
+    /// fix it.
+    fn wallet_save_failed_toast(e: &str) -> String {
+        format!(
+            "Kao couldn't save your wallet ({e}). Your latest change works for now but may be \
+             gone after a restart."
+        )
+    }
+
+    /// The user confirmed "Reset saved history and connections": the vault couldn't read the
+    /// wallet file's sealed tables this session (`key_unavailable`), so nothing new is saved
+    /// until they're reset. `reset` (`wallet::reset_sealed`) runs off the UI thread with the held
+    /// passphrase and lands as `SealedReset`. One at a time, and only while there's something to
+    /// reset.
+    fn request_sealed_reset_with(&mut self, reset: SealedResetFn) -> iced::Task<Message> {
+        if self.sealed_reset_running {
+            debug!("sealed reset: one is already running");
+            return iced::Task::none();
+        }
+        if !self.vault.unreadable().key_unavailable {
+            debug!("sealed reset: the saved state is readable — nothing to reset");
+            return iced::Task::none();
+        }
+        let Some(pw) = self.passphrase.clone() else {
+            warn!("sealed reset refused: the wallet is locked");
+            return iced::Task::none();
+        };
+        self.sealed_reset_running = true;
+        info!("resetting the saved history and connections at the user's request");
+        iced::Task::perform(run_sealed_reset(pw, reset), Message::SealedReset)
+    }
+
+    /// A reset landed: the vault adopts the key it minted (its mint cleared the tables, so this
+    /// epoch's ids are free) and the panes stop saying nothing is saved; a failure is a toast.
+    fn sealed_reset_landed(
+        &mut self,
+        result: Result<(wallet::DataKey, wallet::KeyOrigin), String>,
+    ) -> iced::Task<Message> {
+        self.sealed_reset_running = false;
+        let (key, origin) = match result {
+            Ok(minted) => minted,
+            Err(e) => {
+                error!(error = %e, "resetting the saved history and connections failed");
+                return iced::Task::done(Message::WalletError(format!(
+                    "Kao couldn't reset the saved history and connections ({e})."
+                )));
+            }
+        };
+        info!(
+            ?origin,
+            "saved history and connections reset: handing the vault the fresh key"
+        );
+        self.vault.set_key(key, origin);
+        if let Screen::Wallet(ws) = &mut self.screen {
+            ws.refresh_history_views();
+        }
+        if !self.vault.can_persist() {
+            // Locked meanwhile (the next unlock reads the reset tables), or the vault
+            // refused the key: nothing to tell.
+            return iced::Task::none();
+        }
+        iced::Task::done(Message::Notice(
+            "Kao reset the saved history and connections — it saves them again from now on."
+                .to_string(),
+        ))
     }
 
     /// Routes the active account of `self.wallet` to the right destination.
@@ -934,16 +1150,69 @@ impl App {
             self.reconnect_open_send = false;
             return self.enter_active_from_wallet(Some(nav));
         }
-        self.screen = if wallet::wallet_exists() {
-            self.passphrase = None;
-            self.wallet = None;
-            self.pp_seed = None;
-            self.pp_loaded = false;
-            Screen::Unlock(UnlockScreen::default())
-        } else {
-            Screen::SelectHardwareWallet(SelectHardwareWalletScreen::default())
-        };
+        if wallet::wallet_exists() {
+            return self.lock_wallet();
+        }
+        self.screen = Screen::SelectHardwareWallet(SelectHardwareWalletScreen::default());
         iced::Task::none()
+    }
+
+    /// Lock: forget the passphrase, the decrypted wallet and the pool seed,
+    /// and land on the unlock screen.
+    fn lock_wallet(&mut self) -> iced::Task<Message> {
+        // The vault's epoch ends first: its records and data key leave memory
+        // now, and nothing a runtime still does can reach the next unlock's.
+        let flush = self.vault.lock();
+        self.passphrase = None;
+        self.wallet = None;
+        self.pp_seed = None;
+        self.pp_loaded = false;
+        // Locking suspends WalletConnect: dapps stay connected (they aren't
+        // told anything), the state goes to disk through `flush`, and the next
+        // unlock restores it. Without a data key, the full teardown instead.
+        let suspend = self.suspend_wc(flush);
+        // The unlock screen holds the successor slot: its unlock waits for
+        // this suspend (and the writer's drain) before reading the store.
+        self.screen = Screen::Unlock(UnlockScreen::new(self.wc_slot.clone()));
+        suspend
+    }
+
+    /// Lock path: replace the slot, close the old one, and end its runtime.
+    /// With a data key (`flush.can_persist()`) it is suspended — waiting and
+    /// in-review requests are answered 4900, sessions stay (no dapp hears a
+    /// disconnect), and the final state is saved through `flush`. Without
+    /// one, today's full teardown: every session is disconnected (dapps hear
+    /// 6000), and the flush's drain is counted on its own. The next unlock
+    /// gets a fresh slot.
+    ///
+    /// Both run on the runtime's own tokio handle, not inside the returned
+    /// task, and the fresh slot (sharing the old one's teardown registry)
+    /// keeps count of them: a quit right after the lock (iced then never
+    /// polls this task again) waits for them, and so does the next unlock.
+    fn suspend_wc(&mut self, flush: VaultFlush) -> iced::Task<Message> {
+        let next = self.wc_slot.successor();
+        let old = std::mem::replace(&mut self.wc_slot, next);
+        match old.close() {
+            Some(rt) => {
+                // `spawn_teardown` / `spawn_suspend` mark it closed
+                // synchronously, before any task runs: from here `before_send`
+                // refuses, so a signature still in flight broadcasts nothing.
+                // Suspend needs a data key to save into; without one, the
+                // full teardown.
+                let running = if flush.can_persist() {
+                    old.spawn_suspend(rt, flush)
+                } else {
+                    let running = old.spawn_teardown(rt);
+                    old.track_flush(flush);
+                    running
+                };
+                iced::Task::perform(running, |_| Message::WcTornDown)
+            }
+            None => {
+                old.track_flush(flush);
+                iced::Task::none()
+            }
+        }
     }
 
     /// Drop back to the dashboard without going through setup again, using
@@ -1643,11 +1912,28 @@ impl App {
     fn adopt_unlocked_wallet(
         &mut self,
         passphrase: SecretString,
-        mut descriptor: WalletDescriptor,
+        unlocked: Arc<wallet::Unlocked>,
     ) -> iced::Task<Message> {
+        let wallet::Unlocked {
+            mut descriptor,
+            data_key,
+            key_status,
+            sealed,
+        } = Arc::unwrap_or_clone(unlocked);
+        // A key row that was there but unreadable (`Lost`), or one the unlock
+        // couldn't write (no key, nothing wrong reading): a wallet save mints
+        // the key, and nothing else would run one this session — without it,
+        // what the vault records is gone at the next lock. A key the storage
+        // couldn't be read for (`Unavailable`) is left alone: a save would
+        // find the same key, which this epoch must not adopt.
+        let mint_key = key_status == wallet::KeyStatus::Lost
+            || (data_key.is_none() && key_status == wallet::KeyStatus::Ok);
         // Hold the passphrase for the unlocked session so we
         // can re-save the wallet file on add/switch account.
         self.passphrase = Some(passphrase);
+        // The vault's epoch starts before the dashboard is built, so its
+        // WalletConnect slot sees this unlock's saved state.
+        self.vault.unlock(data_key, key_status, sealed);
         // Repair BEFORE the refresh below snapshots the Safes, so the
         // snapshot (and the dashboard) already carry the links. Only a
         // wallet saved before the repair shipped gets it, once: the marker
@@ -1672,6 +1958,14 @@ impl App {
         // the gated contacts load below opens the file.
         let enter = self.enter_active_from_wallet(None);
         let load_contacts = self.start_contacts_load();
+        // Queued behind the contacts load; it lands as `WalletSaved` with
+        // the minted key, which the vault adopts.
+        let mint = if mint_key {
+            info!(?key_status, "unlock: no data key — a wallet save mints one");
+            self.persist_wallet("mint data key")
+        } else {
+            iced::Task::none()
+        };
         // Refresh-on-app-open: kick off a parallel
         // re-inspect for every Safe so the dashboard
         // renders against verified-fresh owner sets and
@@ -1690,7 +1984,39 @@ impl App {
             }
             _ => iced::Task::none(),
         };
-        iced::Task::batch(vec![enter, load_contacts, refresh_safes])
+        iced::Task::batch(vec![enter, load_contacts, mint, refresh_safes])
+    }
+
+    /// The create-password screen; `acquire` takes the instance lock before a new wallet's
+    /// session starts (`wallet::acquire_instance_lock`, or a test's stand-in).
+    fn create_password_with(
+        &mut self,
+        msg: CreatePasswordMessage,
+        acquire: crate::ui::unlock::AcquireInstanceLock,
+    ) -> iced::Task<Message> {
+        let Screen::CreatePassword(screen) = &mut self.screen else {
+            return iced::Task::none();
+        };
+        let (cmd, outcome) = screen.update(msg);
+        if let Some(CreatePasswordOutcome::Created(passphrase)) = outcome {
+            // A second Kao process on the same wallet file would write
+            // over this one's history and saved WalletConnect state.
+            if crate::ui::unlock::claim_instance_with(acquire).is_err() {
+                screen.set_error(crate::ui::unlock::ALREADY_OPEN.to_string());
+                return cmd.map(Message::CreatePassword);
+            }
+            self.passphrase = Some(passphrase);
+            // A fresh wallet's vault epoch starts keyless: nothing is on
+            // disk to seal into until the first wallet save mints the
+            // data key (`WalletSaved`), and what it records meanwhile
+            // waits in memory for that key.
+            self.vault
+                .unlock(None, wallet::KeyStatus::Ok, wallet::SealedLoad::default());
+            self.setup_context = Some(SetupContext::FreshWallet);
+            self.screen = Screen::NetworkSetup(NetworkSetupScreen::new(WizardMode::Onboarding));
+            return iced::Task::none();
+        }
+        cmd.map(Message::CreatePassword)
     }
 
     pub fn update(&mut self, message: Message) -> iced::Task<Message> {
@@ -1747,20 +2073,7 @@ impl App {
     fn update_inner(&mut self, message: Message) -> iced::Task<Message> {
         match message {
             // ── CreatePassword ──────────────────────────────────────
-            Message::CreatePassword(msg) => {
-                let Screen::CreatePassword(screen) = &mut self.screen else {
-                    return iced::Task::none();
-                };
-                let (cmd, outcome) = screen.update(msg);
-                if let Some(CreatePasswordOutcome::Created(passphrase)) = outcome {
-                    self.passphrase = Some(passphrase);
-                    self.setup_context = Some(SetupContext::FreshWallet);
-                    self.screen =
-                        Screen::NetworkSetup(NetworkSetupScreen::new(WizardMode::Onboarding));
-                    return iced::Task::none();
-                }
-                cmd.map(Message::CreatePassword)
-            }
+            Message::CreatePassword(msg) => self.create_password_with(msg, self.create_acquire),
 
             // ── Unlock ──────────────────────────────────────────────
             Message::Unlock(msg) => {
@@ -1770,10 +2083,10 @@ impl App {
                 let (cmd, outcome) = screen.update(msg);
                 if let Some(UnlockOutcome::Unlocked {
                     passphrase,
-                    descriptor,
+                    unlocked,
                 }) = outcome
                 {
-                    return self.adopt_unlocked_wallet(passphrase, descriptor);
+                    return self.adopt_unlocked_wallet(passphrase, unlocked);
                 }
                 cmd.map(Message::Unlock)
             }
@@ -1790,6 +2103,10 @@ impl App {
                         iced::Task::none()
                     }
                     Some(NetworkSetupOutcome::Back) => {
+                        // The passphrase goes, so the vault's (keyless) epoch
+                        // ends with it; its drain counts until it's done.
+                        let flush = self.vault.lock();
+                        self.wc_slot.track_flush(flush);
                         self.passphrase = None;
                         self.pp_seed = None;
                         self.pp_loaded = false;
@@ -2172,6 +2489,12 @@ impl App {
             // ── Wallet ──────────────────────────────────────────────
             Message::WalletDashboard(msg) => {
                 let Screen::Wallet(screen) = &mut self.screen else {
+                    // A dashboard message landing off-screen (locked, or in a
+                    // hardware reconnect / add-account flow). Only a finished
+                    // WalletConnect signature needs anything: its dapp is
+                    // answered from here, so it never waits on a dashboard
+                    // that may not come back.
+                    crate::ui::wallet_dashboard::handle_orphan_message(msg, &self.wc_slot);
                     return iced::Task::none();
                 };
                 let (cmd, outcome) = screen.update(msg);
@@ -2248,6 +2571,10 @@ impl App {
                         let t = self.pool_create_identity();
                         iced::Task::batch(vec![cmd.map(Message::WalletDashboard), t])
                     }
+                    Some(WalletDashboardOutcome::PoolRetryIdentity) => {
+                        let t = self.retry_pp_identity();
+                        iced::Task::batch(vec![cmd.map(Message::WalletDashboard), t])
+                    }
                     Some(WalletDashboardOutcome::PoolRestoreIdentity(phrase)) => {
                         let t = self.pool_restore_identity(phrase);
                         iced::Task::batch(vec![cmd.map(Message::WalletDashboard), t])
@@ -2256,6 +2583,14 @@ impl App {
                         let t = self.pool_reveal_backup();
                         iced::Task::batch(vec![cmd.map(Message::WalletDashboard), t])
                     }
+                    Some(WalletDashboardOutcome::ResetSealedHistory) => {
+                        let t = self.request_sealed_reset_with(wallet::reset_sealed);
+                        iced::Task::batch(vec![cmd.map(Message::WalletDashboard), t])
+                    }
+                    Some(WalletDashboardOutcome::Notice(s)) => iced::Task::batch(vec![
+                        cmd.map(Message::WalletDashboard),
+                        iced::Task::done(Message::Notice(s)),
+                    ]),
                     None => cmd.map(Message::WalletDashboard),
                 }
             }
@@ -2266,8 +2601,32 @@ impl App {
                 // made while that save ran, one save of the latest wallet
                 // covers them all.
                 let next = self.db_op_landed(DbOp::WalletSave);
-                let Err(e) = result else {
-                    return next;
+                let e = match result {
+                    Ok(None) => {
+                        // The descriptor is on disk; the key row couldn't be
+                        // settled (the store logged why). The vault keeps
+                        // whatever key it has, or stays keyless.
+                        debug!("wallet saved without a data key: the vault is left alone");
+                        return next;
+                    }
+                    Ok(Some((key, origin))) => {
+                        // A keyless vault epoch (a fresh wallet's, or one whose
+                        // unlock couldn't read the data key) gets the key the
+                        // save just made sure of: what it buffered reaches disk.
+                        // The vault decides whether the key's origin lets this
+                        // epoch adopt it.
+                        if self.vault.is_unlocked() && !self.vault.can_persist() {
+                            info!(?origin, "wallet saved: handing the vault its data key");
+                            self.vault.set_key(key, origin);
+                            // The history panes and the WalletConnect pane say
+                            // whether Kao keeps what it records: tell them now.
+                            if let Screen::Wallet(ws) = &mut self.screen {
+                                ws.refresh_history_views();
+                            }
+                        }
+                        return next;
+                    }
+                    Err(e) => e,
                 };
                 error!(error = %e, "wallet save error");
                 if self.db.wallet_save_pending() {
@@ -2278,12 +2637,12 @@ impl App {
                 }
                 iced::Task::batch(vec![
                     next,
-                    iced::Task::done(Message::WalletError(format!(
-                        "Kao couldn't save your wallet ({e}). Your latest change works for \
-                         now but may be gone after a restart."
-                    ))),
+                    iced::Task::done(Message::WalletError(Self::wallet_save_failed_toast(&e))),
                 ])
             }
+
+            // ── User-requested reset of the sealed tables ───────────
+            Message::SealedReset(result) => self.sealed_reset_landed(result),
 
             // ── Post-unlock Safe refresh batch ──────────────────────
             Message::SafesRefreshed(results) => self.handle_safes_refreshed(results),
@@ -2343,7 +2702,50 @@ impl App {
                 }
                 iced::Task::none()
             }
+
+            // ── Quit ────────────────────────────────────────────────
+            Message::CloseRequested(window) => match self.close_requested() {
+                QuitStep::Now => {
+                    info!(?window, "close requested — quitting now");
+                    iced::exit()
+                }
+                QuitStep::After(wait) => {
+                    info!(
+                        ?window,
+                        "quit requested — saving WalletConnect and history first"
+                    );
+                    iced::Task::perform(wait, |()| Message::Exit)
+                }
+            },
+            Message::WcTornDown => iced::Task::none(),
+            Message::Exit => iced::exit(),
         }
+    }
+
+    /// What a close request does: exit at once, or once `wait` — what must finish first — has.
+    /// A second close while the first one's wait runs means "now".
+    fn close_requested(&mut self) -> QuitStep<impl Future<Output = ()> + Send + use<>> {
+        if self.closing {
+            return QuitStep::Now;
+        }
+        match self.begin_quit() {
+            None => QuitStep::Now,
+            Some(wait) => QuitStep::After(wait),
+        }
+    }
+
+    /// The first close request: nothing starts from here on (`closing`, and
+    /// the slot closes for good), the vault's epoch ends, and the slot ends
+    /// its runtime — suspended, so its dapps reconnect at the next unlock.
+    /// Returns what the process must wait for before it exits, bounded by
+    /// QUIT_TEARDOWN_BUDGET so a dead relay can't trap the window open:
+    /// everything still running — this suspend and its final save, a lock's
+    /// teardown, a retire's session deletes, a vault writer's drain. Exiting
+    /// sooner would cut them short. `None` when nothing runs.
+    fn begin_quit(&mut self) -> Option<impl Future<Output = ()> + Send + use<>> {
+        self.closing = true;
+        let flush = self.vault.lock();
+        self.wc_slot.quit(flush)
     }
 
     /// Put `msg` in the toast slot (replacing whatever is there) and
@@ -2399,6 +2801,15 @@ impl App {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
+        // On every screen: `main` turns off iced's exit-on-close, so this is
+        // the only way the window's close button quits.
+        Subscription::batch([
+            self.screen_subscription(),
+            iced::window::close_requests().map(Message::CloseRequested),
+        ])
+    }
+
+    fn screen_subscription(&self) -> Subscription<Message> {
         match &self.screen {
             Screen::CreatePassword(screen) => screen.subscription().map(Message::CreatePassword),
             Screen::Unlock(_) => Subscription::none(),
@@ -2521,7 +2932,7 @@ fn save_descriptor_task(
             })
             .await;
             let outcome = match join {
-                Ok(Ok(())) => Ok(()),
+                Ok(Ok(saved)) => Ok(saved),
                 Ok(Err(e)) => Err(e.to_string()),
                 Err(join_err) => Err(format!("wallet save panicked: {join_err}")),
             };
@@ -2530,6 +2941,19 @@ fn save_descriptor_task(
         },
         Message::WalletSaved,
     )
+}
+
+/// `reset` (`wallet::reset_sealed`) on the blocking pool: it runs Argon2 to check the passphrase,
+/// then waits for the store lock.
+async fn run_sealed_reset(
+    passphrase: SecretString,
+    reset: SealedResetFn,
+) -> Result<(wallet::DataKey, wallet::KeyOrigin), String> {
+    match tokio::task::spawn_blocking(move || reset(&passphrase)).await {
+        Ok(Ok(minted)) => Ok(minted),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(join_err) => Err(format!("reset task panicked: {join_err}")),
+    }
 }
 
 /// Fold onboarded Safe descriptors into `wallet` (`upsert_safe` each) and
@@ -2670,10 +3094,14 @@ mod tests {
     use super::*;
     use crate::net::MockFetcher;
     use crate::ui::create_password::CreatePasswordScreen;
+    use crate::ui::wallet_dashboard::{SignTag, WcSignKind};
+    use crate::walletconnect::runtime::WcRuntime;
+    use crate::walletconnect::{WcKey, codes as wc_codes, testkit};
     use alloy::primitives::B256;
 
     fn build_app(screen: Screen) -> App {
         let network: Arc<dyn BalanceFetcher> = Arc::new(MockFetcher::new());
+        let vault = Vault::new();
         App {
             screen,
             passphrase: None,
@@ -2693,6 +3121,13 @@ mod tests {
             pending_add_signer: Vec::new(),
             db: DbGate::default(),
             safes_dirty: false,
+            wc_slot: WcSlot::with_vault(vault.clone()),
+            vault,
+            closing: false,
+            sealed_reset_running: false,
+            // Tests never take the real process lock (it would leave a lock file in the
+            // per-process sandbox); `App::new`'s wiring is pinned on its own.
+            create_acquire: || Ok(()),
         }
     }
 
@@ -2850,6 +3285,7 @@ mod tests {
             modules: Vec::new(),
             guard: None,
             fallback_handler: None,
+            module_guard: None,
             linked_signer_indices: linked,
             sibling_chains,
             cached_at: 10,
@@ -2915,12 +3351,18 @@ mod tests {
         assert_eq!(app.save_state_name(), "saving+queued");
 
         // The first save lands: exactly one follow-up goes out.
-        let follow_up = app.update(Message::WalletSaved(Ok(())));
+        let follow_up = app.update(Message::WalletSaved(Ok(Some((
+            test_key(),
+            wallet::KeyOrigin::Existing,
+        )))));
         assert!(follow_up.units() > 0);
         assert_eq!(app.save_state_name(), "saving");
 
         // The follow-up lands: nothing left to do.
-        let done = app.update(Message::WalletSaved(Ok(())));
+        let done = app.update(Message::WalletSaved(Ok(Some((
+            test_key(),
+            wallet::KeyOrigin::Existing,
+        )))));
         assert_eq!(done.units(), 0);
         assert_eq!(app.save_state_name(), "idle");
     }
@@ -3062,8 +3504,30 @@ mod tests {
     fn unlock(wallet: WalletDescriptor) -> App {
         let mut app = build_app(placeholder_screen());
         app.pp_loaded = true;
-        let _ = app.adopt_unlocked_wallet(test_pw(), wallet);
+        let _ = app.adopt_unlocked_wallet(test_pw(), unlocked_of(wallet));
         app
+    }
+
+    /// What `load_wallet` hands the unlock screen for `descriptor`: with its data key.
+    fn unlocked_of(descriptor: WalletDescriptor) -> Arc<wallet::Unlocked> {
+        unlocked_with(descriptor, Some(test_key()), wallet::KeyStatus::Ok)
+    }
+
+    fn unlocked_with(
+        descriptor: WalletDescriptor,
+        data_key: Option<wallet::DataKey>,
+        key_status: wallet::KeyStatus,
+    ) -> Arc<wallet::Unlocked> {
+        Arc::new(wallet::Unlocked {
+            descriptor,
+            data_key,
+            key_status,
+            sealed: wallet::SealedLoad::default(),
+        })
+    }
+
+    fn test_key() -> wallet::DataKey {
+        wallet::DataKey::for_test([0x42; 32])
     }
 
     #[test]
@@ -3116,7 +3580,7 @@ mod tests {
         app.pp_loaded = true;
         app.safes_dirty = true; // stale flag from an earlier session
         let descriptor = wallet_of(vec![a0], vec![safe_at(0x55, 1, vec![], vec![0], vec![])]);
-        let _ = app.adopt_unlocked_wallet(test_pw(), descriptor);
+        let _ = app.adopt_unlocked_wallet(test_pw(), unlocked_of(descriptor));
         assert!(!app.safes_dirty);
     }
 
@@ -3194,7 +3658,10 @@ mod tests {
             let flushed = app.update(Message::ContactsLoaded(loaded));
             assert_eq!(app.save_state_name(), "saving", "failed load: {failed}");
             assert!(flushed.units() > 0);
-            let _ = app.update(Message::WalletSaved(Ok(())));
+            let _ = app.update(Message::WalletSaved(Ok(Some((
+                test_key(),
+                wallet::KeyOrigin::Existing,
+            )))));
             assert_eq!(app.save_state_name(), "idle");
         }
     }
@@ -3214,7 +3681,10 @@ mod tests {
         );
         assert_eq!(app.db.contacts_save_queued.as_ref().map(Vec::len), Some(2));
 
-        let flushed = app.update(Message::WalletSaved(Ok(())));
+        let flushed = app.update(Message::WalletSaved(Ok(Some((
+            test_key(),
+            wallet::KeyOrigin::Existing,
+        )))));
         assert!(flushed.units() > 0);
         assert_eq!(app.save_state_name(), "saving_contacts");
 
@@ -3224,7 +3694,10 @@ mod tests {
         assert_eq!(app.save_state_name(), "saving_contacts+queued");
         let _ = app.update(Message::ContactsSaved(Err("disk full".into())));
         assert_eq!(app.save_state_name(), "saving");
-        let _ = app.update(Message::WalletSaved(Ok(())));
+        let _ = app.update(Message::WalletSaved(Ok(Some((
+            test_key(),
+            wallet::KeyOrigin::Existing,
+        )))));
         assert_eq!(app.save_state_name(), "idle");
     }
 
@@ -3238,12 +3711,18 @@ mod tests {
         assert_eq!(app.save_state_name(), "saving+queued+contacts_queued");
 
         // After a wallet save, the waiting contacts go first…
-        let _ = app.update(Message::WalletSaved(Ok(())));
+        let _ = app.update(Message::WalletSaved(Ok(Some((
+            test_key(),
+            wallet::KeyOrigin::Existing,
+        )))));
         assert_eq!(app.save_state_name(), "saving_contacts+queued");
         // …then the wallet.
         let _ = app.update(Message::ContactsSaved(Ok(())));
         assert_eq!(app.save_state_name(), "saving");
-        let _ = app.update(Message::WalletSaved(Ok(())));
+        let _ = app.update(Message::WalletSaved(Ok(Some((
+            test_key(),
+            wallet::KeyOrigin::Existing,
+        )))));
         assert_eq!(app.save_state_name(), "idle");
     }
 
@@ -3254,7 +3733,14 @@ mod tests {
         let _ = app.start_contacts_load();
         let _ = app.persist_wallet("test");
         assert_eq!(app.save_state_name(), "loading_contacts+queued");
-        assert_eq!(app.update(Message::WalletSaved(Ok(()))).units(), 0);
+        assert_eq!(
+            app.update(Message::WalletSaved(Ok(Some((
+                test_key(),
+                wallet::KeyOrigin::Existing
+            )))))
+            .units(),
+            0
+        );
         assert_eq!(
             app.save_state_name(),
             "loading_contacts+queued",
@@ -3272,7 +3758,10 @@ mod tests {
         // Refused before it opens anything: no seed, no file touched.
         let _ = app.pool_create_identity();
         assert!(app.pp_seed.is_none());
-        let _ = app.update(Message::WalletSaved(Ok(())));
+        let _ = app.update(Message::WalletSaved(Ok(Some((
+            test_key(),
+            wallet::KeyOrigin::Existing,
+        )))));
         assert!(app.pool_seed_write_blocked().is_none());
     }
 
@@ -3944,5 +4433,840 @@ mod tests {
             "no key in Kao signs for the active Safe any more"
         );
         assert_eq!(screen.test_address(), k2, "same account, now at 1");
+    }
+
+    // ── WalletConnect: lock, quit, off-screen answers ───────────────────
+
+    const WC_ADDR: alloy::primitives::Address =
+        alloy::primitives::address!("ab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb");
+
+    /// A session with one `personal_sign` Kao is already signing — the dashboard's half of
+    /// admission and review done by hand, as the runtime tests do.
+    async fn wc_signing_request(
+        rt: &WcRuntime,
+        dapp: &wallet_connect::sign::SignClient,
+    ) -> (WcKey, testkit::DappCall) {
+        let topic = testkit::connect_raw(rt, dapp, WC_ADDR, &[1]).await;
+        let params = testkit::personal_sign_params("hi", WC_ADDR);
+        let call = testkit::dapp_request(dapp, &topic, 1, "personal_sign", params);
+        let (req, at) = testkit::next_request(&rt.events()).await;
+        let key = WcKey {
+            topic: req.topic.clone(),
+            id: req.id,
+        };
+        rt.admit(&req, at, Ok(testkit::admitted_personal(WC_ADDR, 1, "hi")));
+        rt.with_book(|b| {
+            assert!(b.mark_in_review(&key, 1));
+            assert!(b.mark_signing(&key, 1));
+        });
+        (key, call)
+    }
+
+    #[tokio::test]
+    async fn lock_closes_and_replaces_the_slot() {
+        let (_relay, dapp, _events, rt, slot) = testkit::harness().await;
+        let (key, _call) = wc_signing_request(&rt, &dapp).await;
+        let mut app = build_app(placeholder_screen());
+        app.wc_slot = slot.clone();
+        app.passphrase = Some(SecretString::new("pw".to_string().into_boxed_str()));
+        app.pp_seed = Some(SecretString::new("seed".to_string().into_boxed_str()));
+        app.pp_loaded = true;
+        assert!(rt.is_live(&key));
+
+        // The lock itself — what Back on a connect screen runs when a wallet exists.
+        let task = app.lock_wallet();
+        assert!(matches!(app.screen, Screen::Unlock(_)));
+        assert!(app.passphrase.is_none() && app.pp_seed.is_none() && !app.pp_loaded);
+        assert!(task.units() > 0, "the bounded teardown runs as a task");
+        // Closed synchronously, before that task ever runs: the signature in flight can no
+        // longer be broadcast or answered.
+        assert!(rt.is_closed());
+        assert!(!rt.is_live(&key));
+        // The old slot is empty and closed for good — a start racing the lock can't install.
+        assert!(slot.is_closed() && slot.get().is_none());
+        assert!(!slot.begin_start());
+        // The next unlock starts from a fresh, empty slot.
+        assert!(!app.wc_slot.is_closed() && app.wc_slot.get().is_none());
+        // With nothing running there is nothing to tear down.
+        assert_eq!(app.suspend_wc(VaultFlush::none()).units(), 0);
+        assert!(!app.wc_slot.is_closed());
+    }
+
+    #[tokio::test]
+    async fn close_request_ends_walletconnect_before_exiting() {
+        let (_relay, dapp, _events, rt, slot) = testkit::harness().await;
+        let (key, _call) = wc_signing_request(&rt, &dapp).await;
+        let mut app = build_app(placeholder_screen());
+        app.wc_slot = slot.clone();
+        let window = iced::window::Id::unique();
+
+        // The arm's decision: wait for the teardown, then exit — never exit while it runs.
+        let QuitStep::After(wait) = app.close_requested() else {
+            panic!("the close waits for the teardown");
+        };
+        assert!(app.closing);
+        assert!(slot.is_closed() && slot.get().is_none());
+        assert!(rt.is_closed() && !rt.is_live(&key));
+        // A second close while that runs quits at once.
+        assert!(matches!(app.close_requested(), QuitStep::Now));
+        wait.await;
+        assert_eq!(
+            slot.teardowns_running(),
+            0,
+            "the wait ended with the teardown"
+        );
+        assert_eq!(app.update(Message::WcTornDown).units(), 0);
+
+        // Through `update`: the same arm (the first close perform-then-exits).
+        let (_relay, _dapp, _events, _rt, slot) = testkit::harness().await;
+        let mut app = build_app(placeholder_screen());
+        app.wc_slot = slot.clone();
+        let task = app.update(Message::CloseRequested(window));
+        assert!(app.closing && slot.is_closed());
+        assert!(task.units() > 0);
+    }
+
+    #[test]
+    fn close_request_without_walletconnect_exits_at_once() {
+        let mut app = build_app(placeholder_screen());
+        assert!(app.begin_quit().is_none(), "nothing to wait for");
+        assert!(app.closing);
+        assert!(app.wc_slot.is_closed(), "nothing can start while quitting");
+
+        let mut app = build_app(placeholder_screen());
+        assert!(
+            matches!(app.close_requested(), QuitStep::Now),
+            "nothing runs: exit at once"
+        );
+
+        let mut app = build_app(placeholder_screen());
+        let _ = app.update(Message::CloseRequested(iced::window::Id::unique()));
+        assert!(app.closing && app.wc_slot.is_closed());
+    }
+
+    /// A lock's teardown is still running when the window closes: iced exits as soon as the quit
+    /// task resolves and never polls the lock's task again, so the teardown must run on its own
+    /// and the quit must wait for it — the dapp still hears 6000.
+    #[tokio::test]
+    async fn quit_waits_for_a_lock_teardown_still_running() {
+        let (_relay, dapp, _events, rt, slot) = testkit::harness().await;
+        let topic = testkit::connect_raw(&rt, &dapp, WC_ADDR, &[1]).await;
+        let mut app = build_app(placeholder_screen());
+        app.wc_slot = slot.clone();
+        // What process exit does to the lock's pending task.
+        drop(app.suspend_wc(VaultFlush::none()));
+        assert_eq!(
+            app.wc_slot.teardowns_running(),
+            1,
+            "the fresh slot counts the lock's teardown, so the quit below waits for it"
+        );
+        let wait = app
+            .begin_quit()
+            .expect("the quit waits for the lock's teardown");
+        assert!(app.closing && app.wc_slot.is_closed());
+        wait.await;
+        assert_eq!(
+            app.wc_slot.teardowns_running(),
+            0,
+            "the quit's wait ended with the teardown"
+        );
+        testkit::settle(|| !dapp.sessions().iter().any(|s| s.topic == topic)).await;
+        assert!(
+            !dapp.sessions().iter().any(|s| s.topic == topic),
+            "the dapp heard 6000"
+        );
+    }
+
+    /// A WalletConnect signature finishing while no dashboard is on screen (a lock, a hardware
+    /// reconnect, the add-account flow) still answers its dapp, from the App.
+    #[tokio::test]
+    async fn off_screen_signing_result_is_answered() {
+        let (_relay, dapp, _events, rt, slot) = testkit::harness().await;
+        let (key, call) = wc_signing_request(&rt, &dapp).await;
+        let mut app = build_app(placeholder_screen());
+        app.wc_slot = slot.clone();
+
+        let task = app.update(Message::WalletDashboard(WalletDashboardMessage::Signed {
+            tag: SignTag::WalletConnect {
+                key: key.clone(),
+                kind: WcSignKind::Personal,
+            },
+            signer: None,
+            result: Err("the Ledger was unplugged".into()),
+        }));
+        assert_eq!(task.units(), 0);
+        let Err(wallet_connect::Error::Peer(e)) = testkit::dapp_result(call).await else {
+            panic!("the dapp hears a failure");
+        };
+        assert_eq!(e.code, wc_codes::INTERNAL);
+        assert!(
+            !e.message.contains("Ledger"),
+            "the detail stays with the user"
+        );
+        assert_eq!(rt.with_book(|b| b.state_of(&key)), None, "answered once");
+    }
+
+    // ── Vault: create-password, saves, lock, quit (DESIGN §4) ───────────
+
+    fn type_new_password(app: &mut App) {
+        for msg in [
+            CreatePasswordMessage::PasswordInput("longenough1".into()),
+            CreatePasswordMessage::ConfirmInput("longenough1".into()),
+            CreatePasswordMessage::CreatePressed,
+        ] {
+            let _ = app.update(Message::CreatePassword(msg));
+        }
+    }
+
+    /// A fresh wallet's vault epoch starts keyless at create-password (nothing is on disk to seal
+    /// into yet), and backing out of the network wizard — which forgets the passphrase — ends it.
+    #[test]
+    fn create_password_starts_a_keyless_vault_and_backing_out_ends_it() {
+        let mut app = build_app(Screen::CreatePassword(CreatePasswordScreen::default()));
+        type_new_password(&mut app);
+        assert!(matches!(app.screen, Screen::NetworkSetup(_)));
+        assert!(app.vault.is_unlocked() && !app.vault.can_persist());
+
+        let _ = app.update(Message::NetworkSetup(NetworkSetupMessage::Back));
+        assert!(matches!(app.screen, Screen::CreatePassword(_)));
+        assert!(app.passphrase.is_none());
+        assert!(
+            !app.vault.is_unlocked(),
+            "the epoch ends with the passphrase"
+        );
+    }
+
+    /// Creating a wallet takes the instance lock first: with another Kao process holding it, no
+    /// session starts — the vault stays locked, no passphrase is held, and the form says the
+    /// wallet is open elsewhere. A lock that can't be taken for any other reason doesn't keep the
+    /// user out.
+    #[test]
+    fn creating_a_wallet_another_process_holds_is_refused() {
+        let type_both = |app: &mut App| {
+            for msg in [
+                CreatePasswordMessage::PasswordInput("longenough1".into()),
+                CreatePasswordMessage::ConfirmInput("longenough1".into()),
+            ] {
+                let _ = app.update(Message::CreatePassword(msg));
+            }
+        };
+        let mut app = build_app(Screen::CreatePassword(CreatePasswordScreen::default()));
+        type_both(&mut app);
+        let _ = app.create_password_with(CreatePasswordMessage::CreatePressed, || {
+            Err(wallet::WalletError::InUse)
+        });
+        assert!(!app.vault.is_unlocked(), "no vault epoch");
+        assert!(app.passphrase.is_none(), "no passphrase held");
+        assert!(app.setup_context.is_none());
+        let Screen::CreatePassword(screen) = &app.screen else {
+            panic!("still on create-password");
+        };
+        assert_eq!(screen.error(), Some(crate::ui::unlock::ALREADY_OPEN));
+
+        type_both(&mut app);
+        let _ = app.create_password_with(CreatePasswordMessage::CreatePressed, || {
+            Err(wallet::WalletError::Io(std::io::Error::other(
+                "no locks here",
+            )))
+        });
+        assert!(matches!(app.screen, Screen::NetworkSetup(_)));
+        assert!(app.vault.is_unlocked() && app.passphrase.is_some());
+    }
+
+    /// Create-password through `update` asks the App's own acquire for the instance lock — a
+    /// refusal there keeps the session from starting — and the App `App::new` builds (with a
+    /// wallet file or without) carries the real lock, as the unlock screen does. Test apps carry a
+    /// stand-in, so no test takes the real process lock.
+    #[test]
+    fn creating_a_wallet_goes_through_the_apps_instance_lock() {
+        let mut app = build_app(Screen::CreatePassword(CreatePasswordScreen::default()));
+        app.create_acquire = || Err(wallet::WalletError::InUse);
+        type_new_password(&mut app);
+        assert!(!app.vault.is_unlocked() && app.passphrase.is_none());
+        let Screen::CreatePassword(screen) = &app.screen else {
+            panic!("still on create-password");
+        };
+        assert_eq!(screen.error(), Some(crate::ui::unlock::ALREADY_OPEN));
+
+        let real = wallet::acquire_instance_lock as crate::ui::unlock::AcquireInstanceLock;
+        assert!(!std::ptr::fn_addr_eq(
+            build_app(placeholder_screen()).create_acquire,
+            real
+        ));
+        for exists in [false, true] {
+            let (app, _) = App::with_network(Arc::new(MockFetcher::new()), exists);
+            assert!(
+                std::ptr::fn_addr_eq(app.create_acquire, real),
+                "wallet file exists: {exists}"
+            );
+            assert_eq!(
+                matches!(app.screen, Screen::Unlock(_)),
+                exists,
+                "the screen follows the wallet file"
+            );
+        }
+    }
+
+    /// An unlock whose sealed tables the storage couldn't read (`Unavailable`), with a dashboard.
+    fn unlocked_unavailable() -> App {
+        let mut app = build_app(placeholder_screen());
+        app.pp_loaded = true;
+        let wallet = WalletDescriptor::single(local_signer_and_account(1).1);
+        let _ = app.adopt_unlocked_wallet(
+            test_pw(),
+            unlocked_with(wallet, None, wallet::KeyStatus::Unavailable),
+        );
+        assert!(app.vault.unreadable().key_unavailable);
+        app
+    }
+
+    fn history_texts(app: &App) -> Vec<String> {
+        let Screen::Wallet(ws) = &app.screen else {
+            panic!("on the dashboard");
+        };
+        ws.test_history_pane_texts()
+    }
+
+    /// The saved history and connections couldn't be read: the confirmed reset from a history
+    /// pane runs off the UI thread (one at a time); when it lands the vault adopts the key it
+    /// minted and the pane stops saying nothing is saved. A failed reset is a toast and leaves the
+    /// session keyless; with nothing unreadable there is nothing to reset.
+    #[test]
+    fn a_sealed_reset_hands_the_vault_its_fresh_key() {
+        use crate::ui::wallet_dashboard::ConnectionHistoryMessage as History;
+        let mut app = unlocked_unavailable();
+        let _ = app.update(Message::WalletDashboard(
+            WalletDashboardMessage::OpenConnectionHistorySettings,
+        ));
+        assert!(
+            history_texts(&app)
+                .iter()
+                .any(|t| t.starts_with("Kao can't read the history saved in your wallet file")),
+            "{:?}",
+            history_texts(&app)
+        );
+        let _ = app.update(Message::WalletDashboard(
+            WalletDashboardMessage::ConnectionHistorySettings(History::AskReset),
+        ));
+        // The real reset's task is built, never run: nothing here reaches a wallet file.
+        let _ = app.update(Message::WalletDashboard(
+            WalletDashboardMessage::ConnectionHistorySettings(History::ConfirmReset),
+        ));
+        assert!(app.sealed_reset_running, "the reset is on its way");
+        // A second one now would mint a key over the first's.
+        assert_eq!(
+            app.request_sealed_reset_with(|_| panic!("not run")).units(),
+            0
+        );
+
+        let notice = app.update(Message::SealedReset(Ok((
+            test_key(),
+            wallet::KeyOrigin::Minted,
+        ))));
+        assert!(!app.sealed_reset_running);
+        assert!(app.vault.can_persist(), "the minted key reached the vault");
+        assert!(!app.vault.unreadable().key_unavailable);
+        assert_eq!(notice.units(), 1, "the user hears it worked");
+        let texts = history_texts(&app);
+        assert!(
+            !texts
+                .iter()
+                .any(|t| t.starts_with("Kao can't read the history saved")),
+            "{texts:?}"
+        );
+        assert!(!texts.iter().any(|t| t.contains("can't keep")), "{texts:?}");
+        // Readable now: nothing more to reset.
+        assert_eq!(
+            app.request_sealed_reset_with(|_| panic!("not run")).units(),
+            0
+        );
+        assert!(!app.sealed_reset_running);
+
+        // A reset that fails: a toast, and the session stays keyless.
+        let mut app = unlocked_unavailable();
+        assert_eq!(
+            app.request_sealed_reset_with(|_| panic!("not run")).units(),
+            1
+        );
+        let toast = app.update(Message::SealedReset(Err("disk full".into())));
+        assert_eq!(toast.units(), 1);
+        assert!(!app.sealed_reset_running);
+        assert!(!app.vault.can_persist());
+        assert!(app.vault.unreadable().key_unavailable);
+    }
+
+    /// The reset runs the store call with the session passphrase on the blocking pool and reports
+    /// either way.
+    #[tokio::test]
+    async fn a_sealed_reset_runs_with_the_session_passphrase() {
+        use secrecy::ExposeSecret;
+        let minted = run_sealed_reset(test_pw(), |pw| {
+            assert_eq!(pw.expose_secret(), "pw");
+            Ok((
+                wallet::DataKey::for_test([9; 32]),
+                wallet::KeyOrigin::Minted,
+            ))
+        })
+        .await;
+        assert!(matches!(minted, Ok((_, wallet::KeyOrigin::Minted))));
+        let failed = run_sealed_reset(test_pw(), |_| Err(wallet::WalletError::NotFound)).await;
+        assert_eq!(failed.err().as_deref(), Some("no wallet found"));
+    }
+
+    /// The panes learn from the vault, through the App, that what this session records is kept:
+    /// keyless after an unlock, the WalletConnect pane says a lock disconnects the dapps and the
+    /// history pane says new records aren't kept; the minting `WalletSaved` puts both back.
+    #[tokio::test]
+    async fn the_panes_hear_from_the_wallet_save_that_records_are_kept() {
+        let (_, account) = local_signer_and_account(1);
+        let address = wallet::account_address(&account).unwrap();
+        let mut app = build_app(placeholder_screen());
+        app.pp_loaded = true;
+        app.vault
+            .unlock(None, wallet::KeyStatus::Ok, wallet::SealedLoad::default());
+        let (_relay, dapp, _events, kao, slot) = testkit::harness_with_vault(&app.vault).await;
+        testkit::connect_raw(&kao, &dapp, address, &[1]).await;
+        app.wc_slot = slot;
+        let _ = app.adopt_unlocked_wallet(
+            test_pw(),
+            unlocked_with(
+                WalletDescriptor::single(account),
+                None,
+                wallet::KeyStatus::Ok,
+            ),
+        );
+        let wc_texts = |app: &mut App| {
+            let Screen::Wallet(ws) = &mut app.screen else {
+                panic!("on the dashboard");
+            };
+            ws.test_wc_pane_texts()
+        };
+        let texts = wc_texts(&mut app);
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.starts_with("Kao can't save your connections right now")),
+            "{texts:?}"
+        );
+        let _ = app.update(Message::WalletDashboard(
+            WalletDashboardMessage::OpenConnectionHistorySettings,
+        ));
+        let texts = history_texts(&app);
+        assert!(
+            texts.iter().any(|t| t.contains("can't keep new records")),
+            "{texts:?}"
+        );
+
+        let _ = app.update(Message::ContactsLoaded(Ok(Vec::new())));
+        assert_eq!(app.db.running, Some(DbOp::WalletSave), "the minting save");
+        let _ = app.update(Message::WalletSaved(Ok(Some((
+            test_key(),
+            wallet::KeyOrigin::Minted,
+        )))));
+        let texts = wc_texts(&mut app);
+        assert!(
+            !texts
+                .iter()
+                .any(|t| t.starts_with("Kao can't save your connections right now")),
+            "{texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.starts_with("These stay connected")
+                    || t.starts_with("You changed the relay")),
+            "{texts:?}"
+        );
+        let texts = history_texts(&app);
+        assert!(!texts.iter().any(|t| t.contains("can't keep")), "{texts:?}");
+    }
+
+    /// The first wallet save of a keyless epoch hands the vault its data key; a save landing on a
+    /// vault that has one, or on a locked vault, changes nothing.
+    #[test]
+    fn wallet_saved_hands_a_keyless_vault_its_key() {
+        let mut app = build_app(placeholder_screen());
+        app.wallet = Some(WalletDescriptor::single(local_signer_and_account(1).1));
+        app.passphrase = Some(test_pw());
+
+        // Locked: ignored (a save from before a lock lands after it).
+        let _ = app.persist_wallet("test");
+        let _ = app.update(Message::WalletSaved(Ok(Some((
+            test_key(),
+            wallet::KeyOrigin::Minted,
+        )))));
+        assert!(!app.vault.is_unlocked());
+
+        app.vault
+            .unlock(None, wallet::KeyStatus::Ok, wallet::SealedLoad::default());
+        let _ = app.persist_wallet("test");
+        let _ = app.update(Message::WalletSaved(Ok(Some((
+            test_key(),
+            wallet::KeyOrigin::Minted,
+        )))));
+        assert!(app.vault.can_persist(), "the save's key reached the vault");
+        let rev = app.vault.revision();
+        let _ = app.persist_wallet("test");
+        let _ = app.update(Message::WalletSaved(Ok(Some((
+            wallet::DataKey::for_test([7; 32]),
+            wallet::KeyOrigin::Existing,
+        )))));
+        assert_eq!(app.vault.revision(), rev, "a keyed epoch keeps its key");
+        // A failed save leaves a keyless vault keyless.
+        let mut app = build_app(placeholder_screen());
+        app.vault
+            .unlock(None, wallet::KeyStatus::Ok, wallet::SealedLoad::default());
+        app.db.running = Some(DbOp::WalletSave);
+        let _ = app.update(Message::WalletSaved(Err("disk full".into())));
+        assert!(!app.vault.can_persist());
+    }
+
+    /// A save that wrote the descriptor but couldn't settle the data key (`Ok(None)`) is a
+    /// success: no toast, the next queued op goes out, and the vault keeps what it had — keyless
+    /// stays keyless, a keyed epoch keeps its key.
+    #[test]
+    fn a_wallet_save_without_a_key_leaves_the_vault_alone() {
+        let (_, a0) = local_signer_and_account(1);
+        let mut app = unlocked_app(WalletDescriptor::single(a0));
+        app.vault
+            .unlock(None, wallet::KeyStatus::Ok, wallet::SealedLoad::default());
+        let rev = app.vault.revision();
+        let _ = app.persist_wallet("test");
+        let _ = app.persist_wallet("test");
+        assert_eq!(app.save_state_name(), "saving+queued");
+        let next = app.update(Message::WalletSaved(Ok(None)));
+        assert!(next.units() > 0, "the queued save went out");
+        assert_eq!(app.save_state_name(), "saving");
+        assert!(app.toast.is_none(), "nothing failed");
+        assert!(!app.vault.can_persist(), "still keyless");
+        assert_eq!(app.vault.revision(), rev, "the vault is untouched");
+
+        let _ = app.update(Message::WalletSaved(Ok(Some((
+            test_key(),
+            wallet::KeyOrigin::Minted,
+        )))));
+        assert!(app.vault.can_persist());
+        let rev = app.vault.revision();
+        let _ = app.persist_wallet("test");
+        let done = app.update(Message::WalletSaved(Ok(None)));
+        assert_eq!(done.units(), 0, "nothing queued, and no failure toast");
+        assert_eq!(app.save_state_name(), "idle");
+        assert!(app.vault.can_persist(), "a keyed epoch keeps its key");
+        assert_eq!(app.vault.revision(), rev);
+        // A failed save in the same spot does toast: that's what the count above tells apart.
+        let _ = app.persist_wallet("test");
+        assert_eq!(
+            app.update(Message::WalletSaved(Err("disk full".into())))
+                .units(),
+            1
+        );
+    }
+
+    /// A failed wallet save gets the plain toast whether or not the wallet file's saved history
+    /// can be read: saves don't depend on it, so the toast never sends the user to the reset.
+    #[test]
+    fn a_failed_save_never_points_to_the_sealed_reset() {
+        let plain = App::wallet_save_failed_toast("disk full");
+        assert_eq!(
+            plain,
+            "Kao couldn't save your wallet (disk full). Your latest change works for now but may \
+             be gone after a restart."
+        );
+        assert!(!plain.contains("Reset saved history"), "{plain}");
+
+        // Through `update`, with the saved state unreadable: the same plain toast, and the
+        // failure lands (and frees the file) as before.
+        let mut app = build_app(placeholder_screen());
+        app.vault.unlock(
+            None,
+            wallet::KeyStatus::Unavailable,
+            wallet::SealedLoad::default(),
+        );
+        app.db.running = Some(DbOp::WalletSave);
+        let toast_task = app.update(Message::WalletSaved(Err("disk full".into())));
+        assert_eq!(toast_task.units(), 1, "the toast");
+        assert_eq!(app.save_state_name(), "idle");
+    }
+
+    /// An unlock without its data key — the row unreadable (`Lost`), or a key the unlock couldn't
+    /// write — queues the wallet save that mints one, behind the contacts load; its `WalletSaved`
+    /// hands the vault the minted key, so what the vault records this session reaches disk. An
+    /// unlock with its key runs no such save, and neither does one whose key the storage couldn't
+    /// be read for (`Unavailable`): a save would find that same key, which the epoch can't adopt.
+    #[test]
+    fn an_unlock_without_its_data_key_mints_one_with_a_wallet_save() {
+        use wallet::KeyStatus;
+        for (data_key, status, mints) in [
+            (None, KeyStatus::Lost, true),
+            (None, KeyStatus::Ok, true),
+            (None, KeyStatus::Unavailable, false),
+            (Some(test_key()), KeyStatus::Ok, false),
+        ] {
+            let mut app = build_app(placeholder_screen());
+            app.pp_loaded = true;
+            let wallet = WalletDescriptor::single(local_signer_and_account(1).1);
+            let _ = app.adopt_unlocked_wallet(test_pw(), unlocked_with(wallet, data_key, status));
+            assert_eq!(app.db.running, Some(DbOp::ContactsLoad), "{status:?}");
+            assert_eq!(app.db.wallet_save_queued, mints, "{status:?}");
+            if !mints {
+                continue;
+            }
+            assert!(
+                !app.vault.can_persist(),
+                "{status:?}: keyless until the save lands"
+            );
+            let _ = app.update(Message::ContactsLoaded(Ok(Vec::new())));
+            assert_eq!(app.db.running, Some(DbOp::WalletSave), "{status:?}");
+            let _ = app.update(Message::WalletSaved(Ok(Some((
+                test_key(),
+                wallet::KeyOrigin::Minted,
+            )))));
+            assert!(
+                app.vault.can_persist(),
+                "{status:?}: the minted key reached the vault"
+            );
+        }
+    }
+
+    /// Lock: the vault's epoch ends before anything else (records and key out of memory), and
+    /// the unlock screen holds the successor slot, so its unlock waits for whatever the lock left
+    /// running in the shared teardown registry.
+    #[test]
+    fn lock_ends_the_vault_epoch_and_hands_the_unlock_screen_the_successor_slot() {
+        let mut app = build_app(placeholder_screen());
+        app.passphrase = Some(test_pw());
+        app.pp_loaded = true;
+        app.vault.unlock(
+            Some(test_key()),
+            wallet::KeyStatus::Ok,
+            wallet::SealedLoad::default(),
+        );
+        let old = app.wc_slot.clone();
+        // Nothing running: no task, and nothing for a quit to wait on.
+        assert_eq!(app.lock_wallet().units(), 0);
+        assert!(!app.vault.is_unlocked() && !app.vault.can_persist());
+        assert!(old.is_closed() && !app.wc_slot.is_closed());
+        let Screen::Unlock(unlock) = &app.screen else {
+            panic!("on the unlock screen");
+        };
+        assert!(app.wc_slot.begin_start());
+        assert!(
+            unlock.slot().is_starting(),
+            "the unlock screen holds the App's (successor) slot"
+        );
+        app.wc_slot.start_failed();
+    }
+
+    /// Without a data key, lock falls back to the full teardown: the dapp hears 6000 — as before
+    /// the vault existed — and the next unlock starts empty.
+    #[tokio::test]
+    async fn a_keyless_lock_tears_walletconnect_down() {
+        let (_relay, dapp, _events, rt, slot) = testkit::harness().await;
+        let topic = testkit::connect_raw(&rt, &dapp, WC_ADDR, &[1]).await;
+        let mut app = build_app(placeholder_screen());
+        app.wc_slot = slot.clone();
+        app.vault
+            .unlock(None, wallet::KeyStatus::Ok, wallet::SealedLoad::default());
+        let task = app.lock_wallet();
+        assert!(task.units() > 0);
+        assert!(rt.is_closed(), "closed synchronously");
+        testkit::settle(|| !dapp.sessions().iter().any(|s| s.topic == topic)).await;
+        assert!(
+            !dapp.sessions().iter().any(|s| s.topic == topic),
+            "the dapp heard 6000"
+        );
+    }
+
+    /// With a data key, lock suspends: the runtime closes synchronously (nothing in flight can
+    /// broadcast), but the dapp is told nothing and keeps its session for the next unlock.
+    #[tokio::test]
+    async fn a_lock_with_a_data_key_suspends_and_the_dapp_keeps_its_session() {
+        let (_relay, dapp, _events, rt, slot) = testkit::harness().await;
+        let topic = testkit::connect_raw(&rt, &dapp, WC_ADDR, &[1]).await;
+        let mut app = build_app(placeholder_screen());
+        app.wc_slot = slot.clone();
+        app.vault.unlock(
+            Some(test_key()),
+            wallet::KeyStatus::Ok,
+            wallet::SealedLoad::default(),
+        );
+        let task = app.lock_wallet();
+        assert!(task.units() > 0, "the suspend runs as a task");
+        assert!(rt.is_closed(), "closed synchronously");
+        app.wc_slot
+            .wait_idle(crate::walletconnect::QUIT_TEARDOWN_BUDGET)
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            dapp.sessions().iter().any(|s| s.topic == topic),
+            "no 6000: the session stays for the next unlock"
+        );
+    }
+
+    /// Quit with a data key suspends the same way, and the quit waits for it: the wait stays
+    /// pending while the suspend and the writer's drain run, and by the time it resolves the
+    /// suspend's final WalletConnect state was handed to the vault and nothing runs any more.
+    #[tokio::test]
+    async fn quit_with_a_data_key_suspends_and_waits_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        // A file the writer can't land on: its drain takes a few bounded attempts.
+        let vault = Vault::with_store_path(dir.path().join("absent.redb"));
+        vault.unlock(
+            Some(test_key()),
+            wallet::KeyStatus::Ok,
+            wallet::SealedLoad::default(),
+        );
+        let (_relay, dapp, _events, rt, slot) = testkit::harness_with_vault(&vault).await;
+        let topic = testkit::connect_raw(&rt, &dapp, WC_ADDR, &[1]).await;
+        let mut app = build_app(placeholder_screen());
+        app.wc_slot = slot.clone();
+        app.vault = vault.clone();
+        // What the connect saved goes, so only the suspend's final save can put one back.
+        vault.session().clear_wc_state();
+        assert_eq!(vault.last_saved_wc_state(), Some(None));
+
+        let wait = app.begin_quit().expect("the suspend runs: the quit waits");
+        assert!(rt.is_closed() && !app.vault.is_unlocked());
+        let mut wait = std::pin::pin!(wait);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut wait)
+                .await
+                .is_err(),
+            "still waiting while the suspend and the drain run"
+        );
+        assert!(app.wc_slot.teardowns_running() > 0);
+        tokio::time::timeout(
+            crate::walletconnect::QUIT_TEARDOWN_BUDGET + std::time::Duration::from_secs(2),
+            wait,
+        )
+        .await
+        .expect("the wait resolves");
+        assert_eq!(app.wc_slot.teardowns_running(), 0, "nothing left running");
+        assert!(
+            matches!(vault.last_saved_wc_state(), Some(Some(_))),
+            "the suspend's final save happened before the wait resolved"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(dapp.sessions().iter().any(|s| s.topic == topic));
+    }
+
+    /// A lock's vault writer still draining (here: a batch it can't land) is counted, so a quit
+    /// right after waits for it instead of cutting it short.
+    #[tokio::test]
+    async fn quit_waits_for_a_tracked_vault_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::with_store_path(dir.path().join("wallet.redb"));
+        let mut app = build_app(placeholder_screen());
+        app.wc_slot = WcSlot::with_vault(vault.clone());
+        app.vault = vault;
+        app.vault.unlock(
+            Some(test_key()),
+            wallet::KeyStatus::Ok,
+            wallet::SealedLoad::default(),
+        );
+        app.vault
+            .session()
+            .message_signed(crate::vault::NewSigned::default());
+        let _ = app.lock_wallet();
+        assert!(app.wc_slot.teardowns_running() > 0, "the drain is counted");
+        let wait = app.begin_quit().expect("the quit waits for the drain");
+        let mut wait = std::pin::pin!(wait);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut wait)
+                .await
+                .is_err(),
+            "pending while the drain runs"
+        );
+        assert!(app.wc_slot.teardowns_running() > 0, "the drain still runs");
+        tokio::time::timeout(
+            crate::walletconnect::QUIT_TEARDOWN_BUDGET + std::time::Duration::from_secs(2),
+            wait,
+        )
+        .await
+        .expect("the wait resolves");
+        assert_eq!(
+            app.wc_slot.teardowns_running(),
+            0,
+            "it resolved once the drain ended"
+        );
+    }
+
+    // ── Privacy Pools seed safety (DESIGN §1.4) ─────────────────────────
+
+    /// While this session's seed load hasn't succeeded, Create is refused before anything is
+    /// generated or written: a seed that couldn't be read may well exist.
+    #[test]
+    fn a_pool_identity_is_never_created_over_an_unread_seed() {
+        let mut app = build_app(placeholder_screen());
+        app.passphrase = Some(test_pw());
+        app.pp_loaded = false;
+        let _ = app.pool_create_identity();
+        assert!(app.pp_seed.is_none() && !app.pp_loaded);
+        // A loaded session's retry is a no-op (no second store read).
+        app.pp_loaded = true;
+        let _ = app.retry_pp_identity();
+        assert!(app.pp_seed.is_none() && app.pp_loaded);
+    }
+
+    /// "Try again" that fails again says so on the pool pane — the card alone wouldn't change, and
+    /// the button would seem to do nothing; one that reads the seed clears the unreadable state.
+    #[test]
+    fn a_pool_identity_retry_that_fails_again_says_so() {
+        let mut app = unlock(WalletDescriptor::single(local_signer_and_account(1).1));
+        app.pp_loaded = false;
+        let _ = app.retry_pp_identity_with(|_| Err(wallet::WalletError::Encryption("x".into())));
+        assert!(!app.pp_loaded);
+        let Screen::Wallet(ws) = &mut app.screen else {
+            panic!("on the dashboard");
+        };
+        assert_eq!(
+            ws.test_pool_error().as_deref(),
+            Some(POOL_IDENTITY_STILL_UNREAD)
+        );
+        let _ = app.retry_pp_identity_with(|_| Ok(None));
+        assert!(app.pp_loaded);
+    }
+
+    // ── Redaction by type (DESIGN §4) ───────────────────────────────────
+
+    /// App traces whole messages before any arm runs, so the new payloads redact by type: the
+    /// unlock result (data key, sealed rows), a save's data key, a pool sync, and the history
+    /// panes' messages (ids only).
+    #[test]
+    fn new_message_payloads_redact_by_type() {
+        let (_, account) = local_signer_and_account(1);
+        let unlocked = Arc::new(wallet::Unlocked {
+            descriptor: WalletDescriptor::single(account),
+            data_key: Some(wallet::DataKey::for_test([0x5a; 32])),
+            key_status: wallet::KeyStatus::Ok,
+            sealed: wallet::SealedLoad {
+                wc_state: Some(zeroize::Zeroizing::new(b"symKeys-SECRET".to_vec())),
+                ..Default::default()
+            },
+        });
+        let messages = [
+            Message::Unlock(UnlockMessage::UnlockResult(Ok(unlocked))),
+            Message::WalletSaved(Ok(Some((
+                wallet::DataKey::for_test([0x5a; 32]),
+                wallet::KeyOrigin::Existing,
+            )))),
+            Message::WalletDashboard(WalletDashboardMessage::PoolSynced {
+                pool: alloy::primitives::Address::ZERO,
+                chain: crate::chain::Chain::Mainnet,
+                result: crate::ui::wallet_dashboard::PoolSyncResult(Err("SECRET".into())),
+            }),
+            Message::WalletDashboard(WalletDashboardMessage::Wc(
+                crate::ui::wallet_dashboard::WcMsg::Restored(
+                    crate::walletconnect::RestoreOutcome::Nothing,
+                ),
+            )),
+        ];
+        for m in messages {
+            let dbg = format!("{m:?}");
+            assert!(
+                !dbg.contains("SECRET") && !dbg.contains("90, 90") && !dbg.contains("5a5a"),
+                "{dbg}"
+            );
+        }
     }
 }

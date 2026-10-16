@@ -20,11 +20,24 @@ mod store;
 pub mod tx;
 
 pub use contacts::{Contact, ContactEns, ContactsBook};
+pub use store::acquire_instance_lock;
 pub use store::db_exists as wallet_exists;
 pub use store::{
-    clear_pp_notes, load_all_pp_notes, load_contacts, load_descriptor, load_pp_seed, save_contacts,
-    save_descriptor, save_pp_notes, save_pp_seed,
+    DataKey, KeyOrigin, KeyStatus, SealedLoad, SealedRows, Unlocked, clear_pp_notes, db_path,
+    load_all_pp_notes, load_contacts, load_pp_seed, load_wallet, save_contacts, save_descriptor,
+    save_pp_notes, save_pp_seed,
 };
+pub use store::{SealedTable, SealedWrite};
+pub(crate) use store::{WC_STATE_ID, write_sealed_at};
+
+pub use store::create_pp_seed;
+#[cfg(test)]
+pub(crate) use store::load_wallet_at;
+
+pub use store::reset_sealed;
+
+#[cfg(test)]
+pub(crate) use store::{reset_sealed_at, save_descriptor_at};
 
 /// Errors that can occur during wallet operations.
 #[derive(Debug)]
@@ -37,6 +50,8 @@ pub enum WalletError {
     Io(std::io::Error),
     /// No wallet found on disk.
     NotFound,
+    /// Another Kao process holds the instance lock (`acquire_instance_lock`).
+    InUse,
 }
 
 impl std::fmt::Display for WalletError {
@@ -46,6 +61,7 @@ impl std::fmt::Display for WalletError {
             WalletError::Encryption(e) => write!(f, "encryption error: {e}"),
             WalletError::Io(e) => write!(f, "io error: {e}"),
             WalletError::NotFound => write!(f, "no wallet found"),
+            WalletError::InUse => write!(f, "Kao is already open in another window."),
         }
     }
 }
@@ -697,6 +713,15 @@ pub struct SafeDescriptor {
     /// loader falls back to the pre-field layout for older wallets
     /// (`store::decode_safe`). New fields must keep appending.
     pub tx_service_url: Option<String>,
+    /// Module guard, if set (Safe ≥ 1.5.0; always `None` for older
+    /// versions, which have none). It runs before and after every module
+    /// transaction and can veto any of them, so a malicious one can cut a
+    /// Safe off from its recovery or allowance modules. It cannot move
+    /// funds itself.
+    ///
+    /// Appended after `tx_service_url` for the same postcard reason; see
+    /// `store::decode_safe` before appending anything else.
+    pub module_guard: Option<[u8; 20]>,
 }
 
 impl SafeDescriptor {
@@ -710,9 +735,10 @@ impl SafeDescriptor {
     }
 
     /// Take the cached on-chain state — version, trust, threshold, owners,
-    /// modules, guard, fallback handler and `cached_at` — from `fresh`, a
-    /// newer read of the same Safe, leaving everything the user configured
-    /// (name, linked signers, `sibling_chains`, service URL) as it is.
+    /// modules, guard, module guard, fallback handler and `cached_at` — from
+    /// `fresh`, a newer read of the same Safe, leaving everything the user
+    /// configured (name, linked signers, `sibling_chains`, service URL) as it
+    /// is.
     ///
     /// Skipped when `fresh` is older than what's cached, so a slow read can
     /// never roll the cache back. Returns whether it adopted.
@@ -726,6 +752,7 @@ impl SafeDescriptor {
         self.owners = fresh.owners.clone();
         self.modules = fresh.modules.clone();
         self.guard = fresh.guard;
+        self.module_guard = fresh.module_guard;
         self.fallback_handler = fresh.fallback_handler;
         self.cached_at = fresh.cached_at;
         true
@@ -948,8 +975,9 @@ impl KaoSigner {
     /// Hardware variants return `UnsupportedOperation` on purpose:
     /// Ledger's Ethereum app refuses bare-hash signing under its
     /// blind-signing policy, and Trezor likewise. Device EIP-712
-    /// signing needs the structured-fields APDU path
-    /// (`sign_typed_data_v4`). `ViewOnly` has no key.
+    /// signing goes through [`Self::sign_eip712`] /
+    /// [`Self::sign_typed_json`] instead (Ledger only — see there).
+    /// `ViewOnly` has no key.
     #[allow(dead_code)]
     pub async fn sign_hash(&self, hash: B256) -> Result<Signature, alloy::signers::Error> {
         match self {
@@ -1027,11 +1055,22 @@ impl KaoSigner {
     }
 
     /// Sign an EIP-712 typed-data payload (e.g. a `SafeTx`) — the path
-    /// that makes **hardware** Safe signing work where `sign_hash` does
+    /// that makes **Ledger** Safe signing work where `sign_hash` does
     /// not. Each inner signer's `sign_typed_data` drives its native
-    /// EIP-712 flow: software hashes locally; Ledger/Trezor send the
-    /// domain separator + struct hash to the device (the hashed-message
-    /// EIP-712 mode their firmware permits even under blind-signing).
+    /// EIP-712 flow: software hashes locally; Ledger sends the domain
+    /// separator + struct hash to the device (APDU `0x0C`, the
+    /// hashed-message EIP-712 mode its firmware permits under blind
+    /// signing; Ethereum app ≥ 1.6).
+    ///
+    /// **Trezor has no EIP-712 path here.** `alloy-signer-trezor` 2.4.2
+    /// implements neither `sign_typed_data` nor an `eip712` feature, so the
+    /// call falls through the trait default to `sign_hash`, which Trezor
+    /// refuses — every Trezor call fails with
+    /// `UnsupportedOperation(SignHash)`. Trezor Safe owners still sign
+    /// because both owner flows catch that and fall back to an `eth_sign`
+    /// personal message over the hash (`v + 4`): `safe::tx::sign_owner` and
+    /// `cow::safe_sig::sign_eip1271_digest`. Callers without such a
+    /// fallback (CoW orders from a Trezor EOA) fail.
     ///
     /// For `Local` this is byte-identical to `sign_hash` over
     /// `payload.eip712_signing_hash(domain)` — verified by
@@ -1051,6 +1090,43 @@ impl KaoSigner {
             KaoSigner::ViewOnly(_) => Err(alloy::signers::Error::UnsupportedOperation(
                 alloy::signers::UnsupportedSignerOperation::SignTypedData,
             )),
+        }
+    }
+
+    /// EIP-712 over dapp JSON. Local: hash locally. Ledger:
+    /// `sign_dynamic_typed_data` (APDU 0x0C "v0": the device shows only the
+    /// domain hash and message hash; app ≥ 1.6). Trezor / ViewOnly: explicit
+    /// `UnsupportedOperation(SignTypedData)` — alloy-signer-trezor 2.4.2 has no
+    /// EIP-712.
+    ///
+    /// Both signing paths commit to `keccak256(0x1901 ‖ domain.separator() ‖
+    /// hashStruct(message))` — the ERC-8213 triple the review shows — with one
+    /// exception this refuses outright: `primaryType == "EIP712Domain"`, where
+    /// alloy hashes locally over the 34-byte `0x1901 ‖ separator` (the
+    /// eth-sig-util convention) but a Ledger is still sent a struct hash, so the
+    /// two devices would sign different digests for the same review. Trezor is
+    /// refused explicitly rather than left to the trait default, whose
+    /// `UnsupportedOperation(SignHash)` would misname what is missing.
+    ///
+    /// The caller still owns the `from == signer` check: recover the result
+    /// over the reviewed digest (`sign::recover::assert_prehash_signer`).
+    pub async fn sign_typed_json(
+        &self,
+        td: &alloy::dyn_abi::TypedData,
+    ) -> Result<Signature, alloy::signers::Error> {
+        if td.primary_type == "EIP712Domain" {
+            return Err(alloy::signers::Error::other(
+                "refusing to sign typed data whose primary type is EIP712Domain",
+            ));
+        }
+        match self {
+            KaoSigner::Local(s) => s.sign_dynamic_typed_data(td).await,
+            KaoSigner::Ledger(s) => s.sign_dynamic_typed_data(td).await,
+            KaoSigner::Trezor(_) | KaoSigner::ViewOnly(_) => {
+                Err(alloy::signers::Error::UnsupportedOperation(
+                    alloy::signers::UnsupportedSignerOperation::SignTypedData,
+                ))
+            }
         }
     }
 
@@ -1093,6 +1169,50 @@ impl KaoSigner {
 /// hide a genuinely novel failure.
 pub fn friendly_signer_error(e: &alloy::signers::Error) -> String {
     friendly_signer_error_text(&e.to_string())
+}
+
+/// What an EIP-712 signing failure says about signing the same 32-byte hash as
+/// a personal message (`eth_sign`) instead — the fallback Safe owner signing
+/// has for signers without EIP-712.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Eip712Failure {
+    /// The signer has no EIP-712 path and nothing was shown on a device: a
+    /// Trezor or a view-only key (`UnsupportedOperation`), or a Ledger Ethereum
+    /// app too old for EIP-712 (refused by the version check that runs before
+    /// any signing prompt).
+    Unavailable,
+    /// The Ledger was sent the EIP-712 hashes and answered with a refusal: the
+    /// user declined the prompt, or Blind signing is off (both `6985`), or the
+    /// app rejected the request. The user has seen — and may have declined — a
+    /// prompt for this very hash.
+    DeviceRefused,
+    /// Anything else: a locked or unreachable device, the wrong app open, a
+    /// transport error. A personal-message prompt would fail the same way.
+    Other,
+}
+
+/// Classify an EIP-712 signing failure (see [`Eip712Failure`]). Ledger errors
+/// are read from the typed APDU status, never from their text.
+pub fn classify_eip712_failure(e: &alloy::signers::Error) -> Eip712Failure {
+    use alloy::signers::ledger::{LedgerError, coins_ledger};
+    use coins_ledger::common::APDUResponseCodes as Sw;
+    match e {
+        alloy::signers::Error::UnsupportedOperation(_) => Eip712Failure::Unavailable,
+        alloy::signers::Error::Other(inner) => match inner.downcast_ref::<LedgerError>() {
+            Some(LedgerError::UnsupportedAppVersion(_)) => Eip712Failure::Unavailable,
+            Some(LedgerError::LedgerError(coins_ledger::LedgerError::BadRetcode(code))) => {
+                match code {
+                    // Locked, or not the Ethereum app: nothing was shown.
+                    Sw::UnlockDeviceError | Sw::InsNotSupported | Sw::ClaNotSupported => {
+                        Eip712Failure::Other
+                    }
+                    _ => Eip712Failure::DeviceRefused,
+                }
+            }
+            _ => Eip712Failure::Other,
+        },
+        _ => Eip712Failure::Other,
+    }
 }
 
 /// Inner string-matcher for [`friendly_signer_error`], split out so the APDU
@@ -1377,6 +1497,60 @@ pub fn account_short_address(account: &AccountDescriptor) -> String {
 mod tests {
     use super::*;
     use alloy::primitives::U256;
+
+    /// Which EIP-712 failures leave a personal-message signature of the same hash as a silent
+    /// fallback (nothing was shown), which mean the device showed the prompt and refused it, and
+    /// which are neither — read from the typed errors the signers return.
+    #[test]
+    fn eip712_failures_are_classified_from_the_typed_error() {
+        use alloy::signers::ledger::{LedgerError, coins_ledger};
+        use coins_ledger::common::APDUResponseCodes as Sw;
+        let ledger = |e: LedgerError| alloy::signers::Error::other(e);
+        let status = |sw: Sw| ledger(LedgerError::LedgerError(sw.into()));
+        assert_eq!(
+            classify_eip712_failure(&alloy::signers::Error::UnsupportedOperation(
+                alloy::signers::UnsupportedSignerOperation::SignHash
+            )),
+            Eip712Failure::Unavailable,
+            "a Trezor or view-only key"
+        );
+        assert_eq!(
+            classify_eip712_failure(&ledger(LedgerError::UnsupportedAppVersion(">=1.6.0"))),
+            Eip712Failure::Unavailable,
+            "an old Ledger app, refused before any prompt"
+        );
+        for sw in [
+            Sw::ConditionsNotSatisfied,
+            Sw::InvalidData,
+            Sw::CommandNotAllowed,
+        ] {
+            assert_eq!(
+                classify_eip712_failure(&status(sw)),
+                Eip712Failure::DeviceRefused,
+                "{sw:?}"
+            );
+        }
+        for sw in [
+            Sw::UnlockDeviceError,
+            Sw::InsNotSupported,
+            Sw::ClaNotSupported,
+        ] {
+            assert_eq!(
+                classify_eip712_failure(&status(sw)),
+                Eip712Failure::Other,
+                "{sw:?}"
+            );
+        }
+        assert_eq!(
+            classify_eip712_failure(&ledger(LedgerError::UnexpectedNullResponse)),
+            Eip712Failure::Other
+        );
+        // A message that merely reads like a refusal is not a device status.
+        assert_eq!(
+            classify_eip712_failure(&alloy::signers::Error::message("Code 6985")),
+            Eip712Failure::Other
+        );
+    }
 
     #[test]
     fn friendly_signer_error_maps_ledger_apdu_codes() {
@@ -2032,6 +2206,115 @@ mod tests {
         assert!(ks.sign_eth_message(&[0u8; 32]).await.is_err());
     }
 
+    /// The EIP-712 "Mail" example, as a dapp would send it over
+    /// `eth_signTypedData_v4` (a JSON object, `chainId` as a number).
+    fn mail_typed_data() -> alloy::dyn_abi::TypedData {
+        serde_json::from_value(serde_json::json!({
+            "types": {
+                "EIP712Domain": [
+                    { "name": "name", "type": "string" },
+                    { "name": "version", "type": "string" },
+                    { "name": "chainId", "type": "uint256" },
+                    { "name": "verifyingContract", "type": "address" }
+                ],
+                "Person": [
+                    { "name": "name", "type": "string" },
+                    { "name": "wallet", "type": "address" }
+                ],
+                "Mail": [
+                    { "name": "from", "type": "Person" },
+                    { "name": "to", "type": "Person" },
+                    { "name": "contents", "type": "string" }
+                ]
+            },
+            "primaryType": "Mail",
+            "domain": {
+                "name": "Ether Mail",
+                "version": "1",
+                "chainId": 1,
+                "verifyingContract": "0xCcCCccccCCCCcCCCCCCcCcCccCcCCCcCcccccccC"
+            },
+            "message": {
+                "from": { "name": "Cow", "wallet": "0xCD2a3d9F938E13CD947Ec05AbC7FE734Df8DD826" },
+                "to": { "name": "Bob", "wallet": "0xbBbBBBBbbBBBbbbBbbBbbbbBBbBbbbbBbBbbBBbB" },
+                "contents": "Hello, Bob!"
+            }
+        }))
+        .expect("the EIP-712 Mail example parses")
+    }
+
+    /// A software key signs dapp typed data over exactly the ERC-8213 digest the
+    /// review shows (`0x1901 ‖ domain hash ‖ message hash`), and the signature
+    /// recovers to the account — the property `from == signer` rests on.
+    #[tokio::test]
+    async fn local_sign_typed_json_recovers_to_address() {
+        use crate::sign::digest::Eip712Digests;
+        let parent = derive_parent_key(HARDHAT_PHRASE).unwrap();
+        let (_, signer) = &derive_accounts_from(&parent, 0, 1).unwrap()[0];
+        let ks = KaoSigner::Local(signer.clone());
+        let td = mail_typed_data();
+        let digests = Eip712Digests::from_parts(td.domain.separator(), td.hash_struct().unwrap());
+        // The EIP-712 reference vector for Mail.
+        assert_eq!(
+            digests.digest,
+            alloy::primitives::b256!(
+                "be609aee343fb3c4b28e1df9e632fca64fcfaede20f02e86244efddf30957bd2"
+            ),
+        );
+        let sig = ks
+            .sign_typed_json(&td)
+            .await
+            .expect("local signs typed data");
+        assert_eq!(
+            sig.recover_address_from_prehash(&digests.digest).unwrap(),
+            ks.address(),
+        );
+        assert!(
+            crate::sign::recover::assert_prehash_signer(&sig, digests.digest, ks.address()).is_ok()
+        );
+        // Byte-identical to signing the digest directly: nothing but the
+        // reviewed 32 bytes reaches the key.
+        let direct = ks.sign_hash(digests.digest).await.unwrap();
+        assert_eq!(sig.as_bytes(), direct.as_bytes());
+    }
+
+    /// `primaryType == "EIP712Domain"` is the one shape where a software key and
+    /// a Ledger would sign different digests for the same review; the signer
+    /// refuses it whatever the caller checked.
+    #[tokio::test]
+    async fn sign_typed_json_refuses_domain_primary_type() {
+        let parent = derive_parent_key(HARDHAT_PHRASE).unwrap();
+        let (_, signer) = &derive_accounts_from(&parent, 0, 1).unwrap()[0];
+        let ks = KaoSigner::Local(signer.clone());
+        let mut td = mail_typed_data();
+        td.primary_type = "EIP712Domain".to_string();
+        assert!(ks.sign_typed_json(&td).await.is_err());
+    }
+
+    /// Neither a view-only placeholder nor a Trezor can sign dapp typed data,
+    /// and both say so as `UnsupportedOperation(SignTypedData)` — not the
+    /// trait default's misleading `SignHash`.
+    ///
+    /// A `KaoSigner::Trezor` can't be constructed without a device, so the
+    /// Trezor arm is covered by the exhaustive `match` in `sign_typed_json`
+    /// sharing this exact arm with `ViewOnly` (review checklist), and the
+    /// WalletConnect sign task refuses a Trezor descriptor before any signer is
+    /// touched (`wc_sign::tests::typed_refused_for_trezor_without_touching_the_device`).
+    #[tokio::test]
+    async fn trezor_and_viewonly_sign_typed_json_unsupported() {
+        let ks = KaoSigner::ViewOnly(Address::repeat_byte(0x01));
+        let err = ks.sign_typed_json(&mail_typed_data()).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                alloy::signers::Error::UnsupportedOperation(
+                    alloy::signers::UnsupportedSignerOperation::SignTypedData
+                )
+            ),
+            "{err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn build_owner_signer_local_round_trips() {
         let parent = derive_parent_key(HARDHAT_PHRASE).unwrap();
@@ -2152,6 +2435,7 @@ mod tests {
             modules: Vec::new(),
             guard: None,
             fallback_handler: None,
+            module_guard: None,
             linked_signer_indices: linked,
             sibling_chains: Vec::new(),
             cached_at: 0,

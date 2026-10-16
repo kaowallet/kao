@@ -1,0 +1,153 @@
+{
+  "identity_seed": "fe86921774b494d7a5787f842781b4eb1c5a1d7578ff4ad26b6e20a37da51229",
+  "next_ordinal": 2,
+  "outbox": [],
+  "relay_url": "wss://relay.kao.test",
+  "route_kind": "Loopback",
+  "saved_at": 1792089554,
+  "sessions": [
+    {
+      "chains": [
+        1
+      ],
+      "dapp": {
+        "description": "dapp (test dapp)",
+        "host": "dapp.example",
+        "insecure_scheme": false,
+        "name": "dapp",
+        "url": "https://dapp.example"
+      },
+      "events": [
+        "accountsChanged",
+        "chainChanged"
+      ],
+      "expiry": 1792694354,
+      "identity": {
+        "Eoa": {
+          "address": "0xab16a96d359ec26a11e2c2b3d8f8b8942d5bfcdb"
+        }
+      },
+      "identity_label": "Account 1",
+      "methods": [
+        "personal_sign",
+        "eth_signTypedData_v4",
+        "eth_sendTransaction",
+        "wallet_switchEthereumChain",
+        "eth_accounts",
+        "eth_chainId"
+      ],
+      "ordinal": 1,
+      "pairing_topic": "3686004a5d877dff371b9cc3040ed6d7c6f800af8a98909a5a3b3042c5cc10e4",
+      "paused": false,
+      "topic": "74e3ad16547cbbe8bef5737ab74a88e73714385c91274f86c7335608c563228d"
+    }
+  ],
+  "snapshot": {
+    "history": {},
+    "keyPairs": {},
+    "lastIds": {},
+    "pairings": {},
+    "pendingRequests": {
+      "1792089554203746": {
+        "chainId": "eip155:1",
+        "id": 1792089554203746,
+        "request": {
+          "expiryTimestamp": 1792090454,
+          "method": "personal_sign",
+          "params": [
+            "0x6869",
+            "0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb"
+          ]
+        },
+        "topic": "74e3ad16547cbbe8bef5737ab74a88e73714385c91274f86c7335608c563228d"
+      }
+    },
+    "pendingSessions": {},
+    "proposals": {},
+    "seen": [
+      "b4521268707d9c2eb54b5e87e244fd60738f288265fe2dca15451a30e7a4167d",
+      "b5be426f7164ab6b2bb5b5da040b1b1db16011bca4163131321578a245009b9f",
+      "3cfca9b7ce2daefabb0426b3a5fda44dca41a4ff9b2b85f9adf88caba5e34bc6",
+      "53b44f55a40a1dac1139a60e68de6c0ec2014fc88c37b4968cbf612500bc4083",
+      "22fa5202fb15d3da6ea26be42267f530eafa1e24f80663e8b1cd4b6a6ebbea95",
+      "03efcabcf6b7a969299a96f77676635360d5f72a3b623a37964ac55e82da7ad3"
+    ],
+    "sentProposals": {},
+    "sessions": {
+      "74e3ad16547cbbe8bef5737ab74a88e73714385c91274f86c7335608c563228d": {
+        "acknowledged": true,
+        "controller": "45582ffa003dfbd1e89aec95818d146497b30c8fcf3da57491f94df74d818006",
+        "expiry": 1792694354,
+        "namespaces": {
+          "eip155": {
+            "accounts": [
+              "eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb"
+            ],
+            "chains": [
+              "eip155:1"
+            ],
+            "events": [
+              "accountsChanged",
+              "chainChanged"
+            ],
+            "methods": [
+              "personal_sign",
+              "eth_signTypedData_v4",
+              "eth_sendTransaction",
+              "wallet_switchEthereumChain",
+              "eth_accounts",
+              "eth_chainId"
+            ]
+          }
+        },
+        "optionalNamespaces": {
+          "eip155": {
+            "chains": [
+              "eip155:1"
+            ],
+            "events": [
+              "chainChanged",
+              "accountsChanged"
+            ],
+            "methods": [
+              "personal_sign",
+              "eth_signTypedData_v4",
+              "eth_sendTransaction",
+              "wallet_switchEthereumChain",
+              "eth_accounts",
+              "eth_chainId"
+            ]
+          }
+        },
+        "pairingTopic": "3686004a5d877dff371b9cc3040ed6d7c6f800af8a98909a5a3b3042c5cc10e4",
+        "peer": {
+          "metadata": {
+            "description": "dapp (test dapp)",
+            "icons": [],
+            "name": "dapp",
+            "url": "https://dapp.example"
+          },
+          "publicKey": "86043fdc5b70cefae0aef0c97b90395ac5d8190a67b00038a879bcbd81ae2634"
+        },
+        "relay": {
+          "protocol": "irn"
+        },
+        "requiredNamespaces": {},
+        "self": {
+          "metadata": {
+            "description": "Kao desktop wallet",
+            "icons": [],
+            "name": "Kao Wallet",
+            "url": "https://github.com/kaowallet/kao"
+          },
+          "publicKey": "45582ffa003dfbd1e89aec95818d146497b30c8fcf3da57491f94df74d818006"
+        },
+        "topic": "74e3ad16547cbbe8bef5737ab74a88e73714385c91274f86c7335608c563228d"
+      }
+    },
+    "symKeys": {
+      "74e3ad16547cbbe8bef5737ab74a88e73714385c91274f86c7335608c563228d": "76335eb3a232b23adac360ad50c90fef626ea5f157bca601413c81b7132cb1f1"
+    }
+  },
+  "v": 1
+}

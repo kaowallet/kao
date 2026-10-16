@@ -10,4 +10,5 @@
 pub mod broadcast;
 pub mod context;
 pub mod digest;
+pub mod recover;
 pub mod typed;

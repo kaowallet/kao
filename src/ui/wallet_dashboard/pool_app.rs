@@ -34,7 +34,7 @@ use crate::pool::sync::PoolState;
 use crate::portfolio::{LiveToken, format_token_balance};
 use crate::ui::kao_theme::{KaoTheme, with_alpha};
 use crate::ui::kao_widgets::{
-    black, bold, bullet_wave, ghost_button, hint_pill, hover_tint, kao_fit_size,
+    black, bold, bullet_wave, caution_color, ghost_button, hint_pill, hover_tint, kao_fit_size,
     kao_scrollable_style, kao_toggle, mono, mono_bold, primary_button, progress_bar,
     screen_subtitle, screen_title, secondary_button, text_input_style, thin_divider, token_avatar,
     vspace,
@@ -43,10 +43,22 @@ use crate::ui::kao_widgets::{
 /// The chains Privacy Pools runs on, in display order.
 const CHAINS: &[Chain] = &[Chain::Mainnet, Chain::Optimism];
 
+/// Shown in place of "Create identity" while this session's pool-seed load failed: the seed may
+/// well be there, unread, and creating one would bury it.
+pub const IDENTITY_UNREAD: &str = "Kao couldn't read your pool identity — try again.";
+/// "Try again" failed again: the card alone wouldn't change, so the pane says so.
+pub const IDENTITY_STILL_UNREAD: &str =
+    "Still couldn't read it — Kao will try again when you reopen the wallet.";
+/// Restoring while the identity couldn't be read: the phrase replaces whatever is there.
+const RESTORE_REPLACES: &str = "Restoring from your phrase replaces the identity Kao couldn't \
+     read. Use the phrase of the identity you want to keep.";
+
 #[derive(Debug, Clone)]
 pub enum Message {
     // setup / identity
     CreateIdentity,
+    /// "Try again" on the couldn't-read card: the coordinator loads the seed again.
+    RetryIdentity,
     OpenRestore,
     /// Restore-phrase keystrokes — redacted at the type level so the derived
     /// `Debug` (and thus the GUI trace) never sees the mnemonic.
@@ -191,6 +203,8 @@ impl TargetResolution {
 pub enum Outcome {
     /// Generate + save a fresh 24-word pool mnemonic.
     CreateIdentity,
+    /// Load the saved pool seed again (the last load failed).
+    RetryIdentity,
     /// Restore the pool identity from a phrase.
     RestoreIdentity(SecretString),
     /// User wants to see the recovery phrase — coordinator calls `show_backup`.
@@ -222,6 +236,7 @@ impl Outcome {
     fn name(&self) -> &'static str {
         match self {
             Outcome::CreateIdentity => "CreateIdentity",
+            Outcome::RetryIdentity => "RetryIdentity",
             Outcome::RestoreIdentity(_) => "RestoreIdentity",
             Outcome::RevealBackup => "RevealBackup",
             Outcome::Sync(_) => "Sync",
@@ -303,6 +318,10 @@ impl View {
 pub struct PoolApp {
     view: View,
     has_identity: bool,
+    /// This session's pool-seed load failed: Setup says so (with "Try again", and a restore from
+    /// the phrase that replaces it) instead of offering to create an identity over one that may
+    /// exist.
+    identity_unreadable: bool,
     chain: Chain,
     syncing: bool,
     /// When the current sync began — drives the "loading pools" skeleton
@@ -388,6 +407,7 @@ impl PoolApp {
         Self {
             view: View::Setup,
             has_identity: false,
+            identity_unreadable: false,
             chain: Chain::Mainnet,
             syncing: false,
             syncing_started: None,
@@ -455,6 +475,19 @@ impl PoolApp {
             self.deposit_started = None;
             self.approvals.clear();
         }
+    }
+
+    /// Whether this session's pool-seed load failed (see `identity_unreadable`).
+    pub fn set_identity_unreadable(&mut self, unreadable: bool) {
+        if self.identity_unreadable != unreadable {
+            crate::trace::state(
+                "pool",
+                "identity_unreadable",
+                self.identity_unreadable,
+                unreadable,
+            );
+        }
+        self.identity_unreadable = unreadable;
     }
 
     pub fn set_syncing(&mut self, syncing: bool) {
@@ -754,7 +787,12 @@ impl PoolApp {
     fn update_inner(&mut self, msg: Message) -> Option<Outcome> {
         self.error = None;
         match msg {
+            // Never over a seed this session couldn't read (the button isn't drawn then either).
+            Message::CreateIdentity if self.identity_unreadable => None,
             Message::CreateIdentity => Some(Outcome::CreateIdentity),
+            Message::RetryIdentity => Some(Outcome::RetryIdentity),
+            // Restore stays open when the seed couldn't be read: the user's own phrase is the way
+            // back from a row Kao can't read, and the Restore view says it replaces that row.
             Message::OpenRestore => {
                 self.view = View::Restore;
                 None
@@ -1123,6 +1161,9 @@ impl PoolApp {
     }
 
     fn setup_view<'a>(&self, t: KaoTheme) -> Element<'a, Message> {
+        if self.identity_unreadable {
+            return self.unreadable_view(t);
+        }
         column![
             exit_link(t),
             vspace(10),
@@ -1149,7 +1190,47 @@ impl PoolApp {
         .into()
     }
 
+    /// Setup while this session's seed load failed: no Create — a new identity could write over
+    /// one that is there but unread — but "Try again", and a restore from the phrase, which
+    /// replaces the unread one (the Restore view says so).
+    fn unreadable_view<'a>(&self, t: KaoTheme) -> Element<'a, Message> {
+        column![
+            exit_link(t),
+            vspace(10),
+            title_with_kaomoji(t),
+            vspace(22),
+            card(t, column![
+                text(IDENTITY_UNREAD).size(15).color(t.text).font(bold()),
+                vspace(4),
+                text("Kao couldn't check your wallet for a pool identity just now. Creating one could replace the one you may already have, so Kao waits until it can read it. Nothing was changed.")
+                    .size(12).color(t.sub).font(mono()),
+                vspace(14),
+                primary_button(t, "Try again", true).on_press(Message::RetryIdentity),
+            ].into()),
+            vspace(10),
+            container(
+                ghost_button(t, text("I have the phrase — restore from it").size(13).color(t.a1).font(bold()))
+                    .on_press(Message::OpenRestore),
+            )
+            .center_x(Length::Fill),
+        ]
+        .width(Length::Fill)
+        .into()
+    }
+
     fn restore_view<'a>(&self, t: KaoTheme) -> Element<'a, Message> {
+        let restore_warning: Element<'a, Message> = if self.identity_unreadable {
+            column![
+                text(RESTORE_REPLACES)
+                    .size(12)
+                    .color(caution_color())
+                    .font(bold()),
+                vspace(12),
+            ]
+            .into()
+        } else {
+            Space::new().into()
+        };
         column![
             back_link(t),
             vspace(8),
@@ -1157,6 +1238,7 @@ impl PoolApp {
             vspace(6),
             screen_subtitle(t, "Enter your 24-word Privacy Pools recovery phrase."),
             vspace(18),
+            restore_warning,
             text_input("word1 word2 word3 …", self.restore_input.as_str())
                 .on_input(|s| Message::RestoreInput(s.into()))
                 .on_submit(Message::RestoreSubmit)
@@ -2410,6 +2492,49 @@ fn parse_amount(s: &str, decimals: u8) -> Option<U256> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// While this session's seed load failed, Setup doesn't offer Create — it could write over an
+    /// identity that is there but unread — but "Try again", which asks the coordinator to load
+    /// again, and a restore from the user's own phrase: the way back from a row Kao can't read,
+    /// whose view warns that it replaces that row. A load that succeeds brings Create back.
+    #[test]
+    fn an_unread_identity_offers_try_again_and_a_restore_that_replaces_it() {
+        let t = KaoTheme::for_kind(crate::ui::kao_theme::ThemeKind::Void);
+        let mut app = PoolApp::new();
+        app.set_identity_unreadable(true);
+        let texts = super::super::test_support::texts(app.setup_view(t));
+        assert!(texts.iter().any(|s| s == IDENTITY_UNREAD), "{texts:?}");
+        assert!(texts.iter().any(|s| s == "Try again"), "{texts:?}");
+        assert!(!texts.iter().any(|s| s == "Create identity"), "{texts:?}");
+        assert!(
+            texts
+                .iter()
+                .any(|s| s == "I have the phrase — restore from it"),
+            "{texts:?}"
+        );
+        assert!(app.update(Message::CreateIdentity).is_none());
+        assert!(matches!(
+            app.update(Message::RetryIdentity),
+            Some(Outcome::RetryIdentity)
+        ));
+        assert!(app.update(Message::OpenRestore).is_none());
+        assert_eq!(app.view, View::Restore);
+        let texts = super::super::test_support::texts(app.restore_view(t));
+        assert!(texts.iter().any(|s| s == RESTORE_REPLACES), "{texts:?}");
+        // The coordinator saying so again (a dashboard rebuild, a retry) leaves the restore open.
+        app.set_identity_unreadable(true);
+        assert_eq!(app.view, View::Restore);
+
+        app.set_identity_unreadable(false);
+        let texts = super::super::test_support::texts(app.restore_view(t));
+        assert!(!texts.iter().any(|s| s == RESTORE_REPLACES), "{texts:?}");
+        let texts = super::super::test_support::texts(app.setup_view(t));
+        assert!(texts.iter().any(|s| s == "Create identity"), "{texts:?}");
+        assert!(matches!(
+            app.update(Message::CreateIdentity),
+            Some(Outcome::CreateIdentity)
+        ));
+    }
 
     #[test]
     fn parse_amount_scales_by_decimals() {

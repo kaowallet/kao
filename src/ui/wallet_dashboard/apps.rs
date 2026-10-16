@@ -6,6 +6,11 @@
 //! Pane state is the shared [`SwapComposer`] plus which view is showing; the
 //! tracked-order list lives on the dashboard coordinator (so it survives leaving
 //! this pane) and is threaded into [`AppsPane::view`].
+//!
+//! The launcher also carries WalletConnect's `wc:` row at the top (the
+//! [`WcApp`]'s own component): pasting a dapp's link there and pressing Connect
+//! bubbles the pairing up and switches to the WalletConnect pane, so the user
+//! watches the connection come up.
 
 use iced::border::Radius;
 use iced::keyboard;
@@ -23,6 +28,7 @@ use super::approvals_app::{self, ApprovalsApp};
 use super::names_app::{self, NamesApp};
 use super::pool_app::{self, PoolApp};
 use super::tx_builder::{self, TxBuilderApp};
+use super::wc_app::{self, WcApp};
 use crate::ui::kao_theme::{KaoTheme, with_alpha};
 use crate::ui::kao_widgets::{
     avatar, bold, ghost_button, kao_scrollable_style, mono, mono_bold, screen_subtitle,
@@ -63,6 +69,10 @@ pub enum Message {
     /// Raw keyboard event — only subscribed inside the Swap app, where Esc
     /// steps back to the launcher.
     Key(keyboard::Event),
+    /// Open the WalletConnect app from the launcher.
+    OpenWalletConnectApp,
+    /// Messages for the embedded WalletConnect app.
+    Wc(wc_app::Message),
 }
 
 /// Which Apps view is showing: the launcher, or one of the sub-apps.
@@ -74,6 +84,7 @@ enum AppsView {
     PrivacyPools,
     TxBuilder,
     Approvals,
+    WalletConnect,
 }
 
 impl AppsView {
@@ -86,6 +97,7 @@ impl AppsView {
             AppsView::PrivacyPools => "PrivacyPools",
             AppsView::TxBuilder => "TxBuilder",
             AppsView::Approvals => "Approvals",
+            AppsView::WalletConnect => "WalletConnect",
         }
     }
 }
@@ -124,6 +136,10 @@ pub enum Outcome {
     /// A scan step bubbled up from the embedded Approvals app; the coordinator
     /// services it and feeds the result back via [`AppsPane::approvals_pane`].
     Approvals(approvals_app::Outcome),
+    /// A request bubbled up from the embedded WalletConnect app; the
+    /// coordinator services it (`handle_wc_outcome`) and mirrors the result
+    /// back via [`AppsPane::wc_pane`]. `Close` is handled inside the pane.
+    Wc(wc_app::Outcome),
 }
 
 impl Outcome {
@@ -139,6 +155,7 @@ impl Outcome {
             Outcome::Name(_) => "Name",
             Outcome::Pool(_) => "Pool",
             Outcome::TxBuilder(_) => "TxBuilder",
+            Outcome::Wc(_) => "Wc",
         }
     }
 }
@@ -150,6 +167,7 @@ pub struct AppsPane {
     pool: PoolApp,
     tx_builder: TxBuilderApp,
     approvals: ApprovalsApp,
+    wc: WcApp,
     view: AppsView,
 }
 
@@ -165,8 +183,25 @@ impl AppsPane {
             pool: PoolApp::new(),
             tx_builder,
             approvals: ApprovalsApp::new(owner),
+            wc: WcApp::new(),
             view: AppsView::Launcher,
         }
+    }
+
+    /// Mutable access to the WalletConnect app so the coordinator can mirror
+    /// the runtime's snapshot into it (`wc_mirror`).
+    pub fn wc_pane(&mut self) -> &mut WcApp {
+        &mut self.wc
+    }
+
+    /// Show the WalletConnect app (a pairing started from elsewhere).
+    pub fn open_wc(&mut self) {
+        self.view = AppsView::WalletConnect;
+    }
+
+    /// Whether the WalletConnect app is the one on screen.
+    pub fn wc_visible(&self) -> bool {
+        self.view == AppsView::WalletConnect
     }
 
     /// Mutable access to the Approvals app so the coordinator can deliver each
@@ -262,8 +297,12 @@ impl AppsPane {
 
     pub fn update(&mut self, msg: Message) -> Option<Outcome> {
         // Pool's Tick is a ~16ms animation frame (proving spinner / loading
-        // skeleton) — tracing it would drown the stream.
-        if !matches!(msg, Message::Pool(pool_app::Message::Tick)) {
+        // skeleton), WalletConnect's a 1s countdown repaint — tracing either
+        // would drown the stream.
+        if !matches!(
+            msg,
+            Message::Pool(pool_app::Message::Tick) | Message::Wc(wc_app::Message::Tick)
+        ) {
             crate::trace_msg!("apps", &msg);
         }
         let view_before = self.view.name();
@@ -343,6 +382,14 @@ impl AppsPane {
                 }
                 None => None,
             },
+            Message::OpenWalletConnectApp => {
+                self.view = AppsView::WalletConnect;
+                None
+            }
+            Message::Wc(child) => {
+                let out = self.wc.update(child);
+                self.route_wc(out)
+            }
             Message::Cancel(uid) => Some(Outcome::RequestCancel { uid }),
             Message::CopyExplorerLink(url) => Some(Outcome::CopyText(url)),
             Message::RefreshOrders => Some(Outcome::RefreshOrders),
@@ -369,6 +416,13 @@ impl AppsPane {
                                 other => other.map(Outcome::TxBuilder),
                             };
                         }
+                        // WalletConnect too: a staged two-step confirm or the
+                        // settings form unwinds first, and only then does it
+                        // step back. Esc never answers a dapp.
+                        AppsView::WalletConnect => {
+                            let out = self.wc.update(wc_app::Message::Escape);
+                            return self.route_wc(out);
+                        }
                         AppsView::Swap
                         | AppsView::Names
                         | AppsView::PrivacyPools
@@ -380,6 +434,24 @@ impl AppsPane {
                 }
                 None
             }
+        }
+    }
+
+    /// Handle what the WalletConnect pane (or its launcher row) bubbled up. The
+    /// "← Apps" link steps back to the launcher in-pane; a Connect switches to
+    /// the pane so the pairing's progress is on screen; everything else is the
+    /// coordinator's.
+    fn route_wc(&mut self, out: Option<wc_app::Outcome>) -> Option<Outcome> {
+        match out {
+            Some(wc_app::Outcome::Close) => {
+                self.view = AppsView::Launcher;
+                None
+            }
+            Some(pair @ wc_app::Outcome::Pair { .. }) => {
+                self.view = AppsView::WalletConnect;
+                Some(Outcome::Wc(pair))
+            }
+            other => other.map(Outcome::Wc),
         }
     }
 
@@ -402,6 +474,9 @@ impl AppsPane {
             ]),
             // Esc closes the JSON overlay if one is open, else steps back.
             AppsView::TxBuilder | AppsView::Approvals => keyboard::listen().map(Message::Key),
+            // Esc-only keys (never the typed link / project id) plus a 1s
+            // countdown tick while something on the pane is counting down.
+            AppsView::WalletConnect => self.wc.subscription().map(Message::Wc),
             AppsView::Launcher => Subscription::none(),
         }
     }
@@ -433,6 +508,7 @@ impl AppsPane {
             AppsView::PrivacyPools => self.pool.view(t, portfolio, recipients).map(Message::Pool),
             AppsView::TxBuilder => self.tx_builder.view(t).map(Message::TxBuilder),
             AppsView::Approvals => self.approvals.view(t).map(Message::Approvals),
+            AppsView::WalletConnect => self.wc.view(t).map(Message::Wc),
         };
 
         // The Transaction Builder runs its own full-height, two-pane layout and
@@ -479,7 +555,7 @@ impl AppsPane {
     /// simulating and reading all work without a signer, and each app's write
     /// action refuses on its own terms when the key isn't there.
     fn launcher_view<'a>(
-        &self,
+        &'a self,
         t: KaoTheme,
         orders: &[&'a TrackedOrder],
         names_available: bool,
@@ -492,13 +568,15 @@ impl AppsPane {
             "Trade tokens via CoW Protocol".to_string()
         };
         // Names and Swap come and go with the identity; Privacy Pools, the
-        // Transaction Builder and Approvals are always there, so the subtitle
-        // never claims less than the cards below it.
+        // Transaction Builder, Approvals and WalletConnect are always there, so
+        // the subtitle never claims less than the cards below it.
         let subtitle = match (swap_available, names_available) {
-            (true, true) => "On-chain apps — swaps, names, privacy, approvals and transactions",
-            (true, false) => "On-chain apps — swaps, privacy, approvals and transactions",
-            (false, true) => "On-chain apps — names, privacy, approvals and transactions",
-            (false, false) => "On-chain apps — privacy, approvals and transactions",
+            (true, true) => {
+                "On-chain apps — swaps, names, privacy, approvals, transactions and dapps"
+            }
+            (true, false) => "On-chain apps — swaps, privacy, approvals, transactions and dapps",
+            (false, true) => "On-chain apps — names, privacy, approvals, transactions and dapps",
+            (false, false) => "On-chain apps — privacy, approvals, transactions and dapps",
         };
 
         // The cards carry their own `spacing`, so any card can be the first one
@@ -550,12 +628,25 @@ impl AppsPane {
             "Find the allowances you've granted & revoke them",
             Message::OpenApprovalsApp,
         ));
+        // WalletConnect connects whichever identity is active (it can sign),
+        // so the card is always available; it carries the live counts.
+        cards = cards.push(app_card(
+            t,
+            wc_app::KAO_MASCOT,
+            "WalletConnect",
+            &self.wc.launcher_card_subtitle(),
+            Message::OpenWalletConnectApp,
+        ));
 
+        // The `wc:` row sits above the cards: pasting a dapp's link is the one
+        // launcher action that doesn't start by picking an app.
         column![
             screen_title(t, "Apps"),
             Space::new().height(6),
             screen_subtitle(t, subtitle),
             Space::new().height(20),
+            self.wc.launcher_row(t).map(Message::Wc),
+            Space::new().height(16),
             cards,
         ]
         .width(Length::Fill)
@@ -932,6 +1023,85 @@ mod tests {
         assert_eq!(pane.view, AppsView::Approvals);
         pane.load_revokes(crate::chain::Chain::Mainnet, revokes(1));
         assert_eq!(pane.view, AppsView::TxBuilder, "one call at a time is fine");
+    }
+
+    const WC_URI: &str = "wc:7f6e504bfad60b485450578e05678ed3e8e8c4751d3c6160be17160d63ec90f9@2?relay-protocol=irn&symKey=587d5484ce2a2a6ee3ba1962fdd7e8588e06200c46823bd18fbd67def96ad303";
+
+    /// The `wc:` row sits between the launcher's subtitle and its cards, and
+    /// the WalletConnect card is among the cards.
+    #[test]
+    fn launcher_has_wc_row_above_cards() {
+        let pane = AppsPane::new(Address::ZERO);
+        let theme = KaoTheme::for_kind(crate::ui::kao_theme::ThemeKind::Mint);
+        let texts = super::super::test_support::texts(pane.launcher_view(theme, &[], true, true));
+        let at = |needle: &str| texts.iter().position(|s| s == needle);
+        let subtitle = texts.iter().position(|s| s.starts_with("On-chain apps"));
+        let status = at("Connect Kao to a dapp: copy its WalletConnect link and paste it here.");
+        let connect = at("Connect");
+        let first_card = at("Swap");
+        assert!(
+            subtitle.is_some() && status.is_some() && connect.is_some() && first_card.is_some(),
+            "{texts:?}"
+        );
+        assert!(subtitle < connect && connect < status, "{texts:?}");
+        assert!(
+            status < first_card,
+            "the wc: row is above the cards: {texts:?}"
+        );
+        assert!(at("WalletConnect") > first_card, "{texts:?}");
+    }
+
+    /// The pane's "← Apps" (and Esc) step back to the launcher in-pane — the
+    /// coordinator never sees a Close.
+    #[test]
+    fn wc_close_returns_to_launcher() {
+        let mut pane = AppsPane::new(Address::ZERO);
+        pane.update(Message::OpenWalletConnectApp);
+        assert_eq!(pane.view, AppsView::WalletConnect);
+        assert!(pane.wc_visible());
+        assert!(pane.update(Message::Wc(wc_app::Message::Back)).is_none());
+        assert_eq!(pane.view, AppsView::Launcher);
+        pane.open_wc();
+        assert!(pane.update(Message::Wc(wc_app::Message::Escape)).is_none());
+        assert_eq!(pane.view, AppsView::Launcher);
+    }
+
+    /// Connect from the launcher row bubbles the pairing up and switches to the
+    /// pane, so the user watches the connection come up.
+    #[test]
+    fn pair_switches_to_wc_view() {
+        let mut pane = AppsPane::new(Address::ZERO);
+        assert_eq!(pane.view, AppsView::Launcher);
+        pane.update(Message::Wc(wc_app::Message::UriChanged(WC_URI.into())));
+        assert_eq!(pane.view, AppsView::Launcher, "typing alone stays put");
+        let out = pane.update(Message::Wc(wc_app::Message::Connect));
+        let Some(Outcome::Wc(wc_app::Outcome::Pair { uri })) = out else {
+            panic!("Connect bubbles the pairing");
+        };
+        assert_eq!(uri.expose(), WC_URI);
+        assert_eq!(pane.view, AppsView::WalletConnect);
+        // Not a link: nothing bubbles, nothing moves.
+        pane.update(Message::BackHome);
+        pane.update(Message::Wc(wc_app::Message::UriChanged("hello".into())));
+        assert!(pane.update(Message::Wc(wc_app::Message::Connect)).is_none());
+        assert_eq!(pane.view, AppsView::Launcher);
+    }
+
+    /// Esc inside WalletConnect first closes what the pane has open (here the
+    /// settings form), and only a second Esc leaves — the TxBuilder pattern.
+    #[test]
+    fn esc_gives_wc_first_refusal() {
+        let mut pane = AppsPane::new(Address::ZERO);
+        pane.update(Message::OpenWalletConnectApp);
+        pane.update(Message::Wc(wc_app::Message::ToggleSettings));
+        assert!(pane.update(Message::Key(esc_event())).is_none());
+        assert_eq!(
+            pane.view,
+            AppsView::WalletConnect,
+            "the form closed, the pane stayed"
+        );
+        assert!(pane.update(Message::Key(esc_event())).is_none());
+        assert_eq!(pane.view, AppsView::Launcher);
     }
 
     #[test]

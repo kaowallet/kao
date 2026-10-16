@@ -28,6 +28,31 @@ pub const EIP712_DIGEST_LABEL: &str = "EIP-712 Digest";
 pub const DOMAIN_HASH_LABEL: &str = "Domain Hash";
 pub const MESSAGE_HASH_LABEL: &str = "Message Hash";
 
+/// Label for an EIP-191 `personal_sign` digest (`keccak256("\x19Ethereum Signed
+/// Message:\n" ‖ len ‖ message)`). Explicitly **not** an ERC-8213 label —
+/// ERC-8213 prescribes no EIP-191 digest — so it is kept apart from the four
+/// above; the review shows it alongside them for WalletConnect messages.
+pub const EIP191_DIGEST_LABEL: &str = "Message Digest (EIP-191)";
+
+/// Labels for the dapp's own EIP-712 digests when a Safe signs typed data as an EIP-1271 message.
+/// The standard labels belong to the `SafeMessage` the owners sign; the inner triple gets a "Dapp"
+/// prefix so the two sets can't be mistaken for each other. Shared by the review
+/// (`sign_review/wc.rs`) and the signed-message history (`walletconnect::message::digest_rows`).
+pub const DAPP_EIP712_DIGEST_LABEL: &str = "Dapp EIP-712 Digest";
+pub const DAPP_DOMAIN_HASH_LABEL: &str = "Dapp Domain Hash";
+pub const DAPP_MESSAGE_HASH_LABEL: &str = "Dapp Message Hash";
+
+/// Label for the call a Safe transaction makes — the `SafeTx`'s own `data` — beside the
+/// `execTransaction` calldata digest of the transaction that carries it.
+pub const INNER_CALLDATA_DIGEST_LABEL: &str = "Calldata Digest (inner call)";
+
+/// Labels for the CoW EIP-712 digest a Safe's `SafeMessage` wraps (EIP-1271): the order's when
+/// placing, the `OrderCancellations`' when cancelling — beside the standard labels of the
+/// `SafeMessage` the owners sign. Shared by the review (`sign_review`) and the signed-message
+/// history (`cow::history`).
+pub const COW_ORDER_DIGEST_LABEL: &str = "Order Digest (CoW EIP-712)";
+pub const COW_CANCELLATION_DIGEST_LABEL: &str = "Cancellation Digest (CoW EIP-712)";
+
 /// ERC-8213 **Calldata Digest**: `keccak256( uint256(len(calldata)) ‖ calldata )`.
 ///
 /// The 32-byte big-endian length prefix is part of the pre-image; `chainId` is

@@ -1,6 +1,5 @@
 [workspace]
 members = ["xtask", "proxy-env"]
-exclude = ["vendor/op-alloy-network"]
 
 [package]
 name = "kao"
@@ -48,26 +47,13 @@ clear-signing = { git = "https://github.com/kaowallet/clear-signing", features =
 # at build time (CI runners have one). Version tracks what alloy already resolves.
 rusb = { version = "0.9.4", features = ["vendored"] }
 async-trait = "0.1"
-# Helios's API is built against alloy 1.x; we need its BlockId type to call
-# eth_getBalance against the verified light-client. alloy 1.x and 2.x share
-# the same alloy-primitives version (1.5.7), so Address/U256/B256 cross the
-# boundary unchanged — only block-id types need the v1 import.
-alloy-eips = "1"
-# Same alloy-1 boundary as `alloy-eips`: needed to construct the
-# `TransactionRequest` Helios's `HeliosClient::call` accepts. Without
-# this, clear-signing's `symbol()` / `decimals()` probes against ERC-20
-# targets fall through the unverified raw provider — which means an
-# attacker on the RPC could lie about a contract's symbol/decimals,
-# and the user signs trusting cosmetic metadata. With it, those reads
-# go through Helios's verified eth_call (re-executes locally against
-# proof-verified state), matching the verification guarantee
-# `get_code` and `get_storage_at` already provide.
-alloy-rpc-types-eth = "1"
 # Helios's OpStack network uses `OpTransactionRequest` (a wrapper around
-# alloy-1's TransactionRequest with deposit-tx support) for its `call`
+# alloy's TransactionRequest with deposit-tx support) for its `call`
 # input. Already in the dep graph as a transitive — pulling it direct
-# so we can construct values.
-op-alloy-rpc-types = "0.20"
+# so we can construct values. Routing `call` through Helios matters:
+# clear-signing's `symbol()` / `decimals()` probes then re-execute
+# against proof-verified state instead of trusting the raw RPC.
+op-alloy-rpc-types = "2"
 argon2 = "0.5.3"
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }
 # Isolated helper crate whose sole job is the one `unsafe std::env::set_var`
@@ -89,22 +75,18 @@ ens-normalize-rs = "0.1.1"
 evmole = "0.9"
 futures = "0.3"
 getrandom = "0.4.3"
-# Pinned to a commit two past tag 0.11.1 (#788, #804): #804 trims helios's
-# jsonrpsee 0.19 to server/macros/client-core, which drops its unused rustls
-# 0.21 client stack (RUSTSEC-2026-0346/-0349). Same workspace manifest as
-# 0.11.1 (alloy 1.0.37, revm 29.0.1). Bump deliberately rather than tracking
-# a branch.
-helios-ethereum = { git = "https://github.com/a16z/helios", rev = "43a8c9f3cdda41a6f383c4db41d9a83f102638b1" }
+# Pinned to the commit tag 0.12.0 points at (alloy 2.1, revm 43). Pinned by
+# rev, not tag, so a re-pointed tag can't change the build. Bump deliberately
+# rather than tracking a branch.
+helios-ethereum = { git = "https://github.com/a16z/helios", rev = "2af9b41887e069144ee56cd710f3ddca195473f8" }
 # Same git rev as helios-ethereum: both crates ship from the a16z/helios
 # workspace and share types (alloy versions, network presets, etc.). The
 # OP-Stack client wraps Helios's verified L1 anchor with L2 fault-proof
 # bootstrap; the wallet uses it for Base / Optimism balance reads.
 #
-# Pulls in two upstream-broken transitive deps that we work around via
-# [patch.crates-io] below: yanked `core2 0.4.0` (libp2p chain) and
-# coherence-conflicting `op-alloy-network 0.20.0`. See the patch entries
-# for the full story.
-helios-opstack = { git = "https://github.com/a16z/helios", rev = "43a8c9f3cdda41a6f383c4db41d9a83f102638b1" }
+# Pulls in the yanked `core2 0.4.0` (libp2p chain), which we work around
+# via [patch.crates-io] below. See the patch entry for the full story.
+helios-opstack = { git = "https://github.com/a16z/helios", rev = "2af9b41887e069144ee56cd710f3ddca195473f8" }
 # `advanced` exposes the custom-widget API (Widget/Tree/Clipboard), used by
 # `colored_address`'s hover-grey + click-to-copy widget in src/ui/kao_widgets.rs.
 iced = { version = "0.14.0", features = ["tokio", "image", "qr_code", "svg", "advanced"] }
@@ -127,16 +109,16 @@ wallet-connect = { git = "https://github.com/kaowallet/wallet-connect", default-
 rand = "0.8"
 redb = "4.2.0"
 # Local EVM for transaction preflight. Pinned to the same version helios
-# pulls in (cargo unifies them into one build of revm 29.0.1 instead of
+# pulls in (cargo unifies them into one build of revm 43.0.3 instead of
 # duplicating). The three `optional_*` features disable basefee / nonce /
 # block-gas validation during simulation — preflight is advisory, so a tx
 # whose nonce is one ahead of the on-chain account or whose max-fee
 # happens to dip below the base-fee window should still simulate, not
 # abort with a config error. Matches helios's own feature set verbatim
-# (helios/Cargo.toml workspace dep, rev 43a8c9f) so the unified build has
+# (helios/Cargo.toml workspace dep, rev 2af9b41) so the unified build has
 # the same EVM semantics inside Kao as Helios uses for its verified
 # eth_call.
-revm = { version = "29.0.1", default-features = false, features = [
+revm = { version = "43.0.3", default-features = false, features = [
     "std",
     "optional_block_gas_limit",
     "optional_eip3607",
@@ -185,9 +167,9 @@ tempfile = "3"
 # reqwest's `From<http::Response<T>>`) is a regular dependency now — see the
 # `[dependencies]` entry.
 
-# Workarounds for two upstream-broken transitive deps pulled in by
-# helios-opstack. Drop both entries the moment the upstreams ship fixes
-# (see each entry for the exact "drop when" condition).
+# Workaround for an upstream-broken transitive dep pulled in by
+# helios-opstack. Drop the entry the moment upstream ships a fix (see the
+# entry for the exact "drop when" condition).
 [patch.crates-io]
 # helios-opstack -> libp2p 0.51.3 -> multiaddr 0.17 -> multihash 0.17 ->
 # core2 ^0.4.0 (yanked from crates.io). The unmodified upstream source of
@@ -197,15 +179,6 @@ tempfile = "3"
 # Drop when: libp2p (or anything upstream of multihash) drops the core2
 # dependency, or republishes a non-yanked 0.4.x.
 core2 = { git = "https://github.com/bbqsrc/core2", rev = "545e84bcb0f235b12e21351e0c69767958efe2a7" }
-# helios-opstack -> op-alloy-network 0.20.0 carries an explicit
-# `impl NetworkWallet<Optimism> for EthereumWallet` that overlaps with
-# alloy-network 1.x's blanket `impl<N: Network> NetworkWallet<N> for
-# EthereumWallet`. Rust's coherence rule rejects the overlap (E0119) once
-# both crates are linked into the same binary. We vendor a fork of the
-# crate with the explicit impl deleted — see vendor/op-alloy-network/.
-# Drop when: op-alloy-rs ships a release without the explicit impl AND
-# helios-opstack's pinned rev consumes that release.
-op-alloy-network = { path = "vendor/op-alloy-network" }
 
 # Flatpak is not a cargo-packager format. Releases build it from
 # flatpak/com.kaowallet.kao.yml via flatpak/build.sh.

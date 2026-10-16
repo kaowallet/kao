@@ -21,7 +21,7 @@ yanked = "deny"
 #
 # Entries are grouped by the helios subtree they live in. Revisit each group
 # when helios upgrades the upstream dep that pins it (jsonrpsee 0.19,
-# libp2p 0.51, reqwest's hickory-dns feature, alloy 1.x), or when any
+# libp2p 0.51, reqwest's hickory-dns feature), or when any
 # non-helios direct dep starts pulling the affected crate — that would be a
 # new attack surface worth fixing at the source.
 ignore = [

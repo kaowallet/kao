@@ -31,7 +31,7 @@ use revm::context::result::{ExecutionResult, Output};
 use revm::context::{BlockEnv, CfgEnv, TxEnv};
 use revm::context_interface::block::BlobExcessGasAndPrice;
 use revm::database_interface::DBErrorMarker;
-use revm::primitives::{HashMap as RevmHashMap, KECCAK_EMPTY, hardfork::SpecId};
+use revm::primitives::{AddressMap, KECCAK_EMPTY, hardfork::SpecId};
 use revm::state::{Account, AccountInfo, Bytecode};
 use revm::{
     Context, Database, DatabaseCommit, ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext,
@@ -254,12 +254,7 @@ impl Database for HeliosDb {
         } else {
             keccak256(&code.value)
         };
-        let info = AccountInfo {
-            balance: balance.value,
-            nonce: nonce.value,
-            code_hash,
-            code: Some(bytecode),
-        };
+        let info = AccountInfo::new(balance.value, nonce.value, code_hash, bytecode);
         self.accounts.insert(address, info.clone());
         Ok(Some(info))
     }
@@ -320,7 +315,7 @@ impl Database for HeliosDb {
 /// value. Only exercised by [`simulate_batch`]; the single-call path uses
 /// `replay()` and never commits.
 impl DatabaseCommit for HeliosDb {
-    fn commit(&mut self, changes: RevmHashMap<Address, Account>) {
+    fn commit(&mut self, changes: AddressMap<Account>) {
         for (address, account) in changes {
             if !account.is_touched() {
                 continue;
@@ -792,7 +787,7 @@ pub async fn simulate_batch(
                     return Err(SimError::Evm(msg));
                 }
             };
-            gas_used = gas_used.saturating_add(res.gas_used());
+            gas_used = gas_used.saturating_add(res.tx_gas_used());
             match res {
                 ExecutionResult::Success { logs, .. } => {
                     transfers.extend(extract_transfers(&logs));
@@ -873,6 +868,8 @@ fn build_block_env(block: &LatestBlock) -> BlockEnv {
         difficulty: U256::ZERO,
         prevrandao: Some(block.prevrandao),
         blob_excess_gas_and_price: Some(blob),
+        // EIP-7843 SLOTNUM is Amsterdam-only; `build_cfg` pins Prague.
+        slot_num: 0,
     }
 }
 
@@ -932,7 +929,7 @@ fn build_cfg(chain_id: u64) -> CfgEnv {
 }
 
 fn materialize(result: ExecutionResult, verified: bool, base_fee_per_gas: u64) -> SimulationResult {
-    let gas_used = result.gas_used();
+    let gas_used = result.tx_gas_used();
     let (outcome, logs) = match result {
         ExecutionResult::Success { output, logs, .. } => {
             let bytes = match output {

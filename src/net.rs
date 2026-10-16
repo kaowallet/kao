@@ -20,11 +20,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
+use alloy::eips::BlockId;
 use alloy::network::Ethereum;
 use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::providers::{Provider, RootProvider};
 use alloy::rpc::client::RpcClient;
-use alloy_eips::BlockId;
+use alloy::rpc::types::eth::{Header, TransactionInput, TransactionRequest};
 use async_trait::async_trait;
 use rand::seq::SliceRandom;
 use tokio::sync::Mutex;
@@ -294,24 +295,21 @@ impl HeliosBackend {
     /// light client cryptographically vouched for, not values an RPC
     /// provider chose to return.
     ///
-    /// The boundary on this method is the type swap: our crate uses
-    /// alloy 2.x but Helios's `call` takes alloy 1's `TransactionRequest`
-    /// (or `OpTransactionRequest` on OP-Stack). Both share the same
-    /// alloy-primitives 1.5.7 for `Address`, `Bytes`, etc., so we
-    /// build the v1 request inside this method and never expose the v1
-    /// type to callers.
+    /// OP-Stack's `call` takes `OpTransactionRequest` rather than the
+    /// plain `TransactionRequest`, so the request is built here and
+    /// callers only ever pass `to` + `data`.
     async fn call(&self, to: Address, data: Bytes, block: BlockId) -> Result<Bytes, String> {
         match self {
             Self::Eth(c) => {
-                let req = alloy_rpc_types_eth::TransactionRequest::default()
+                let req = TransactionRequest::default()
                     .to(to)
-                    .input(alloy_rpc_types_eth::TransactionInput::new(data));
+                    .input(TransactionInput::new(data));
                 c.call(&req, block, None).await.map_err(|e| e.to_string())
             }
             Self::Op(c) => {
-                let inner = alloy_rpc_types_eth::TransactionRequest::default()
+                let inner = TransactionRequest::default()
                     .to(to)
-                    .input(alloy_rpc_types_eth::TransactionInput::new(data));
+                    .input(TransactionInput::new(data));
                 // `OpTransactionRequest::from(addr)` is the inherent
                 // setter for the `from` field — distinct from the
                 // `From<TransactionRequest>` trait we want. Use
@@ -1191,22 +1189,8 @@ impl NetworkClient {
                 msg
             })?
             .ok_or_else(|| format!("no latest block on {}", chain.label()))?;
-        // alloy 2.x's `Block.header` is the same `Header<H>` shape as
-        // alloy 1.x (header struct lives in `alloy-consensus`, which
-        // shares the same primitives crate across major versions), so
-        // the helper takes the wire-shape from either path.
-        let header = LatestBlock {
-            number: block.header.inner.number,
-            hash: block.header.hash,
-            timestamp: block.header.inner.timestamp,
-            gas_limit: block.header.inner.gas_limit,
-            base_fee_per_gas: block.header.inner.base_fee_per_gas.unwrap_or(0),
-            prevrandao: block.header.inner.mix_hash,
-            beneficiary: block.header.inner.beneficiary,
-            excess_blob_gas: block.header.inner.excess_blob_gas,
-        };
         Ok(VerifiedRead {
-            value: header,
+            value: latest_from_rpc_header(&block.header),
             verified: false,
         })
     }
@@ -1245,13 +1229,13 @@ impl NetworkClient {
     }
 }
 
-/// Flatten an alloy-1 RPC `Header` (used by both Helios and the raw
+/// Flatten an RPC `Header` (used by both Helios and the raw
 /// fallback's deserialized response) into our network-agnostic
 /// `LatestBlock`. Pre-merge blocks have no base fee and no prevrandao;
 /// for Kao's send-flow simulator both default to zero — the wallet
 /// won't ship a tx against a pre-London chain, but defaulting is
 /// cheaper than threading an extra error case through the trait.
-fn latest_from_rpc_header(header: &alloy_rpc_types_eth::Header) -> LatestBlock {
+fn latest_from_rpc_header(header: &Header) -> LatestBlock {
     LatestBlock {
         number: header.inner.number,
         hash: header.hash,
@@ -2177,13 +2161,7 @@ mod pure_tests {
 
     #[test]
     fn latest_from_rpc_header_flattens_fields() {
-        // The Header type is `alloy_rpc_types_eth::Header` from alloy v1,
-        // whose `inner` is alloy_consensus v1's `Header` (different crate
-        // version from alloy 2.x's `alloy::consensus::Header`). We
-        // construct via Default::default() and patch the fields we care
-        // about — their numeric/byte types come from alloy_primitives,
-        // which is a single version across the graph.
-        let mut header: alloy_rpc_types_eth::Header = alloy_rpc_types_eth::Header {
+        let mut header: Header = Header {
             hash: B256::from([0xbb; 32]),
             ..Default::default()
         };
@@ -2208,7 +2186,7 @@ mod pure_tests {
 
     #[test]
     fn latest_from_rpc_header_defaults_base_fee_to_zero() {
-        let mut header: alloy_rpc_types_eth::Header = Default::default();
+        let mut header: Header = Header::default();
         header.inner.base_fee_per_gas = None;
         let lb = latest_from_rpc_header(&header);
         assert_eq!(lb.base_fee_per_gas, 0);

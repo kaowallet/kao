@@ -461,17 +461,20 @@ fn token_row<'a>(t: KaoTheme, tk: &'a LiveToken, idx: usize) -> Element<'a, Mess
 /// Group thousands, 2 decimals. Used by both the hero total and per-token
 /// USD values; co-located here because the home view is the only consumer.
 pub(super) fn format_usd(n: f64) -> String {
-    let whole = n.trunc() as i64;
-    let frac = ((n - whole as f64).abs() * 100.0).round() as u64;
+    // Round to whole cents *before* splitting, so 24.996 carries into
+    // "25.00" instead of rendering the rounded-up cents as "24.100".
+    let cents = (n * 100.0).round() as i64;
+    let whole = cents.unsigned_abs() / 100;
+    let frac = cents.unsigned_abs() % 100;
     let mut s = String::new();
-    let digits: Vec<u8> = whole.abs().to_string().bytes().collect();
+    let digits: Vec<u8> = whole.to_string().bytes().collect();
     for (i, b) in digits.iter().enumerate() {
         if i > 0 && (digits.len() - i).is_multiple_of(3) {
             s.push(',');
         }
         s.push(*b as char);
     }
-    if whole < 0 {
+    if cents < 0 {
         s.insert(0, '-');
     }
     s.push('.');
@@ -527,6 +530,22 @@ pub(super) fn network_display_name(network: NetworkId) -> String {
 mod tests {
     use super::*;
     use crate::chain::Chain;
+
+    #[test]
+    fn usd_cents_carry_into_dollars() {
+        assert_eq!(format_usd(24.996), "25.00");
+        assert_eq!(format_usd(999.999), "1,000.00");
+        assert_eq!(format_usd(0.999), "1.00");
+    }
+
+    #[test]
+    fn usd_groups_thousands_and_pads_cents() {
+        assert_eq!(format_usd(0.0), "0.00");
+        assert_eq!(format_usd(24.1), "24.10");
+        assert_eq!(format_usd(1234567.891), "1,234,567.89");
+        assert_eq!(format_usd(-0.3), "-0.30");
+        assert_eq!(format_usd(-1234.5), "-1,234.50");
+    }
 
     #[test]
     fn mainnet_symbol_has_no_suffix() {

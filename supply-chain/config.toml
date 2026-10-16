@@ -771,10 +771,6 @@ version = "2.6.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.async-lock]]
-version = "2.8.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.async-lock]]
 version = "3.4.2"
 criteria = "safe-to-deploy"
 
@@ -1783,10 +1779,6 @@ version = "0.9.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.event-listener]]
-version = "2.5.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.event-listener]]
 version = "5.4.1"
 criteria = "safe-to-deploy"
 
@@ -2090,20 +2082,8 @@ criteria = "safe-to-deploy"
 version = "0.4.20"
 criteria = "safe-to-deploy"
 
-[[exemptions.gloo-net]]
-version = "0.3.1"
-criteria = "safe-to-deploy"
-
 [[exemptions.gloo-timers]]
 version = "0.2.6"
-criteria = "safe-to-deploy"
-
-[[exemptions.gloo-timers]]
-version = "0.4.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.gloo-utils]]
-version = "0.1.7"
 criteria = "safe-to-deploy"
 
 [[exemptions.glow]]
@@ -2296,10 +2276,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.hyper]]
 version = "1.11.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.hyper-rustls]]
-version = "0.24.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.hyper-rustls]]
@@ -2634,15 +2610,7 @@ criteria = "safe-to-deploy"
 version = "0.19.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.jsonrpsee-client-transport]]
-version = "0.19.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.jsonrpsee-core]]
-version = "0.19.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.jsonrpsee-http-client]]
 version = "0.19.0"
 criteria = "safe-to-deploy"
 
@@ -2655,14 +2623,6 @@ version = "0.19.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.jsonrpsee-types]]
-version = "0.19.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.jsonrpsee-wasm-client]]
-version = "0.19.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.jsonrpsee-ws-client]]
 version = "0.19.0"
 criteria = "safe-to-deploy"
 
@@ -3344,10 +3304,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.openssl]]
 version = "0.10.81"
-criteria = "safe-to-deploy"
-
-[[exemptions.openssl-probe]]
-version = "0.1.6"
 criteria = "safe-to-deploy"
 
 [[exemptions.openssl-probe]]
@@ -4123,19 +4079,11 @@ version = "0.20.9"
 criteria = "safe-to-deploy"
 
 [[exemptions.rustls]]
-version = "0.21.12"
-criteria = "safe-to-deploy"
-
-[[exemptions.rustls]]
 version = "0.23.39"
 criteria = "safe-to-deploy"
 
 [[exemptions.rustls]]
-version = "0.23.45"
-criteria = "safe-to-deploy"
-
-[[exemptions.rustls-native-certs]]
-version = "0.6.3"
+version = "0.23.46"
 criteria = "safe-to-deploy"
 
 [[exemptions.rustls-native-certs]]
@@ -4144,10 +4092,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.rustls-native-certs]]
 version = "0.8.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.rustls-pemfile]]
-version = "1.0.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.rustls-pki-types]]
@@ -4168,10 +4112,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.rustls-platform-verifier-android]]
 version = "0.1.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.rustls-webpki]]
-version = "0.101.7"
 criteria = "safe-to-deploy"
 
 [[exemptions.rustls-webpki]]
@@ -4276,10 +4216,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.secret-service]]
 version = "4.0.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.security-framework]]
-version = "2.11.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.security-framework]]
@@ -4535,10 +4471,6 @@ version = "0.4.10"
 criteria = "safe-to-deploy"
 
 [[exemptions.socket2]]
-version = "0.5.10"
-criteria = "safe-to-deploy"
-
-[[exemptions.socket2]]
 version = "0.6.3"
 criteria = "safe-to-deploy"
 
@@ -4784,10 +4716,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.tokio-macros]]
 version = "2.7.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.tokio-rustls]]
-version = "0.24.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.tokio-rustls]]
@@ -5216,10 +5144,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.webpki-root-certs]]
 version = "1.0.9"
-criteria = "safe-to-deploy"
-
-[[exemptions.webpki-roots]]
-version = "0.24.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.webpki-roots]]

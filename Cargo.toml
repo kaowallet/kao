@@ -89,8 +89,12 @@ ens-normalize-rs = "0.1.1"
 evmole = "0.9"
 futures = "0.3"
 getrandom = "0.4.3"
-# Pinned to commit on tag 0.11.1. Bump deliberately rather than tracking a branch.
-helios-ethereum = { git = "https://github.com/a16z/helios", rev = "204c998a927348e1c000a664f08d5b37b1b0d924" }
+# Pinned to a commit two past tag 0.11.1 (#788, #804): #804 trims helios's
+# jsonrpsee 0.19 to server/macros/client-core, which drops its unused rustls
+# 0.21 client stack (RUSTSEC-2026-0346/-0349). Same workspace manifest as
+# 0.11.1 (alloy 1.0.37, revm 29.0.1). Bump deliberately rather than tracking
+# a branch.
+helios-ethereum = { git = "https://github.com/a16z/helios", rev = "43a8c9f3cdda41a6f383c4db41d9a83f102638b1" }
 # Same git rev as helios-ethereum: both crates ship from the a16z/helios
 # workspace and share types (alloy versions, network presets, etc.). The
 # OP-Stack client wraps Helios's verified L1 anchor with L2 fault-proof
@@ -100,7 +104,7 @@ helios-ethereum = { git = "https://github.com/a16z/helios", rev = "204c998a92734
 # [patch.crates-io] below: yanked `core2 0.4.0` (libp2p chain) and
 # coherence-conflicting `op-alloy-network 0.20.0`. See the patch entries
 # for the full story.
-helios-opstack = { git = "https://github.com/a16z/helios", rev = "204c998a927348e1c000a664f08d5b37b1b0d924" }
+helios-opstack = { git = "https://github.com/a16z/helios", rev = "43a8c9f3cdda41a6f383c4db41d9a83f102638b1" }
 # `advanced` exposes the custom-widget API (Widget/Tree/Clipboard), used by
 # `colored_address`'s hover-grey + click-to-copy widget in src/ui/kao_widgets.rs.
 iced = { version = "0.14.0", features = ["tokio", "image", "qr_code", "svg", "advanced"] }
@@ -129,7 +133,7 @@ redb = "4.2.0"
 # whose nonce is one ahead of the on-chain account or whose max-fee
 # happens to dip below the base-fee window should still simulate, not
 # abort with a config error. Matches helios's own feature set verbatim
-# (helios/Cargo.toml workspace dep, rev 204c998) so the unified build has
+# (helios/Cargo.toml workspace dep, rev 43a8c9f) so the unified build has
 # the same EVM semantics inside Kao as Helios uses for its verified
 # eth_call.
 revm = { version = "29.0.1", default-features = false, features = [

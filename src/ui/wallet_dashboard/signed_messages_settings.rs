@@ -1,5 +1,7 @@
 //! Settings → Signed messages: what the user signed for dapps over WalletConnect — `personal_sign`,
-//! typed data, and both through a Safe (an EIP-1271 SafeMessage) — newest first, from the vault.
+//! typed data, and both through a Safe (an EIP-1271 SafeMessage) — and Kao's own CoW swap orders
+//! and order cancellations (an account's EIP-712, or a Safe's EIP-1271), newest first, from the
+//! vault.
 //!
 //! The pane is a viewer: the dashboard seeds it from `Vault::signed()` and reseeds it whenever the
 //! vault's revision moves (`set_records`), and a confirmed "Clear history" goes straight to the
@@ -11,10 +13,15 @@
 //! message is shown as the review showed it — text by the review's own rule
 //! (`walletconnect::message::classify`), else hex under the reason — never with characters dropped.
 //!
+//! A CoW record shows the order instead of a dapp — what it sells and the least it buys (token
+//! symbols are token metadata, sanitized the same way) — and its UID; what was signed is its
+//! EIP-712 typed data.
+//!
 //! A signature is shown (and copyable) only once it reached the dapp. Until then its record keeps
 //! only its fingerprint: the signature itself waits, encrypted, in the saved WalletConnect state,
 //! so Kao can send it again after a restart, and leaves the disk with it. One that never reached
-//! the dapp is not kept at all.
+//! the dapp is not kept at all. A CoW signature is kept once the orderbook took it, and never
+//! before: Kao doesn't send one again.
 
 use std::collections::BTreeSet;
 
@@ -26,13 +33,16 @@ use iced::{Alignment, Background, Border, Element, Length, Padding, Task};
 
 use super::activity::format_relative;
 use super::sign_review::format_iso_utc;
+use super::sim_view::trim_trailing_decimal_zeros;
 use crate::sanitize::{escape_unsafe_display, sanitize_display};
 use crate::ui::kao_theme::KaoTheme;
 use crate::ui::kao_widgets::{
     BadgeKind, black, bold, colored_hash_copyable, ghost_button, hover_tint, kao_scrollable_style,
     mono, mono_bold, mono_box, privacy_badge, small_danger_button, small_secondary_button,
 };
-use crate::vault::{Delivery, SignOrigin, SignedKind, SignedPayload, SignedRecord, Unreadable};
+use crate::vault::{
+    CowOrderRecord, Delivery, SignOrigin, SignedKind, SignedPayload, SignedRecord, Unreadable,
+};
 use crate::walletconnect::{BinaryReason, MessageShape};
 
 /// Records listed per page ("Show more" adds another).
@@ -43,14 +53,22 @@ const MAX_PAYLOAD_LINES: usize = 300;
 const HEX_BYTES_PER_LINE: usize = 16;
 /// `primaryType` clamp on the row header.
 const MAX_PRIMARY_TYPE_CHARS: usize = 40;
+/// Token-symbol clamp on a CoW order's summary.
+const MAX_SYMBOL_CHARS: usize = 16;
 
-const NOTE: &str = "Messages and typed data you signed for dapps over WalletConnect. Kept \
-     encrypted in your wallet.";
+const NOTE: &str = "Messages and typed data you signed for dapps over WalletConnect, and the CoW \
+     swap orders and cancellations you signed in Kao. Kept encrypted in your wallet.";
 /// An answer the dapp hasn't confirmed yet: its signature waits in the saved WalletConnect state.
 const SENDING_SIGNATURE: &str = "Kao keeps this signature (encrypted) until the dapp gets it, so \
      it can send it again after a restart.";
 /// An answer that never reached the dapp: its signature was dropped with it.
 const NOT_DELIVERED_SIGNATURE: &str = "Signature not kept — it never reached the dapp.";
+/// A CoW order or cancellation the orderbook hasn't confirmed taking — yet, or ever (Kao locked or
+/// quit before it answered): its signature is kept only once it does.
+const COW_SENDING_SIGNATURE: &str =
+    "Not kept unless the CoW orderbook confirms it took this signature.";
+/// A CoW order or cancellation the orderbook didn't take (or that never left Kao).
+const COW_NOT_DELIVERED_SIGNATURE: &str = "Signature not kept — the CoW orderbook didn't take it.";
 /// The empty list while some records exist that Kao couldn't read (or their key is gone).
 pub(super) const NONE_SHOWN: &str = "No records Kao can show.";
 /// The history panes' note while the wallet file's saved state can't be read
@@ -333,7 +351,8 @@ impl SignedMessagesPane {
                 t,
                 nothing_unshown(self.unreadable.signed, self.unreadable),
                 "Nothing signed yet.",
-                "Messages you sign for a dapp you connected with WalletConnect show up here.",
+                "Messages you sign for a dapp you connected with WalletConnect, and CoW swap \
+                 orders you sign, show up here.",
             ));
         }
 
@@ -587,26 +606,81 @@ pub(super) fn reset_controls<'a, M: Clone + 'a>(
     }
 }
 
-/// The dapp of a record's origin.
-fn origin_dapp(r: &SignedRecord) -> (&str, &str) {
-    match &r.origin {
-        SignOrigin::WalletConnect { dapp, .. } => {
-            (dapp.host.as_deref().unwrap_or("unknown site"), &dapp.name)
-        }
+/// What line 1 calls a record: its kind, or for a CoW signature what it did (and, from a Safe,
+/// that its owners signed a SafeMessage).
+fn kind_label(r: &SignedRecord) -> &'static str {
+    let safe = r.kind == SignedKind::SafeMessage;
+    match (&r.origin, r.kind) {
+        (SignOrigin::WalletConnect { .. }, SignedKind::Message) => "Message",
+        (SignOrigin::WalletConnect { .. }, SignedKind::TypedData) => "Typed data",
+        (SignOrigin::WalletConnect { .. }, SignedKind::SafeMessage) => "Safe message",
+        (SignOrigin::CowOrder { .. }, _) if safe => "CoW order · Safe message",
+        (SignOrigin::CowOrder { .. }, _) => "CoW order",
+        (SignOrigin::CowCancel { .. }, _) if safe => "CoW cancellation · Safe message",
+        (SignOrigin::CowCancel { .. }, _) => "CoW cancellation",
     }
 }
 
-/// Lines 1-3: what kind of signature and when; the dapp (host in its box, then its claim); who
-/// signed, on which network, and whether it reached the dapp.
+/// A CoW order as the history names it: "Sell 1.5 WETH for at least 2400 USDC" — the amounts it
+/// was signed with, symbols sanitized and clamped.
+fn cow_order_summary(o: &CowOrderRecord) -> String {
+    let amount = |raw, decimals| {
+        trim_trailing_decimal_zeros(&crate::portfolio::format_token_balance(raw, decimals).0)
+    };
+    let symbol =
+        |s: &str| sanitize_display(&escape_unsafe_display(s), MAX_SYMBOL_CHARS).into_owned();
+    format!(
+        "Sell {} {} for at least {} {}",
+        amount(o.sell_amount, o.sell_decimals),
+        symbol(&o.sell_symbol),
+        amount(o.buy_amount, o.buy_decimals),
+        symbol(&o.buy_symbol)
+    )
+}
+
+/// `0x12345678…abcdef` — an order UID (112 hex digits) cut to fit a row.
+fn short_uid(uid: &str) -> String {
+    if uid.chars().count() <= 18 || !uid.is_ascii() {
+        return uid.to_string();
+    }
+    format!("{}…{}", &uid[..10], &uid[uid.len() - 6..])
+}
+
+/// Line 2: who asked — the dapp (host in its box, then its claim) — or, for a CoW signature, the
+/// order in its box and what the signature did to it.
+fn origin_line<'a>(t: KaoTheme, r: &'a SignedRecord) -> Element<'a, Message> {
+    let (boxed, after) = match &r.origin {
+        SignOrigin::WalletConnect { dapp, .. } => (
+            dapp.host.as_deref().unwrap_or("unknown site").to_string(),
+            format!("calls itself \"{}\"", dapp.name),
+        ),
+        SignOrigin::CowOrder { order } => (
+            cow_order_summary(order),
+            format!("CoW order {}", short_uid(&order.uid)),
+        ),
+        SignOrigin::CowCancel { order } => (
+            cow_order_summary(order),
+            format!("cancels CoW order {}", short_uid(&order.uid)),
+        ),
+    };
+    row![
+        mono_box(
+            t,
+            text(boxed).size(13).color(t.text).font(mono_bold()).into()
+        ),
+        Space::new().width(8),
+        text(after).size(12).color(t.sub),
+    ]
+    .align_y(Alignment::Center)
+    .width(Length::Fill)
+    .into()
+}
+
+/// Lines 1-3: what kind of signature and when; the dapp (host in its box, then its claim) or the
+/// CoW order; who signed, on which network, and whether it reached the dapp (or the orderbook).
 fn summary_lines<'a>(t: KaoTheme, r: &'a SignedRecord, now: u64) -> Element<'a, Message> {
     let mut kind = row![].spacing(6).align_y(Alignment::Center);
-    kind = match r.kind {
-        SignedKind::Message => kind.push(text("Message").size(13).color(t.text).font(bold())),
-        SignedKind::TypedData => kind.push(text("Typed data").size(13).color(t.text).font(bold())),
-        SignedKind::SafeMessage => {
-            kind.push(text("Safe message").size(13).color(t.text).font(bold()))
-        }
-    };
+    kind = kind.push(text(kind_label(r)).size(13).color(t.text).font(bold()));
     // The dapp's own type name: a dapp string, so in its own mono chip.
     if let Some(pt) = r.primary_type.as_deref().filter(|p| !p.is_empty()) {
         kind = kind.push(mono_chip(
@@ -614,7 +688,6 @@ fn summary_lines<'a>(t: KaoTheme, r: &'a SignedRecord, now: u64) -> Element<'a, 
             sanitize_display(&escape_unsafe_display(pt), MAX_PRIMARY_TYPE_CHARS).into_owned(),
         ));
     }
-    let (host, name) = origin_dapp(r);
     let mut who = row![
         text(format!(
             "by {} · {} · {}",
@@ -650,22 +723,7 @@ fn summary_lines<'a>(t: KaoTheme, r: &'a SignedRecord, now: u64) -> Element<'a, 
         .align_y(Alignment::Center)
         .width(Length::Fill),
         Space::new().height(6),
-        row![
-            mono_box(
-                t,
-                text(host.to_string())
-                    .size(13)
-                    .color(t.text)
-                    .font(mono_bold())
-                    .into()
-            ),
-            Space::new().width(8),
-            text(format!("calls itself \"{name}\""))
-                .size(12)
-                .color(t.sub),
-        ]
-        .align_y(Alignment::Center)
-        .width(Length::Fill),
+        origin_line(t, r),
         Space::new().height(6),
         who,
     ]
@@ -685,6 +743,21 @@ fn detail<'a>(t: KaoTheme, r: &'a SignedRecord) -> Element<'a, Message> {
     ]
     .spacing(0)
     .width(Length::Fill);
+
+    if let SignOrigin::CowOrder { order } | SignOrigin::CowCancel { order } = &r.origin
+        && !order.uid.is_empty()
+    {
+        col = col.push(text("Order UID").size(11).color(t.sub).font(bold()));
+        col = col.push(Space::new().height(4));
+        col = col.push(
+            text(order.uid.clone())
+                .size(11)
+                .color(t.text)
+                .font(mono())
+                .wrapping(Wrapping::Glyph),
+        );
+        col = col.push(Space::new().height(8));
+    }
 
     let (label, lines) = payload_lines(&r.payload);
     col = col.push(text(label).size(11).color(t.sub).font(bold()));
@@ -739,15 +812,7 @@ fn detail<'a>(t: KaoTheme, r: &'a SignedRecord) -> Element<'a, Message> {
             );
         }
         None => {
-            col = col.push(
-                text(match r.delivery {
-                    Delivery::NotDelivered => NOT_DELIVERED_SIGNATURE,
-                    Delivery::Sending => SENDING_SIGNATURE,
-                    Delivery::Delivered => "Signature not kept.",
-                })
-                .size(12)
-                .color(t.sub),
-            );
+            col = col.push(text(unshown_signature(r)).size(12).color(t.sub));
         }
     }
     col = col.push(Space::new().height(6));
@@ -761,6 +826,19 @@ fn detail<'a>(t: KaoTheme, r: &'a SignedRecord) -> Element<'a, Message> {
     );
     col = col.push(colored_hash_copyable(t, r.signature_hash));
     col.into()
+}
+
+/// Why a record shows no signature: where it is (a WalletConnect answer on its way) or why it
+/// isn't kept.
+fn unshown_signature(r: &SignedRecord) -> &'static str {
+    let cow = !matches!(r.origin, SignOrigin::WalletConnect { .. });
+    match r.delivery {
+        Delivery::NotDelivered if cow => COW_NOT_DELIVERED_SIGNATURE,
+        Delivery::NotDelivered => NOT_DELIVERED_SIGNATURE,
+        Delivery::Sending if cow => COW_SENDING_SIGNATURE,
+        Delivery::Sending => SENDING_SIGNATURE,
+        Delivery::Delivered => "Signature not kept.",
+    }
 }
 
 /// What was signed, as display lines under a label: a message as the review showed it — text by
@@ -1306,6 +1384,246 @@ mod tests {
         pane.update(Message::ShowMore);
         assert_eq!(count(&pane), PAGE + 3);
         assert!(!render(&pane).iter().any(|s| s == "Show more"));
+    }
+
+    const COW_UID_HEAD: &str = "0x12345678";
+
+    fn cow_order() -> CowOrderRecord {
+        CowOrderRecord {
+            uid: format!("{COW_UID_HEAD}{}fedcba", "ab".repeat(51)),
+            sell_token: Address::repeat_byte(0x01),
+            sell_symbol: "WETH".into(),
+            sell_decimals: 18,
+            sell_amount: alloy::primitives::U256::from(10).pow(alloy::primitives::U256::from(18)),
+            buy_token: Address::repeat_byte(0x02),
+            buy_symbol: "USDC".into(),
+            buy_decimals: 6,
+            buy_amount: alloy::primitives::U256::from(2_400_000_000u64),
+            valid_to: 1_900_000_000,
+        }
+    }
+
+    /// A CoW record — an order or a cancellation, by an account or a Safe.
+    fn cow_record(id: u64, cancel: bool, safe: bool, delivery: Delivery) -> SignedRecord {
+        let mut r = record(id, SignedKind::TypedData, delivery);
+        r.origin = if cancel {
+            SignOrigin::CowCancel { order: cow_order() }
+        } else {
+            SignOrigin::CowOrder { order: cow_order() }
+        };
+        r.chain_id = 8453;
+        if safe {
+            r.kind = SignedKind::SafeMessage;
+            r.account = AccountRef::Safe {
+                address: Address::repeat_byte(0x5a),
+                chain_id: 8453,
+                label: "Treasury".into(),
+            };
+        }
+        r.primary_type = Some(
+            if cancel {
+                "OrderCancellations"
+            } else {
+                "Order"
+            }
+            .into(),
+        );
+        r.digests = vec![DigestRow {
+            label: crate::sign::digest::COW_ORDER_DIGEST_LABEL.into(),
+            hash: B256::repeat_byte(0x44),
+        }];
+        r
+    }
+
+    /// A CoW record names the order where a dapp's host would be — what it sells and the least it
+    /// buys, then which order — and says what the signature did.
+    #[test]
+    fn a_cow_record_shows_the_order_instead_of_a_dapp() {
+        let pane = SignedMessagesPane::new(
+            vec![
+                cow_record(3, true, true, Delivery::Sending),
+                cow_record(2, false, false, Delivery::Delivered),
+                record(1, SignedKind::Message, Delivery::Delivered),
+            ],
+            Unreadable::default(),
+        );
+        let texts = render(&pane);
+        let order = texts.iter().position(|s| s == "CoW order").unwrap();
+        let cancel = texts
+            .iter()
+            .position(|s| s == "CoW cancellation · Safe message")
+            .unwrap();
+        assert!(cancel < order, "newest first: {texts:?}");
+        assert!(texts.iter().any(|s| s == "Order"), "{texts:?}");
+        assert!(texts.iter().any(|s| s == "OrderCancellations"), "{texts:?}");
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|s| *s == "Sell 1 WETH for at least 2400 USDC")
+                .count(),
+            2,
+            "{texts:?}"
+        );
+        let short = format!("{COW_UID_HEAD}…fedcba");
+        assert!(
+            texts.iter().any(|s| *s == format!("CoW order {short}")),
+            "{texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|s| *s == format!("cancels CoW order {short}")),
+            "{texts:?}"
+        );
+        // Only the WalletConnect record has a dapp.
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|s| s.starts_with("calls itself"))
+                .count(),
+            1,
+            "{texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|s| s.starts_with("by Treasury · ") && s.ends_with("Base")),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|s| s == "! Delivery unconfirmed"),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|s| s == NOTE) && NOTE.contains("CoW"),
+            "{texts:?}"
+        );
+    }
+
+    /// Expanded, a CoW record shows its UID, the typed data that was signed, its fingerprints and
+    /// — once the orderbook took it — its signature. One the orderbook didn't take, or hasn't
+    /// confirmed, says so in its own words: Kao never re-sends a CoW signature, so it doesn't
+    /// promise to (the WalletConnect wording would).
+    #[test]
+    fn expanding_a_cow_record_shows_its_uid_typed_data_and_only_a_taken_signature() {
+        let vault = crate::vault::Vault::with_store_path(std::path::PathBuf::from(
+            "/nonexistent/kao-cow-pane-test.redb",
+        ));
+        vault.unlock(
+            None,
+            crate::wallet::KeyStatus::Ok,
+            crate::wallet::SealedLoad::default(),
+        );
+        let by = AccountRef::Eoa {
+            address: Address::repeat_byte(0x11),
+            label: "Account 1".into(),
+        };
+        let order = crate::cow::order::build_sell_order(
+            Address::repeat_byte(0x01),
+            Address::repeat_byte(0x02),
+            by.address(),
+            alloy::primitives::U256::from(10).pow(alloy::primitives::U256::from(18)),
+            alloy::primitives::U256::from(2_500_000_000u64),
+            1_900_000_000,
+            50,
+            crate::cow::market_app_data(50).1,
+        );
+        let tokens = crate::cow::history::OrderTokens {
+            sell_symbol: "WETH".into(),
+            sell_decimals: 18,
+            buy_symbol: "USDC".into(),
+            buy_decimals: 6,
+        };
+        let new = crate::cow::history::order_record(
+            &by,
+            &order,
+            crate::chain::Chain::Base,
+            &tokens,
+            &[0xab; 65],
+            1_700_000_000,
+        );
+        let id = vault.session().record_signed(new).unwrap();
+        vault.session().signed_delivery(id, Delivery::Delivered);
+        let mut pane = SignedMessagesPane::new(vault.signed(), Unreadable::default());
+        pane.update(Message::Toggle(id));
+        let texts = render(&pane);
+        let SignOrigin::CowOrder { order: summary } = &vault.signed()[0].origin else {
+            panic!("an order")
+        };
+        assert!(texts.iter().any(|s| s == "Order UID"), "{texts:?}");
+        assert!(texts.contains(&summary.uid), "{texts:?}");
+        assert!(texts.iter().any(|s| s == "Typed data"), "{texts:?}");
+        assert!(
+            texts
+                .iter()
+                .any(|s| s.trim() == "\"primaryType\": \"Order\","),
+            "{texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|s| s.trim() == "\"name\": \"Gnosis Protocol\","),
+            "{texts:?}"
+        );
+        for label in [
+            crate::sign::digest::EIP712_DIGEST_LABEL,
+            crate::sign::digest::DOMAIN_HASH_LABEL,
+            crate::sign::digest::MESSAGE_HASH_LABEL,
+        ] {
+            assert!(texts.iter().any(|s| s == label), "{label}: {texts:?}");
+        }
+        assert!(texts.iter().any(|s| s == "Copy"), "{texts:?}");
+
+        for (delivery, note) in [
+            (Delivery::Sending, COW_SENDING_SIGNATURE),
+            (Delivery::NotDelivered, COW_NOT_DELIVERED_SIGNATURE),
+        ] {
+            let mut r = cow_record(9, false, true, delivery);
+            r.signature = None;
+            let mut pane = SignedMessagesPane::new(vec![r], Unreadable::default());
+            pane.update(Message::Toggle(9));
+            let texts = render(&pane);
+            assert!(texts.iter().any(|s| s == note), "{texts:?}");
+            assert!(
+                !texts
+                    .iter()
+                    .any(|s| s == SENDING_SIGNATURE || s == NOT_DELIVERED_SIGNATURE),
+                "{texts:?}"
+            );
+            assert!(!texts.iter().any(|s| s == "Copy"), "{texts:?}");
+            assert!(
+                texts
+                    .iter()
+                    .any(|s| s == crate::sign::digest::COW_ORDER_DIGEST_LABEL),
+                "{texts:?}"
+            );
+        }
+    }
+
+    /// Token symbols are token metadata: a hidden character is shown escaped, never drawn, and a
+    /// long one is clamped.
+    #[test]
+    fn cow_symbols_are_escaped_and_clamped() {
+        let mut o = cow_order();
+        o.sell_symbol = "US\u{202e}DC".into();
+        o.buy_symbol = "X".repeat(64);
+        let line = cow_order_summary(&o);
+        assert!(!line.contains('\u{202e}'), "{line}");
+        assert!(line.contains("US\\u{202E}DC"), "{line}");
+        assert!(!line.contains(&"X".repeat(MAX_SYMBOL_CHARS + 1)), "{line}");
+        // An empty record (fields lost) still renders.
+        let mut r = cow_record(1, false, false, Delivery::Delivered);
+        r.origin = SignOrigin::CowOrder {
+            order: CowOrderRecord::default(),
+        };
+        let mut pane = SignedMessagesPane::new(vec![r], Unreadable::default());
+        pane.update(Message::Toggle(1));
+        let texts = render(&pane);
+        assert!(
+            texts.iter().any(|s| s == "Sell 0  for at least 0 "),
+            "{texts:?}"
+        );
+        assert!(!texts.iter().any(|s| s == "Order UID"), "{texts:?}");
     }
 
     #[test]

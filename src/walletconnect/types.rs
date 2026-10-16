@@ -1094,6 +1094,9 @@ impl LogEffect {
             Self::ConnectionOpened(c) => &c.topic,
             Self::MessageSigned(s) => match &s.origin {
                 crate::vault::SignOrigin::WalletConnect { topic, .. } => topic,
+                // Never a WalletConnect log: Kao's own CoW signatures are recorded by their task.
+                crate::vault::SignOrigin::CowOrder { .. }
+                | crate::vault::SignOrigin::CowCancel { .. } => "",
             },
             Self::ConnectionAcked { topic, .. }
             | Self::ConnectionEnded { topic, .. }

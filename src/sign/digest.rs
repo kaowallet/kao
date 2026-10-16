@@ -46,6 +46,13 @@ pub const DAPP_MESSAGE_HASH_LABEL: &str = "Dapp Message Hash";
 /// `execTransaction` calldata digest of the transaction that carries it.
 pub const INNER_CALLDATA_DIGEST_LABEL: &str = "Calldata Digest (inner call)";
 
+/// Labels for the CoW EIP-712 digest a Safe's `SafeMessage` wraps (EIP-1271): the order's when
+/// placing, the `OrderCancellations`' when cancelling — beside the standard labels of the
+/// `SafeMessage` the owners sign. Shared by the review (`sign_review`) and the signed-message
+/// history (`cow::history`).
+pub const COW_ORDER_DIGEST_LABEL: &str = "Order Digest (CoW EIP-712)";
+pub const COW_CANCELLATION_DIGEST_LABEL: &str = "Cancellation Digest (CoW EIP-712)";
+
 /// ERC-8213 **Calldata Digest**: `keccak256( uint256(len(calldata)) ‖ calldata )`.
 ///
 /// The 32-byte big-endian length prefix is part of the pre-image; `chainId` is

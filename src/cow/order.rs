@@ -26,8 +26,9 @@ sol! {
     /// on-chain struct stores them as `bytes32`, but the EIP-712 *type string*
     /// declares them as `string`, so the encoded value is `keccak256(<the
     /// literal>)` — exactly what alloy does for a `string` member). We pass the
-    /// literals `"sell"`/`"buy"` and `"erc20"`.
-    #[derive(Debug)]
+    /// literals `"sell"`/`"buy"` and `"erc20"`. `Serialize` is for the EIP-712
+    /// JSON the signed-message history keeps (`cow::history`).
+    #[derive(Debug, Serialize)]
     struct Order {
         address sellToken;
         address buyToken;
@@ -47,7 +48,7 @@ sol! {
     /// `DELETE /orders`). The signed message is over an array of 56-byte order
     /// UIDs as *dynamic* `bytes` (NOT `bytes32`) — EIP-712 type
     /// `OrderCancellations(bytes[] orderUids)`.
-    #[derive(Debug)]
+    #[derive(Debug, Serialize)]
     struct OrderCancellations {
         bytes[] orderUids;
     }
@@ -168,7 +169,7 @@ pub async fn sign_order(
 }
 
 /// The `OrderCancellations` EIP-712 message for a set of 56-byte order UIDs.
-fn build_cancellations(uids: &[[u8; 56]]) -> OrderCancellations {
+pub fn build_cancellations(uids: &[[u8; 56]]) -> OrderCancellations {
     OrderCancellations {
         orderUids: uids.iter().map(|u| Bytes::copy_from_slice(u)).collect(),
     }

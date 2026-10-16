@@ -1,4 +1,5 @@
-//! The records Kao keeps in the vault: WalletConnect connection history and signed-message history.
+//! The records Kao keeps in the vault: WalletConnect connection history and signed-message history
+//! (what dapps had signed over WalletConnect, and Kao's own CoW Protocol order signatures).
 //!
 //! Plain data. Every struct is `#[serde(default)]` so a field can be added later without a format
 //! break (the vault stores these as `serde_json`, not postcard — see the module doc of
@@ -6,14 +7,15 @@
 //!
 //! Dapp strings in here ([`DappRecord`], `primary_type`) were sanitized at ingress (`DappLabel`,
 //! the typed-data model) before they were recorded; they are rendered only in mono boxes or as
-//! "calls itself …", like everywhere else.
+//! "calls itself …", like everywhere else. A CoW record's token symbols ([`CowOrderRecord`]) come
+//! from token metadata, not a dapp, but are just as untrusted: the pane sanitizes them on display.
 //!
 //! [`SignedRecord`], [`NewSigned`] and [`SignedPayload`] carry what was signed and the signature,
 //! so their `Debug` is hand-written and prints neither.
 
 use std::fmt;
 
-use alloy::primitives::{Address, B256, Bytes};
+use alloy::primitives::{Address, B256, Bytes, U256};
 use serde::{Deserialize, Serialize};
 
 // ───────────────────────────── shared parts ─────────────────────────────
@@ -151,18 +153,20 @@ pub struct NewConnection {
 
 // ───────────────────────────── signed messages ─────────────────────────────
 
-/// Whether a signed answer reached the dapp.
+/// Whether a signed answer reached the dapp — for a CoW signature, whether the orderbook took it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Delivery {
     /// Not known to have reached the dapp (also the default for a record missing the field — the
-    /// signature-on-disk rule then keeps only its hash).
+    /// signature-on-disk rule then keeps only its hash). A CoW record stays here when Kao locked
+    /// or quit before the orderbook answered.
     #[default]
     Sending,
     Delivered,
     NotDelivered,
 }
 
-/// Where a signature request came from. CoW orders / cancellations are a follow-up variant.
+/// Where a signature request came from: a dapp over WalletConnect, or Kao's own CoW swap (an order,
+/// or the off-chain cancellation of one), whose delivery is the orderbook taking it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SignOrigin {
     WalletConnect {
@@ -174,6 +178,39 @@ pub enum SignOrigin {
         #[serde(default)]
         dapp: DappRecord,
     },
+    /// A CoW Protocol sell order: the GPv2 `Order` (EIP-712), signed by the account or, for a
+    /// Safe, an EIP-1271 SafeMessage over its digest.
+    CowOrder {
+        #[serde(default)]
+        order: CowOrderRecord,
+    },
+    /// The off-chain cancellation of a CoW order (`OrderCancellations`, EIP-712 — or a Safe's
+    /// EIP-1271 SafeMessage over its digest). `order` is the order it cancels, as Kao tracked it.
+    CowCancel {
+        #[serde(default)]
+        order: CowOrderRecord,
+    },
+}
+
+/// The CoW order a signature placed or cancelled, for the history row: what it sells and the least
+/// it buys. Symbols are token metadata — untrusted, sanitized on display.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CowOrderRecord {
+    /// The order's UID: `0x` + 56 bytes (`orderDigest ‖ owner ‖ validTo`).
+    pub uid: String,
+    pub sell_token: Address,
+    pub sell_symbol: String,
+    pub sell_decimals: u8,
+    /// Atoms sold.
+    pub sell_amount: U256,
+    pub buy_token: Address,
+    pub buy_symbol: String,
+    pub buy_decimals: u8,
+    /// The least the order buys, in atoms (the signed `buyAmount`).
+    pub buy_amount: U256,
+    /// Unix seconds.
+    pub valid_to: u32,
 }
 
 /// Only so the `#[serde(default)]` records can default a missing field.
@@ -230,7 +267,8 @@ pub enum SignedKind {
     /// `personal_sign` by an EOA.
     #[default]
     Message,
-    /// `eth_signTypedData(_v4)` by an EOA.
+    /// EIP-712 typed data by an EOA: a dapp's `eth_signTypedData(_v4)`, or a CoW order /
+    /// cancellation.
     TypedData,
     /// Either of the above by a Safe (an EIP-1271 SafeMessage its owners signed).
     SafeMessage,
@@ -261,11 +299,12 @@ pub struct SignedRecord {
     pub payload: SignedPayload,
     pub digests: Vec<DigestRow>,
     /// The raw signature. In memory from the moment it is recorded; in this record's row only once
-    /// `delivery == Delivered` (a signature that never reached the dapp is not kept as a usable
-    /// bearer token) — otherwise `None` here after a reload, with only `signature_hash` /
-    /// `signature_len`, until a delivery hands it back (`VaultSession::message_delivery`). An
-    /// undelivered WalletConnect answer's signature is on disk only in the encrypted saved-state
-    /// outbox, for the re-send, and leaves with its outbox entry.
+    /// `delivery == Delivered` (a signature that never reached the dapp — or the CoW orderbook — is
+    /// not kept as a usable bearer token) — otherwise `None` here after a reload, with only
+    /// `signature_hash` / `signature_len`, until a delivery hands it back
+    /// (`VaultSession::message_delivery`). An undelivered WalletConnect answer's signature is on
+    /// disk only in the encrypted saved-state outbox, for the re-send, and leaves with its outbox
+    /// entry; an undelivered CoW signature isn't on disk at all (Kao never re-sends one).
     pub signature: Option<Bytes>,
     /// `keccak256(signature)`.
     pub signature_hash: B256,
@@ -391,6 +430,54 @@ mod tests {
         };
         let dbg = format!("{full:?}");
         assert!(!dbg.contains("secret") && !dbg.contains("dead"), "{dbg}");
+    }
+
+    /// The CoW origins round-trip, and one missing its order (or any order field) still decodes.
+    #[test]
+    fn cow_origins_round_trip_and_tolerate_missing_fields() {
+        let order = CowOrderRecord {
+            uid: format!("0x{}", "ab".repeat(56)),
+            sell_token: Address::repeat_byte(0x01),
+            sell_symbol: "WETH".into(),
+            sell_decimals: 18,
+            sell_amount: U256::from(10).pow(U256::from(18)),
+            buy_token: Address::repeat_byte(0x02),
+            buy_symbol: "USDC".into(),
+            buy_decimals: 6,
+            buy_amount: U256::from(2_400_000_000u64),
+            valid_to: 1_900_000_000,
+        };
+        for origin in [
+            SignOrigin::CowOrder {
+                order: order.clone(),
+            },
+            SignOrigin::CowCancel {
+                order: order.clone(),
+            },
+        ] {
+            let rec = SignedRecord {
+                id: 4,
+                origin,
+                kind: SignedKind::TypedData,
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&rec).unwrap();
+            let back: SignedRecord = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, rec);
+        }
+        let bare: SignedRecord = serde_json::from_str(r#"{"origin":{"CowCancel":{}}}"#).unwrap();
+        assert_eq!(
+            bare.origin,
+            SignOrigin::CowCancel {
+                order: CowOrderRecord::default()
+            }
+        );
+        let partial: SignedRecord =
+            serde_json::from_str(r#"{"origin":{"CowOrder":{"order":{"sell_symbol":"DAI"}}}}"#)
+                .unwrap();
+        assert!(
+            matches!(&partial.origin, SignOrigin::CowOrder { order } if order.sell_symbol == "DAI")
+        );
     }
 
     #[test]

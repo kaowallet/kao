@@ -116,6 +116,7 @@ use crate::chain::{Chain, PerChain};
 use crate::cow::{
     self,
     composer::SwapDraft,
+    history::CowHistory,
     tracked::{OrderStatus, TrackedOrder},
 };
 use crate::indexer::IndexedTx;
@@ -2030,10 +2031,21 @@ impl WalletScreen {
                 self.resolve_cow_error(host, msg);
                 return Task::none();
             };
+            let history = self.cow_history(true);
             let handoff = self.park_signer_for_order();
-            spawn_cow_place_safe(self.network.clone(), host, handoff, draft, quote, ctx, pin)
+            spawn_cow_place_safe(
+                self.network.clone(),
+                host,
+                handoff,
+                draft,
+                quote,
+                ctx,
+                pin,
+                history,
+            )
         } else {
             let desc = self.active_signer_descriptor();
+            let history = self.cow_history(false);
             let handoff = self.park_signer_for_order();
             spawn_cow_place(
                 self.network.clone(),
@@ -2043,8 +2055,34 @@ impl WalletScreen {
                 draft,
                 quote,
                 self.address,
+                history,
             )
         }
+    }
+
+    /// Where a CoW sign task records what it signs, for Settings → Signed messages (`None` before
+    /// the App hands the dashboard its vault): the active Safe — its owners sign for it — when
+    /// `safe`, else the active account itself. Named as Kao names them now.
+    fn cow_history(&self, safe: bool) -> Option<CowHistory> {
+        let vault = self.wc_vault()?;
+        let account = match self.active_safe_descriptor().filter(|_| safe) {
+            Some(s) => crate::vault::AccountRef::Safe {
+                address: s.address(),
+                chain_id: s.chain_id,
+                label: wc_flow::identity_label(&s.display_name(self.active_safe.unwrap_or(0))),
+            },
+            None => crate::vault::AccountRef::Eoa {
+                address: self.address,
+                label: wc_flow::identity_label(
+                    &self
+                        .accounts
+                        .get(self.active_index)
+                        .map(|a| a.display_name(self.active_index))
+                        .unwrap_or_else(|| format!("Account {}", self.active_index + 1)),
+                ),
+            },
+        };
+        Some(CowHistory::new(vault.session(), account))
     }
 
     /// Spawn the right off-chain cancel task for `uid`. A Safe-owned order
@@ -2053,11 +2091,11 @@ impl WalletScreen {
     /// resolves through the same `CowCancel` handler. No-op if the order isn't
     /// tracked, or (for a Safe order) if a valid signing context can't be built.
     fn cancel_order_task(&mut self, host: CowHost, uid: String) -> Task<Message> {
-        let Some((chain, owner)) = self
+        let Some((chain, owner, order)) = self
             .tracked_orders
             .iter()
             .find(|o| o.uid == uid)
-            .map(|o| (o.chain, o.owner))
+            .map(|o| (o.chain, o.owner, cow_order_record(o)))
         else {
             return Task::none();
         };
@@ -2069,12 +2107,23 @@ impl WalletScreen {
                 warn!(%uid, "cow: cannot cancel Safe order — no valid signing context");
                 return Task::none();
             };
+            let history = self.cow_history(true);
             let handoff = self.park_signer_for_order();
-            spawn_cow_cancel_safe(self.network.clone(), handoff, host, chain, uid, ctx)
+            spawn_cow_cancel_safe(
+                self.network.clone(),
+                handoff,
+                host,
+                chain,
+                uid,
+                ctx,
+                history,
+                order,
+            )
         } else {
             let desc = self.active_signer_descriptor();
+            let history = self.cow_history(false);
             let handoff = self.park_signer_for_order();
-            spawn_cow_cancel(handoff, desc, host, chain, uid)
+            spawn_cow_cancel(handoff, desc, host, chain, uid, history, order)
         }
     }
 
@@ -10793,6 +10842,22 @@ fn build_order_review(
     }
 }
 
+/// A tracked order as the signed-message history records the order a cancellation cancels.
+fn cow_order_record(o: &TrackedOrder) -> crate::vault::CowOrderRecord {
+    crate::vault::CowOrderRecord {
+        uid: o.uid.clone(),
+        sell_token: o.sell_token,
+        sell_symbol: o.sell_symbol.clone(),
+        sell_decimals: o.sell_decimals,
+        sell_amount: o.sell_amount,
+        buy_token: o.buy_token,
+        buy_symbol: o.buy_symbol.clone(),
+        buy_decimals: o.buy_decimals,
+        buy_amount: o.buy_amount,
+        valid_to: o.valid_to,
+    }
+}
+
 /// `0xabcd…ef01` short form of a 56-byte order UID hex string, for the cancel
 /// review subtitle.
 fn short_order_uid(uid: &str) -> String {
@@ -12805,6 +12870,7 @@ fn spawn_pool_ragequit_prove(
 /// (EthFlow `createOrder`). Runs the whole sequence in one task; the modal shows
 /// a "Placing…" phase meanwhile. The signer rides in via `handoff` and back out
 /// in the result message.
+#[allow(clippy::too_many_arguments)]
 fn spawn_cow_place(
     network: Arc<dyn BalanceFetcher>,
     host: CowHost,
@@ -12813,6 +12879,7 @@ fn spawn_cow_place(
     draft: SwapDraft,
     quote: crate::cow::api::QuoteResponse,
     user: Address,
+    history: Option<CowHistory>,
 ) -> Task<Message> {
     let inner = handoff.clone();
     let chain = draft.chain;
@@ -12829,7 +12896,16 @@ fn spawn_cow_place(
                 Ok(s) => s,
                 Err(e) => return Err::<TrackedOrder, String>(e),
             };
-            let result = cow_place_order(&network, &provider, &signer, &draft, &quote, user).await;
+            let result = cow_place_order(
+                &network,
+                &provider,
+                &signer,
+                &draft,
+                &quote,
+                user,
+                history.as_ref(),
+            )
+            .await;
             if let Ok(mut g) = inner.lock() {
                 *g = Some(signer);
             }
@@ -12881,7 +12957,8 @@ async fn cow_preflight_sim(
     }
 }
 
-/// The order-placement sequence shared by both surfaces.
+/// The order-placement sequence shared by both surfaces. The ERC-20 order's signature is recorded
+/// in Settings → Signed messages (`history`); a native order signs a transaction, not a message.
 async fn cow_place_order(
     network: &Arc<dyn BalanceFetcher>,
     provider: &alloy::providers::RootProvider<alloy::network::Ethereum>,
@@ -12889,6 +12966,7 @@ async fn cow_place_order(
     draft: &SwapDraft,
     quote: &crate::cow::api::QuoteResponse,
     user: Address,
+    history: Option<&CowHistory>,
 ) -> Result<TrackedOrder, String> {
     let chain = draft.chain;
     let q = &quote.quote;
@@ -12995,61 +13073,66 @@ async fn cow_place_order(
             draft.slippage_bps,
             app_data_hash,
         );
-        let domain = cow::order::cow_domain(chain);
-        let sig = cow::order::sign_order(signer, &order, &domain).await?;
-        // Register the appData doc first, mirroring the cow-sdk (which uploads
-        // before posting). The order body also carries the full pre-image, so a
-        // transient failure here isn't fatal — log and proceed.
-        let app_data_hex = format!("{app_data_hash:#x}");
-        if let Err(e) = cow::api::upload_app_data(chain, &app_data_hex, &full_app_data).await {
-            warn!(error = %e, "cow: appData upload failed (proceeding; order carries the pre-image)");
-        }
-        let body = cow::api::OrderCreation {
-            sell_token: order.sellToken,
-            buy_token: order.buyToken,
-            receiver: order.receiver,
-            sell_amount: order.sellAmount,
-            buy_amount: order.buyAmount,
-            valid_to: order.validTo,
-            // POST the exact pre-image of the signed appData hash (and the hash
-            // itself) so the orderbook reproduces it and reads orderClass=market.
-            app_data: full_app_data,
-            app_data_hash: app_data_hex,
-            fee_amount: order.feeAmount,
-            kind: "sell".to_string(),
-            partially_fillable: false,
-            sell_token_balance: "erc20".to_string(),
-            buy_token_balance: "erc20".to_string(),
-            signing_scheme: "eip712".to_string(),
-            signature: format!("0x{}", alloy::hex::encode(sig.as_bytes())),
-            from: user,
-            quote_id: quote.id,
-        };
-        // POST with a short retry when we *just* approved: on Base a tx is
-        // visible to us via a ~200ms flashblock preconfirmation, but CoW's
-        // orderbook only sees the allowance once it indexes the canonical block
-        // — a few seconds later. POSTing in that window 400s with "must give
-        // allowance to VaultRelayer" even though the approval is on-chain. Retry
-        // a few times so the orderbook can catch up. (No race when allowance was
-        // already present — `needs_approve` is false and we post once.)
-        let mut uid_result = cow::api::post_order(chain, &body).await;
-        if needs_approve {
-            let mut attempt = 0u32;
-            while let Err(e) = &uid_result {
-                if attempt >= 5 || !e.to_lowercase().contains("allowance") {
-                    break;
-                }
-                attempt += 1;
-                warn!(
-                    attempt,
-                    error = %e,
-                    "cow: orderbook hasn't indexed the fresh approval yet; retrying POST",
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                uid_result = cow::api::post_order(chain, &body).await;
+        let quote_id = quote.id;
+        let posted = order.clone();
+        let submit = move |sig: alloy::primitives::Signature| async move {
+            // Register the appData doc first, mirroring the cow-sdk (which uploads
+            // before posting). The order body also carries the full pre-image, so a
+            // transient failure here isn't fatal — log and proceed.
+            let app_data_hex = format!("{app_data_hash:#x}");
+            if let Err(e) = cow::api::upload_app_data(chain, &app_data_hex, &full_app_data).await {
+                warn!(error = %e, "cow: appData upload failed (proceeding; order carries the pre-image)");
             }
-        }
-        let uid = uid_result?;
+            let body = cow::api::OrderCreation {
+                sell_token: posted.sellToken,
+                buy_token: posted.buyToken,
+                receiver: posted.receiver,
+                sell_amount: posted.sellAmount,
+                buy_amount: posted.buyAmount,
+                valid_to: posted.validTo,
+                // POST the exact pre-image of the signed appData hash (and the hash
+                // itself) so the orderbook reproduces it and reads orderClass=market.
+                app_data: full_app_data,
+                app_data_hash: app_data_hex,
+                fee_amount: posted.feeAmount,
+                kind: "sell".to_string(),
+                partially_fillable: false,
+                sell_token_balance: "erc20".to_string(),
+                buy_token_balance: "erc20".to_string(),
+                signing_scheme: "eip712".to_string(),
+                signature: format!("0x{}", alloy::hex::encode(sig.as_bytes())),
+                from: user,
+                quote_id,
+            };
+            // POST with a short retry when we *just* approved: on Base a tx is
+            // visible to us via a ~200ms flashblock preconfirmation, but CoW's
+            // orderbook only sees the allowance once it indexes the canonical block
+            // — a few seconds later. POSTing in that window 400s with "must give
+            // allowance to VaultRelayer" even though the approval is on-chain. Retry
+            // a few times so the orderbook can catch up. (No race when allowance was
+            // already present — `needs_approve` is false and we post once.)
+            let mut uid_result = cow::api::post_order(chain, &body).await;
+            if needs_approve {
+                let mut attempt = 0u32;
+                while let Err(e) = &uid_result {
+                    if attempt >= 5 || !e.to_lowercase().contains("allowance") {
+                        break;
+                    }
+                    attempt += 1;
+                    warn!(
+                        attempt,
+                        error = %e,
+                        "cow: orderbook hasn't indexed the fresh approval yet; retrying POST",
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    uid_result = cow::api::post_order(chain, &body).await;
+                }
+            }
+            uid_result
+        };
+        let uid =
+            cow_sign_submit_order(signer, &order, chain, history, &order_tokens(draft), submit)
+                .await?;
         Ok(TrackedOrder {
             uid,
             chain,
@@ -13069,6 +13152,88 @@ async fn cow_place_order(
             is_ethflow: false,
         })
     }
+}
+
+/// The tokens `draft` trades, as the history records them.
+fn order_tokens(draft: &SwapDraft) -> crate::cow::history::OrderTokens {
+    crate::cow::history::OrderTokens {
+        sell_symbol: draft.sell_symbol.clone(),
+        sell_decimals: draft.sell_decimals,
+        buy_symbol: draft.buy_symbol.clone(),
+        buy_decimals: draft.buy_decimals,
+    }
+}
+
+/// The EOA order's signature, from signing to the orderbook's answer: sign `order` (EIP-712) with
+/// `signer`, record it in `history`, hand it to `submit` (the appData upload + POST, which returns
+/// the UID) and settle the record by the answer. `submit` is a parameter so tests can stand in for
+/// the orderbook.
+async fn cow_sign_submit_order<F, Fut>(
+    signer: &KaoSigner,
+    order: &cow::order::Order,
+    chain: crate::chain::Chain,
+    history: Option<&CowHistory>,
+    tokens: &crate::cow::history::OrderTokens,
+    submit: F,
+) -> Result<String, String>
+where
+    F: FnOnce(alloy::primitives::Signature) -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
+    let sig = cow::order::sign_order(signer, order, &cow::order::cow_domain(chain)).await?;
+    let pending = history.map(|h| h.order_signed(order, chain, tokens, &sig.as_bytes()));
+    let result = submit(sig).await;
+    if let Some(p) = pending {
+        p.settle(&result);
+    }
+    result
+}
+
+/// [`cow_sign_submit_order`] for a Safe: the owners sign the order digest as an EIP-1271
+/// `SafeMessage`, the blob is recorded, checked against the live Safe (`isValidSignature`)
+/// before it leaves the wallet, then handed to `submit`. A blob the Safe rejects never reaches the
+/// orderbook: its record is settled not delivered.
+#[allow(clippy::too_many_arguments)]
+async fn cow_sign_submit_order_safe<F, Fut>(
+    network: &Arc<dyn BalanceFetcher>,
+    owners: &[KaoSigner],
+    order: &cow::order::Order,
+    safe: Address,
+    chain: crate::chain::Chain,
+    history: Option<&CowHistory>,
+    tokens: &crate::cow::history::OrderTokens,
+    submit: F,
+) -> Result<String, String>
+where
+    F: FnOnce(Bytes) -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
+    let order_digest = cow::order::order_digest(order, &cow::order::cow_domain(chain));
+    let signature = cow::safe_sig::sign_eip1271_digest(
+        owners,
+        order_digest,
+        safe,
+        chain,
+        crate::safe::tx::OwnerSigMode::Auto,
+    )
+    .await?;
+    let pending = history.map(|h| h.order_signed(order, chain, tokens, &signature));
+    let result = async {
+        cow::safe_sig::verify_eip1271_on_chain(
+            network.as_ref(),
+            safe,
+            chain,
+            order_digest,
+            &signature,
+        )
+        .await?;
+        submit(signature).await
+    }
+    .await;
+    if let Some(p) = pending {
+        p.settle(&result);
+    }
+    result
 }
 
 /// Everything the Safe-swap place task needs that isn't in the draft/quote:
@@ -13319,6 +13484,7 @@ fn spawn_cow_place_safe(
     quote: crate::cow::api::QuoteResponse,
     ctx: SafeSwapCtx,
     pin: Option<sign_review::CowSafePin>,
+    history: Option<CowHistory>,
 ) -> Task<Message> {
     Task::perform(
         async move {
@@ -13352,7 +13518,15 @@ fn spawn_cow_place_safe(
                 None => &owners[0],
             };
             cow_place_order_safe(
-                &network, &provider, &owners, executor, &draft, &quote, &ctx, pin,
+                &network,
+                &provider,
+                &owners,
+                executor,
+                &draft,
+                &quote,
+                &ctx,
+                pin,
+                history.as_ref(),
             )
             .await
         },
@@ -13488,6 +13662,7 @@ async fn cow_place_order_safe(
     quote: &crate::cow::api::QuoteResponse,
     ctx: &SafeSwapCtx,
     pin: Option<sign_review::CowSafePin>,
+    history: Option<&CowHistory>,
 ) -> Result<TrackedOrder, String> {
     use crate::safe::tx::{
         Operation, SafeTxInput, assemble_signatures, build_safe_tx_with_nonce, current_safe_nonce,
@@ -13636,7 +13811,8 @@ async fn cow_place_order_safe(
     }
 
     // 2. Build the order (receiver = the Safe), sign EIP-1271, and verify the
-    //    blob against the live Safe before it leaves the wallet.
+    //    blob against the live Safe before it leaves the wallet
+    //    (`cow_sign_submit_order_safe`, which records the signature).
     let order = cow::order::build_sell_order(
         draft.sell_token,
         draft.buy_token,
@@ -13654,57 +13830,61 @@ async fn cow_place_order_safe(
         cow::safe_sig::safe_message_hash(order_digest, safe, chain),
         pin.msg_hash,
     )?;
-    let signature = cow::safe_sig::sign_eip1271_digest(
+    // 3. Upload the appData pre-image, then POST the eip1271 order.
+    let quote_id = quote.id;
+    let posted = order.clone();
+    let submit = move |signature: Bytes| async move {
+        let app_data_hex = format!("{app_data_hash:#x}");
+        if let Err(e) = cow::api::upload_app_data(chain, &app_data_hex, &full_app_data).await {
+            warn!(error = %e, "cow(safe): appData upload failed (proceeding; order carries the pre-image)");
+        }
+        let body = cow::api::OrderCreation {
+            sell_token: posted.sellToken,
+            buy_token: posted.buyToken,
+            receiver: posted.receiver,
+            sell_amount: posted.sellAmount,
+            buy_amount: posted.buyAmount,
+            valid_to: posted.validTo,
+            app_data: full_app_data,
+            app_data_hash: app_data_hex,
+            fee_amount: posted.feeAmount,
+            kind: "sell".to_string(),
+            partially_fillable: false,
+            sell_token_balance: "erc20".to_string(),
+            buy_token_balance: "erc20".to_string(),
+            signing_scheme: "eip1271".to_string(),
+            signature: format!("0x{}", alloy::hex::encode(&signature)),
+            from: safe,
+            quote_id,
+        };
+        // Same fresh-approval indexing race as the EOA path: after our approval
+        // mines, the orderbook may not see the Safe's allowance for a few seconds.
+        let mut uid_result = cow::api::post_order(chain, &body).await;
+        if needs_approve {
+            let mut attempt = 0u32;
+            while let Err(e) = &uid_result {
+                if attempt >= 5 || !e.to_lowercase().contains("allowance") {
+                    break;
+                }
+                attempt += 1;
+                warn!(attempt, error = %e, "cow(safe): orderbook hasn't indexed the fresh approval yet; retrying POST");
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                uid_result = cow::api::post_order(chain, &body).await;
+            }
+        }
+        uid_result
+    };
+    let uid = cow_sign_submit_order_safe(
+        network,
         owners,
-        order_digest,
+        &order,
         safe,
         chain,
-        crate::safe::tx::OwnerSigMode::Auto,
+        history,
+        &order_tokens(draft),
+        submit,
     )
     .await?;
-    cow::safe_sig::verify_eip1271_on_chain(network.as_ref(), safe, chain, order_digest, &signature)
-        .await?;
-
-    // 3. Upload the appData pre-image, then POST the eip1271 order.
-    let app_data_hex = format!("{app_data_hash:#x}");
-    if let Err(e) = cow::api::upload_app_data(chain, &app_data_hex, &full_app_data).await {
-        warn!(error = %e, "cow(safe): appData upload failed (proceeding; order carries the pre-image)");
-    }
-    let body = cow::api::OrderCreation {
-        sell_token: order.sellToken,
-        buy_token: order.buyToken,
-        receiver: order.receiver,
-        sell_amount: order.sellAmount,
-        buy_amount: order.buyAmount,
-        valid_to: order.validTo,
-        app_data: full_app_data,
-        app_data_hash: app_data_hex,
-        fee_amount: order.feeAmount,
-        kind: "sell".to_string(),
-        partially_fillable: false,
-        sell_token_balance: "erc20".to_string(),
-        buy_token_balance: "erc20".to_string(),
-        signing_scheme: "eip1271".to_string(),
-        signature: format!("0x{}", alloy::hex::encode(&signature)),
-        from: safe,
-        quote_id: quote.id,
-    };
-    // Same fresh-approval indexing race as the EOA path: after our approval
-    // mines, the orderbook may not see the Safe's allowance for a few seconds.
-    let mut uid_result = cow::api::post_order(chain, &body).await;
-    if needs_approve {
-        let mut attempt = 0u32;
-        while let Err(e) = &uid_result {
-            if attempt >= 5 || !e.to_lowercase().contains("allowance") {
-                break;
-            }
-            attempt += 1;
-            warn!(attempt, error = %e, "cow(safe): orderbook hasn't indexed the fresh approval yet; retrying POST");
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-            uid_result = cow::api::post_order(chain, &body).await;
-        }
-    }
-    let uid = uid_result?;
     Ok(TrackedOrder {
         uid,
         chain,
@@ -13727,13 +13907,16 @@ async fn cow_place_order_safe(
 
 /// Off-chain cancel an ERC-20 order (signed `DELETE /orders`). EthFlow orders
 /// cancel on-chain (deferred) and never reach here — the Apps pane hides their
-/// cancel affordance.
+/// cancel affordance. `order` is the order as tracked, for the signed-message
+/// history (`history`).
 fn spawn_cow_cancel(
     handoff: SignerHandoff,
     desc: AccountDescriptor,
     host: CowHost,
     chain: crate::chain::Chain,
     uid: String,
+    history: Option<CowHistory>,
+    order: crate::vault::CowOrderRecord,
 ) -> Task<Message> {
     let inner = handoff.clone();
     let uid_for_msg = uid.clone();
@@ -13743,7 +13926,15 @@ fn spawn_cow_cancel(
                 Ok(s) => s,
                 Err(e) => return Err::<(), String>(e),
             };
-            let res = cow_cancel(&signer, chain, &uid).await;
+            let res = cow_cancel(
+                &signer,
+                chain,
+                &uid,
+                history.as_ref(),
+                order,
+                move |body| async move { cow::api::delete_orders(chain, &body).await },
+            )
+            .await;
             if let Ok(mut g) = inner.lock() {
                 *g = Some(signer);
             }
@@ -13760,20 +13951,35 @@ fn spawn_cow_cancel(
     )
 }
 
-async fn cow_cancel(
+/// Sign the cancellation of `uid` (EIP-712 `OrderCancellations`) with the EOA `signer`, record it
+/// in `history`, hand the `DELETE /orders` body to `submit` and settle the record by its answer.
+/// `submit` is a parameter so tests can stand in for the orderbook.
+async fn cow_cancel<F, Fut>(
     signer: &KaoSigner,
     chain: crate::chain::Chain,
     uid: &str,
-) -> Result<(), String> {
+    history: Option<&CowHistory>,
+    order: crate::vault::CowOrderRecord,
+    submit: F,
+) -> Result<(), String>
+where
+    F: FnOnce(cow::api::CancellationBody) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
     let bytes = parse_order_uid(uid)?;
     let domain = cow::order::cow_domain(chain);
     let sig = cow::order::sign_cancellations(signer, &[bytes], &domain).await?;
+    let pending = history.map(|h| h.cancellation_signed(&bytes, chain, order, &sig.as_bytes()));
     let body = cow::api::CancellationBody {
         order_uids: vec![uid.to_string()],
         signature: format!("0x{}", alloy::hex::encode(sig.as_bytes())),
         signing_scheme: "eip712".to_string(),
     };
-    cow::api::delete_orders(chain, &body).await
+    let result = submit(body).await;
+    if let Some(p) = pending {
+        p.settle(&result);
+    }
+    result
 }
 
 /// EIP-1271 off-chain cancel of a Safe-owned order. No gas / executor — the
@@ -13782,6 +13988,7 @@ async fn cow_cancel(
 /// `isValidSignature`. Builds the Safe's owner signers (software or hardware)
 /// and reuses the same `CowCancel` result handler (the `handoff` carries the
 /// parked active signer straight back, untouched).
+#[allow(clippy::too_many_arguments)]
 fn spawn_cow_cancel_safe(
     network: Arc<dyn BalanceFetcher>,
     handoff: SignerHandoff,
@@ -13789,6 +13996,8 @@ fn spawn_cow_cancel_safe(
     chain: crate::chain::Chain,
     uid: String,
     ctx: SafeSwapCtx,
+    history: Option<CowHistory>,
+    order: crate::vault::CowOrderRecord,
 ) -> Task<Message> {
     let uid_for_msg = uid.clone();
     Task::perform(
@@ -13803,7 +14012,17 @@ fn spawn_cow_cancel_safe(
             if owners.is_empty() {
                 return Err("no signable owners for this Safe".into());
             }
-            cow_cancel_safe(&network, &owners, ctx.safe, chain, &uid).await
+            cow_cancel_safe(
+                &network,
+                &owners,
+                ctx.safe,
+                chain,
+                &uid,
+                history.as_ref(),
+                order,
+                move |body| async move { cow::api::delete_orders(chain, &body).await },
+            )
+            .await
         },
         move |result| Message::Signed {
             tag: SignTag::CowCancel {
@@ -13818,15 +14037,24 @@ fn spawn_cow_cancel_safe(
 
 /// The Safe variant of [`cow_cancel`]: sign the `OrderCancellations` digest as
 /// an EIP-1271 Safe message (owner signatures over the Safe-wrapped digest),
-/// verify it against the live Safe, then `DELETE /orders` with
-/// `signingScheme: eip1271`.
-async fn cow_cancel_safe(
+/// record it, verify it against the live Safe, then hand `submit` the
+/// `DELETE /orders` body with `signingScheme: eip1271`. A blob the Safe rejects
+/// is never sent: its record is settled not delivered.
+#[allow(clippy::too_many_arguments)]
+async fn cow_cancel_safe<F, Fut>(
     network: &Arc<dyn BalanceFetcher>,
     owners: &[KaoSigner],
     safe: Address,
     chain: crate::chain::Chain,
     uid: &str,
-) -> Result<(), String> {
+    history: Option<&CowHistory>,
+    order: crate::vault::CowOrderRecord,
+    submit: F,
+) -> Result<(), String>
+where
+    F: FnOnce(cow::api::CancellationBody) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
     let bytes = parse_order_uid(uid)?;
     let domain = cow::order::cow_domain(chain);
     let digest = cow::order::cancellations_digest(&[bytes], &domain);
@@ -13838,14 +14066,22 @@ async fn cow_cancel_safe(
         crate::safe::tx::OwnerSigMode::Auto,
     )
     .await?;
-    cow::safe_sig::verify_eip1271_on_chain(network.as_ref(), safe, chain, digest, &signature)
-        .await?;
-    let body = cow::api::CancellationBody {
-        order_uids: vec![uid.to_string()],
-        signature: format!("0x{}", alloy::hex::encode(&signature)),
-        signing_scheme: "eip1271".to_string(),
-    };
-    cow::api::delete_orders(chain, &body).await
+    let pending = history.map(|h| h.cancellation_signed(&bytes, chain, order, &signature));
+    let result = async {
+        cow::safe_sig::verify_eip1271_on_chain(network.as_ref(), safe, chain, digest, &signature)
+            .await?;
+        let body = cow::api::CancellationBody {
+            order_uids: vec![uid.to_string()],
+            signature: format!("0x{}", alloy::hex::encode(&signature)),
+            signing_scheme: "eip1271".to_string(),
+        };
+        submit(body).await
+    }
+    .await;
+    if let Some(p) = pending {
+        p.settle(&result);
+    }
+    result
 }
 
 fn parse_order_uid(uid: &str) -> Result<[u8; 56], String> {
@@ -21002,6 +21238,473 @@ mod tests {
         assert_eq!(left[0].topic, "b");
         let texts = history_texts(&screen);
         assert!(!texts.iter().any(|s| s == "a.example"), "{texts:?}");
+    }
+
+    // ── CoW signatures in Settings → Signed messages ─────────────────────
+
+    /// An unlocked, keyless vault (records stay in memory).
+    fn cow_vault() -> crate::vault::Vault {
+        let v = crate::vault::Vault::with_store_path(std::path::PathBuf::from(
+            "/nonexistent/kao-cow-history-dashboard-test.redb",
+        ));
+        v.unlock(
+            None,
+            crate::wallet::KeyStatus::Ok,
+            crate::wallet::SealedLoad::default(),
+        );
+        v
+    }
+
+    fn cow_local(seed: u8) -> KaoSigner {
+        KaoSigner::Local(crate::wallet::signer_from_bytes(&B256::repeat_byte(seed)).unwrap())
+    }
+
+    const COW_SAFE: Address = Address::repeat_byte(0x5a);
+
+    fn cow_history_for(
+        vault: &crate::vault::Vault,
+        account: crate::vault::AccountRef,
+    ) -> CowHistory {
+        CowHistory::new(vault.session(), account)
+    }
+
+    fn cow_test_order(receiver: Address) -> cow::order::Order {
+        cow::order::build_sell_order(
+            addr(0xE1),
+            addr(0xE2),
+            receiver,
+            U256::from(10).pow(U256::from(18)),
+            U256::from(2_500_000_000u64),
+            1_900_000_000,
+            50,
+            cow::market_app_data(50).1,
+        )
+    }
+
+    fn cow_tokens() -> cow::history::OrderTokens {
+        cow::history::OrderTokens {
+            sell_symbol: "WETH".into(),
+            sell_decimals: 18,
+            buy_symbol: "USDC".into(),
+            buy_decimals: 6,
+        }
+    }
+
+    /// The review's order panel for `order` — only `eip712` feeds the fingerprints.
+    fn cow_order_review(order: &cow::order::Order, chain: Chain) -> sign_review::OrderReview {
+        sign_review::OrderReview {
+            chain,
+            sell_amount: String::new(),
+            sell_symbol: String::new(),
+            buy_amount: String::new(),
+            buy_symbol: String::new(),
+            min_received: String::new(),
+            receiver: order.receiver,
+            valid_to: order.validTo,
+            slippage_bps: 50,
+            settlement: cow::SETTLEMENT,
+            native: false,
+            eip712: crate::sign::digest::Eip712Digests::of(order, &cow::order::cow_domain(chain)),
+        }
+    }
+
+    fn rows_of(rec: &crate::vault::SignedRecord) -> Vec<(String, B256)> {
+        rec.digests
+            .iter()
+            .map(|d| (d.label.clone(), d.hash))
+            .collect()
+    }
+
+    /// `isValidSignature(data_hash, blob)` on `COW_SAFE` answers the EIP-1271 magic.
+    fn cow_plant_valid(mock: &crate::net::CallMock, data_hash: B256, blob: &Bytes) {
+        use alloy::sol_types::{SolCall, SolValue};
+        mock.set_call(
+            COW_SAFE,
+            Bytes::from(
+                cow::safe_sig::isValidSignatureCall {
+                    _dataHash: data_hash,
+                    _signature: blob.clone(),
+                }
+                .abi_encode(),
+            ),
+            Bytes::from(alloy::primitives::FixedBytes::<4>([0x16, 0x26, 0xba, 0x7e]).abi_encode()),
+            true,
+        );
+    }
+
+    fn cow_safe_account() -> crate::vault::AccountRef {
+        crate::vault::AccountRef::Safe {
+            address: COW_SAFE,
+            chain_id: Chain::Base.chain_id(),
+            label: "Treasury".into(),
+        }
+    }
+
+    /// EOA order: recorded `Sending` the moment it is signed (before the POST), with the review's
+    /// fingerprints; settled by the orderbook's answer; the signature recorded is the one posted.
+    #[tokio::test]
+    async fn an_eoa_order_signature_is_recorded_then_settled_by_the_post() {
+        let vault = cow_vault();
+        let signer = cow_local(0x31);
+        let me = signer.address();
+        let h = cow_history_for(
+            &vault,
+            crate::vault::AccountRef::Eoa {
+                address: me,
+                label: "Account 1".into(),
+            },
+        );
+        let order = cow_test_order(me);
+        let posted = Arc::new(std::sync::Mutex::new(None));
+        let (v, seen) = (vault.clone(), posted.clone());
+        let uid = cow_sign_submit_order(
+            &signer,
+            &order,
+            Chain::Base,
+            Some(&h),
+            &cow_tokens(),
+            move |sig| async move {
+                let rec = &v.signed()[0];
+                assert_eq!(
+                    rec.delivery,
+                    crate::vault::Delivery::Sending,
+                    "recorded before the POST"
+                );
+                *seen.lock().unwrap() = Some(Bytes::copy_from_slice(&sig.as_bytes()));
+                Ok("0xuid".to_string())
+            },
+        )
+        .await;
+        assert_eq!(uid.as_deref(), Ok("0xuid"));
+        let rec = vault.signed().remove(0);
+        assert_eq!(rec.delivery, crate::vault::Delivery::Delivered);
+        assert_eq!(rec.signature, posted.lock().unwrap().clone());
+        assert_eq!(rec.kind, crate::vault::SignedKind::TypedData);
+        assert!(
+            matches!(&rec.origin, crate::vault::SignOrigin::CowOrder { order: o } if o.sell_symbol == "WETH")
+        );
+        assert_eq!(
+            rows_of(&rec),
+            sign_review::erc8213_rows(&sign_review::SignStep::Typed(cow_order_review(
+                &order,
+                Chain::Base
+            ))),
+            "the fingerprints the review showed, in its order and under its labels"
+        );
+        // The signature is the account's over the order digest.
+        let digest = cow::order::order_digest(&order, &cow::order::cow_domain(Chain::Base));
+        let sig =
+            alloy::primitives::Signature::try_from(&rec.signature.as_ref().unwrap()[..]).unwrap();
+        assert_eq!(sig.recover_address_from_prehash(&digest).unwrap(), me);
+
+        // Refused by the orderbook: not delivered.
+        let refused = cow_sign_submit_order(
+            &signer,
+            &order,
+            Chain::Base,
+            Some(&h),
+            &cow_tokens(),
+            |_| async { Err("400 Bad Request".to_string()) },
+        )
+        .await;
+        assert!(refused.is_err());
+        assert_eq!(
+            vault.signed()[0].delivery,
+            crate::vault::Delivery::NotDelivered
+        );
+        assert_eq!(vault.signed().len(), 2);
+        // No vault handed over: nothing recorded, the POST still runs.
+        let without = cow_sign_submit_order(
+            &signer,
+            &order,
+            Chain::Base,
+            None,
+            &cow_tokens(),
+            |_| async { Ok("0xuid".to_string()) },
+        )
+        .await;
+        assert_eq!(without.as_deref(), Ok("0xuid"));
+        assert_eq!(vault.signed().len(), 2);
+    }
+
+    /// Safe order: the owners' EIP-1271 blob is recorded (a SafeMessage with the review's
+    /// fingerprints), checked against the live Safe, then posted and settled; a blob the Safe
+    /// rejects never reaches the orderbook and is settled not delivered.
+    #[tokio::test]
+    async fn a_safe_order_signature_is_recorded_checked_then_settled() {
+        let vault = cow_vault();
+        let owners = vec![cow_local(0x41)];
+        let h = cow_history_for(&vault, cow_safe_account());
+        let order = cow_test_order(COW_SAFE);
+        let digest = cow::order::order_digest(&order, &cow::order::cow_domain(Chain::Base));
+        let blob = cow::safe_sig::sign_eip1271_digest(
+            &owners,
+            digest,
+            COW_SAFE,
+            Chain::Base,
+            crate::safe::tx::OwnerSigMode::Auto,
+        )
+        .await
+        .unwrap();
+        let mock = crate::net::CallMock::new();
+        cow_plant_valid(&mock, digest, &blob);
+        let net: Arc<dyn BalanceFetcher> = Arc::new(mock);
+        let sent = blob.clone();
+        let uid = cow_sign_submit_order_safe(
+            &net,
+            &owners,
+            &order,
+            COW_SAFE,
+            Chain::Base,
+            Some(&h),
+            &cow_tokens(),
+            move |signature| async move {
+                assert_eq!(signature, sent, "the blob checked is the blob posted");
+                Ok("0xsafe-uid".to_string())
+            },
+        )
+        .await;
+        assert_eq!(uid.as_deref(), Ok("0xsafe-uid"));
+        let rec = vault.signed().remove(0);
+        assert_eq!(rec.delivery, crate::vault::Delivery::Delivered);
+        assert_eq!(rec.signature.as_ref(), Some(&blob));
+        assert_eq!(rec.kind, crate::vault::SignedKind::SafeMessage);
+        assert_eq!(rec.account, cow_safe_account());
+        let review = sign_review::SafeMessageReview {
+            order: cow_order_review(&order, Chain::Base),
+            safe: COW_SAFE,
+            threshold: 1,
+            owner_count: 1,
+            order_digest: digest,
+            message_hash: cow::safe_sig::safe_message_hash(digest, COW_SAFE, Chain::Base),
+            eip712: cow::safe_sig::safe_message_digests(digest, COW_SAFE, Chain::Base),
+        };
+        assert_eq!(
+            rows_of(&rec),
+            sign_review::erc8213_rows(&sign_review::SignStep::SafeMessage(review))
+        );
+
+        // The Safe doesn't answer the magic: refused before any POST, not delivered.
+        let silent: Arc<dyn BalanceFetcher> = Arc::new(crate::net::CallMock::new());
+        let refused = cow_sign_submit_order_safe(
+            &silent,
+            &owners,
+            &order,
+            COW_SAFE,
+            Chain::Base,
+            Some(&h),
+            &cow_tokens(),
+            |_| async { panic!("a rejected EIP-1271 blob must not be posted") },
+        )
+        .await;
+        assert!(refused.is_err());
+        let rec = vault.signed().remove(0);
+        assert_eq!(rec.delivery, crate::vault::Delivery::NotDelivered);
+    }
+
+    fn cow_tracked(uid: &str) -> crate::vault::CowOrderRecord {
+        crate::vault::CowOrderRecord {
+            uid: uid.to_string(),
+            sell_symbol: "WETH".into(),
+            sell_decimals: 18,
+            sell_amount: U256::from(10).pow(U256::from(18)),
+            buy_symbol: "USDC".into(),
+            buy_decimals: 6,
+            buy_amount: U256::from(2_400_000_000u64),
+            ..Default::default()
+        }
+    }
+
+    /// EOA cancellation: recorded before the DELETE, with the order it cancels; settled by the
+    /// orderbook's answer; the signature recorded is the one sent.
+    #[tokio::test]
+    async fn an_eoa_cancellation_is_recorded_then_settled_by_the_delete() {
+        let vault = cow_vault();
+        let signer = cow_local(0x51);
+        let h = cow_history_for(
+            &vault,
+            crate::vault::AccountRef::Eoa {
+                address: signer.address(),
+                label: "Account 1".into(),
+            },
+        );
+        let uid = format!("0x{}", "cd".repeat(56));
+        let sent = Arc::new(std::sync::Mutex::new(String::new()));
+        let (v, seen) = (vault.clone(), sent.clone());
+        let ok = cow_cancel(
+            &signer,
+            Chain::Mainnet,
+            &uid,
+            Some(&h),
+            cow_tracked("stale"),
+            move |body| async move {
+                assert_eq!(v.signed()[0].delivery, crate::vault::Delivery::Sending);
+                assert_eq!(body.signing_scheme, "eip712");
+                *seen.lock().unwrap() = body.signature;
+                Ok(())
+            },
+        )
+        .await;
+        assert!(ok.is_ok());
+        let rec = vault.signed().remove(0);
+        assert_eq!(rec.delivery, crate::vault::Delivery::Delivered);
+        assert_eq!(
+            rec.signature.as_ref().map(alloy::hex::encode_prefixed),
+            Some(sent.lock().unwrap().clone())
+        );
+        assert_eq!(rec.kind, crate::vault::SignedKind::TypedData);
+        assert_eq!(rec.primary_type.as_deref(), Some("OrderCancellations"));
+        assert_eq!(
+            rec.origin,
+            crate::vault::SignOrigin::CowCancel {
+                order: cow_tracked(&uid)
+            },
+            "the order it cancels, under the UID signed"
+        );
+        let digest = cow::order::cancellations_digest(
+            &[parse_order_uid(&uid).unwrap()],
+            &cow::order::cow_domain(Chain::Mainnet),
+        );
+        assert_eq!(rec.digests[0].hash, digest);
+
+        let refused = cow_cancel(
+            &signer,
+            Chain::Mainnet,
+            &uid,
+            Some(&h),
+            cow_tracked(&uid),
+            |_| async { Err("404".to_string()) },
+        )
+        .await;
+        assert!(refused.is_err());
+        assert_eq!(
+            vault.signed()[0].delivery,
+            crate::vault::Delivery::NotDelivered
+        );
+        // A UID that doesn't parse is refused before anything is signed or recorded.
+        assert!(
+            cow_cancel(
+                &signer,
+                Chain::Mainnet,
+                "0x12",
+                Some(&h),
+                cow_tracked(""),
+                |_| async { Ok(()) }
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(vault.signed().len(), 2);
+    }
+
+    /// Safe cancellation: recorded, checked against the live Safe, sent and settled; a blob the
+    /// Safe rejects is never sent and is settled not delivered.
+    #[tokio::test]
+    async fn a_safe_cancellation_is_recorded_checked_then_settled() {
+        let vault = cow_vault();
+        let owners = vec![cow_local(0x61)];
+        let h = cow_history_for(&vault, cow_safe_account());
+        let uid = format!("0x{}", "ef".repeat(56));
+        let digest = cow::order::cancellations_digest(
+            &[parse_order_uid(&uid).unwrap()],
+            &cow::order::cow_domain(Chain::Base),
+        );
+        let blob = cow::safe_sig::sign_eip1271_digest(
+            &owners,
+            digest,
+            COW_SAFE,
+            Chain::Base,
+            crate::safe::tx::OwnerSigMode::Auto,
+        )
+        .await
+        .unwrap();
+        let mock = crate::net::CallMock::new();
+        cow_plant_valid(&mock, digest, &blob);
+        let net: Arc<dyn BalanceFetcher> = Arc::new(mock);
+        let ok = cow_cancel_safe(
+            &net,
+            &owners,
+            COW_SAFE,
+            Chain::Base,
+            &uid,
+            Some(&h),
+            cow_tracked(&uid),
+            |body| async move {
+                assert_eq!(body.signing_scheme, "eip1271");
+                Ok(())
+            },
+        )
+        .await;
+        assert!(ok.is_ok());
+        let rec = vault.signed().remove(0);
+        assert_eq!(rec.delivery, crate::vault::Delivery::Delivered);
+        assert_eq!(rec.signature.as_ref(), Some(&blob));
+        assert_eq!(rec.kind, crate::vault::SignedKind::SafeMessage);
+        assert_eq!(
+            rows_of(&rec).last().cloned(),
+            Some((
+                crate::sign::digest::COW_CANCELLATION_DIGEST_LABEL.to_string(),
+                digest
+            ))
+        );
+        assert_eq!(
+            rec.digests[0].hash,
+            cow::safe_sig::safe_message_hash(digest, COW_SAFE, Chain::Base)
+        );
+
+        let silent: Arc<dyn BalanceFetcher> = Arc::new(crate::net::CallMock::new());
+        let refused = cow_cancel_safe(
+            &silent,
+            &owners,
+            COW_SAFE,
+            Chain::Base,
+            &uid,
+            Some(&h),
+            cow_tracked(&uid),
+            |_| async { panic!("a rejected EIP-1271 blob must not be sent") },
+        )
+        .await;
+        assert!(refused.is_err());
+        assert_eq!(
+            vault.signed()[0].delivery,
+            crate::vault::Delivery::NotDelivered
+        );
+    }
+
+    /// The account a CoW record names: the active account, or the active Safe when its owners
+    /// sign — as Kao names them; none before the App hands over its vault.
+    #[test]
+    fn cow_history_names_the_account_or_safe_that_signs() {
+        let safe = Address::repeat_byte(0x5b);
+        let mut screen = safe_screen(Chain::Base.chain_id(), safe);
+        assert!(screen.cow_history(false).is_none(), "no vault yet");
+        let vault = cow_vault();
+        let _ = screen.set_wc_slot(crate::walletconnect::runtime::WcSlot::with_vault(
+            vault.clone(),
+        ));
+        let h = screen.cow_history(true).expect("a vault");
+        let order = cow_test_order(safe);
+        h.order_signed(&order, Chain::Base, &cow_tokens(), &[1; 65])
+            .settle(&Ok::<(), ()>(()));
+        assert_eq!(
+            vault.signed()[0].account,
+            crate::vault::AccountRef::Safe {
+                address: safe,
+                chain_id: Chain::Base.chain_id(),
+                label: screen.identity_name(),
+            }
+        );
+        let h = screen.cow_history(false).expect("a vault");
+        h.cancellation_signed(&[2; 56], Chain::Base, cow_tracked(""), &[2; 65])
+            .settle(&Ok::<(), ()>(()));
+        assert_eq!(
+            vault.signed()[0].account,
+            crate::vault::AccountRef::Eoa {
+                address: addr(0xAA),
+                label: "Account 1".into(),
+            },
+            "the account behind the Safe, for an order the Safe doesn't own"
+        );
     }
 
     /// Without a WalletConnect slot (tests, or before the App handed one over) the history panes

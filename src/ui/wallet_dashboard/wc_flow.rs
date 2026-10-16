@@ -525,7 +525,9 @@ fn eoa_kind(desc: &AccountDescriptor) -> Option<wc::EoaKind> {
     }
 }
 
-fn identity_label(name: &str) -> String {
+/// An account's or Safe's name as Kao shows it beside what it signed: sanitized and clamped. Also
+/// the CoW signed-message records' (`WalletScreen::cow_history`).
+pub(super) fn identity_label(name: &str) -> String {
     crate::sanitize::sanitize_display(name, IDENTITY_LABEL_CHARS).into_owned()
 }
 

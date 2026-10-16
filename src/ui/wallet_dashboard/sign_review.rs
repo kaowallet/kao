@@ -37,8 +37,8 @@ use crate::cow::composer::SwapDraft;
 use crate::decode::clear_sign::DecodeResult;
 use crate::names::registrar::{Namespace, RegisterPlan};
 use crate::sign::digest::{
-    self, CALLDATA_DIGEST_LABEL, DOMAIN_HASH_LABEL, EIP712_DIGEST_LABEL, Eip712Digests,
-    INNER_CALLDATA_DIGEST_LABEL, MESSAGE_HASH_LABEL,
+    self, CALLDATA_DIGEST_LABEL, COW_ORDER_DIGEST_LABEL, DOMAIN_HASH_LABEL, EIP712_DIGEST_LABEL,
+    Eip712Digests, INNER_CALLDATA_DIGEST_LABEL, MESSAGE_HASH_LABEL,
 };
 use crate::sign::typed::{IntoTypedModel, TypedDataModel, TypedRow, TypedValue};
 use crate::ui::kao_theme::KaoTheme;
@@ -1565,7 +1565,7 @@ pub(crate) fn erc8213_rows(step: &SignStep) -> Vec<(String, B256)> {
         }
         SignStep::SafeMessage(m) => {
             push_eip712(&mut rows, &m.eip712);
-            rows.push(("Order Digest (CoW EIP-712)".to_string(), m.order_digest));
+            rows.push((COW_ORDER_DIGEST_LABEL.to_string(), m.order_digest));
         }
         SignStep::Send(r) => {
             if let Some(cd) = r.calldata_digest {

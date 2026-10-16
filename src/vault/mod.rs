@@ -21,9 +21,11 @@
 //! changes; pruning (connections: newest 500, never an open one; signed messages: newest 500 and
 //! at most 16 MiB of payload) is written as `Delete`s in the same batch; a user's "Clear history"
 //! is a table `Clear` (the store compacts after it). A signed record's raw signature reaches disk
-//! only once the dapp has it (`Delivery::Delivered`); before that the row carries only
-//! `signature_hash` and `signature_len` — a signature that never reached the dapp must not sit in
-//! the file as a usable bearer token.
+//! only once the dapp has it — for a CoW order or cancellation, once the orderbook took it —
+//! (`Delivery::Delivered`); before that the row carries only `signature_hash` and
+//! `signature_len` — a signature that never reached the dapp must not sit in the file as a usable
+//! bearer token. A CoW sign task settles its record by id ([`VaultSession::record_signed`] →
+//! [`VaultSession::signed_delivery`]).
 //!
 //! The one exception is deliberate: the raw signature of an answer the dapp hasn't received yet
 //! is kept inside the saved WalletConnect state (the encrypted `wc_state` row's outbox), so that
@@ -32,7 +34,8 @@
 //! the signature back from it and the history row carries it from then on — history rows hold a
 //! raw signature only once it is `Delivered`.
 //!
-//! Layering: `walletconnect` → `vault` (the vault never names WalletConnect types).
+//! Layering: `walletconnect` → `vault` and `cow` → `vault` (the vault never names WalletConnect
+//! or CoW types; [`CowOrderRecord`] is its own plain copy).
 //!
 //! Plaintext format: `serde_json`, with every record `#[serde(default)]`-tolerant ([`records`]) so
 //! fields can be added without the postcard legacy rungs the wallet's own tables need — a
@@ -766,6 +769,14 @@ impl VaultSession {
     /// raw signature stays in memory and reaches this record's row only once delivered (until
     /// then, only the saved WalletConnect state's outbox holds it — see the module doc).
     pub fn message_signed(&self, rec: NewSigned) {
+        let _ = self.record_signed(rec);
+    }
+
+    /// [`Self::message_signed`], returning the new record's id — `None` when this session's epoch
+    /// has ended (nothing was recorded) — for a caller that settles the delivery itself
+    /// ([`Self::signed_delivery`]). Ids never repeat within an epoch (a clear doesn't reset them).
+    pub fn record_signed(&self, rec: NewSigned) -> Option<u64> {
+        let mut recorded = None;
         self.with_current("message_signed", |v| {
             let id = v.next_signed_id;
             v.next_signed_id = id.saturating_add(1);
@@ -791,6 +802,22 @@ impl VaultSession {
             ops.extend(v.prune_signed());
             v.emit(ops);
             v.bump();
+            recorded = Some(id);
+        });
+        recorded
+    }
+
+    /// The record `id` ([`Self::record_signed`] of this epoch) gets `d`; once `Delivered`, the
+    /// signature it holds in memory is written with it. A record pruned or cleared since is gone,
+    /// and this is a no-op.
+    pub fn signed_delivery(&self, id: u64, d: Delivery) {
+        self.with_current("signed_delivery", |v| {
+            if let Some(r) = v.signed.iter_mut().rev().find(|r| r.id == id) {
+                r.delivery = d;
+                let op = put_signed(r);
+                v.emit(vec![op]);
+                v.bump();
+            }
         });
     }
 
@@ -815,6 +842,7 @@ impl VaultSession {
                     request_id: id,
                     ..
                 } => t == topic && *id == request_id,
+                SignOrigin::CowOrder { .. } | SignOrigin::CowCancel { .. } => false,
             });
             if let Some(r) = found {
                 r.delivery = d;
@@ -1496,6 +1524,59 @@ mod tests {
         assert_eq!(rec.signature.as_ref().map(|b| b.as_ref()), Some(&sig[..]));
         assert_eq!(rec.delivery, Delivery::Delivered);
         within(v.lock().finish()).await;
+    }
+
+    /// A CoW sign task's path: `record_signed` hands back the id (`None` from an ended epoch),
+    /// `signed_delivery` settles that record alone — the raw signature reaching disk only once
+    /// delivered, never for a not-delivered one — and a WalletConnect delivery never touches it.
+    #[tokio::test]
+    async fn a_record_settled_by_id_keeps_its_signature_only_once_delivered() {
+        let (_dir, path, key) = wallet_file();
+        let v = unlocked_on(&path, &key);
+        let s = v.session();
+        let cow = |sig: &[u8]| NewSigned {
+            origin: SignOrigin::CowOrder {
+                order: CowOrderRecord::default(),
+            },
+            signature: Bytes::copy_from_slice(sig),
+            ..Default::default()
+        };
+        let delivered = s.record_signed(cow(&[0xaa; 65])).unwrap();
+        let refused = s.record_signed(cow(&[0xbb; 65])).unwrap();
+        assert_eq!(refused, delivered + 1);
+        // A WalletConnect delivery matches WalletConnect records only.
+        s.message_delivery("", 0, Delivery::Delivered, None);
+        assert!(v.signed().iter().all(|r| r.delivery == Delivery::Sending));
+
+        s.signed_delivery(delivered, Delivery::Delivered);
+        s.signed_delivery(refused, Delivery::NotDelivered);
+        let by_id = |id: u64| v.signed().into_iter().find(|r| r.id == id).unwrap();
+        assert_eq!(by_id(delivered).delivery, Delivery::Delivered);
+        assert_eq!(by_id(refused).delivery, Delivery::NotDelivered);
+        within(v.wait_writer_idle()).await;
+        let disk: Vec<(u64, Option<Bytes>, Delivery)> =
+            decoded::<SignedRecord>(&reload(&path).signed)
+                .into_iter()
+                .map(|(id, r)| (id, r.signature, r.delivery))
+                .collect();
+        assert_eq!(
+            disk,
+            vec![
+                (
+                    delivered,
+                    Some(Bytes::copy_from_slice(&[0xaa; 65])),
+                    Delivery::Delivered
+                ),
+                (refused, None, Delivery::NotDelivered),
+            ]
+        );
+
+        // Cleared since: settling it is a no-op. An ended epoch records nothing.
+        v.clear_signed();
+        s.signed_delivery(delivered, Delivery::Delivered);
+        assert!(v.signed().is_empty());
+        within(v.lock().finish()).await;
+        assert_eq!(s.record_signed(cow(&[1; 65])), None);
     }
 
     /// The record for WalletConnect request `(topic, _)`.

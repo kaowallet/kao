@@ -19,7 +19,7 @@ const SETTINGS_ROWS: &[(&str, &str, &str)] = &[
     (
         "Signed messages",
         "(｀・ω・´)ゞ",
-        "What you signed for dapps",
+        "What you signed for dapps · CoW swaps",
     ),
     (
         "Connection history",

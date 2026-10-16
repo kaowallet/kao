@@ -670,7 +670,7 @@ async fn prepare_safe_tx_call(
     let sender = safe.unwrap_or(Address::ZERO);
     let delegatecall = operation == 1;
     let batch = if delegatecall && canonical_multisend_call_only(to).is_some() {
-        decode_batch_sub_legs(network.as_ref(), net, sender, true, &data, &local_names)
+        decode_batch_sub_legs(network.as_ref(), net, sender, Some(to), &data, &local_names)
             .await
             .inspect_err(|e| warn!(error = %e, "wc: a SafeTx MultiSend batch didn't unpack"))
             .ok()
@@ -1933,11 +1933,12 @@ async fn sign_safe_message(
         let moved = owner_set_moved(network, chain, safe, threshold, owners).await;
         return Err(Failure::new(text, moved));
     }
-    // Only a handler that implements EIP-1271 can ever accept the signature: with any other, every
-    // owner would be prompted for a blob the Safe can't validate, on every retry.
-    match crate::safe::read_fallback_handler(network, chain, safe).await {
-        Ok(Some(handler)) if crate::safe::is_eip1271_handler(handler) => {}
-        Ok(_) => {
+    // Only a handler that implements EIP-1271 (for this Safe's version) can ever accept the
+    // signature: with any other, every owner would be prompted for a blob the Safe can't validate,
+    // on every retry.
+    match crate::safe::read_eip1271_support(network, chain, safe).await {
+        Ok(true) => {}
+        Ok(false) => {
             return Err(Failure::stale(
                 "this Safe's fallback handler can't validate EIP-1271 signatures, so the Safe \
                  could never accept a message signature — nothing was signed",

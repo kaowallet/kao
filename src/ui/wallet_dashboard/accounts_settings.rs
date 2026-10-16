@@ -768,6 +768,7 @@ mod tests {
             modules: Vec::new(),
             guard: None,
             fallback_handler: None,
+            module_guard: None,
             linked_signer_indices: linked,
             sibling_chains: Vec::new(),
             cached_at: 0,

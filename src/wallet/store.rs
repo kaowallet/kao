@@ -1354,6 +1354,26 @@ fn read_descriptor(
 /// test fixture that leaves it empty will not catch it. Test the fallback with
 /// the field *populated* (see `decode_safe_never_loses_a_populated_field`).
 fn decode_safe(plaintext: &[u8], idx: u32) -> Result<SafeDescriptor, WalletError> {
+    /// `SafeDescriptor` exactly as persisted before `module_guard` shipped
+    /// (Safe 1.5.0 support). Field order/types must never change.
+    #[derive(serde::Deserialize)]
+    struct LegacySafeV2 {
+        name: Option<String>,
+        chain_id: u64,
+        address: [u8; 20],
+        version: String,
+        trust: crate::wallet::SafeTrust,
+        threshold: u32,
+        owners: Vec<[u8; 20]>,
+        modules: Vec<[u8; 20]>,
+        guard: Option<[u8; 20]>,
+        fallback_handler: Option<[u8; 20]>,
+        linked_signer_indices: Vec<u32>,
+        sibling_chains: Vec<u64>,
+        cached_at: u64,
+        tx_service_url: Option<String>,
+    }
+
     /// `SafeDescriptor` exactly as persisted before `tx_service_url`
     /// shipped. Field order/types must never change.
     #[derive(serde::Deserialize)]
@@ -1376,6 +1396,27 @@ fn decode_safe(plaintext: &[u8], idx: u32) -> Result<SafeDescriptor, WalletError
     if let Ok(safe) = postcard::from_bytes::<SafeDescriptor>(plaintext) {
         return Ok(safe);
     }
+    if let Ok(legacy) = postcard::from_bytes::<LegacySafeV2>(plaintext) {
+        return Ok(SafeDescriptor {
+            name: legacy.name,
+            chain_id: legacy.chain_id,
+            address: legacy.address,
+            version: legacy.version,
+            trust: legacy.trust,
+            threshold: legacy.threshold,
+            owners: legacy.owners,
+            modules: legacy.modules,
+            guard: legacy.guard,
+            fallback_handler: legacy.fallback_handler,
+            linked_signer_indices: legacy.linked_signer_indices,
+            sibling_chains: legacy.sibling_chains,
+            cached_at: legacy.cached_at,
+            tx_service_url: legacy.tx_service_url,
+            // Unknown until the next refresh reads it; the unlock refresh
+            // fills it in for a 1.5.0 Safe.
+            module_guard: None,
+        });
+    }
     let legacy: LegacySafeV1 = postcard::from_bytes(plaintext)
         .map_err(|e| WalletError::Encryption(format!("deserialize safe {idx}: {e}")))?;
     Ok(SafeDescriptor {
@@ -1393,6 +1434,7 @@ fn decode_safe(plaintext: &[u8], idx: u32) -> Result<SafeDescriptor, WalletError
         sibling_chains: legacy.sibling_chains,
         cached_at: legacy.cached_at,
         tx_service_url: None,
+        module_guard: None,
     })
 }
 
@@ -2370,6 +2412,7 @@ mod tests {
             sibling_chains: Vec::new(),
             cached_at: 1_700_000_000,
             tx_service_url: None,
+            module_guard: None,
         }
     }
 
@@ -2394,6 +2437,7 @@ mod tests {
             sibling_chains: vec![1, 8453], // mainnet, base
             cached_at: 1_700_000_042,
             tx_service_url: Some("https://txs.example-dao.org".into()),
+            module_guard: Some([0xe1; 20]),
         }
     }
 
@@ -2429,6 +2473,42 @@ mod tests {
         assert_eq!(decode_safe(&bytes, 1).unwrap(), rich);
     }
 
+    #[test]
+    fn decode_safe_falls_back_to_pre_module_guard_layout() {
+        // A row written before Safe 1.5.0 support: everything up to and
+        // including `tx_service_url`. It has to load with its URL intact and
+        // `module_guard: None` (filled by the next refresh), not drop through
+        // to the V1 rung and lose the URL.
+        let rich = rich_safe(0x42);
+        let legacy_bytes = postcard::to_stdvec(&(
+            &rich.name,
+            rich.chain_id,
+            rich.address,
+            &rich.version,
+            &rich.trust,
+            rich.threshold,
+            &rich.owners,
+            &rich.modules,
+            rich.guard,
+            rich.fallback_handler,
+            &rich.linked_signer_indices,
+            &rich.sibling_chains,
+            rich.cached_at,
+            &rich.tx_service_url,
+        ))
+        .unwrap();
+        let decoded = decode_safe(&legacy_bytes, 0).unwrap();
+        assert_eq!(decoded.tx_service_url, rich.tx_service_url);
+        assert_eq!(decoded.module_guard, None);
+        assert_eq!(
+            decoded,
+            SafeDescriptor {
+                module_guard: None,
+                ..rich
+            },
+        );
+    }
+
     /// The guard on the *next* field addition, and the one the fallback test
     /// above cannot provide.
     ///
@@ -2449,11 +2529,16 @@ mod tests {
             rich.tx_service_url.is_some(),
             "the whole point is a populated newest field",
         );
+        assert!(rich.module_guard.is_some());
         let bytes = postcard::to_stdvec(&rich).unwrap();
+        let decoded = decode_safe(&bytes, 0).unwrap();
         assert_eq!(
-            decode_safe(&bytes, 0).unwrap().tx_service_url,
-            rich.tx_service_url,
+            decoded.tx_service_url, rich.tx_service_url,
             "the newest shape has to win over any legacy rung that also parses",
+        );
+        assert_eq!(
+            decoded.module_guard, rich.module_guard,
+            "nor may the pre-module-guard rung swallow a row that has one",
         );
 
         // And the mechanism behind that requirement, stated as a fact about the

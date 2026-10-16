@@ -713,6 +713,15 @@ pub struct SafeDescriptor {
     /// loader falls back to the pre-field layout for older wallets
     /// (`store::decode_safe`). New fields must keep appending.
     pub tx_service_url: Option<String>,
+    /// Module guard, if set (Safe ≥ 1.5.0; always `None` for older
+    /// versions, which have none). It runs before and after every module
+    /// transaction and can veto any of them, so a malicious one can cut a
+    /// Safe off from its recovery or allowance modules. It cannot move
+    /// funds itself.
+    ///
+    /// Appended after `tx_service_url` for the same postcard reason; see
+    /// `store::decode_safe` before appending anything else.
+    pub module_guard: Option<[u8; 20]>,
 }
 
 impl SafeDescriptor {
@@ -726,9 +735,10 @@ impl SafeDescriptor {
     }
 
     /// Take the cached on-chain state — version, trust, threshold, owners,
-    /// modules, guard, fallback handler and `cached_at` — from `fresh`, a
-    /// newer read of the same Safe, leaving everything the user configured
-    /// (name, linked signers, `sibling_chains`, service URL) as it is.
+    /// modules, guard, module guard, fallback handler and `cached_at` — from
+    /// `fresh`, a newer read of the same Safe, leaving everything the user
+    /// configured (name, linked signers, `sibling_chains`, service URL) as it
+    /// is.
     ///
     /// Skipped when `fresh` is older than what's cached, so a slow read can
     /// never roll the cache back. Returns whether it adopted.
@@ -742,6 +752,7 @@ impl SafeDescriptor {
         self.owners = fresh.owners.clone();
         self.modules = fresh.modules.clone();
         self.guard = fresh.guard;
+        self.module_guard = fresh.module_guard;
         self.fallback_handler = fresh.fallback_handler;
         self.cached_at = fresh.cached_at;
         true
@@ -2424,6 +2435,7 @@ mod tests {
             modules: Vec::new(),
             guard: None,
             fallback_handler: None,
+            module_guard: None,
             linked_signer_indices: linked,
             sibling_chains: Vec::new(),
             cached_at: 0,

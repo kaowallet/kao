@@ -512,12 +512,12 @@ impl ReviewState {
         })
     }
 
-    /// An included chain has different modules / guard / fallback handler
-    /// than the one on screen.
+    /// An included chain has different modules / guard / module guard /
+    /// fallback handler than the one on screen.
     fn danger_surfaces_differ(&self) -> bool {
         self.differs_from_focused(|md| {
             let modules: BTreeSet<Address> = md.modules.iter().copied().collect();
-            (modules, md.guard, md.fallback_handler)
+            (modules, md.guard, md.module_guard, md.fallback_handler)
         })
     }
 }
@@ -1183,6 +1183,7 @@ impl SafeOnboardingScreen {
                     modules: Vec::new(),
                     guard: None,
                     fallback_handler: None,
+                    module_guard: None,
                     nonce: alloy::primitives::U256::ZERO,
                 };
                 (chain, ScanResult::Canonical(md))
@@ -1365,6 +1366,7 @@ fn descriptor_from(
         modules: md.modules.iter().map(|a| (*a).into()).collect(),
         guard: md.guard.map(|a| a.into()),
         fallback_handler: md.fallback_handler.map(|a| a.into()),
+        module_guard: md.module_guard.map(|a| a.into()),
         linked_signer_indices,
         sibling_chains,
         cached_at,
@@ -1883,7 +1885,7 @@ fn view_security<'a>(
     }
     if r.danger_surfaces_differ() {
         col = col.push(vspace(6)).push(
-            text("⚠ Modules / guard / fallback handler differ across chains — review each one")
+            text("⚠ Modules / guards / fallback handler differ across chains — review each one")
                 .size(11)
                 .color(t.a2)
                 .font(mono_bold()),
@@ -1910,7 +1912,8 @@ fn view_security<'a>(
         }
     }
 
-    col.push(vspace(14))
+    col = col
+        .push(vspace(14))
         .push(danger_block(
             t,
             "Modules",
@@ -1923,8 +1926,18 @@ fn view_security<'a>(
             "Guard",
             md.guard.as_slice(),
             "no guard set",
-        ))
-        .push(vspace(10))
+        ));
+    // Only a 1.5.0+ Safe has a module guard; for an older one the row would
+    // describe something the contract can't have.
+    if safe::has_module_guard(&md.version) {
+        col = col.push(vspace(10)).push(danger_block(
+            t,
+            "Module guard",
+            md.module_guard.as_slice(),
+            "no module guard set",
+        ));
+    }
+    col.push(vspace(10))
         .push(danger_block(
             t,
             "Fallback handler",
@@ -1934,9 +1947,9 @@ fn view_security<'a>(
         .into()
 }
 
-/// Render one of the "danger surfaces" — modules / guard / fallback —
-/// with classification labels next to each address. Unknown addresses
-/// get a warning-styled label since they're a standing security
+/// Render one of the "danger surfaces" — modules / guard / module guard /
+/// fallback — with classification labels next to each address. Unknown
+/// addresses get a warning-styled label since they're a standing security
 /// surface that deserves attention.
 fn danger_block<'a, T: AsRef<[Address]>>(
     t: KaoTheme,
@@ -2300,6 +2313,7 @@ mod tests {
             modules: vec![],
             guard: None,
             fallback_handler: None,
+            module_guard: None,
             nonce: U256::ZERO,
         }
     }
@@ -3024,6 +3038,29 @@ mod tests {
         // Looking at Base itself: nothing hidden any more.
         let _ = s.update(Message::ChainFocused(Chain::Base));
         assert!(!review(&s).danger_surfaces_differ());
+    }
+
+    #[test]
+    fn a_differing_module_guard_counts_as_a_differing_danger_surface() {
+        // Same owners, same modules — only the 1.5.0 module guard differs. It
+        // can veto every module transaction, so it is reviewed per chain too.
+        let s = reviewing(
+            Vec::new(),
+            vec![
+                canonical_hit(Chain::Mainnet, vec![owner_a()]),
+                (
+                    Chain::Base,
+                    ScanResult::Canonical(SafeMetadata {
+                        chain_id: 8453,
+                        version: "1.5.0".into(),
+                        module_guard: Some(owner_d()),
+                        ..fake_metadata_with_owners(vec![owner_a()], 1)
+                    }),
+                ),
+            ],
+        );
+        assert!(review(&s).danger_surfaces_differ());
+        assert!(!review(&s).owners_differ());
     }
 
     // ── Chain inclusion ──────────────────────────────────────────────

@@ -56,7 +56,11 @@ pub const MULTISEND_CALL_ONLY_1_3_0_EIP155: Address =
     address!("0xA1dabEF33b3B82c7814B6D82A79e50F4AC44102B");
 /// The 1.5.0 `MultiSendCallOnly` deployment (canonical only). Recognized when
 /// reviewing a batch someone else built; Kao's own 1.5.x batches use the 1.4.1
-/// library.
+/// library (see [`multisend_call_only`] for why).
+///
+/// Unlike every earlier release, this one sends a sub-call addressed to the
+/// zero address to `address(this)` instead, which under a Safe's DELEGATECALL
+/// is the Safe itself — so decode its batches with [`decode_batch`].
 pub const MULTISEND_CALL_ONLY_1_5_0: Address =
     address!("0xA83c336B20401Af773B6219BA5027174338D1836");
 
@@ -77,6 +81,12 @@ pub fn canonical_multisend_call_only(address: Address) -> Option<&'static str> {
 /// The `MultiSendCallOnly` address matching a Safe `version`. Kao only
 /// signs for Safe 1.3.0–1.5.x (`ensure_signable_version`); 1.3.x uses the
 /// 1.3.0 library, 1.4.x/1.5.x use the 1.4.1 library.
+///
+/// 1.5.x stays on 1.4.1 on purpose, although the 1.5.0 library is deployed on
+/// every chain here. The 1.5.0 library sends a sub-call addressed to the zero
+/// address to the Safe itself, so a queued call to `0x0` (a burn, say) would
+/// run as a call from the Safe to itself. The 1.4.1 library has no such rule:
+/// what the queue says is what runs.
 pub fn multisend_call_only(version: &str) -> Result<Address, TxBuilderError> {
     let mut parts = version.split('.');
     match (parts.next(), parts.next()) {
@@ -128,9 +138,17 @@ pub struct PackedCall {
     /// `MultiSendCallOnly` reverts on anything else, but it is surfaced so a
     /// foreign blob can be shown for what it is.
     pub operation: u8,
+    /// The account the library calls. From [`decode_batch`] this is where the
+    /// call really lands, which is not always what the blob says (see
+    /// `redirected_to_self`).
     pub to: Address,
     pub value: U256,
     pub data: Bytes,
+    /// The blob addresses this call to the zero address, and the library sends
+    /// it to the Safe running the batch instead (`MultiSendCallOnly` 1.5.0).
+    /// `to` already holds the Safe; this records that the bytes said `0x0`, so
+    /// a review can say why the two differ. Only [`decode_batch`] sets it.
+    pub redirected_to_self: bool,
 }
 
 /// The most sub-calls this wallet will unpack from one blob.
@@ -192,6 +210,7 @@ pub fn decode_packed(packed: &[u8]) -> Result<Vec<PackedCall>, TxBuilderError> {
             to,
             value,
             data: Bytes::copy_from_slice(&packed[header_end..data_end]),
+            redirected_to_self: false,
         });
         i = data_end;
     }
@@ -243,6 +262,33 @@ pub fn decode_multisend_calldata(calldata: &[u8]) -> Result<Vec<PackedCall>, TxB
         ));
     }
     decode_packed(&calldata[start..end])
+}
+
+/// The sub-calls of a batch `safe` runs by delegatecalling `library`, each
+/// with the `to` the library really calls.
+///
+/// Through `MultiSendCallOnly` 1.5.0 a sub-call addressed to the zero address
+/// goes to `address(this)`, which under the delegatecall is the Safe. Read
+/// literally, that call looks like a harmless call to `0x0`. Read correctly,
+/// it is a call from the Safe to itself, the only kind that passes the
+/// `authorized` check on `addOwnerWithThreshold`, `enableModule` and the rest.
+/// So the zero target becomes `safe` here, before anything renders it.
+///
+/// Every other library calls the zero address as written; for those this is
+/// [`decode_multisend_calldata`] unchanged.
+pub fn decode_batch(
+    library: Address,
+    safe: Address,
+    calldata: &[u8],
+) -> Result<Vec<PackedCall>, TxBuilderError> {
+    let mut calls = decode_multisend_calldata(calldata)?;
+    if library == MULTISEND_CALL_ONLY_1_5_0 {
+        for c in calls.iter_mut().filter(|c| c.to == Address::ZERO) {
+            c.to = safe;
+            c.redirected_to_self = true;
+        }
+    }
+    Ok(calls)
 }
 
 /// Build the wrapping `SafeTxInput` for a batch: a delegatecall to the
@@ -572,5 +618,43 @@ mod tests {
             decode_packed(ok).expect("at the ceiling").len(),
             MAX_DECODED_CALLS
         );
+    }
+
+    /// MultiSendCallOnly 1.5.0 runs `to := or(to, mul(iszero(to), address()))`
+    /// on every record. A batch for it that says `0x0` is a call from the Safe
+    /// to itself, and has to be decoded as one, or `addOwnerWithThreshold`
+    /// reads as a call to nobody.
+    #[test]
+    fn the_1_5_0_library_sends_a_zero_target_to_the_safe() {
+        let safe = address!("0x00000000000000000000000000000000000005a5");
+        let other = address!("0x00000000000000000000000000000000000000C1");
+        let cd = encode_multisend_calldata(&encode_packed(&[
+            call(other, 0, &[0x01]),
+            call(Address::ZERO, 0, &[0x0d, 0x58, 0x2f, 0x13]),
+        ]));
+
+        let calls = decode_batch(MULTISEND_CALL_ONLY_1_5_0, safe, &cd).expect("decodes");
+        assert_eq!(calls[0].to, other);
+        assert!(!calls[0].redirected_to_self);
+        assert_eq!(calls[1].to, safe, "the zero target is the Safe itself");
+        assert!(calls[1].redirected_to_self);
+        assert_eq!(&calls[1].data[..], &[0x0d, 0x58, 0x2f, 0x13]);
+    }
+
+    /// Every earlier library calls the zero address as written, so it stays the
+    /// zero address. Rewriting it there would invent a self-call that never runs.
+    #[test]
+    fn earlier_libraries_call_the_zero_address_as_written() {
+        let safe = address!("0x00000000000000000000000000000000000005a5");
+        let cd = encode_multisend_calldata(&encode_packed(&[call(Address::ZERO, 1, &[])]));
+        for lib in [
+            MULTISEND_CALL_ONLY_1_3_0,
+            MULTISEND_CALL_ONLY_1_3_0_EIP155,
+            MULTISEND_CALL_ONLY_1_4_1,
+        ] {
+            let calls = decode_batch(lib, safe, &cd).expect("decodes");
+            assert_eq!(calls[0].to, Address::ZERO, "{lib}");
+            assert!(!calls[0].redirected_to_self, "{lib}");
+        }
     }
 }

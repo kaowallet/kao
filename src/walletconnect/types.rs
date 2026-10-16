@@ -207,9 +207,9 @@ pub struct SafeCaps {
     pub owner_count: u32,
     /// Strict: linked ∧ Local/Ledger/Trezor ∧ address ∈ cached owners (`strict_signable_indices`).
     pub local_signers: u32,
-    /// The fallback handler validates EIP-1271 signatures (a known
-    /// `CompatibilityFallbackHandler`, `safe::is_eip1271_handler`). Without it
-    /// a message signature can never be checked by the Safe.
+    /// The fallback handler validates EIP-1271 signatures for this Safe's
+    /// version (one of Safe's own handlers, `safe::validates_eip1271`).
+    /// Without it a message signature can never be checked by the Safe.
     pub fallback_handler: bool,
     /// `trust.signing_block_reason()` / `ensure_signable_version` failure, if any.
     pub signing_block: Option<String>,

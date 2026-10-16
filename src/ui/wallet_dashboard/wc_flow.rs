@@ -1109,11 +1109,12 @@ impl WalletScreen {
                             strict_signable_indices(d, &self.accounts).len(),
                         )
                         .unwrap_or(u32::MAX),
-                        // Only a handler that implements EIP-1271 lets the Safe validate a
-                        // message signature; with any other, every owner would sign for nothing.
-                        fallback_handler: d
-                            .fallback_handler
-                            .is_some_and(|h| crate::safe::is_eip1271_handler(Address::from(h))),
+                        // Only a handler that implements EIP-1271 for this Safe's version lets
+                        // the Safe validate a message signature; with any other, every owner
+                        // would sign for nothing.
+                        fallback_handler: d.fallback_handler.is_some_and(|h| {
+                            crate::safe::validates_eip1271(Address::from(h), &d.version)
+                        }),
                         signing_block,
                     }),
                     // A Safe is single-chain, and never on a custom network.
@@ -4348,6 +4349,7 @@ mod tests {
             modules: Vec::new(),
             guard: None,
             fallback_handler: Some(COMPAT_HANDLER),
+            module_guard: None,
             linked_signer_indices: linked,
             sibling_chains: Vec::new(),
             cached_at: 0,
@@ -4862,15 +4864,17 @@ mod tests {
         );
     }
 
-    /// Only a fallback handler that implements EIP-1271 (Safe's CompatibilityFallbackHandler)
-    /// lets a Safe sign messages: with any other handler, `isValidSignature` can't answer, so
-    /// every owner would be prompted for a signature the Safe can never validate.
+    /// Only a fallback handler that implements EIP-1271 (Safe's own handlers) lets a Safe sign
+    /// messages: with any other handler, `isValidSignature` can't answer, so every owner would
+    /// be prompted for a signature the Safe can never validate. A 1.5.0 handler only answers
+    /// behind a 1.5.0+ Safe.
     #[test]
     fn a_safe_whose_handler_cant_validate_eip1271_cant_sign_messages() {
         let a = PrivateKeySigner::random();
-        let caps_with = |handler: Option<[u8; 20]>| {
+        let caps_for = |handler: Option<[u8; 20]>, version: &str| {
             let mut d = safe(0x51, 1, &[a.address()], vec![0], 1);
             d.fallback_handler = handler;
+            d.version = version.into();
             let s = screen(vec![local_account(&a)], 0, vec![d]);
             s.wc_caps(&wc::WcIdentity::Safe {
                 address: Address::from([0x51; 20]),
@@ -4878,6 +4882,7 @@ mod tests {
             })
             .expect("caps")
         };
+        let caps_with = |handler: Option<[u8; 20]>| caps_for(handler, "1.4.1");
         // An unknown contract (or an EOA) as the handler.
         let unknown = caps_with(Some([0xfa; 20]));
         let err = unknown
@@ -4885,17 +4890,33 @@ mod tests {
             .expect_err("an unknown handler can't sign messages");
         assert!(err.detail.contains("EIP-1271"), "{}", err.detail);
         assert!(unknown.transactions().is_ok(), "transactions don't need it");
-        // Every CompatibilityFallbackHandler Kao knows.
+        // Every pre-1.5.0 CompatibilityFallbackHandler Kao knows, behind a 1.4.1 or 1.5.0 Safe.
         for handler in [
-            "0x3EfCBb83A4A7AfcB4F68D501E2c2203a38be77f4",
             "0xfd0732Dc9E303f09fCEf3a7388Ad10A83459Ec99",
             "0xf48f2B2d2a534e402487b3ee7C18c33Aec0Fe5e4",
             "0x017062a1dE2FE6b99BE3d9d37841FeD19F573804",
         ] {
             let h: Address = handler.parse().unwrap();
+            for version in ["1.4.1", "1.5.0"] {
+                assert!(
+                    caps_for(Some(h.into_array()), version).messages().is_ok(),
+                    "{handler} behind {version}"
+                );
+            }
+        }
+        // The 1.5.0 handlers (Compatibility and Extensible): only behind a 1.5.0 Safe.
+        for handler in [
+            "0x3EfCBb83A4A7AfcB4F68D501E2c2203a38be77f4",
+            "0x85a8ca358D388530ad0fB95D0cb89Dd44Fc242c3",
+        ] {
+            let h: Address = handler.parse().unwrap();
             assert!(
-                caps_with(Some(h.into_array())).messages().is_ok(),
+                caps_for(Some(h.into_array()), "1.5.0").messages().is_ok(),
                 "{handler}"
+            );
+            assert!(
+                caps_with(Some(h.into_array())).messages().is_err(),
+                "{handler} behind 1.4.1 can't validate anything"
             );
         }
     }

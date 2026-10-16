@@ -11,7 +11,7 @@
 //!    Safe-TX flow will enable signing only on this branch.
 //! 2. **UnrecognizedImpl** — singleton is unknown to us but `VERSION()`
 //!    returns a string matching the recognized-shape allowlist
-//!    (`1.[0-4].\d+`) and the core view methods (`getOwners`,
+//!    (`1.[0-5].\d+`) and the core view methods (`getOwners`,
 //!    `getThreshold`) succeed. Surfaced with a visible warning badge;
 //!    no signing in v1.
 //! 3. **NotASafe / NotDeployed** — rejected outright.
@@ -27,7 +27,7 @@
 //! - `inspect_on_chain` does the full read sequence on one chain
 //!   (`get_code` → bail if empty; then in parallel:
 //!   proxy-slot-0 + VERSION + owners + threshold + nonce + modules +
-//!   guard-slot + fallback-handler-slot).
+//!   guard-slot + module-guard-slot + fallback-handler-slot).
 //! - `scan_across_chains` fans `inspect_on_chain` across `Chain::ALL`
 //!   in parallel so the onboarding chain chooser can show previews.
 //! - `refresh_one` re-reads the cached fields of an existing
@@ -123,6 +123,15 @@ sol! {
 const GUARD_STORAGE_SLOT: B256 =
     b256!("0x4a204f620c8c5ccdca3fd54d003badd85ba500436a431f0cbda4f558c93c34c8");
 
+/// `keccak256("module_manager.module_guard.address")` — where Safe ≥ 1.5.0
+/// stores the optional module guard, which `execTransactionFromModule`
+/// consults before and after every module transaction. Same shape as
+/// `GUARD_STORAGE_SLOT`: no getter, keccak-derived, verified by a test.
+/// Older Safes have no module guard, so the slot means nothing there (see
+/// [`has_module_guard`]).
+const MODULE_GUARD_STORAGE_SLOT: B256 =
+    b256!("0xb104e0b93118902c651344349b610029d694cfdec91c589c91ebafbcd0289947");
+
 /// `keccak256("fallback_manager.handler.address")` — slot for the
 /// fallback handler. Same shape as `GUARD_STORAGE_SLOT`: no getter,
 /// keccak-derived, verified by a test.
@@ -174,11 +183,8 @@ struct KnownSingleton {
 const KNOWN_SINGLETONS: &[KnownSingleton] = &[
     // ── 1.5.0 ────────────────────────────────────────────────────────
     // 1.5.0 only has a `canonical` variant per safe-deployments (no
-    // EIP-155 split). Deployed on Mainnet and Base; notably NOT yet
-    // deployed on Optimism at the time of writing — a Safe a user
-    // pastes on OP cannot legitimately use this implementation, but
-    // our classifier matches by address alone so we just label it and
-    // let the per-chain `get_code` check do the deployment gating.
+    // EIP-155 split, and no zkSync EraVM build at all). Deployed on
+    // Mainnet, Optimism and Base.
     KnownSingleton {
         // Safe 1.5.0 (Safe.sol) — canonical L1 singleton.
         address: address!("0xFf51A5898e281Db6DfC7855790607438dF2ca44b"),
@@ -272,6 +278,13 @@ const KNOWN_MODULES: &[(Address, &str)] = &[
         address!("0x3EfCBb83A4A7AfcB4F68D501E2c2203a38be77f4"),
         "Safe CompatibilityFallbackHandler 1.5.0",
     ),
+    // 1.5.0 also ships the ExtensibleFallbackHandler (originally CoW
+    // Swap's): per-selector custom methods and per-domain signature
+    // verifiers on top of EIP-1271. Canonical on Mainnet, OP and Base.
+    (
+        address!("0x85a8ca358D388530ad0fB95D0cb89Dd44Fc242c3"),
+        "Safe ExtensibleFallbackHandler 1.5.0",
+    ),
     (
         address!("0xfd0732Dc9E303f09fCEf3a7388Ad10A83459Ec99"),
         "Safe CompatibilityFallbackHandler 1.4.1",
@@ -286,22 +299,48 @@ const KNOWN_MODULES: &[(Address, &str)] = &[
     ),
 ];
 
-/// The `CompatibilityFallbackHandler` deployments in [`KNOWN_MODULES`]: the
-/// fallback handlers that implement EIP-1271 `isValidSignature` for a Safe.
-const EIP1271_HANDLERS: [Address; 4] = [
+/// The fallback handlers in [`KNOWN_MODULES`] that implement EIP-1271
+/// `isValidSignature` for a Safe: every `CompatibilityFallbackHandler`, and
+/// the 1.5.0 `ExtensibleFallbackHandler`. The extensible one answers an
+/// ordinary owner signature through `defaultIsValidSignature`, which checks
+/// the same `SafeMessage` hash the compatibility handler does; only a
+/// signature in its own `safeSignature(...)` envelope is routed to a
+/// domain verifier instead.
+const EIP1271_HANDLERS: [Address; 5] = [
     address!("0x3EfCBb83A4A7AfcB4F68D501E2c2203a38be77f4"),
+    address!("0x85a8ca358D388530ad0fB95D0cb89Dd44Fc242c3"),
     address!("0xfd0732Dc9E303f09fCEf3a7388Ad10A83459Ec99"),
     address!("0xf48f2B2d2a534e402487b3ee7C18c33Aec0Fe5e4"),
     address!("0x017062a1dE2FE6b99BE3d9d37841FeD19F573804"),
 ];
 
-/// Whether a Safe whose fallback handler is `handler` can have a message
-/// signature validated (EIP-1271): only Safe's own `CompatibilityFallbackHandler`
-/// is known to answer `isValidSignature`. With any other handler — an unknown
-/// contract, a handler without EIP-1271, an EOA — the call answers nothing or
-/// reverts, so owners asked to sign a message would sign for nothing.
-pub fn is_eip1271_handler(handler: Address) -> bool {
+/// The [`EIP1271_HANDLERS`] from the 1.5.0 release. They verify through
+/// `checkSignatures(address,bytes32,bytes)`, an overload only Safe 1.5.0+
+/// has, so behind an older Safe their `isValidSignature` reverts. (The older
+/// handlers call the three-argument `checkSignatures(bytes32,bytes,bytes)`,
+/// which 1.5.0 kept, so they work behind any Safe from 1.3.0 on.)
+const EIP1271_HANDLERS_1_5: [Address; 2] = [
+    address!("0x3EfCBb83A4A7AfcB4F68D501E2c2203a38be77f4"),
+    address!("0x85a8ca358D388530ad0fB95D0cb89Dd44Fc242c3"),
+];
+
+/// Whether `handler` is one of Safe's own handlers that answer
+/// `isValidSignature`, regardless of which Safe sits in front of it. See
+/// [`validates_eip1271`] for the question callers actually ask.
+fn is_eip1271_handler(handler: Address) -> bool {
     EIP1271_HANDLERS.contains(&handler)
+}
+
+/// Whether a Safe at `version` whose fallback handler is `handler` can have
+/// a message signature validated (EIP-1271). Only Safe's own handlers are
+/// known to answer `isValidSignature`, and a 1.5.0 handler only behind a
+/// 1.5.0+ Safe. With any other pairing — an unknown contract, a handler
+/// without EIP-1271, an EOA, a 1.5.0 handler on a 1.4.1 Safe — the call
+/// answers nothing or reverts, so owners asked to sign a message would sign
+/// for nothing.
+pub fn validates_eip1271(handler: Address, version: &str) -> bool {
+    is_eip1271_handler(handler)
+        && (!EIP1271_HANDLERS_1_5.contains(&handler) || is_1_5_or_later(version))
 }
 
 /// Human-readable label for a known module / guard / handler address,
@@ -352,6 +391,24 @@ fn is_recognized_safe_version(v: &str) -> bool {
         return false;
     }
     parts.next().is_none()
+}
+
+/// `version` is a 1.x release from 1.5.0 on.
+fn is_1_5_or_later(version: &str) -> bool {
+    let mut parts = version.split('.');
+    parts.next() == Some("1")
+        && parts
+            .next()
+            .and_then(|minor| minor.parse::<u32>().ok())
+            .is_some_and(|minor| minor >= 5)
+}
+
+/// Whether a Safe at `version` has a module guard at all. The module guard
+/// arrived in 1.5.0; on an older Safe nothing reads
+/// `MODULE_GUARD_STORAGE_SLOT`, so whatever sits there guards nothing and
+/// is not reported as if it did.
+pub fn has_module_guard(version: &str) -> bool {
+    is_1_5_or_later(version)
 }
 
 // ── Public types ────────────────────────────────────────────────────────────
@@ -408,6 +465,9 @@ pub struct SafeMetadata {
     pub owners: Vec<Address>,
     pub modules: Vec<Address>,
     pub guard: Option<Address>,
+    /// Module guard (Safe ≥ 1.5.0), if set. Always `None` for older
+    /// versions — see [`has_module_guard`].
+    pub module_guard: Option<Address>,
     pub fallback_handler: Option<Address>,
     /// Current Safe `nonce()`. Snapshot only — immediately stale after
     /// inspection. The Safe-TX flow re-reads before quoting. Useful in
@@ -436,6 +496,10 @@ pub enum SafeChange {
         to: Option<Address>,
     },
     FallbackHandlerChanged {
+        from: Option<Address>,
+        to: Option<Address>,
+    },
+    ModuleGuardChanged {
         from: Option<Address>,
         to: Option<Address>,
     },
@@ -524,6 +588,7 @@ pub async fn inspect_on_chain(net: &dyn BalanceFetcher, chain: Chain, addr: Addr
         nonce_res,
         modules_res,
         guard_res,
+        module_guard_res,
         fallback_res,
     ) = tokio::join!(
         read_implementation(net, chain, addr),
@@ -533,6 +598,7 @@ pub async fn inspect_on_chain(net: &dyn BalanceFetcher, chain: Chain, addr: Addr
         read_nonce(net, chain, addr),
         read_modules(net, chain, addr),
         read_guard(net, chain, addr),
+        read_module_guard(net, chain, addr),
         read_fallback_handler(net, chain, addr),
     );
 
@@ -567,6 +633,7 @@ pub async fn inspect_on_chain(net: &dyn BalanceFetcher, chain: Chain, addr: Addr
     let nonce = nonce_res.unwrap_or(U256::ZERO);
     let modules = modules_res.unwrap_or_default();
     let guard = guard_res.ok().flatten();
+    let module_guard = module_guard_res.ok().flatten();
     let fallback_handler = fallback_res.ok().flatten();
 
     let metadata = SafeMetadata {
@@ -578,8 +645,21 @@ pub async fn inspect_on_chain(net: &dyn BalanceFetcher, chain: Chain, addr: Addr
         owners,
         modules,
         guard,
+        module_guard,
         fallback_handler,
         nonce,
+    };
+
+    // Which version decides whether the module-guard slot means anything:
+    // the registry's for a known singleton, `VERSION()` otherwise.
+    let effective_version = classify_implementation(implementation).unwrap_or(version.as_str());
+    let metadata = if has_module_guard(effective_version) {
+        metadata
+    } else {
+        SafeMetadata {
+            module_guard: None,
+            ..metadata
+        }
     };
 
     if let Some(canonical_version) = classify_implementation(implementation) {
@@ -680,6 +760,7 @@ pub async fn refresh_one(
         cached_at: now,
         // User configuration, not on-chain state — survives refresh.
         tx_service_url: existing.tx_service_url.clone(),
+        module_guard: metadata.module_guard.map(|a| a.into()),
     };
     Ok((new_desc, diff))
 }
@@ -725,10 +806,28 @@ pub async fn refresh_all_safes(
 /// - **Trust demoted Canonical → UnrecognizedImpl** — implies the
 ///   proxy was upgraded to an unaudited singleton, which pulls the
 ///   trust anchor out from under the user.
+/// - **Fallback handler set to an unknown contract** — the handler
+///   answers EIP-1271 `isValidSignature`, so a malicious one can make
+///   the Safe "sign" anything: a Permit2 permit, a CoW order, any
+///   off-chain approval a dapp checks that way, none of them seen by an
+///   owner. The worst of the three.
+/// - **Transaction guard set to an unknown contract** — it runs on
+///   every owner transaction and can veto any of them, so a hostile one
+///   bricks the Safe.
+/// - **Module guard set to an unknown contract** (Safe ≥ 1.5.0) — it
+///   can veto every module transaction, cutting the Safe off from a
+///   recovery or allowance module. Narrower than the transaction guard,
+///   but nothing else would tell the user it happened.
+///
+/// For all three, "unknown" means `classify_module` doesn't name it,
+/// the same test as for modules. Changing to a recognized contract and
+/// removing one are silent: neither hands a stranger's code a new
+/// power over the Safe.
 ///
 /// Silent diffs (still persisted but no banner): owner added that
-/// isn't ours, recognized module added, module removed, guard /
-/// fallback changes, version bumps within Canonical, threshold drop
+/// isn't ours, recognized module added, module removed, guard / module
+/// guard / fallback handler removed or set to a recognized contract,
+/// version bumps within Canonical, threshold drop
 /// that's also a Trust transition (already covered by the trust line),
 /// trust *promotion* UnrecognizedImpl → Canonical (good news, no
 /// interruption needed).
@@ -761,6 +860,29 @@ pub fn summarize_user_facing_changes(
                 to: SafeTrust::UnrecognizedImpl,
             } => {
                 alerts.push("Implementation upgraded to an unknown contract".into());
+            }
+            SafeChange::FallbackHandlerChanged { to: Some(addr), .. }
+                if classify_module(*addr).is_none() =>
+            {
+                alerts.push(format!(
+                    "Unknown fallback handler set: {} — it decides which signatures this Safe \
+                     accepts",
+                    short_address(*addr),
+                ));
+            }
+            SafeChange::GuardChanged { to: Some(addr), .. } if classify_module(*addr).is_none() => {
+                alerts.push(format!(
+                    "Unknown transaction guard set: {} — it can block every transaction",
+                    short_address(*addr),
+                ));
+            }
+            SafeChange::ModuleGuardChanged { to: Some(addr), .. }
+                if classify_module(*addr).is_none() =>
+            {
+                alerts.push(format!(
+                    "Unknown module guard set: {} — it can block module transactions",
+                    short_address(*addr),
+                ));
             }
             _ => {}
         }
@@ -874,6 +996,41 @@ async fn read_guard(
         .get_storage_at_raw(addr, B256_to_u256(GUARD_STORAGE_SLOT), chain)
         .await?;
     Ok(non_zero_address(b256_to_address(slot.value)))
+}
+
+async fn read_module_guard(
+    net: &dyn BalanceFetcher,
+    chain: Chain,
+    addr: Address,
+) -> Result<Option<Address>, String> {
+    let slot = net
+        .get_storage_at_raw(addr, B256_to_u256(MODULE_GUARD_STORAGE_SLOT), chain)
+        .await?;
+    Ok(non_zero_address(b256_to_address(slot.value)))
+}
+
+/// Whether `safe` can validate an EIP-1271 message signature right now
+/// ([`validates_eip1271`]), read live: the fallback handler always, and the
+/// Safe's version only when the handler is a 1.5.0 one, the only case where
+/// it matters. The version comes from the singleton registry when the
+/// implementation is known, from `VERSION()` otherwise.
+pub(crate) async fn read_eip1271_support(
+    net: &dyn BalanceFetcher,
+    chain: Chain,
+    safe: Address,
+) -> Result<bool, String> {
+    let Some(handler) = read_fallback_handler(net, chain, safe).await? else {
+        return Ok(false);
+    };
+    if !EIP1271_HANDLERS_1_5.contains(&handler) {
+        return Ok(is_eip1271_handler(handler));
+    }
+    let implementation = read_implementation(net, chain, safe).await?;
+    let version = match classify_implementation(implementation) {
+        Some(v) => v.to_string(),
+        None => read_version(net, chain, safe).await?,
+    };
+    Ok(validates_eip1271(handler, &version))
 }
 
 pub(crate) async fn read_fallback_handler(
@@ -1001,6 +1158,13 @@ fn compute_diff(prev: &SafeDescriptor, fresh: &SafeMetadata, new_trust: SafeTrus
             to: fresh.fallback_handler,
         });
     }
+    let prev_mg = prev.module_guard.map(Address::from);
+    if prev_mg != fresh.module_guard {
+        changes.push(SafeChange::ModuleGuardChanged {
+            from: prev_mg,
+            to: fresh.module_guard,
+        });
+    }
 
     if prev.trust != new_trust {
         changes.push(SafeChange::TrustChanged {
@@ -1036,6 +1200,15 @@ mod tests {
             GUARD_STORAGE_SLOT, derived,
             "GUARD_STORAGE_SLOT constant disagrees with keccak256 of the canonical string — \
              update the constant or the string, do NOT just adjust the test",
+        );
+    }
+
+    #[test]
+    fn verifies_module_guard_storage_slot_matches_keccak() {
+        let derived = keccak256(b"module_manager.module_guard.address");
+        assert_eq!(
+            MODULE_GUARD_STORAGE_SLOT, derived,
+            "MODULE_GUARD_STORAGE_SLOT constant disagrees with keccak256 of the canonical string",
         );
     }
 
@@ -1088,6 +1261,18 @@ mod tests {
         assert!(!is_recognized_safe_version("v1.4.1"));
     }
 
+    #[test]
+    fn only_1_5_and_later_have_a_module_guard() {
+        for v in ["1.5.0", "1.5.1", "1.6.0", "1.10.0"] {
+            assert!(has_module_guard(v), "{v}");
+        }
+        for v in [
+            "1.0.0", "1.3.0", "1.4.1", "2.0.0", "1.x.0", "1", "", "v1.5.0",
+        ] {
+            assert!(!has_module_guard(v), "{v}");
+        }
+    }
+
     // ── Singleton classification ─────────────────────────────────────
 
     #[test]
@@ -1098,7 +1283,7 @@ mod tests {
         // variant from the registry or added one with a wrong address.
 
         // 1.5.0 — canonical L1 + canonical L2 (no eip155 split).
-        // Deployed on Mainnet and Base; not on Optimism at registry time.
+        // Deployed on Mainnet, Optimism and Base.
         assert_eq!(
             classify_implementation(address!("0xFf51A5898e281Db6DfC7855790607438dF2ca44b")),
             Some("1.5.0"),
@@ -1182,22 +1367,28 @@ mod tests {
             classify_module(address!("0x017062a1dE2FE6b99BE3d9d37841FeD19F573804")),
             Some("Safe CompatibilityFallbackHandler 1.3.0 (EIP-155)"),
         );
+        // The other fallback handler 1.5.0 ships.
+        assert_eq!(
+            classify_module(address!("0x85a8ca358D388530ad0fB95D0cb89Dd44Fc242c3")),
+            Some("Safe ExtensibleFallbackHandler 1.5.0"),
+        );
     }
 
-    /// Exactly the known CompatibilityFallbackHandlers validate EIP-1271 signatures — nothing
-    /// else Kao labels (the Allowance Module), and no unknown address.
+    /// Exactly the known fallback handlers validate EIP-1271 signatures — every
+    /// CompatibilityFallbackHandler and the 1.5.0 ExtensibleFallbackHandler — and nothing else
+    /// Kao labels (the Allowance Module), and no unknown address.
     #[test]
     fn eip1271_handlers_are_the_known_compatibility_fallback_handlers() {
+        let is_1271_label = |l: &str| {
+            l.contains("CompatibilityFallbackHandler") || l.contains("ExtensibleFallbackHandler")
+        };
         for h in EIP1271_HANDLERS {
             assert!(is_eip1271_handler(h));
-            assert!(
-                classify_module(h).is_some_and(|l| l.contains("CompatibilityFallbackHandler")),
-                "{h}"
-            );
+            assert!(classify_module(h).is_some_and(is_1271_label), "{h}");
         }
         let labelled = KNOWN_MODULES
             .iter()
-            .filter(|(_, l)| l.contains("CompatibilityFallbackHandler"))
+            .filter(|(_, l)| is_1271_label(l))
             .count();
         assert_eq!(labelled, EIP1271_HANDLERS.len());
         assert!(!is_eip1271_handler(address!(
@@ -1205,6 +1396,32 @@ mod tests {
         )));
         assert!(!is_eip1271_handler(Address::ZERO));
         assert!(!is_eip1271_handler(Address::repeat_byte(0xfa)));
+    }
+
+    /// The 1.5.0 handlers verify through an overload only 1.5.0+ Safes have; the older handlers
+    /// use the one 1.5.0 kept. So a 1.5.0 handler on a 1.4.1 Safe validates nothing, while a
+    /// 1.4.1 handler on a 1.5.0 Safe still works.
+    #[test]
+    fn a_1_5_0_handler_validates_only_behind_a_1_5_0_safe() {
+        let compat_150 = address!("0x3EfCBb83A4A7AfcB4F68D501E2c2203a38be77f4");
+        let extensible_150 = address!("0x85a8ca358D388530ad0fB95D0cb89Dd44Fc242c3");
+        let compat_141 = address!("0xfd0732Dc9E303f09fCEf3a7388Ad10A83459Ec99");
+        let compat_130 = address!("0xf48f2B2d2a534e402487b3ee7C18c33Aec0Fe5e4");
+        for h in [compat_150, extensible_150] {
+            assert!(validates_eip1271(h, "1.5.0"), "{h}");
+            assert!(!validates_eip1271(h, "1.4.1"), "{h}");
+            assert!(!validates_eip1271(h, "1.3.0"), "{h}");
+        }
+        for h in [compat_141, compat_130] {
+            for v in ["1.3.0", "1.4.1", "1.5.0"] {
+                assert!(validates_eip1271(h, v), "{h} behind {v}");
+            }
+        }
+        assert!(!validates_eip1271(Address::repeat_byte(0xfa), "1.5.0"));
+        assert!(!validates_eip1271(
+            address!("0xCFbFaC74C26F8647cBDb8c5caf80BB5b32E43134"),
+            "1.5.0"
+        ));
     }
 
     #[test]
@@ -1346,6 +1563,137 @@ mod tests {
             true,
         );
         addr
+    }
+
+    /// `plant_canonical_safe`, re-pointed at the canonical 1.5.0 L2 singleton.
+    fn plant_canonical_1_5_0_safe(mock: &CallMock, owners: &[Address]) -> Address {
+        let addr = plant_canonical_safe(mock, owners, 1, &[], None, None);
+        let mut impl_word = [0u8; 32];
+        impl_word[12..]
+            .copy_from_slice(address!("0xEdd160fEBBD92E350D4D398fb636302fccd67C7e").as_slice());
+        mock.set_storage(addr, B256::ZERO, B256::from(impl_word), true);
+        mock.set_call(
+            addr,
+            Bytes::from(VERSIONCall {}.abi_encode()),
+            Bytes::from("1.5.0".to_string().abi_encode()),
+            true,
+        );
+        addr
+    }
+
+    fn plant_module_guard(mock: &CallMock, addr: Address, guard: Address) {
+        let mut buf = [0u8; 32];
+        buf[12..].copy_from_slice(guard.as_slice());
+        mock.set_storage(addr, MODULE_GUARD_STORAGE_SLOT, B256::from(buf), true);
+    }
+
+    #[tokio::test]
+    async fn inspect_reads_the_module_guard_of_a_1_5_0_safe() {
+        let mock = CallMock::new();
+        let owners = vec![address!("0x000000000000000000000000000000000000beef")];
+        let addr = plant_canonical_1_5_0_safe(&mock, &owners);
+        let guard = address!("0x000000000000000000000000000000000000cccc");
+        plant_module_guard(&mock, addr, guard);
+        match inspect_on_chain(&mock, Chain::Optimism, addr).await {
+            ScanResult::Canonical(md) => {
+                assert_eq!(md.version, "1.5.0");
+                assert_eq!(md.module_guard, Some(guard));
+                assert_eq!(md.guard, None, "the transaction guard is a different slot");
+            }
+            other => panic!("expected Canonical, got {other:?}"),
+        }
+    }
+
+    /// A 1.4.1 Safe has no module guard: nothing reads that slot, so whatever a
+    /// delegatecall left there guards nothing and must not be shown as if it did.
+    #[tokio::test]
+    async fn inspect_ignores_the_module_guard_slot_before_1_5_0() {
+        let mock = CallMock::new();
+        let owners = vec![address!("0x000000000000000000000000000000000000beef")];
+        let addr = plant_canonical_safe(&mock, &owners, 1, &[], None, None);
+        plant_module_guard(
+            &mock,
+            addr,
+            address!("0x000000000000000000000000000000000000cccc"),
+        );
+        match inspect_on_chain(&mock, Chain::Mainnet, addr).await {
+            ScanResult::Canonical(md) => {
+                assert_eq!(md.version, "1.4.1");
+                assert_eq!(md.module_guard, None);
+            }
+            other => panic!("expected Canonical, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_keeps_the_module_guard_in_the_descriptor() {
+        let mock = CallMock::new();
+        let owners = vec![address!("0x000000000000000000000000000000000000beef")];
+        let addr = plant_canonical_1_5_0_safe(&mock, &owners);
+        let md = match inspect_on_chain(&mock, Chain::Mainnet, addr).await {
+            ScanResult::Canonical(md) => md,
+            other => panic!("expected Canonical, got {other:?}"),
+        };
+        let existing = descriptor_from_metadata(&md, SafeTrust::Canonical);
+        assert_eq!(existing.module_guard, None);
+
+        let guard = address!("0x000000000000000000000000000000000000cccc");
+        plant_module_guard(&mock, addr, guard);
+        let (fresh, diff) = refresh_one(&mock, &existing).await.expect("refreshes");
+        assert_eq!(fresh.module_guard, Some(guard.into()));
+        assert_eq!(
+            diff.changes,
+            vec![SafeChange::ModuleGuardChanged {
+                from: None,
+                to: Some(guard),
+            }],
+        );
+    }
+
+    #[tokio::test]
+    async fn eip1271_support_is_read_against_the_safes_version() {
+        let compat_150 = address!("0x3EfCBb83A4A7AfcB4F68D501E2c2203a38be77f4");
+        let compat_141 = address!("0xfd0732Dc9E303f09fCEf3a7388Ad10A83459Ec99");
+        let owners = vec![address!("0x000000000000000000000000000000000000beef")];
+
+        // 1.5.0 Safe, 1.5.0 handler: the pairing Safe ships.
+        let mock = CallMock::new();
+        let addr = plant_canonical_1_5_0_safe(&mock, &owners);
+        set_fallback(&mock, addr, compat_150);
+        assert_eq!(
+            read_eip1271_support(&mock, Chain::Mainnet, addr).await,
+            Ok(true)
+        );
+
+        // 1.4.1 Safe, 1.5.0 handler: the handler calls an overload the Safe lacks.
+        let mock = CallMock::new();
+        let addr = plant_canonical_safe(&mock, &owners, 1, &[], None, Some(compat_150));
+        assert_eq!(
+            read_eip1271_support(&mock, Chain::Mainnet, addr).await,
+            Ok(false)
+        );
+
+        // 1.4.1 Safe, 1.4.1 handler.
+        let mock = CallMock::new();
+        let addr = plant_canonical_safe(&mock, &owners, 1, &[], None, Some(compat_141));
+        assert_eq!(
+            read_eip1271_support(&mock, Chain::Mainnet, addr).await,
+            Ok(true)
+        );
+
+        // No handler at all.
+        let mock = CallMock::new();
+        let addr = plant_canonical_safe(&mock, &owners, 1, &[], None, None);
+        assert_eq!(
+            read_eip1271_support(&mock, Chain::Mainnet, addr).await,
+            Ok(false)
+        );
+    }
+
+    fn set_fallback(mock: &CallMock, addr: Address, handler: Address) {
+        let mut buf = [0u8; 32];
+        buf[12..].copy_from_slice(handler.as_slice());
+        mock.set_storage(addr, FALLBACK_HANDLER_STORAGE_SLOT, B256::from(buf), true);
     }
 
     #[tokio::test]
@@ -1561,6 +1909,7 @@ mod tests {
             modules: md.modules.iter().map(|a| (*a).into()).collect(),
             guard: md.guard.map(|a| a.into()),
             fallback_handler: md.fallback_handler.map(|a| a.into()),
+            module_guard: md.module_guard.map(|a| a.into()),
             linked_signer_indices: Vec::new(),
             sibling_chains: Vec::new(),
             cached_at: 0,
@@ -1582,6 +1931,7 @@ mod tests {
             modules: vec![address!("0xCFbFaC74C26F8647cBDb8c5caf80BB5b32E43134")],
             guard: None,
             fallback_handler: None,
+            module_guard: None,
             nonce: U256::from(10u64),
         }
     }
@@ -1769,21 +2119,32 @@ mod tests {
     fn summarize_silent_changes_dont_produce_alerts() {
         // Everything that's deliberately silent: owner added (someone
         // else joining governance), module removed (security surface
-        // shrank — good news), guard / fallback transitions, version
-        // bumps within Canonical trust. Bundling them in one diff and
-        // asserting empty alerts pins the silent-by-default policy.
+        // shrank — good news), a guard / module guard / fallback handler
+        // removed or moved to a recognized contract, version bumps
+        // within Canonical trust. Bundling them in one diff and asserting
+        // empty alerts pins the silent-by-default policy.
         let known_module = address!("0xCFbFaC74C26F8647cBDb8c5caf80BB5b32E43134");
+        let compat_150 = address!("0x3EfCBb83A4A7AfcB4F68D501E2c2203a38be77f4");
         let alerts = summarize_user_facing_changes(
             &diff_with(vec![
                 SafeChange::OwnerAdded(address!("0x000000000000000000000000000000000000aaaa")),
                 SafeChange::ModuleRemoved(known_module),
                 SafeChange::GuardChanged {
-                    from: None,
-                    to: Some(address!("0x000000000000000000000000000000000000bbbb")),
+                    from: Some(address!("0x000000000000000000000000000000000000bbbb")),
+                    to: None,
+                },
+                SafeChange::ModuleGuardChanged {
+                    from: Some(address!("0x000000000000000000000000000000000000dddd")),
+                    to: None,
                 },
                 SafeChange::FallbackHandlerChanged {
                     from: Some(address!("0x000000000000000000000000000000000000cccc")),
                     to: None,
+                },
+                // The upgrade path Safe ships: one known handler to another.
+                SafeChange::FallbackHandlerChanged {
+                    from: Some(address!("0xfd0732Dc9E303f09fCEf3a7388Ad10A83459Ec99")),
+                    to: Some(compat_150),
                 },
                 SafeChange::VersionChanged {
                     from: "1.3.0".into(),
@@ -1796,6 +2157,76 @@ mod tests {
             alerts.is_empty(),
             "silent changes should produce no alerts, got {alerts:?}"
         );
+    }
+
+    #[test]
+    fn summarize_unknown_fallback_handler_alerts() {
+        // The handler answers `isValidSignature`. An unknown one can
+        // approve signatures no owner made, so it is named, with why.
+        let unknown = address!("0x000000000000000000000000000000000000cccc");
+        let alerts = summarize_user_facing_changes(
+            &diff_with(vec![SafeChange::FallbackHandlerChanged {
+                from: Some(address!("0xfd0732Dc9E303f09fCEf3a7388Ad10A83459Ec99")),
+                to: Some(unknown),
+            }]),
+            &[],
+        );
+        assert_eq!(alerts.len(), 1);
+        assert!(
+            alerts[0].contains("Unknown fallback handler"),
+            "{}",
+            alerts[0]
+        );
+        assert!(alerts[0].contains(&short_address(unknown)), "{}", alerts[0]);
+        assert!(alerts[0].contains("signatures"), "{}", alerts[0]);
+
+        // Set where there was none: the same.
+        let alerts = summarize_user_facing_changes(
+            &diff_with(vec![SafeChange::FallbackHandlerChanged {
+                from: None,
+                to: Some(unknown),
+            }]),
+            &[],
+        );
+        assert_eq!(alerts.len(), 1);
+    }
+
+    #[test]
+    fn summarize_unknown_transaction_guard_alerts() {
+        let unknown = address!("0x000000000000000000000000000000000000bbbb");
+        for from in [
+            None,
+            Some(address!("0x000000000000000000000000000000000000aaaa")),
+        ] {
+            let alerts = summarize_user_facing_changes(
+                &diff_with(vec![SafeChange::GuardChanged {
+                    from,
+                    to: Some(unknown),
+                }]),
+                &[],
+            );
+            assert_eq!(alerts.len(), 1, "from {from:?}");
+            assert!(alerts[0].contains("transaction guard"), "{}", alerts[0]);
+            assert!(alerts[0].contains(&short_address(unknown)), "{}", alerts[0]);
+        }
+    }
+
+    #[test]
+    fn summarize_unknown_module_guard_alerts_as_a_module_guard() {
+        // Named as the module guard, not "guard": the two veto different
+        // things, and the user should be able to tell which moved.
+        let unknown = address!("0x000000000000000000000000000000000000dddd");
+        let alerts = summarize_user_facing_changes(
+            &diff_with(vec![SafeChange::ModuleGuardChanged {
+                from: None,
+                to: Some(unknown),
+            }]),
+            &[],
+        );
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].contains("module guard"), "{}", alerts[0]);
+        assert!(!alerts[0].contains("transaction guard"), "{}", alerts[0]);
+        assert!(alerts[0].contains(&short_address(unknown)), "{}", alerts[0]);
     }
 
     #[test]
@@ -1837,6 +2268,7 @@ mod tests {
             modules: Vec::new(),
             guard: None,
             fallback_handler: None,
+            module_guard: None,
             linked_signer_indices: vec![3],
             sibling_chains: vec![10],
             cached_at: 100,
@@ -1876,6 +2308,7 @@ mod tests {
             modules: Vec::new(),
             guard: None,
             fallback_handler: None,
+            module_guard: None,
             linked_signer_indices: Vec::new(),
             sibling_chains: Vec::new(),
             cached_at: 100,
@@ -1903,6 +2336,7 @@ mod tests {
             modules: Vec::new(),
             guard: None,
             fallback_handler: None,
+            module_guard: None,
             linked_signer_indices: Vec::new(),
             sibling_chains: Vec::new(),
             cached_at: 0,
@@ -1935,6 +2369,7 @@ mod tests {
             modules: Vec::new(),
             guard: None,
             fallback_handler: None,
+            module_guard: None,
             linked_signer_indices: Vec::new(),
             sibling_chains: Vec::new(),
             cached_at: 0,

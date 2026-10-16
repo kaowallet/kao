@@ -6391,6 +6391,11 @@ impl WalletScreen {
                         r.show_fingerprints = !r.show_fingerprints;
                     }
                 }
+                sign_review::Message::ToggleFeeDetails => {
+                    if let Some(r) = self.sign_review.as_mut() {
+                        r.show_fee_details = !r.show_fee_details;
+                    }
+                }
                 // The overlay's optional second action ("Propose to co-signers",
                 // on a Safe send or a Transaction Builder batch). Ignore once a
                 // signature is already in flight, and inside a review's arming
@@ -8921,55 +8926,80 @@ async fn decode_leg(
 /// account itself for a 7702 self-call — so decoders that care about `from`
 /// (allowance framing, self-transfer detection) see the truth.
 ///
+/// `safe_library` is the MultiSend library a Safe batch delegatecalls, `None`
+/// for a 7702 account. It decides where each sub-call lands: through
+/// `MultiSendCallOnly` 1.5.0 a call addressed to `0x0` runs as a call to the
+/// Safe itself, and is reviewed as one.
+///
 /// A blob that won't parse is a hard error: the overlay must never present a
 /// batch it can only partly account for.
 async fn decode_batch_sub_legs(
     network: &dyn BalanceFetcher,
     net: crate::chain::NetworkId,
     sender: Address,
-    is_safe: bool,
+    safe_library: Option<Address>,
     calldata: &Bytes,
     local_names: &std::collections::HashMap<Address, String>,
 ) -> Result<Vec<sign_review::ReviewLeg>, String> {
     use crate::txbuilder::{eip7702, multisend};
+    let is_safe = safe_library.is_some();
 
-    // (to, value, data) triples, however this batch shape encodes them.
-    let calls: Vec<(Address, U256, Bytes)> = if calldata.len() >= 4
-        && calldata[..4] == eip7702::EXECUTE_BATCH_SELECTOR
-    {
-        eip7702::decode_execute_batch(calldata)?
-    } else {
-        let packed = multisend::decode_multisend_calldata(calldata).map_err(|e| e.to_string())?;
-        // `PackedCall.operation` is decoded so a foreign blob can be shown
-        // for what it is — and was then dropped here, its only consumer.
-        // A sub-call with operation != 0 is a nested delegatecall running
-        // as the Safe, which the leg card does not and should not try to
-        // render as an ordinary call. Refuse the whole review: a batch the
-        // overlay can only partly account for must not reach a device.
-        if let Some(c) = packed.iter().find(|c| c.operation != 0) {
-            return Err(format!(
-                "batch contains a sub-call to {} with operation {} (delegatecall) — refusing \
+    // (to, value, data, redirected-from-0x0) per sub-call, however this batch
+    // shape encodes them.
+    let calls: Vec<(Address, U256, Bytes, bool)> =
+        if calldata.len() >= 4 && calldata[..4] == eip7702::EXECUTE_BATCH_SELECTOR {
+            eip7702::decode_execute_batch(calldata)?
+                .into_iter()
+                .map(|(to, value, data)| (to, value, data, false))
+                .collect()
+        } else {
+            let packed = match safe_library {
+                Some(library) => multisend::decode_batch(library, sender, calldata),
+                None => multisend::decode_multisend_calldata(calldata),
+            }
+            .map_err(|e| e.to_string())?;
+            // `PackedCall.operation` is decoded so a foreign blob can be shown
+            // for what it is — and was then dropped here, its only consumer.
+            // A sub-call with operation != 0 is a nested delegatecall running
+            // as the Safe, which the leg card does not and should not try to
+            // render as an ordinary call. Refuse the whole review: a batch the
+            // overlay can only partly account for must not reach a device.
+            if let Some(c) = packed.iter().find(|c| c.operation != 0) {
+                return Err(format!(
+                    "batch contains a sub-call to {} with operation {} (delegatecall) — refusing \
                      to review a nested delegatecall",
-                short_address(c.to),
-                c.operation,
-            ));
-        }
-        packed
-            .into_iter()
-            .map(|c| (c.to, c.value, c.data))
-            .collect()
-    };
+                    short_address(c.to),
+                    c.operation,
+                ));
+            }
+            packed
+                .into_iter()
+                .map(|c| (c.to, c.value, c.data, c.redirected_to_self))
+                .collect()
+        };
 
     let total = calls.len();
     let mut legs = Vec::with_capacity(total);
-    for (i, (to, value, data)) in calls.into_iter().enumerate() {
+    for (i, (to, value, data, redirected)) in calls.into_iter().enumerate() {
         let decoded = decode_leg(network, net, sender, to, data.clone(), value, local_names).await;
+        let self_admin = self_admin_warning(sender, is_safe, to, &data).map(|w| {
+            if redirected {
+                // The dapp, or another wallet, may show this call as going to
+                // `0x0`. Say why this review shows the Safe instead.
+                format!(
+                    "{w} It is encoded as a call to the zero address, which MultiSendCallOnly \
+                     1.5.0 sends to the Safe itself."
+                )
+            } else {
+                w
+            }
+        });
         legs.push(sign_review::ReviewLeg {
             title: format!("{} of {}", i + 1, total),
             to,
             value,
             net,
-            self_admin: self_admin_warning(sender, is_safe, to, &data),
+            self_admin,
             calldata: data,
             decoded: Box::new(decoded),
             sub_legs: Vec::new(),
@@ -9132,7 +9162,7 @@ async fn build_txbuilder_steps(
                     network,
                     s.chain.into(),
                     s.safe,
-                    true,
+                    Some(s.input.to),
                     &s.input.data,
                     &local_names,
                 )
@@ -9255,7 +9285,7 @@ async fn build_txbuilder_steps(
                 // and the outer self-call stays undecoded.
                 let calldata = eip7702::encode_execute_batch(&e.calls);
                 let sub_legs =
-                    decode_batch_sub_legs(network, e.net, e.from, false, &calldata, &local_names)
+                    decode_batch_sub_legs(network, e.net, e.from, None, &calldata, &local_names)
                         .await?;
                 let leg = sign_review::ReviewLeg {
                     title: format!("executeBatch · {} calls", e.calls.len()),
@@ -9848,13 +9878,17 @@ fn safe_batch_inner_calls(
             sreq.input.value,
             sreq.input.data.clone(),
         )]),
-        crate::safe::tx::Operation::DelegateCall => Ok(
-            crate::txbuilder::multisend::decode_multisend_calldata(&sreq.input.data)
-                .map_err(|e| e.to_string())?
-                .into_iter()
-                .map(|c| call(c.to, c.value, c.data))
-                .collect(),
-        ),
+        // Decoded against the library it targets, so the preflight runs each
+        // sub-call against the account the library would really call.
+        crate::safe::tx::Operation::DelegateCall => Ok(crate::txbuilder::multisend::decode_batch(
+            sreq.input.to,
+            sreq.safe,
+            &sreq.input.data,
+        )
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|c| call(c.to, c.value, c.data))
+        .collect()),
     }
 }
 
@@ -15091,6 +15125,7 @@ mod tests {
             modules: Vec::new(),
             guard: None,
             fallback_handler: None,
+            module_guard: None,
             linked_signer_indices: vec![0],
             sibling_chains: Vec::new(),
             cached_at: 0,
@@ -16988,6 +17023,7 @@ mod tests {
             modules: Vec::new(),
             guard: None,
             fallback_handler: None,
+            module_guard: None,
             linked_signer_indices: Vec::new(),
             sibling_chains: Vec::new(),
             cached_at: 0,
@@ -18154,7 +18190,7 @@ mod tests {
             &mock,
             crate::chain::NetworkId::Builtin(Chain::Mainnet),
             addr(0x5A),
-            true,
+            Some(crate::txbuilder::multisend::MULTISEND_CALL_ONLY_1_4_1),
             &blob,
             &std::collections::HashMap::new(),
         )
@@ -19781,7 +19817,7 @@ mod tests {
             &mock,
             crate::chain::NetworkId::Builtin(Chain::Mainnet),
             safe,
-            true,
+            Some(crate::txbuilder::multisend::MULTISEND_CALL_ONLY_1_4_1),
             &blob,
             &std::collections::HashMap::new(),
         )
@@ -19802,6 +19838,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_zero_target_in_a_1_5_0_batch_is_flagged_as_a_call_to_the_safe() {
+        // MultiSendCallOnly 1.5.0 sends a sub-call addressed to `0x0` to
+        // `address(this)`, the Safe. Hiding `addOwnerWithThreshold` behind a
+        // zero target must not get it past the warning a Safe-addressed call gets.
+        use crate::txbuilder::multisend;
+        let safe = addr(0x5A);
+        let attacker = addr(0xBAD_u32 as u8);
+        let calls = vec![
+            queued(1, addr(0xC1), 0, vec![0x01, 0x02, 0x03, 0x04]),
+            queued(2, Address::ZERO, 0, add_owner_data(attacker, 1)),
+        ];
+        let blob = multisend::encode_multisend_calldata(&multisend::encode_packed(&calls));
+        let mock = CallMock::new();
+        let legs = decode_batch_sub_legs(
+            &mock,
+            crate::chain::NetworkId::Builtin(Chain::Mainnet),
+            safe,
+            Some(multisend::MULTISEND_CALL_ONLY_1_5_0),
+            &blob,
+            &std::collections::HashMap::new(),
+        )
+        .await
+        .expect("the batch decodes");
+
+        assert!(legs[0].self_admin.is_none());
+        assert_eq!(legs[1].to, safe, "the leg names where the call really goes");
+        let w = legs[1]
+            .self_admin
+            .as_deref()
+            .expect("the governance call is flagged");
+        assert!(w.contains("adds an owner"), "it names the effect: {w}");
+        assert!(w.contains("zero address"), "and says why it isn't 0x0: {w}");
+
+        // Through 1.4.1 the same bytes call the zero address, and nothing runs as the Safe.
+        let legs = decode_batch_sub_legs(
+            &mock,
+            crate::chain::NetworkId::Builtin(Chain::Mainnet),
+            safe,
+            Some(multisend::MULTISEND_CALL_ONLY_1_4_1),
+            &blob,
+            &std::collections::HashMap::new(),
+        )
+        .await
+        .expect("the batch decodes");
+        assert_eq!(legs[1].to, Address::ZERO);
+        assert!(legs[1].self_admin.is_none());
+    }
+
+    #[tokio::test]
     async fn an_unrecognised_call_to_the_safe_is_flagged_harder_not_softer() {
         // Not knowing what a call to your own multisig does is a worse position
         // to sign from, not a better one.
@@ -19815,7 +19900,7 @@ mod tests {
             &mock,
             crate::chain::NetworkId::Builtin(Chain::Mainnet),
             safe,
-            true,
+            Some(crate::txbuilder::multisend::MULTISEND_CALL_ONLY_1_4_1),
             &blob,
             &std::collections::HashMap::new(),
         )
@@ -19841,7 +19926,7 @@ mod tests {
             &mock,
             crate::chain::NetworkId::Builtin(Chain::Mainnet),
             safe,
-            true,
+            Some(crate::txbuilder::multisend::MULTISEND_CALL_ONLY_1_4_1),
             &blob,
             &std::collections::HashMap::new(),
         )

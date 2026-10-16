@@ -93,6 +93,10 @@ pub enum Message {
     /// (gas limit, fee caps, balance, how each figure is wrong). Warnings and
     /// the headline figures stay visible either way.
     ToggleFeeDetails,
+    /// Expand/collapse an already-active delegation card for a known delegate
+    /// (see [`DelegationReview::collapsible`]). Other delegation cards have no
+    /// toggle.
+    ToggleDelegation,
     /// The overlay's optional secondary action (Safe send: "Propose to
     /// co-signers", alongside the primary "Sign & execute"). Only emitted when a
     /// `secondary_label` is set.
@@ -219,6 +223,26 @@ impl DelegationReview {
     /// zero address, which EIP-7702 interprets as "clear the designator".
     pub fn is_revocation(&self) -> bool {
         self.delegate.is_zero()
+    }
+
+    /// The delegate's name when it is one this wallet recognises: its own
+    /// [`EF_SIMPLE_7702_ACCOUNT`](crate::txbuilder::eip7702::EF_SIMPLE_7702_ACCOUNT)
+    /// or a listed third-party implementation. `None` for anything else.
+    pub fn known_delegate_name(&self) -> Option<&'static str> {
+        use crate::txbuilder::eip7702;
+        if self.delegate == eip7702::EF_SIMPLE_7702_ACCOUNT {
+            Some("Ethereum Foundation Simple7702Account")
+        } else {
+            eip7702::third_party_delegate_name(self.delegate)
+        }
+    }
+
+    /// True when the card may fold behind a toggle: the delegation is already
+    /// in place (nothing is signed) and points at a delegate this wallet
+    /// recognises. A fresh authorization, a replacement, a revocation, or an
+    /// unrecognised delegate always renders in full.
+    pub fn collapsible(&self) -> bool {
+        self.already_active && !self.is_revocation() && self.known_delegate_name().is_some()
     }
 }
 
@@ -906,6 +930,9 @@ pub struct SignReview {
     /// Expand state for the fee breakdown under the "Network fee" and "Cost"
     /// cards. One flag unfolds both: they sit together and answer one question.
     pub show_fee_details: bool,
+    /// Expand state for a collapsible delegation card
+    /// ([`DelegationReview::collapsible`]). Folded by default.
+    pub show_delegation: bool,
     /// The ceremony the waiting card describes once signing is in flight. Set at
     /// dispatch for a multi-device Safe send (execute or propose) so the "waiting
     /// for a signature" card lays out the per-owner device prompts; `None` for a
@@ -1003,6 +1030,7 @@ impl SignReview {
             show_calldata: false,
             show_fingerprints: false,
             show_fee_details: false,
+            show_delegation: false,
             signing_progress: None,
             armed_at: None,
             owner_eth_sign: None,
@@ -1132,6 +1160,7 @@ pub fn view<'a>(t: KaoTheme, review: &'a SignReview, progress: f32) -> Element<'
             review.show_calldata,
             review.show_fingerprints,
             review.show_fee_details,
+            review.show_delegation,
             review.signing_since.is_some(),
         ));
     }
@@ -1513,11 +1542,12 @@ fn step_card<'a>(
     show_calldata: bool,
     show_fingerprints: bool,
     show_fee_details: bool,
+    show_delegation: bool,
     signing: bool,
 ) -> Element<'a, Message> {
     let panel = match step {
         SignStep::RawTx(leg) => leg_card(t, leg, show_calldata),
-        SignStep::Delegation(d) => delegation_panel(t, d),
+        SignStep::Delegation(d) => delegation_panel(t, d, show_delegation),
         SignStep::Typed(order) => order_panel(t, order),
         SignStep::SafeExec(x) => safe_exec_panel(t, x, show_calldata),
         SignStep::SafeMessage(m) => safe_message_panel(t, m),
@@ -1937,7 +1967,51 @@ fn self_admin_banner<'a>(t: KaoTheme, warning: &'a str) -> Element<'a, Message> 
 /// The EIP-7702 authorization card. Deliberately leads with what changes about
 /// the *account* rather than with the transaction: this is the only signature
 /// in the wallet whose effect survives the transaction that carried it.
-fn delegation_panel<'a>(t: KaoTheme, d: &'a DelegationReview) -> Element<'a, Message> {
+///
+/// A [collapsible](DelegationReview::collapsible) card — an existing
+/// delegation to a known delegate, where nothing is signed — folds to a
+/// one-line toggle naming the delegate; `show` unfolds it.
+fn delegation_panel<'a>(t: KaoTheme, d: &'a DelegationReview, show: bool) -> Element<'a, Message> {
+    let Some(name) = d.known_delegate_name().filter(|_| d.collapsible()) else {
+        return card(t, delegation_body(t, d).into());
+    };
+    let caret = if show { "▾" } else { "▸" };
+    let header = row![
+        text(caret).size(12).color(t.sub).font(mono()),
+        Space::new().width(6),
+        text(format!("Account delegated to {name}"))
+            .size(12)
+            .color(t.text)
+            .font(mono_bold()),
+        Space::new().width(Length::Fill),
+        text(if show { "hide" } else { "details" })
+            .size(11)
+            .color(t.sub)
+            .font(mono()),
+    ]
+    .align_y(Alignment::Center)
+    .spacing(0);
+    let toggle: Element<'a, Message> = button(header.width(Length::Fill))
+        .width(Length::Fill)
+        .padding(0)
+        .on_press(Message::ToggleDelegation)
+        .style(move |_theme, _status| button::Style {
+            background: Some(iced::Background::Color(iced::Color::TRANSPARENT)),
+            text_color: t.text,
+            ..button::Style::default()
+        })
+        .into();
+    let mut col = column![toggle].spacing(0).width(Length::Fill);
+    if show {
+        col = col.push(Space::new().height(10));
+        col = col.push(delegation_body(t, d));
+    }
+    card(t, col.into())
+}
+
+/// The full contents of a delegation card (everything [`delegation_panel`]
+/// shows unfolded), without the surrounding card.
+fn delegation_body<'a>(t: KaoTheme, d: &'a DelegationReview) -> iced::widget::Column<'a, Message> {
     let mut col = column![
         text("Account delegation — EIP-7702 authorization")
             .size(11)
@@ -2022,7 +2096,7 @@ fn delegation_panel<'a>(t: KaoTheme, d: &'a DelegationReview) -> Element<'a, Mes
         .color(if d.already_active { t.sub } else { t.down })
         .font(bold()),
     );
-    card(t, col.into())
+    col
 }
 
 /// A CoW order authorized via EIP-1271 from a Safe: the order rows (same as the
@@ -3154,6 +3228,80 @@ mod tests {
         assert!(!review.show_fingerprints);
     }
 
+    fn delegation(delegate: Address, already_active: bool) -> DelegationReview {
+        DelegationReview {
+            delegate,
+            delegate_label: String::new(),
+            authority: Address::repeat_byte(0xE0),
+            chain_id: 8453,
+            net: crate::chain::NetworkId::Builtin(Chain::Base),
+            already_active,
+            incumbent: already_active.then_some(delegate),
+            auth_nonce: None,
+            auth_digest: None,
+        }
+    }
+
+    #[test]
+    fn an_existing_delegation_to_a_known_delegate_folds() {
+        use crate::txbuilder::eip7702;
+        for delegate in [
+            eip7702::EF_SIMPLE_7702_ACCOUNT,
+            eip7702::AMBIRE_7702_DELEGATE,
+            eip7702::METAMASK_STATELESS_DELEGATOR,
+        ] {
+            assert!(delegation(delegate, true).collapsible(), "{delegate}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_or_signed_delegation_never_folds() {
+        use crate::txbuilder::eip7702;
+        // Unrecognised: the warning is the point of the card.
+        assert!(!delegation(Address::repeat_byte(0x77), true).collapsible());
+        // A fresh authorization is a real signature, known delegate or not.
+        assert!(!delegation(eip7702::EF_SIMPLE_7702_ACCOUNT, false).collapsible());
+        // Revocation signs an authorization too.
+        assert!(!delegation(Address::ZERO, false).collapsible());
+    }
+
+    #[test]
+    fn folded_delegation_names_the_delegate_and_hides_the_details() {
+        let t = KaoTheme::for_kind(crate::ui::kao_theme::ThemeKind::Mint);
+        let step = SignStep::Delegation(delegation(
+            crate::txbuilder::eip7702::AMBIRE_7702_DELEGATE,
+            true,
+        ));
+        let render = |show| {
+            super::super::test_support::texts(step_card(t, &step, false, false, false, show, false))
+                .join("\n")
+        };
+        let folded = render(false);
+        assert!(folded.contains("Account delegated to Ambire"), "{folded}");
+        assert!(!folded.contains("Your account already runs this code"));
+        let open = render(true);
+        assert!(
+            open.contains("Your account already runs this code"),
+            "{open}"
+        );
+    }
+
+    #[test]
+    fn delegation_card_defaults_collapsed() {
+        let review = SignReview::pending(
+            "Cancel order".into(),
+            None,
+            Vec::new(),
+            None,
+            0,
+            SignAction::CowCancel {
+                host: CowHost::Apps,
+                uid: "0xabc".into(),
+            },
+        );
+        assert!(!review.show_delegation);
+    }
+
     /// After an owner's device refused the EIP-712 prompt, Confirm signs the Safe hash as a
     /// personal message and every owner's device shows its EIP-191 digest. That digest stays on
     /// screen while the devices prompt — the moment it has to be checked — with the instruction
@@ -3242,7 +3390,15 @@ mod tests {
 
     fn rendered(step: &SignStep, show_calldata: bool) -> Vec<String> {
         let t = KaoTheme::for_kind(crate::ui::kao_theme::ThemeKind::Mint);
-        super::super::test_support::texts(step_card(t, step, show_calldata, true, true, false))
+        super::super::test_support::texts(step_card(
+            t,
+            step,
+            show_calldata,
+            true,
+            true,
+            true,
+            false,
+        ))
     }
 
     /// A call Kao can't decode (a custom network has no verified chain to resolve it against)

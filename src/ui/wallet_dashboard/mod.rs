@@ -6396,6 +6396,11 @@ impl WalletScreen {
                         r.show_fee_details = !r.show_fee_details;
                     }
                 }
+                sign_review::Message::ToggleDelegation => {
+                    if let Some(r) = self.sign_review.as_mut() {
+                        r.show_delegation = !r.show_delegation;
+                    }
+                }
                 // The overlay's optional second action ("Propose to co-signers",
                 // on a Safe send or a Transaction Builder batch). Ignore once a
                 // signature is already in flight, and inside a review's arming

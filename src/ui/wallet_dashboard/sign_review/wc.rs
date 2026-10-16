@@ -1869,6 +1869,7 @@ mod tests {
             true,
             true,
             true,
+            true,
             false,
         ))
     }
@@ -1942,6 +1943,7 @@ mod tests {
         let folded = super::super::super::test_support::texts(super::super::step_card(
             theme(),
             &step,
+            false,
             false,
             false,
             false,
@@ -2170,6 +2172,7 @@ mod tests {
             super::super::super::test_support::texts(super::super::step_card(
                 theme(),
                 step,
+                false,
                 false,
                 false,
                 false,

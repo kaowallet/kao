@@ -3,15 +3,26 @@
 //! Ownership: `App` owns one [`runtime::WcSlot`]. The [`runtime::WcRuntime`] inside it holds the
 //! `SignClient`, Kao's [`book::WcBook`], a `closed` flag and the tokio handle it spawns every relay side
 //! effect on — so nothing WalletConnect sends depends on an iced `Task` surviving a dashboard rebuild.
-//! Lazy network: nothing here dials until the user pastes a `wc:` link and presses Connect.
+//!
+//! Sessions survive a lock, a quit or a reboot: the runtime saves its state ([`persist::WcStateRecord`]
+//! — the client state with its keys, Kao's bindings, the answers still owed, the relay identity)
+//! in the vault, sealed under the wallet's data key, and records the connection and signed-message
+//! history there too. Lock and quit **suspend** (requests answered, no dapp disconnected, the final
+//! state saved); the next unlock **restores** what is still alive. Turn off disconnects every dapp
+//! and clears the saved state. Without a data key, lock and quit fall back to the full teardown.
+//!
+//! Lazy network: nothing here dials until the user pastes a `wc:` link and presses Connect — or, at
+//! unlock, while unexpired saved sessions exist and the route is at least as private as the one
+//! they were saved under (otherwise the restore waits for the user).
 //! Proxy: the relay socket goes through [`transport::KaoConnector`] — SOCKS5h whenever a proxy is
-//! installed or exported by the environment Kao was launched from, fail closed. Sessions are in-memory only and end on lock / quit.
+//! installed or exported by the environment Kao was launched from, fail closed.
 
 pub mod book;
 #[cfg(test)]
 mod e2e_tests;
 pub mod message;
 pub mod namespaces;
+pub mod persist;
 pub mod request;
 pub mod runtime;
 #[cfg(test)]

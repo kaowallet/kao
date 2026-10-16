@@ -139,6 +139,18 @@ impl CreatePasswordScreen {
         }
     }
 
+    /// Show `e` under the form — a refusal the parent decided on after `Created` (another Kao
+    /// process holds the wallet). The typed password was taken with `Created`, so it is retyped.
+    pub fn set_error(&mut self, e: String) {
+        self.error = Some(e);
+    }
+
+    /// The error under the form (the App's tests).
+    #[cfg(test)]
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
     fn try_create(&mut self) -> Option<Outcome> {
         if self.password.len() < 8 {
             self.error = Some("Password must be at least 8 characters".into());

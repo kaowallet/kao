@@ -21,19 +21,14 @@ use iced::widget::text::Wrapping;
 
 use crate::chain::NetworkId;
 use crate::sanitize::{escape_unsafe_display, sanitize_display};
-use crate::sign::digest::EIP191_DIGEST_LABEL;
+use crate::sign::digest::{
+    DAPP_DOMAIN_HASH_LABEL, DAPP_EIP712_DIGEST_LABEL, DAPP_MESSAGE_HASH_LABEL, EIP191_DIGEST_LABEL,
+};
 use crate::ui::kao_widgets::{BadgeKind, caution_color, privacy_badge, span_label};
 use crate::walletconnect::{
     AllowanceExpiry, AllowanceGrant, BinaryReason, DomainSummary, ExactValue, TypedKind,
     TypedWarning, format_gwei,
 };
-
-/// ERC-8213 labels for the dapp's own EIP-712 digests when a Safe signs typed data as an EIP-1271
-/// message. The standard labels belong to the `SafeMessage` the owners sign; the inner triple gets a
-/// "Dapp" prefix so the two sets can't be mistaken for each other.
-const DAPP_EIP712_DIGEST_LABEL: &str = "Dapp EIP-712 Digest";
-const DAPP_DOMAIN_HASH_LABEL: &str = "Dapp Domain Hash";
-const DAPP_MESSAGE_HASH_LABEL: &str = "Dapp Message Hash";
 
 /// Display clamps for dapp strings drawn in the typed-data and SIWE boxes. Generous on purpose —
 /// the fingerprints cover every byte, but a value the user can't read in full is one they can't

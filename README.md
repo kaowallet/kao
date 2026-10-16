@@ -16,6 +16,7 @@ Note: Apps use their APIs:
 
 - CoW Swap -> api.cow.fi (getting a quote)
 - Privacy Pools -> api.0xbow.io (loading pools, ASP feed)
+- WalletConnect -> the relay you configure (Reown's by default), only once you connect a dapp. Connected dapps stay connected when Kao locks or quits: their sessions are kept encrypted in your wallet, and Kao reconnects them when you unlock — through your proxy, if they were made through it. Turn WalletConnect off to disconnect them for good.
 
 ## ( ˶˘ ³˘)♡ No phoning home ε=ε=ε=ε=ε=ε=┌(;￣◇￣)┘
 
@@ -27,7 +28,7 @@ For too long we've been relying on slow and vulnerable JavaScript for building u
 
 # ‧₊˚♪ 𝄞₊˚⊹ Roadmap ▶︎ •၊၊||၊|။||||| 0:10
 
-- [x] WalletConnect
+- [x] WalletConnect (sessions that survive restarts, connection and signed-message history)
 - [x] ERC-7730 clear signing support
 - Kohaku-aligned integrations:
     - [ ] Stealth Addresses

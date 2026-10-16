@@ -22,6 +22,7 @@ mod activity;
 mod appearance;
 mod approvals_app;
 mod apps;
+mod connection_history_settings;
 mod contacts_settings;
 mod function_panel;
 mod header;
@@ -38,27 +39,37 @@ mod send;
 mod settings_root;
 mod sidebar;
 mod sign_review;
+mod signed_messages_settings;
 mod sim_view;
 mod swap;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
+/// For the App's tests, which drive Settings → Connection history from outside.
+#[cfg(test)]
+pub(crate) use connection_history_settings::Message as ConnectionHistoryMessage;
 mod tx_builder;
 mod tx_details;
 mod wc_app;
 mod wc_flow;
 mod wc_sign;
 
+pub use pool_app::IDENTITY_STILL_UNREAD as POOL_IDENTITY_STILL_UNREAD;
+pub use pool_app::IDENTITY_UNREAD as POOL_IDENTITY_UNREAD;
+#[cfg(test)]
+pub use wc_flow::WcMsg;
 pub use wc_flow::handle_orphan_message;
 
 use account_dropdown::AccountDropdown;
 use accounts_settings::AccountsPane;
 use apps::AppsPane;
+use connection_history_settings::ConnectionsPane;
 use contacts_settings::ContactsPane;
 use receive::ReceivePane;
 use safe_tx_detail::SafeTxDetailPane;
 use safes_settings::SafesPane;
 use send::SafeSendRequest;
 use send::SendPane;
+use signed_messages_settings::SignedMessagesPane;
 use swap::SwapPane;
 use tx_details::TxDetailsPane;
 
@@ -163,6 +174,11 @@ impl CopyKick for contacts_settings::Message {
 impl CopyKick for safes_settings::Message {
     fn copy_kick() -> Option<Self> {
         Some(safes_settings::Message::AddressCopied)
+    }
+}
+impl CopyKick for signed_messages_settings::Message {
+    fn copy_kick() -> Option<Self> {
+        Some(signed_messages_settings::Message::AddressCopied)
     }
 }
 impl CopyKick for accounts_settings::Message {
@@ -397,6 +413,14 @@ pub enum Message {
     OpenAppearanceSettings,
     CloseAppearanceSettings,
     OpenContactsSettings,
+    /// Open Settings → Signed messages (from the Settings root).
+    OpenSignedMessagesSettings,
+    /// Child messages of Settings → Signed messages: record ids, never what was signed.
+    SignedMessagesSettings(signed_messages_settings::Message),
+    /// Open Settings → Connection history — from the Settings root, or the WalletConnect pane's
+    /// "See all in Settings ›".
+    OpenConnectionHistorySettings,
+    ConnectionHistorySettings(connection_history_settings::Message),
     /// Open the Contacts pane in Add mode pre-filled with the given
     /// address (and optional ENS string when known). Wired from the Send
     /// pane's "Save as contact" CTA so users go straight from a fresh
@@ -620,7 +644,7 @@ pub enum Message {
     PoolSynced {
         pool: Address,
         chain: crate::chain::Chain,
-        result: Result<(crate::pool::sync::PoolState, crate::pool::sync::CachedNotes), String>,
+        result: PoolSyncResult,
     },
     /// A relayer fee quote for a withdrawal returned.
     PoolQuoted {
@@ -696,6 +720,25 @@ pub enum Message {
     Wc(wc_flow::WcMsg),
 }
 
+/// One pool's sync result ([`Message::PoolSynced`]): the synced state plus the refreshed note
+/// cache, or the error. Its `Debug` is shape-only BY TYPE: the state and the notes embed each
+/// recovered note's (nullifier, secret) spending keys, which the SDK types Debug-print, and both
+/// the App and the dashboard trace whole messages — the App's trace runs before any dashboard arm
+/// could redact.
+#[derive(Clone)]
+pub struct PoolSyncResult(
+    pub Result<(crate::pool::sync::PoolState, crate::pool::sync::CachedNotes), String>,
+);
+
+impl std::fmt::Debug for PoolSyncResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Ok((state, _)) => write!(f, "Ok({} accounts)", state.accounts.len()),
+            Err(_) => f.write_str("Err(..)"),
+        }
+    }
+}
+
 /// Outcomes bubbled up to the parent app.
 #[derive(Debug, Clone)]
 pub enum Outcome {
@@ -766,10 +809,16 @@ pub enum Outcome {
     /// `WalletScreen::set_pp_account` + `show_pool_backup`. Needs the App's
     /// held passphrase, which the dashboard doesn't have.
     PoolCreateIdentity,
+    /// The pool-seed load failed this session; the user asked to load it again.
+    PoolRetryIdentity,
     /// Persist + adopt a restored Privacy Pools mnemonic.
     PoolRestoreIdentity(secrecy::SecretString),
     /// Re-load the pool seed and hand its phrase to the backup view.
     PoolRevealBackup,
+    /// The user confirmed "Reset saved history and connections" (offered while the vault couldn't
+    /// read the wallet file's saved state): the App runs `wallet::reset_sealed` with the held
+    /// passphrase off the UI thread and hands the vault the fresh key it mints.
+    ResetSealedHistory,
     /// A neutral toast for App (`Message::Notice`).
     Notice(String),
 }
@@ -799,8 +848,10 @@ impl Outcome {
             Outcome::RenameAccount { .. } => "RenameAccount",
             Outcome::RemoveAccount { .. } => "RemoveAccount",
             Outcome::PoolCreateIdentity => "PoolCreateIdentity",
+            Outcome::PoolRetryIdentity => "PoolRetryIdentity",
             Outcome::PoolRestoreIdentity(_) => "PoolRestoreIdentity",
             Outcome::PoolRevealBackup => "PoolRevealBackup",
+            Outcome::ResetSealedHistory => "ResetSealedHistory",
             Outcome::Notice(_) => "Notice",
         }
     }
@@ -862,6 +913,8 @@ enum SettingsPane {
     Accounts(AccountsPane),
     Appearance,
     Contacts(ContactsPane),
+    SignedMessages(SignedMessagesPane),
+    Connections(ConnectionsPane),
 }
 
 impl SettingsPane {
@@ -874,6 +927,8 @@ impl SettingsPane {
             SettingsPane::Accounts(_) => "Accounts",
             SettingsPane::Appearance => "Appearance",
             SettingsPane::Contacts(_) => "Contacts",
+            SettingsPane::SignedMessages(_) => "SignedMessages",
+            SettingsPane::Connections(_) => "Connections",
         }
     }
 }
@@ -944,6 +999,9 @@ pub struct WalletScreen {
     checkpoint_refreshing: bool,
     /// Which Settings sub-screen is currently rendered.
     settings_pane: SettingsPane,
+    /// The vault revision an open history pane (Signed messages, Connection history) was last
+    /// seeded at; it reseeds when the vault moves past it (`refresh_history_views`).
+    settings_history_rev: Option<u64>,
     /// Live portfolio entries fetched from on-chain balances + CoinGecko.
     portfolio: Vec<LiveToken>,
     /// True while a portfolio fetch is in flight.
@@ -1169,6 +1227,7 @@ impl WalletScreen {
             verification: VerificationStatus::Connecting,
             checkpoint_refreshing: false,
             settings_pane: SettingsPane::Root,
+            settings_history_rev: None,
             portfolio,
             portfolio_loading,
             portfolio_refreshing: false,
@@ -1247,6 +1306,13 @@ impl WalletScreen {
     /// App owns the seed and hands the phrase in only for display).
     pub fn show_pool_backup(&mut self, phrase: secrecy::SecretString) {
         self.apps.pool_pane().show_backup(phrase);
+    }
+
+    /// Whether this session's pool-seed load failed: the pool app then offers "Try again" (and a
+    /// restore from the phrase, which replaces it) instead of creating an identity over one it
+    /// couldn't read.
+    pub fn set_pp_identity_unreadable(&mut self, unreadable: bool) {
+        self.apps.pool_pane().set_identity_unreadable(unreadable);
     }
 
     /// Surface an App-side error (e.g. seed save failed) on the pool pane.
@@ -1487,6 +1553,73 @@ impl WalletScreen {
             &self.safes,
             self.active_index,
         ));
+    }
+
+    /// Show Settings → Signed messages, from the vault (empty without a WalletConnect slot).
+    fn open_signed_messages_settings(&mut self) {
+        let vault = self.wc_vault();
+        let (records, unreadable) = vault
+            .as_ref()
+            .map(|v| (v.signed(), v.unreadable()))
+            .unwrap_or_default();
+        let mut pane = SignedMessagesPane::new(records, unreadable);
+        pane.set_can_persist(vault.as_ref().is_none_or(crate::vault::Vault::can_persist));
+        self.settings_history_rev = vault.map(|v| v.revision());
+        self.settings_pane = SettingsPane::SignedMessages(pane);
+    }
+
+    /// Show Settings → Connection history, from the vault (empty without a WalletConnect slot) —
+    /// from the Settings root, or the WalletConnect pane's "See all in Settings ›".
+    fn open_connection_history_settings(&mut self) -> Task<Message> {
+        let vault = self.wc_vault();
+        let (records, unreadable) = vault
+            .as_ref()
+            .map(|v| (v.connections(), v.unreadable()))
+            .unwrap_or_default();
+        let mut pane = ConnectionsPane::new(records, unreadable);
+        pane.set_can_persist(vault.as_ref().is_none_or(crate::vault::Vault::can_persist));
+        // Saved dapps a restore hasn't brought back yet aren't "Connected now";
+        // `refresh_history_views` keeps this current as the restore moves on.
+        pane.set_restoring(self.wc_restoring());
+        self.settings_history_rev = vault.map(|v| v.revision());
+        self.nav = Nav::Settings;
+        self.settings_pane = SettingsPane::Connections(pane);
+        Task::none()
+    }
+
+    /// After every dispatch: a history view on screen follows the vault, which also changes from
+    /// the WalletConnect runtime's own tasks (a dapp's delivery ack, a session ending) — reseeded
+    /// only when its revision moved. The App calls it too when the vault gets its data key (which
+    /// moves the revision), so the panes stop saying records aren't kept. Connection history also
+    /// follows the slot's restore (its open records wait to reconnect while one runs or waits),
+    /// which changes without the vault.
+    pub fn refresh_history_views(&mut self) {
+        self.wc_sync_history();
+        if matches!(self.settings_pane, SettingsPane::Connections(_)) {
+            let restoring = self.wc_restoring();
+            if let SettingsPane::Connections(p) = &mut self.settings_pane {
+                p.set_restoring(restoring);
+            }
+        }
+        let Some(vault) = self.wc_vault() else {
+            return;
+        };
+        let rev = vault.revision();
+        if self.settings_history_rev == Some(rev) {
+            return;
+        }
+        match &mut self.settings_pane {
+            SettingsPane::SignedMessages(p) => {
+                p.set_records(vault.signed(), vault.unreadable());
+                p.set_can_persist(vault.can_persist());
+            }
+            SettingsPane::Connections(p) => {
+                p.set_records(vault.connections(), vault.unreadable());
+                p.set_can_persist(vault.can_persist());
+            }
+            _ => return,
+        }
+        self.settings_history_rev = Some(rev);
     }
 
     /// Short network label for the sidebar footer — the Safe's chain in
@@ -2022,6 +2155,7 @@ impl WalletScreen {
         use pool_app::Outcome as O;
         match o {
             O::CreateIdentity => (Task::none(), Some(Outcome::PoolCreateIdentity)),
+            O::RetryIdentity => (Task::none(), Some(Outcome::PoolRetryIdentity)),
             O::RestoreIdentity(phrase) => {
                 (Task::none(), Some(Outcome::PoolRestoreIdentity(phrase)))
             }
@@ -4871,22 +5005,6 @@ impl WalletScreen {
             // chrome / clipboard chip / copy toast; see `subscription`) —
             // tracing it would drown the stream.
             Message::Tick => {}
-            // Redacted: the Ok payload embeds each recovered note's
-            // (nullifier, secret) spending keys, which the SDK types
-            // Debug-print — trace the variant without the payload.
-            Message::PoolSynced {
-                pool,
-                chain,
-                result,
-            } => {
-                crate::trace_msg!(
-                    "dashboard",
-                    &format_args!(
-                        "PoolSynced {{ pool: {pool}, chain: {chain:?}, ok: {} }}",
-                        result.is_ok()
-                    )
-                );
-            }
             // Shape only: the payload is every account's name and address
             // (keys are redacted by type, but the lot clamps to noise).
             Message::AccountsUpdated {
@@ -4915,6 +5033,7 @@ impl WalletScreen {
         let wc_identity_before = self.wc_active_identity();
 
         let (mut task, outcome) = self.update_inner(message);
+        self.refresh_history_views();
 
         // A WalletConnect runtime that retired itself left its reason in the
         // slot: iced may have cancelled its stream before delivering it.
@@ -6570,7 +6689,7 @@ impl WalletScreen {
             Message::PoolSynced {
                 pool,
                 chain,
-                result,
+                result: PoolSyncResult(result),
             } => {
                 match result {
                     Ok((state, notes)) => {
@@ -7488,6 +7607,62 @@ impl WalletScreen {
                 self.settings_pane =
                     SettingsPane::Contacts(ContactsPane::new(self.contacts.clone()));
             }
+            Message::OpenSignedMessagesSettings => self.open_signed_messages_settings(),
+            Message::SignedMessagesSettings(child_msg) => {
+                let SettingsPane::SignedMessages(p) = &mut self.settings_pane else {
+                    return (Task::none(), None);
+                };
+                let (task, outcome) = p.update(child_msg);
+                let task = task.map(Message::SignedMessagesSettings);
+                match outcome {
+                    Some(signed_messages_settings::Outcome::Closed) => {
+                        self.settings_pane = SettingsPane::Root;
+                    }
+                    // Straight to the vault (its writer clears the table on disk); the pane
+                    // reseeds from it after this dispatch.
+                    Some(signed_messages_settings::Outcome::Clear) => {
+                        if let Some(vault) = self.wc_vault() {
+                            info!("signed-message history cleared by the user");
+                            vault.clear_signed();
+                        }
+                    }
+                    Some(signed_messages_settings::Outcome::CopyText(s)) => {
+                        return (Task::batch([task, self.arm_clipboard_clear(s)]), None);
+                    }
+                    // Needs the App's passphrase: the App runs it.
+                    Some(signed_messages_settings::Outcome::Reset) => {
+                        return (task, Some(Outcome::ResetSealedHistory));
+                    }
+                    None => {}
+                }
+                return (task, None);
+            }
+            Message::OpenConnectionHistorySettings => {
+                return (self.open_connection_history_settings(), None);
+            }
+            Message::ConnectionHistorySettings(child_msg) => {
+                let SettingsPane::Connections(p) = &mut self.settings_pane else {
+                    return (Task::none(), None);
+                };
+                let (task, outcome) = p.update(child_msg);
+                let task = task.map(Message::ConnectionHistorySettings);
+                match outcome {
+                    Some(connection_history_settings::Outcome::Closed) => {
+                        self.settings_pane = SettingsPane::Root;
+                    }
+                    Some(connection_history_settings::Outcome::Clear) => {
+                        if let Some(vault) = self.wc_vault() {
+                            info!("connection history cleared by the user (open ones kept)");
+                            vault.clear_ended_connections();
+                        }
+                    }
+                    Some(connection_history_settings::Outcome::Reset) => {
+                        return (task, Some(Outcome::ResetSealedHistory));
+                    }
+                    None => {}
+                }
+                return (task, None);
+            }
             Message::OpenContactsPaneWith { address, ens } => {
                 // From the Send pane's "Save as contact" CTA. Switch
                 // the nav to Settings, close the Send modal (the chrome
@@ -8017,6 +8192,8 @@ impl WalletScreen {
                 SettingsPane::Accounts(p) => p.view(t).map(Message::AccountsSettings),
                 SettingsPane::Appearance => appearance::view(t, self.theme_kind),
                 SettingsPane::Contacts(p) => p.view(t).map(Message::Contacts),
+                SettingsPane::SignedMessages(p) => p.view(t).map(Message::SignedMessagesSettings),
+                SettingsPane::Connections(p) => p.view(t).map(Message::ConnectionHistorySettings),
             },
         };
 
@@ -12177,7 +12354,7 @@ fn spawn_pool_account_sync(
         move |result| Message::PoolSynced {
             pool,
             chain,
-            result,
+            result: PoolSyncResult(result),
         },
     )
 }
@@ -13868,6 +14045,27 @@ impl WalletScreen {
 
     pub(crate) fn test_active_safe(&self) -> Option<usize> {
         self.active_safe
+    }
+
+    /// The pool app's error banner, if any.
+    pub(crate) fn test_pool_error(&mut self) -> Option<String> {
+        self.apps.pool_pane().error().map(str::to_string)
+    }
+
+    /// What the WalletConnect pane's home view draws.
+    pub(crate) fn test_wc_pane_texts(&mut self) -> Vec<String> {
+        let t = KaoTheme::for_kind(crate::ui::kao_theme::ThemeKind::Void);
+        test_support::texts(self.apps.wc_pane().view(t))
+    }
+
+    /// What the open Settings history pane (Signed messages or Connection history) draws.
+    pub(crate) fn test_history_pane_texts(&self) -> Vec<String> {
+        let t = KaoTheme::for_kind(crate::ui::kao_theme::ThemeKind::Void);
+        match &self.settings_pane {
+            SettingsPane::SignedMessages(p) => test_support::texts(p.view(t)),
+            SettingsPane::Connections(p) => test_support::texts(p.view(t)),
+            other => panic!("not a history pane: {}", other.name()),
+        }
     }
 
     /// Make the Safe at `idx` the active identity, as the account
@@ -20635,6 +20833,193 @@ mod tests {
                 Some(sign_review::SigningKind::SafePropose { .. })
             ),
             "armed: the propose ceremony starts"
+        );
+    }
+
+    // ── Settings → Signed messages / Connection history ─────────────────
+
+    fn history_texts(screen: &WalletScreen) -> Vec<String> {
+        let t = KaoTheme::for_kind(ThemeKind::Void);
+        match &screen.settings_pane {
+            SettingsPane::SignedMessages(p) => test_support::texts(p.view(t)),
+            SettingsPane::Connections(p) => test_support::texts(p.view(t)),
+            other => panic!("not a history pane: {}", other.name()),
+        }
+    }
+
+    fn signed(host: &str, delivery: crate::vault::Delivery) -> crate::vault::NewSigned {
+        crate::vault::NewSigned {
+            at: 100,
+            origin: crate::vault::SignOrigin::WalletConnect {
+                topic: "t".into(),
+                request_id: 1,
+                session_ordinal: 1,
+                dapp: crate::vault::DappRecord {
+                    name: "App".into(),
+                    host: Some(host.into()),
+                    ..Default::default()
+                },
+            },
+            payload: crate::vault::SignedPayload::Message {
+                bytes: b"hello".to_vec(),
+            },
+            signature: Bytes::from(vec![0x11; 65]),
+            delivery,
+            ..Default::default()
+        }
+    }
+
+    /// Settings → Signed messages reads the vault (records the unlock loaded included), follows
+    /// it while open, copies a delivered signature through the auto-clearing clipboard, and its
+    /// confirmed Clear empties the vault.
+    #[test]
+    fn signed_messages_pane_reads_and_clears_the_vault() {
+        let vault = crate::vault::Vault::with_store_path(std::path::PathBuf::from(
+            "/nonexistent/kao-dashboard-test.redb",
+        ));
+        let loaded = crate::vault::SignedRecord {
+            id: 4,
+            delivery: crate::vault::Delivery::Delivered,
+            origin: crate::vault::SignOrigin::WalletConnect {
+                topic: "t".into(),
+                request_id: 9,
+                session_ordinal: 1,
+                dapp: crate::vault::DappRecord {
+                    name: "Loaded".into(),
+                    host: Some("loaded.example".into()),
+                    ..Default::default()
+                },
+            },
+            ..Default::default()
+        };
+        vault.unlock(
+            None,
+            crate::wallet::KeyStatus::Ok,
+            crate::wallet::SealedLoad {
+                signed: crate::wallet::SealedRows {
+                    rows: vec![(
+                        4,
+                        zeroize::Zeroizing::new(serde_json::to_vec(&loaded).unwrap()),
+                    )],
+                    dropped: 0,
+                },
+                ..Default::default()
+            },
+        );
+        let mut screen = screen_with_accounts(0, Vec::new());
+        let _ = screen.set_wc_slot(crate::walletconnect::runtime::WcSlot::with_vault(
+            vault.clone(),
+        ));
+        let _ = screen.update(Message::OpenSignedMessagesSettings);
+        assert_eq!(screen.settings_pane.name(), "SignedMessages");
+        let texts = history_texts(&screen);
+        assert!(texts.iter().any(|s| s == "loaded.example"), "{texts:?}");
+
+        // Recorded while the pane is open: it shows after the next dispatch.
+        vault
+            .session()
+            .message_signed(signed("new.example", crate::vault::Delivery::Delivered));
+        let _ = screen.update(Message::Tick);
+        let texts = history_texts(&screen);
+        let new = texts.iter().position(|s| s == "new.example").unwrap();
+        let old = texts.iter().position(|s| s == "loaded.example").unwrap();
+        assert!(new < old, "newest first: {texts:?}");
+
+        let id = vault.signed()[0].id;
+        let _ = screen.update(Message::SignedMessagesSettings(
+            signed_messages_settings::Message::Toggle(id),
+        ));
+        let (copy, _) = screen.update(Message::SignedMessagesSettings(
+            signed_messages_settings::Message::CopySignature(id),
+        ));
+        assert!(
+            copy.units() > 0,
+            "copied through the auto-clearing clipboard"
+        );
+
+        let _ = screen.update(Message::SignedMessagesSettings(
+            signed_messages_settings::Message::AskClear,
+        ));
+        let _ = screen.update(Message::SignedMessagesSettings(
+            signed_messages_settings::Message::ConfirmClear,
+        ));
+        assert!(vault.signed().is_empty(), "cleared in the vault");
+        let texts = history_texts(&screen);
+        assert!(
+            texts.iter().any(|s| s == "Nothing signed yet."),
+            "{texts:?}"
+        );
+
+        let _ = screen.update(Message::SignedMessagesSettings(
+            signed_messages_settings::Message::Back,
+        ));
+        assert_eq!(screen.settings_pane.name(), "Root");
+    }
+
+    /// Settings → Connection history: from the vault, Clear keeps the open ones.
+    #[test]
+    fn connection_history_pane_clears_ended_ones_only() {
+        let vault = crate::vault::Vault::with_store_path(std::path::PathBuf::from(
+            "/nonexistent/kao-dashboard-test.redb",
+        ));
+        vault.unlock(
+            None,
+            crate::wallet::KeyStatus::Ok,
+            crate::wallet::SealedLoad::default(),
+        );
+        let session = vault.session();
+        let open = |topic: &str, host: &str| {
+            session.connection_opened(crate::vault::NewConnection {
+                topic: topic.into(),
+                dapp: crate::vault::DappRecord {
+                    host: Some(host.into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+        };
+        open("a", "a.example");
+        session.connection_ended("a", 50, crate::vault::EndReason::YouDisconnected);
+        let mut screen = screen_with_accounts(0, Vec::new());
+        let _ = screen.set_wc_slot(crate::walletconnect::runtime::WcSlot::with_vault(
+            vault.clone(),
+        ));
+        // Opened during the session: the unlock's first dashboard (above) ends any record still
+        // open without saved state behind it — it ended while Kao was closed.
+        open("b", "b.example");
+        let _ = screen.update(Message::OpenConnectionHistorySettings);
+        assert_eq!(screen.settings_pane.name(), "Connections");
+        let texts = history_texts(&screen);
+        assert!(texts.iter().any(|s| s == "a.example") && texts.iter().any(|s| s == "b.example"));
+        let _ = screen.update(Message::ConnectionHistorySettings(
+            connection_history_settings::Message::AskClear,
+        ));
+        let _ = screen.update(Message::ConnectionHistorySettings(
+            connection_history_settings::Message::ConfirmClear,
+        ));
+        let left = vault.connections();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].topic, "b");
+        let texts = history_texts(&screen);
+        assert!(!texts.iter().any(|s| s == "a.example"), "{texts:?}");
+    }
+
+    /// Without a WalletConnect slot (tests, or before the App handed one over) the history panes
+    /// open, empty.
+    #[test]
+    fn history_panes_without_a_slot_render_empty() {
+        let mut screen = screen_with_accounts(0, Vec::new());
+        let _ = screen.update(Message::OpenSignedMessagesSettings);
+        assert!(
+            history_texts(&screen)
+                .iter()
+                .any(|s| s == "Nothing signed yet.")
+        );
+        let _ = screen.update(Message::OpenConnectionHistorySettings);
+        assert!(
+            history_texts(&screen)
+                .iter()
+                .any(|s| s == "No connections yet.")
         );
     }
 }

@@ -1,5 +1,6 @@
 //! Test harness for the runtime: an in-process `RelayServer`, a dapp `SignClient` on it, and a Kao
-//! [`WcRuntime`] installed in a fresh [`WcSlot`]. No real network, no settings, no wallet.
+//! [`WcRuntime`] installed in a fresh [`WcSlot`] — persisting nowhere, or to an in-memory vault
+//! ([`harness_with_vault`]). No real network, no settings, no wallet.
 //!
 //! Besides the harness helpers there is a [`RawPeer`]: a bare relay client that publishes hand-built,
 //! encrypted JSON-RPC (a short-expiry request, a colliding id, a refused settlement) — things a
@@ -25,6 +26,7 @@ use super::runtime::{WcEventSource, WcRuntime, WcSlot, event_stream, next_genera
 use super::types::*;
 use super::{caip2, now_secs};
 use crate::chain::Chain;
+use crate::vault::Vault;
 
 const ITEM_TIMEOUT: Duration = Duration::from_secs(2);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -53,6 +55,49 @@ pub(crate) async fn harness_on(
         .await
         .expect("Kao's runtime starts on the in-process relay");
     let slot = WcSlot::new();
+    slot.install(kao.clone())
+        .expect("a fresh slot accepts the runtime");
+    (relay, dapp, dapp_events, kao, slot)
+}
+
+/// The data key [`keyed_vault`] unlocks with.
+pub(crate) const TEST_DATA_KEY: [u8; 32] = [0x7e; 32];
+
+/// A vault unlocked with a data key — so what the runtime saves and records lands in it — over a
+/// store file that doesn't exist in the test sandbox: nothing reaches a disk.
+pub(crate) fn keyed_vault() -> Vault {
+    let vault = Vault::with_store_path(crate::paths::data_dir().join("wc-tests/absent.redb"));
+    vault.unlock(
+        Some(crate::wallet::DataKey::for_test(TEST_DATA_KEY)),
+        crate::wallet::KeyStatus::Ok,
+        crate::wallet::SealedLoad::default(),
+    );
+    vault
+}
+
+/// [`harness`] with Kao's runtime persisting to `vault`'s current epoch, in a slot over `vault`.
+pub(crate) async fn harness_with_vault(
+    vault: &Vault,
+) -> (RelayServer, SignClient, SignEvents, WcRuntime, WcSlot) {
+    harness_with_vault_on(vault, RouteKind::Loopback).await
+}
+
+/// [`harness_with_vault`] with Kao's runtime reporting `route`.
+pub(crate) async fn harness_with_vault_on(
+    vault: &Vault,
+    route: RouteKind,
+) -> (RelayServer, SignClient, SignEvents, WcRuntime, WcSlot) {
+    let relay = RelayServer::new();
+    let (dapp, dapp_events) = dapp_client(&relay, "dapp").await;
+    let kao = WcRuntime::start_with_connector_in(
+        relay.connector("kao"),
+        next_generation(),
+        route,
+        vault.session(),
+    )
+    .await
+    .expect("Kao's runtime starts on the in-process relay");
+    let slot = WcSlot::with_vault(vault.clone());
     slot.install(kao.clone())
         .expect("a fresh slot accepts the runtime");
     (relay, dapp, dapp_events, kao, slot)

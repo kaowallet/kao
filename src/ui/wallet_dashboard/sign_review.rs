@@ -38,7 +38,7 @@ use crate::decode::clear_sign::DecodeResult;
 use crate::names::registrar::{Namespace, RegisterPlan};
 use crate::sign::digest::{
     self, CALLDATA_DIGEST_LABEL, DOMAIN_HASH_LABEL, EIP712_DIGEST_LABEL, Eip712Digests,
-    MESSAGE_HASH_LABEL,
+    INNER_CALLDATA_DIGEST_LABEL, MESSAGE_HASH_LABEL,
 };
 use crate::sign::typed::{IntoTypedModel, TypedDataModel, TypedRow, TypedValue};
 use crate::ui::kao_theme::KaoTheme;
@@ -65,10 +65,6 @@ const FORM_MAX_HEIGHT: f32 = 520.0;
 
 /// Bytes per line of the hex dump raw signed bytes render as.
 const HEX_DUMP_BYTES_PER_LINE: usize = 16;
-
-/// ERC-8213 label for the call a Safe transaction makes — the `SafeTx`'s own `data` — beside the
-/// `execTransaction` calldata digest of the transaction that carries it.
-const INNER_CALLDATA_DIGEST_LABEL: &str = "Calldata Digest (inner call)";
 
 /// A revert reason is whatever string the reverting contract chose — bounded for display.
 const MAX_REVERT_REASON_CHARS: usize = 200;
@@ -2615,7 +2611,9 @@ fn format_expiry(valid_to: u32) -> String {
 
 /// `YYYY-MM-DD HH:MM UTC` from unix seconds (Howard Hinnant's civil-day algo —
 /// the same one `tx_details` uses, kept inline to avoid a chrono dependency).
-fn format_iso_utc(unix_secs: u64) -> String {
+/// Also the history panes' absolute time (Settings → Signed messages /
+/// Connection history).
+pub(super) fn format_iso_utc(unix_secs: u64) -> String {
     let days = (unix_secs / 86_400) as i64;
     let secs_of_day = unix_secs % 86_400;
     let (y, m, d) = civil_from_days(days);

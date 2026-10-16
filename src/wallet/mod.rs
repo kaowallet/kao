@@ -20,11 +20,24 @@ mod store;
 pub mod tx;
 
 pub use contacts::{Contact, ContactEns, ContactsBook};
+pub use store::acquire_instance_lock;
 pub use store::db_exists as wallet_exists;
 pub use store::{
-    clear_pp_notes, load_all_pp_notes, load_contacts, load_descriptor, load_pp_seed, save_contacts,
-    save_descriptor, save_pp_notes, save_pp_seed,
+    DataKey, KeyOrigin, KeyStatus, SealedLoad, SealedRows, Unlocked, clear_pp_notes, db_path,
+    load_all_pp_notes, load_contacts, load_pp_seed, load_wallet, save_contacts, save_descriptor,
+    save_pp_notes, save_pp_seed,
 };
+pub use store::{SealedTable, SealedWrite};
+pub(crate) use store::{WC_STATE_ID, write_sealed_at};
+
+pub use store::create_pp_seed;
+#[cfg(test)]
+pub(crate) use store::load_wallet_at;
+
+pub use store::reset_sealed;
+
+#[cfg(test)]
+pub(crate) use store::{reset_sealed_at, save_descriptor_at};
 
 /// Errors that can occur during wallet operations.
 #[derive(Debug)]
@@ -37,6 +50,8 @@ pub enum WalletError {
     Io(std::io::Error),
     /// No wallet found on disk.
     NotFound,
+    /// Another Kao process holds the instance lock (`acquire_instance_lock`).
+    InUse,
 }
 
 impl std::fmt::Display for WalletError {
@@ -46,6 +61,7 @@ impl std::fmt::Display for WalletError {
             WalletError::Encryption(e) => write!(f, "encryption error: {e}"),
             WalletError::Io(e) => write!(f, "io error: {e}"),
             WalletError::NotFound => write!(f, "no wallet found"),
+            WalletError::InUse => write!(f, "Kao is already open in another window."),
         }
     }
 }

@@ -79,6 +79,12 @@ pub enum WcMsg {
     },
     /// The start task installed the runtime (Ok(generation)) or failed (user-facing text).
     Started { result: Result<u64, String> },
+    /// A restore of saved sessions ended (`WcSlot::begin_restore` / `retry_restore`). A nudge
+    /// only: the slot holds the restore's real state, so off-screen this is harmless.
+    Restored(wc::RestoreOutcome),
+    /// The slot's restore moved on without ending — a try failed, the next one began, it now waits
+    /// on the user (`WcSlot::restore_watch`). A nudge to mirror, like `Restored`.
+    RestoreChanged,
 }
 
 impl std::fmt::Debug for WcMsg {
@@ -88,6 +94,8 @@ impl std::fmt::Debug for WcMsg {
                 write!(f, "Stream {{ gen: {generation}, item: {item:?} }}")
             }
             Self::Started { result } => write!(f, "Started {{ ok: {} }}", result.is_ok()),
+            Self::Restored(outcome) => write!(f, "Restored({outcome:?})"),
+            Self::RestoreChanged => f.write_str("RestoreChanged"),
         }
     }
 }
@@ -113,6 +121,8 @@ pub struct WcDashState {
     traced: Option<TraceShape>,
     /// (`gone`, `manual`) presence after the last update, for [`WalletScreen::wc_trace_latches`].
     traced_latches: (bool, bool),
+    /// The vault revision the pane's PAST CONNECTIONS were last pushed for (`wc_sync_history`).
+    history_rev: Option<u64>,
 }
 
 /// What `wc_mirror` traces: `trace::state("wc", "relay"|"sessions"|"queue"|"proposal", ..)`.
@@ -243,6 +253,11 @@ struct DispatchReady {
     shown_executor: Option<Address>,
     /// Owners sign EIP-712, or the hash as a message after a device refused the EIP-712 prompt.
     mode: crate::safe::tx::OwnerSigMode,
+}
+
+/// zero-sized fn item for `Subscription::map`.
+fn wc_restore_changed_msg((): ()) -> Message {
+    Message::Wc(WcMsg::RestoreChanged)
 }
 
 /// zero-sized fn item for `Subscription::map`.
@@ -448,7 +463,7 @@ async fn start_and_pair(
     uri: zeroize::Zeroizing<String>,
 ) -> Result<u64, String> {
     let generation = cfg.generation;
-    let rt = match WcRuntime::start(cfg).await {
+    let rt = match WcRuntime::start(cfg, slot.vault().session()).await {
         Ok(rt) => rt,
         Err(e) => {
             slot.start_failed();
@@ -968,9 +983,21 @@ impl WalletScreen {
                 self.apps.open_wc();
             }
         }
+        // The first dashboard of an unlock restores the sessions the last lock or quit saved
+        // (once per unlock: the slot takes the saved state from the vault). The future installs
+        // the runtime itself; `Restored` only nudges whichever dashboard is on screen then.
+        if let Some(restore) = self.wc.slot.as_ref().and_then(WcSlot::begin_restore) {
+            info!("wc: restoring saved sessions");
+            tasks.push(Task::perform(restore, |o| Message::Wc(WcMsg::Restored(o))));
+        }
         self.wc_mirror();
         tasks.push(self.pump_wc_queue());
         Task::batch(tasks)
+    }
+
+    /// The App's vault, through the slot (`None` before `set_wc_slot`).
+    pub(super) fn wc_vault(&self) -> Option<crate::vault::Vault> {
+        self.wc.slot.as_ref().map(WcSlot::vault)
     }
 
     pub(super) fn wc_runtime(&self) -> Option<WcRuntime> {
@@ -981,13 +1008,28 @@ impl WalletScreen {
             .filter(|rt| !rt.is_closed())
     }
 
-    /// `[Subscription::run_with(rt.events(), wc::runtime::event_stream).map(wc_stream_msg)]` or empty.
+    /// `[Subscription::run_with(rt.events(), wc::runtime::event_stream).map(wc_stream_msg)]`; with
+    /// no runtime, while a restore runs or waits on the user, the slot's restore watch instead
+    /// (`WcMsg::RestoreChanged`); else empty.
     pub(super) fn wc_subscriptions(&self) -> Vec<Subscription<Message>> {
         // Keyed by the runtime's generation alone, so the stream keeps running across every
         // review, modal and nav change, and a new runtime is a new stream.
-        self.wc_runtime()
-            .map(|rt| {
-                Subscription::run_with(rt.events(), wc::runtime::event_stream).map(wc_stream_msg)
+        if let Some(rt) = self.wc_runtime() {
+            return vec![
+                Subscription::run_with(rt.events(), wc::runtime::event_stream).map(wc_stream_msg),
+            ];
+        }
+        // The restore loop runs off-screen and only its end comes back as `Restored`: without
+        // this, the card and the launcher row would show the phase of the last mirror for as long
+        // as the relay stays unreachable — no Retry now, no Forget. Keyed by the slot, so it runs
+        // for the whole restore, whatever the phase.
+        self.wc
+            .slot
+            .as_ref()
+            .filter(|slot| slot.restore_view().is_some())
+            .map(|slot| {
+                Subscription::run_with(slot.restore_watch(), wc::runtime::restore_watch_stream)
+                    .map(wc_restore_changed_msg)
             })
             .into_iter()
             .collect()
@@ -1242,6 +1284,13 @@ impl WalletScreen {
                 self.wc_mirror();
                 (Task::none(), None)
             }
+            WcMsg::Restored(outcome) => self.wc_restored(outcome),
+            WcMsg::RestoreChanged => {
+                // The card, the launcher row and Connect follow the slot's restore. One that just
+                // forgot the saved sessions (the relay changed) left its reason on the slot.
+                self.wc_mirror();
+                (Task::none(), self.wc_take_retired())
+            }
             WcMsg::Stream { generation, item } => {
                 let Some(rt) = self.wc_runtime() else {
                     // The runtime left the slot (retired, turned off) with items still buffered.
@@ -1347,6 +1396,47 @@ impl WalletScreen {
                 (self.pump_wc_queue(), None)
             }
             O::Stop => self.wc_turn_off(),
+            O::RetryRestore { allow_direct } => {
+                let task = self
+                    .wc
+                    .slot
+                    .as_ref()
+                    .and_then(|slot| slot.retry_restore(allow_direct))
+                    .map_or_else(Task::none, |retry| {
+                        Task::perform(retry, |o| Message::Wc(WcMsg::Restored(o)))
+                    });
+                info!(allow_direct, "wc: restore retried by the user");
+                self.wc_mirror();
+                (task, None)
+            }
+            O::ForgetRestore => {
+                let Some(slot) = self.wc.slot.clone() else {
+                    return (Task::none(), None);
+                };
+                // Read before it's gone: with no saved dapp alive, what's dropped is a disconnect —
+                // or nothing, once everything it saved expired.
+                let view = slot.restore_view();
+                info!(
+                    sessions = view.as_ref().map_or(0, |r| r.sessions),
+                    "wc: saved sessions forgotten by the user"
+                );
+                slot.forget_restore();
+                self.wc_mirror();
+                (
+                    Task::none(),
+                    view.map(|r| Outcome::Notice(wc_app::forgot_notice(&r, false).to_string())),
+                )
+            }
+            // Needs the App's passphrase: the App runs it.
+            O::ResetSavedState => (Task::none(), Some(Outcome::ResetSealedHistory)),
+            O::ClearConnectionHistory => {
+                if let Some(slot) = &self.wc.slot {
+                    slot.vault().clear_ended_connections();
+                }
+                self.wc_mirror();
+                (Task::none(), None)
+            }
+            O::OpenConnectionHistory => (self.open_connection_history_settings(), None),
             O::SaveSettings {
                 project_id,
                 relay_url,
@@ -1354,6 +1444,82 @@ impl WalletScreen {
             // Handled inside the Apps pane (back to the launcher); nothing to coordinate.
             O::Close => (Task::none(), None),
         }
+    }
+
+    /// A restore ended. Installed (and still the slot's runtime) → as after a start: the restored
+    /// sessions are checked against this wallet's identities, answers owed to dapps go out, the
+    /// queue is pumped, and the user hears how many dapps are back. Anything else only re-mirrors
+    /// — the slot already holds what the card shows (waiting to retry, waiting on the user).
+    fn wc_restored(&mut self, outcome: wc::RestoreOutcome) -> (Task<Message>, Option<Outcome>) {
+        let wc::RestoreOutcome::Restored {
+            sessions,
+            generation,
+        } = outcome
+        else {
+            debug!(?outcome, "wc: restore ended without a runtime");
+            self.wc_mirror();
+            // A restore that forgot the saved sessions (the relay changed) leaves its reason on
+            // the slot, as a runtime that retired itself does.
+            return (Task::none(), self.wc_take_retired());
+        };
+        let Some(rt) = self.wc_runtime().filter(|rt| rt.generation() == generation) else {
+            debug!(
+                generation,
+                "wc: restore result for a runtime no longer in the slot"
+            );
+            self.wc_mirror();
+            return (Task::none(), None);
+        };
+        info!(sessions, "wc: saved sessions restored");
+        let reconcile = self.wc_reconcile();
+        rt.flush_outbox();
+        let pump = self.pump_wc_queue();
+        let notice = (sessions > 0).then(|| {
+            format!(
+                "Reconnected {sessions} {}.",
+                if sessions == 1 { "dapp" } else { "dapps" }
+            )
+        });
+        (Task::batch([reconcile, pump]), notice.map(Outcome::Notice))
+    }
+
+    /// Whether the slot restores saved sessions (running, or waiting on the user).
+    pub(super) fn wc_restoring(&self) -> bool {
+        self.wc
+            .slot
+            .as_ref()
+            .and_then(WcSlot::restore_view)
+            .is_some()
+    }
+
+    /// Push the latest ended connections into the pane's PAST CONNECTIONS — only when the vault
+    /// changed since the last push (it changes from the runtime's tasks, and from Clear).
+    pub(super) fn wc_sync_history(&mut self) {
+        let Some(vault) = self.wc_vault() else {
+            return;
+        };
+        let rev = vault.revision();
+        if self.wc.history_rev == Some(rev) {
+            return;
+        }
+        self.wc.history_rev = Some(rev);
+        // Getting its data key moves the vault's revision too: the connected dapps' note follows.
+        self.apps.wc_pane().set_can_persist(vault.can_persist());
+        self.apps
+            .wc_pane()
+            .set_key_unavailable(vault.unreadable().key_unavailable);
+        // The latest ENDED first: a long-lived connection that just ended leads, though the vault
+        // lists it where it connected.
+        let mut ended: Vec<_> = vault
+            .connections()
+            .into_iter()
+            .filter(|c| !c.is_open())
+            .collect();
+        ended.sort_by(super::connection_history_settings::latest_ended_first);
+        let total = ended.len();
+        self.apps
+            .wc_pane()
+            .set_past_connections(ended.into_iter().take(wc_app::PAST_SHOWN).collect(), total);
     }
 
     /// The reason a runtime retired itself (idle, a flapping relay, Turn off), once. It is read
@@ -2082,6 +2248,9 @@ impl WalletScreen {
             .sync(snap, active, wc::runtime::config_view());
         let starting = self.wc.slot.as_ref().is_some_and(WcSlot::is_starting);
         self.apps.wc_pane().sync_start(starting);
+        let restore = self.wc.slot.as_ref().and_then(WcSlot::restore_view);
+        self.apps.wc_pane().set_restore(restore);
+        self.wc_sync_history();
     }
 
     fn open_wc_review(&mut self, key: wc::WcKey) -> Task<Message> {
@@ -3685,6 +3854,17 @@ impl WalletScreen {
             ));
             return (Task::none(), None);
         }
+        if let Some(restore) = slot.restore_view() {
+            // A fresh runtime now would start with none of the saved sessions and save over them
+            // — the dapps never told, their history left open. Reconnect (or forget) them first.
+            debug!("wc: connect while saved sessions are being restored — refused");
+            let why = wc_app::paste_refusal(&restore);
+            self.apps
+                .wc_pane()
+                .set_pairing(wc_app::PairingUi::Failed(why.to_string()));
+            self.wc_mirror();
+            return (Task::none(), None);
+        }
         if slot.is_starting() {
             // The pane disables Connect while starting; a second start is never spawned, and a
             // link that gets here anyway is turned away out loud.
@@ -3940,11 +4120,32 @@ impl WalletScreen {
         }
     }
 
-    /// [Turn off WalletConnect]: every dapp is disconnected and the relay closed. A review
-    /// that isn't signing yet closes with it (the teardown answers its request 4900); one that is
-    /// signing finds the runtime closed before anything irreversible.
+    /// [Turn off WalletConnect]: every dapp is disconnected, the saved state cleared (`retire`
+    /// records both before its teardown runs), and the relay closed. A review that isn't signing
+    /// yet closes with it (the teardown answers its request 4900); one that is signing finds the
+    /// runtime closed before anything irreversible.
     fn wc_turn_off(&mut self) -> (Task<Message>, Option<Outcome>) {
         let Some(rt) = self.wc_runtime() else {
+            // No runtime, but saved sessions waiting on the user: off means forgetting them (there
+            // is no relay connection to tell the dapps over).
+            let waiting = self.wc.slot.clone().and_then(|slot| {
+                let view = slot.restore_view()?;
+                matches!(view.phase, wc::RestorePhase::NeedsYou { .. }).then_some((slot, view))
+            });
+            if let Some((slot, view)) = waiting {
+                info!(
+                    sessions = view.sessions,
+                    "wc: turned off while saved sessions wait — forgetting them"
+                );
+                slot.forget_restore();
+                self.wc_mirror();
+                return (
+                    Task::none(),
+                    Some(Outcome::Notice(
+                        wc_app::forgot_notice(&view, true).to_string(),
+                    )),
+                );
+            }
             self.wc_mirror();
             return (Task::none(), None);
         };
@@ -4803,6 +5004,450 @@ mod tests {
             result: Err(secret.to_string()),
         };
         assert_eq!(format!("{m:?}"), "Started { ok: false }");
+    }
+
+    #[test]
+    fn restored_debug_is_shape_only() {
+        let m = WcMsg::Restored(wc::RestoreOutcome::Restored {
+            sessions: 2,
+            generation: 9,
+        });
+        assert_eq!(
+            format!("{m:?}"),
+            "Restored(Restored { sessions: 2, generation: 9 })"
+        );
+        assert_eq!(format!("{:?}", WcMsg::RestoreChanged), "RestoreChanged");
+    }
+
+    /// A restore that installed the slot's runtime is announced ("Reconnected N dapps") and runs
+    /// what a start runs; one for another runtime, or one that ended without a runtime, only
+    /// re-mirrors.
+    #[tokio::test]
+    async fn a_restored_runtime_is_announced_once_it_is_the_slots() {
+        let rig = start_rig().await;
+        let a = PrivateKeySigner::random();
+        let mut s = screen(vec![local_account(&a)], 0, Vec::new());
+        s.set_wc_slot(rig.slot.clone());
+        let generation = rig.rt.generation();
+        let (_, outcome) = s.handle_wc_msg(WcMsg::Restored(wc::RestoreOutcome::Restored {
+            sessions: 2,
+            generation,
+        }));
+        assert!(
+            matches!(&outcome, Some(Outcome::Notice(n)) if n == "Reconnected 2 dapps."),
+            "{outcome:?}"
+        );
+        let (_, outcome) = s.handle_wc_msg(WcMsg::Restored(wc::RestoreOutcome::Restored {
+            sessions: 1,
+            generation,
+        }));
+        assert!(matches!(&outcome, Some(Outcome::Notice(n)) if n == "Reconnected 1 dapp."));
+        for other in [
+            wc::RestoreOutcome::Restored {
+                sessions: 2,
+                generation: generation + 1,
+            },
+            wc::RestoreOutcome::Restored {
+                sessions: 0,
+                generation,
+            },
+            wc::RestoreOutcome::Nothing,
+            wc::RestoreOutcome::Waiting,
+            wc::RestoreOutcome::Stopped,
+        ] {
+            let (_, outcome) = s.handle_wc_msg(WcMsg::Restored(other.clone()));
+            assert!(outcome.is_none(), "{other:?}");
+        }
+    }
+
+    fn unlocked_vault() -> crate::vault::Vault {
+        let v = crate::vault::Vault::with_store_path(std::path::PathBuf::from(
+            "/nonexistent/kao-wc-flow-test.redb",
+        ));
+        v.unlock(
+            None,
+            crate::wallet::KeyStatus::Ok,
+            crate::wallet::SealedLoad::default(),
+        );
+        v
+    }
+
+    fn connection(topic: &str, host: &str) -> crate::vault::NewConnection {
+        crate::vault::NewConnection {
+            topic: topic.into(),
+            dapp: crate::vault::DappRecord {
+                name: format!("{host} app"),
+                host: Some(host.into()),
+                url: format!("https://{host}"),
+                ..Default::default()
+            },
+            connected_at: 10,
+            ..Default::default()
+        }
+    }
+
+    /// PAST CONNECTIONS follows the vault — with no runtime at all — and re-reads it only when it
+    /// changed: here a session the runtime's tasks end after the pane was mirrored.
+    #[test]
+    fn past_connections_follow_the_vault() {
+        let vault = unlocked_vault();
+        let session = vault.session();
+        session.connection_opened(connection("t1", "old.example"));
+        session.connection_ended("t1", 20, crate::vault::EndReason::DappDisconnected);
+        let a = PrivateKeySigner::random();
+        let mut s = screen(vec![local_account(&a)], 0, Vec::new());
+        s.set_wc_slot(WcSlot::with_vault(vault.clone()));
+        // Opened during the session (after the unlock's first dashboard looked for saved state —
+        // a record still open then had ended while Kao was closed).
+        session.connection_opened(connection("t2", "live.example"));
+        s.update(Message::Wc(WcMsg::Stream {
+            generation: 1,
+            item: wc::WcStreamItem::Changed,
+        }));
+        let texts = pane_texts(&mut s);
+        assert!(texts.iter().any(|t| t == "PAST CONNECTIONS"), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "old.example"), "{texts:?}");
+        assert!(
+            !texts.iter().any(|t| t == "live.example"),
+            "open ones aren't past: {texts:?}"
+        );
+
+        // Ended from the runtime's side; the next dispatch picks it up.
+        session.connection_ended("t2", 30, crate::vault::EndReason::Expired);
+        s.update(Message::Wc(WcMsg::Stream {
+            generation: 1,
+            item: wc::WcStreamItem::Changed,
+        }));
+        let texts = pane_texts(&mut s);
+        assert!(texts.iter().any(|t| t == "live.example"), "{texts:?}");
+
+        // The pane's Clear goes straight to the vault (ended ones only).
+        session.connection_opened(connection("t3", "still.example"));
+        s.handle_wc_outcome(wc_app::Outcome::ClearConnectionHistory);
+        let left = vault.connections();
+        assert_eq!(left.len(), 1);
+        assert!(left[0].is_open());
+        let texts = pane_texts(&mut s);
+        assert!(!texts.iter().any(|t| t == "PAST CONNECTIONS"), "{texts:?}");
+    }
+
+    /// The unlock's first dashboard finds no saved WalletConnect state: a connection record the
+    /// vault still has open ended while Kao was closed, and says so. Once per unlock — one the
+    /// runtime opens afterwards stays open through every later rebuild.
+    #[test]
+    fn the_first_dashboard_ends_what_was_left_open_without_saved_state() {
+        let vault = unlocked_vault();
+        let session = vault.session();
+        session.connection_opened(connection("t1", "stale.example"));
+        let a = PrivateKeySigner::random();
+        let mut s = screen(vec![local_account(&a)], 0, Vec::new());
+        let slot = WcSlot::with_vault(vault.clone());
+        let _ = s.set_wc_slot(slot.clone());
+        let stale = vault.connections();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].end, Some(crate::vault::EndReason::Lost));
+        assert!(slot.restore_view().is_none(), "nothing to restore");
+
+        session.connection_opened(connection("t2", "live.example"));
+        let _ = s.set_wc_slot(slot);
+        let live = vault.connections();
+        assert!(
+            live.iter().any(|c| c.topic == "t2" && c.is_open()),
+            "{live:?}"
+        );
+    }
+
+    /// A dapp connected under a loopback relay route, then a lock with a data key (the runtime
+    /// suspends; its saved state is what the store would hold) and the next unlock's vault epoch
+    /// over that state. Returns the relay, the dapp, the vault and the slot the next unlock got.
+    async fn saved_sessions_after_a_lock() -> (RelayServer, SignClient, crate::vault::Vault, WcSlot)
+    {
+        let vault = testkit::keyed_vault();
+        let (relay, dapp, _events, kao, slot) = testkit::harness_with_vault(&vault).await;
+        let a = PrivateKeySigner::random();
+        testkit::connect_raw(&kao, &dapp, a.address(), &[1]).await;
+        let connections = vault.connections();
+        let flush = vault.lock();
+        let next = slot.successor();
+        let rt = slot.close().expect("installed");
+        slot.spawn_suspend(rt, flush)
+            .await
+            .expect("the suspend task");
+        let blob = vault
+            .last_saved_wc_state()
+            .flatten()
+            .expect("the suspend saved");
+        let rows = connections
+            .iter()
+            .map(|r| {
+                (
+                    r.id,
+                    zeroize::Zeroizing::new(serde_json::to_vec(r).unwrap()),
+                )
+            })
+            .collect();
+        vault.unlock(
+            Some(crate::wallet::DataKey::for_test(testkit::TEST_DATA_KEY)),
+            crate::wallet::KeyStatus::Ok,
+            crate::wallet::SealedLoad {
+                wc_state: Some(blob),
+                connections: crate::wallet::SealedRows { rows, dropped: 0 },
+                ..Default::default()
+            },
+        );
+        (relay, dapp, vault, next)
+    }
+
+    /// Saved sessions waiting on the user (the route got less private than the one they were made
+    /// under): Connect is refused with the copy that says why — a fresh runtime would save over
+    /// them — and Turn off forgets them, ending their history as forgotten, never telling a dapp.
+    #[tokio::test]
+    async fn saved_sessions_waiting_on_the_user_block_connect_until_turn_off_forgets_them() {
+        let (relay, _dapp, vault, next) = saved_sessions_after_a_lock().await;
+        let restore = next
+            .begin_restore_over(
+                relay.connector("kao"),
+                wc::runtime::TEST_RELAY_URL,
+                wc::RouteKind::Direct,
+            )
+            .expect("a restore starts");
+        assert_eq!(restore.await, wc::RestoreOutcome::Waiting);
+        let a = PrivateKeySigner::random();
+        let mut s = screen(vec![local_account(&a)], 0, Vec::new());
+        let _ = s.set_wc_slot(next.clone());
+        assert!(
+            matches!(
+                next.restore_view().map(|r| r.phase),
+                Some(wc::RestorePhase::NeedsYou {
+                    direct_override: true,
+                    ..
+                })
+            ),
+            "{:?}",
+            next.restore_view()
+        );
+
+        let _ = s.handle_wc_outcome(wc_app::Outcome::Pair {
+            uri: SecretInput::from(dead_link()),
+        });
+        let texts = pane_texts(&mut s);
+        assert!(
+            texts.iter().any(|t| t == wc_app::RESTORE_FIRST),
+            "{texts:?}"
+        );
+        assert!(
+            next.get().is_none() && !next.is_starting(),
+            "nothing started"
+        );
+
+        let (_, outcome) = s.handle_wc_outcome(wc_app::Outcome::Stop);
+        assert!(
+            matches!(&outcome, Some(Outcome::Notice(n)) if n.contains("forgot your saved dapps")),
+            "{outcome:?}"
+        );
+        assert!(next.restore_view().is_none());
+        let texts = pane_texts(&mut s);
+        assert!(
+            !texts.iter().any(|t| t == wc_app::RESTORE_FIRST),
+            "the refusal went with the saved dapps: {texts:?}"
+        );
+        let records = vault.connections();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].end, Some(crate::vault::EndReason::Forgotten));
+        assert_eq!(
+            vault.last_saved_wc_state(),
+            Some(None),
+            "the saved state cleared"
+        );
+    }
+
+    /// The restore card's Forget… ends a refused paste's "reconnect or forget first" line too: it
+    /// described saved dapps that are gone now (the link was consumed, so the line asked for it
+    /// again).
+    #[tokio::test]
+    async fn forgetting_the_saved_dapps_clears_the_refused_paste_line() {
+        let (relay, _dapp, _vault, next) = saved_sessions_after_a_lock().await;
+        let restore = next
+            .begin_restore_over(
+                relay.connector("kao"),
+                wc::runtime::TEST_RELAY_URL,
+                wc::RouteKind::Direct,
+            )
+            .expect("a restore starts");
+        assert_eq!(restore.await, wc::RestoreOutcome::Waiting);
+        let a = PrivateKeySigner::random();
+        let mut s = screen(vec![local_account(&a)], 0, Vec::new());
+        let _ = s.set_wc_slot(next.clone());
+        let _ = s.handle_wc_outcome(wc_app::Outcome::Pair {
+            uri: SecretInput::from(dead_link()),
+        });
+        let texts = pane_texts(&mut s);
+        assert!(
+            texts.iter().any(|t| t == wc_app::RESTORE_FIRST),
+            "{texts:?}"
+        );
+        assert!(wc_app::RESTORE_FIRST.ends_with("then paste the link again."));
+
+        let (_, outcome) = s.handle_wc_outcome(wc_app::Outcome::ForgetRestore);
+        // Counted before the slot forgot them: saved dapps, not a dropped disconnect.
+        assert!(
+            matches!(&outcome, Some(Outcome::Notice(n)) if n == "Kao forgot your saved dapps — they weren't told."),
+            "{outcome:?}"
+        );
+        assert!(next.restore_view().is_none());
+        let texts = pane_texts(&mut s);
+        assert!(
+            !texts.iter().any(|t| t == wc_app::RESTORE_FIRST),
+            "{texts:?}"
+        );
+    }
+
+    /// Settings → Connection history agrees with the restore card: while saved dapps wait to be
+    /// reconnected (here on the user, after a route downgrade), their open records say "Waiting
+    /// to reconnect", never "Connected now" — which comes back once the restore brought them back.
+    #[tokio::test]
+    async fn connection_history_says_saved_dapps_wait_while_the_restore_does() {
+        let (relay, _dapp, vault, next) = saved_sessions_after_a_lock().await;
+        let restore = next
+            .begin_restore_over(
+                relay.connector("kao"),
+                wc::runtime::TEST_RELAY_URL,
+                wc::RouteKind::Direct,
+            )
+            .expect("a restore starts");
+        assert_eq!(restore.await, wc::RestoreOutcome::Waiting);
+        let a = PrivateKeySigner::random();
+        let mut s = screen(vec![local_account(&a)], 0, Vec::new());
+        let _ = s.set_wc_slot(next.clone());
+        let _ = s.update(Message::OpenConnectionHistorySettings);
+        assert!(vault.connections()[0].is_open(), "the record stays open");
+        let texts = s.test_history_pane_texts();
+        assert!(
+            texts.iter().any(|t| t == "! Waiting to reconnect"),
+            "{texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("Connected now")),
+            "{texts:?}"
+        );
+
+        // Reconnect anyway: the restore installs, and the restore watch's nudge (the restore is
+        // over) reaches the dashboard. (`Restored` would also reconcile, and this screen's
+        // account isn't the one the dapp was given.)
+        let outcome = next.retry_restore(true).expect("a new try").await;
+        assert!(
+            matches!(outcome, wc::RestoreOutcome::Restored { .. }),
+            "{outcome:?}"
+        );
+        assert!(next.restore_view().is_none());
+        let _ = s.update(Message::Wc(WcMsg::RestoreChanged));
+        let texts = s.test_history_pane_texts();
+        assert!(texts.iter().any(|t| t == "✓ Connected now"), "{texts:?}");
+        assert!(
+            !texts.iter().any(|t| t.contains("Waiting to reconnect")),
+            "{texts:?}"
+        );
+    }
+
+    /// While a restore retries with the relay unreachable, nothing but the slot knows its phase:
+    /// the dashboard subscribes to the slot's restore watch, and each `RestoreChanged` re-mirrors —
+    /// the card leaves "Reconnecting…" for the failure and its countdown, with Retry now and
+    /// Forget…, and the launcher row says Kao keeps trying.
+    #[tokio::test]
+    async fn a_restore_phase_change_reaches_the_card_and_the_launcher_row() {
+        let (_relay, _dapp, _vault, next) = saved_sessions_after_a_lock().await;
+        let unreachable = || async {
+            Err::<wallet_connect::relay::Connection, _>(wallet_connect::Error::Transport(
+                "relay unreachable".into(),
+            ))
+        };
+        let restore = next
+            .begin_restore_over(
+                unreachable,
+                wc::runtime::TEST_RELAY_URL,
+                wc::RouteKind::Loopback,
+            )
+            .expect("a restore starts");
+        let a = PrivateKeySigner::random();
+        let mut s = screen(vec![local_account(&a)], 0, Vec::new());
+        let _ = s.set_wc_slot(next.clone());
+        assert_eq!(
+            s.wc_subscriptions().len(),
+            1,
+            "no runtime, a restore: its watch"
+        );
+        let task = tokio::spawn(restore);
+        testkit::settle(|| {
+            matches!(
+                next.restore_view().map(|r| r.phase),
+                Some(wc::RestorePhase::RetryingAt { .. })
+            )
+        })
+        .await;
+        // What the watch delivers on that change.
+        let _ = s.update(Message::Wc(WcMsg::RestoreChanged));
+        let texts = pane_texts(&mut s);
+        assert!(texts.iter().any(|t| t == "Retry now"), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "Forget…"), "{texts:?}");
+        assert!(
+            !texts.iter().any(|t| t == "Connecting to the relay…"),
+            "{texts:?}"
+        );
+        assert_eq!(
+            s.apps.wc_pane().launcher_card_subtitle(),
+            "Couldn't reconnect 1 saved dapp yet — Kao keeps trying."
+        );
+
+        // Forgotten: the restore is over, and so is its watch.
+        let _ = s.handle_wc_outcome(wc_app::Outcome::ForgetRestore);
+        assert!(s.wc_subscriptions().is_empty());
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+    }
+
+    /// A restore that finds WalletConnect on another relay forgets the saved sessions without
+    /// dialing; the dashboard that hears `Restored` shows why the relay is off.
+    #[tokio::test]
+    async fn a_restore_onto_another_relay_says_why_the_dapps_are_gone() {
+        let (relay, _dapp, vault, next) = saved_sessions_after_a_lock().await;
+        let a = PrivateKeySigner::random();
+        let mut s = screen(vec![local_account(&a)], 0, Vec::new());
+        let restore = next
+            .begin_restore_over(
+                relay.connector("kao"),
+                "wss://relay.other.example",
+                wc::RouteKind::Loopback,
+            )
+            .expect("a restore starts");
+        let outcome = restore.await;
+        assert_eq!(outcome, wc::RestoreOutcome::Nothing);
+        let _ = s.set_wc_slot(next.clone());
+        let _ = s.handle_wc_msg(WcMsg::Restored(outcome));
+        let texts = pane_texts(&mut s);
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("WalletConnect uses another relay now")),
+            "{texts:?}"
+        );
+        assert_eq!(
+            vault.connections()[0].end,
+            Some(crate::vault::EndReason::RelayChanged)
+        );
+    }
+
+    /// "See all in Settings ›" lands on Settings → Connection history, built from the vault.
+    #[test]
+    fn see_all_opens_settings_connection_history() {
+        let vault = unlocked_vault();
+        vault
+            .session()
+            .connection_opened(connection("t1", "app.example"));
+        let a = PrivateKeySigner::random();
+        let mut s = screen(vec![local_account(&a)], 0, Vec::new());
+        s.set_wc_slot(WcSlot::with_vault(vault));
+        s.handle_wc_outcome(wc_app::Outcome::OpenConnectionHistory);
+        assert_eq!(s.current_nav(), Nav::Settings);
+        assert_eq!(s.test_settings_pane(), "Connections");
     }
 
     #[test]
@@ -9155,6 +9800,181 @@ mod tests {
     fn pane_texts(s: &mut WalletScreen) -> Vec<String> {
         let theme = crate::ui::kao_theme::KaoTheme::for_kind(crate::ui::kao_theme::ThemeKind::Mint);
         super::super::test_support::texts(s.apps.wc_pane().view(theme))
+    }
+
+    /// A vault over a store file the test sandbox doesn't have, unlocked without its data key.
+    fn keyless_vault(status: crate::wallet::KeyStatus) -> crate::vault::Vault {
+        let vault = crate::vault::Vault::with_store_path(
+            crate::paths::data_dir().join("wc-tests/absent.redb"),
+        );
+        vault.unlock(None, status, crate::wallet::SealedLoad::default());
+        vault
+    }
+
+    /// PAST CONNECTIONS lists the latest ENDED connections: a long-lived one the user just
+    /// disconnected leads, though the vault lists it where it connected (first), and the oldest
+    /// ending drops off.
+    #[test]
+    fn past_connections_lead_with_the_latest_ended() {
+        let vault = keyless_vault(crate::wallet::KeyStatus::Ok);
+        let a = PrivateKeySigner::random();
+        let mut s = screen(vec![local_account(&a)], 0, Vec::new());
+        let _ = s.set_wc_slot(WcSlot::with_vault(vault.clone()));
+        let session = vault.session();
+        for (topic, host) in [
+            ("a", "a.example"),
+            ("b", "b.example"),
+            ("c", "c.example"),
+            ("d", "d.example"),
+        ] {
+            session.connection_opened(crate::vault::NewConnection {
+                topic: topic.into(),
+                dapp: crate::vault::DappRecord {
+                    name: host.into(),
+                    host: Some(host.into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        }
+        for (topic, at) in [("b", 20), ("c", 30), ("d", 40), ("a", 50)] {
+            session.connection_ended(topic, at, crate::vault::EndReason::YouDisconnected);
+        }
+        let _ = s.update(Message::Tick);
+        let texts = pane_texts(&mut s);
+        let pos = |host: &str| texts.iter().position(|t| t == host);
+        let (a, d, c) = (pos("a.example"), pos("d.example"), pos("c.example"));
+        assert!(
+            a.is_some() && a < d && d < c,
+            "latest ended first: {texts:?}"
+        );
+        assert!(
+            pos("b.example").is_none(),
+            "the oldest ending drops off: {texts:?}"
+        );
+    }
+
+    /// The panes learn from the vault whether what this session records is kept: keyless, the
+    /// WalletConnect pane says a lock disconnects the dapps and the history panes say new records
+    /// aren't kept; once the vault has its key (a minting save), both go back to normal.
+    #[tokio::test]
+    async fn the_panes_follow_whether_the_vault_keeps_records() {
+        let vault = keyless_vault(crate::wallet::KeyStatus::Ok);
+        let (_relay, dapp, _events, kao, slot) = testkit::harness_with_vault(&vault).await;
+        let a = PrivateKeySigner::random();
+        testkit::connect_raw(&kao, &dapp, a.address(), &[1]).await;
+        let mut s = screen(vec![local_account(&a)], 0, Vec::new());
+        let _ = s.set_wc_slot(slot.clone());
+        let _ = s.update(Message::Tick);
+        let texts = pane_texts(&mut s);
+        assert!(
+            texts.iter().any(|t| t == wc_app::NOT_SAVED_NOTE),
+            "{texts:?}"
+        );
+        assert!(!texts.iter().any(|t| t == wc_app::STAY_CONNECTED_NOTE));
+        let _ = s.update(Message::OpenSignedMessagesSettings);
+        let texts = s.test_history_pane_texts();
+        assert!(
+            texts.iter().any(|t| t.contains("can't keep new records")),
+            "{texts:?}"
+        );
+        let _ = s.update(Message::OpenConnectionHistorySettings);
+        let texts = s.test_history_pane_texts();
+        assert!(
+            texts.iter().any(|t| t.contains("can't keep new records")),
+            "{texts:?}"
+        );
+
+        vault.set_key(
+            crate::wallet::DataKey::for_test(testkit::TEST_DATA_KEY),
+            crate::wallet::KeyOrigin::Minted,
+        );
+        s.refresh_history_views();
+        let texts = s.test_history_pane_texts();
+        assert!(!texts.iter().any(|t| t.contains("can't keep")), "{texts:?}");
+        // Kept now: the note no longer says a lock disconnects them. (The in-process relay isn't
+        // the relay in settings, so the kept-note may be the relay-change caution.)
+        let texts = pane_texts(&mut s);
+        assert!(
+            texts
+                .iter()
+                .any(|t| t == wc_app::STAY_CONNECTED_NOTE || t == wc_app::RELAY_CHANGED_NOTE),
+            "{texts:?}"
+        );
+        assert!(!texts.iter().any(|t| t == wc_app::NOT_SAVED_NOTE));
+        let _ = s.update(Message::OpenSignedMessagesSettings);
+        let texts = s.test_history_pane_texts();
+        assert!(!texts.iter().any(|t| t.contains("can't keep")), "{texts:?}");
+    }
+
+    /// A vault that couldn't read the wallet file's saved state: the WalletConnect pane hears it
+    /// from the vault and offers the reset, and a confirmed reset — from that pane or either
+    /// history pane — goes to the App, which holds the passphrase it needs.
+    #[test]
+    fn an_unreadable_saved_state_offers_the_reset_and_hands_it_to_the_app() {
+        use super::super::{connection_history_settings, signed_messages_settings};
+        let vault = keyless_vault(crate::wallet::KeyStatus::Unavailable);
+        let a = PrivateKeySigner::random();
+        let mut s = screen(vec![local_account(&a)], 0, Vec::new());
+        let _ = s.set_wc_slot(WcSlot::with_vault(vault.clone()));
+        let _ = s.update(Message::Tick);
+        let texts = pane_texts(&mut s);
+        assert!(
+            texts
+                .iter()
+                .any(|t| t == signed_messages_settings::RESET_LABEL),
+            "{texts:?}"
+        );
+        let _ = s.handle_wc_outcome(wc_app::Outcome::ResetSavedState);
+        let (_, outcome) = s.handle_wc_outcome(wc_app::Outcome::ResetSavedState);
+        assert!(
+            matches!(outcome, Some(Outcome::ResetSealedHistory)),
+            "{outcome:?}"
+        );
+
+        let _ = s.update(Message::OpenSignedMessagesSettings);
+        let texts = s.test_history_pane_texts();
+        assert!(
+            texts
+                .iter()
+                .any(|t| t == signed_messages_settings::KEY_UNAVAILABLE_NOTE),
+            "{texts:?}"
+        );
+        let _ = s.update(Message::SignedMessagesSettings(
+            signed_messages_settings::Message::AskReset,
+        ));
+        let (_, outcome) = s.update(Message::SignedMessagesSettings(
+            signed_messages_settings::Message::ConfirmReset,
+        ));
+        assert!(
+            matches!(outcome, Some(Outcome::ResetSealedHistory)),
+            "{outcome:?}"
+        );
+        let _ = s.update(Message::OpenConnectionHistorySettings);
+        let _ = s.update(Message::ConnectionHistorySettings(
+            connection_history_settings::Message::AskReset,
+        ));
+        let (_, outcome) = s.update(Message::ConnectionHistorySettings(
+            connection_history_settings::Message::ConfirmReset,
+        ));
+        assert!(
+            matches!(outcome, Some(Outcome::ResetSealedHistory)),
+            "{outcome:?}"
+        );
+
+        // The reset landed: the vault adopted the minted key, and the pane stops offering it.
+        vault.set_key(
+            crate::wallet::DataKey::for_test(testkit::TEST_DATA_KEY),
+            crate::wallet::KeyOrigin::Minted,
+        );
+        s.refresh_history_views();
+        let texts = pane_texts(&mut s);
+        assert!(
+            !texts
+                .iter()
+                .any(|t| t == signed_messages_settings::RESET_LABEL),
+            "{texts:?}"
+        );
     }
 
     /// A relay start in flight shows on a dashboard rebuilt meanwhile, not only on the one that

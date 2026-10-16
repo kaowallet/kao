@@ -2279,25 +2279,54 @@ impl NetworkSetupScreen {
 
         let rpc_label = self.step_summary(WizardStep::Rpc);
         let rpc_badges = self.rpc_badges();
-        let rpc_row = self.review_row(t, "RPC Provider", &rpc_label, &rpc_badges, row_style);
+        let rpc_row = self.review_row(
+            t,
+            WizardStep::Rpc,
+            "RPC Provider",
+            &rpc_label,
+            &rpc_badges,
+            row_style,
+        );
 
         let api_label = self.step_summary(WizardStep::Api);
         let api_badges = self.api_badges();
-        let api_row = self.review_row(t, "API / Indexer", &api_label, &api_badges, row_style);
+        let api_row = self.review_row(
+            t,
+            WizardStep::Api,
+            "API / Indexer",
+            &api_label,
+            &api_badges,
+            row_style,
+        );
 
         let safe_label = self.step_summary(WizardStep::SafeTx);
         let safe_badges = self.safe_tx_badges();
-        let safe_row = self.review_row(t, "Safe TX Service", &safe_label, &safe_badges, row_style);
+        let safe_row = self.review_row(
+            t,
+            WizardStep::SafeTx,
+            "Safe TX Service",
+            &safe_label,
+            &safe_badges,
+            row_style,
+        );
 
         let proxy_label = self.step_summary(WizardStep::Proxy);
         let proxy_badges = self.proxy_badges();
-        let proxy_row = self.review_row(t, "Proxy", &proxy_label, &proxy_badges, row_style);
+        let proxy_row = self.review_row(
+            t,
+            WizardStep::Proxy,
+            "Proxy",
+            &proxy_label,
+            &proxy_badges,
+            row_style,
+        );
 
         let consensus_label = self.step_summary(WizardStep::Consensus);
         let consensus_badges: Vec<(BadgeKind, &str)> =
             vec![(BadgeKind::Info, "Helios light-client")];
         let consensus_row = self.review_row(
             t,
+            WizardStep::Consensus,
             "Consensus",
             &consensus_label,
             &consensus_badges,
@@ -2313,6 +2342,7 @@ impl NetworkSetupScreen {
         };
         let custom_row = self.review_row(
             t,
+            WizardStep::CustomNetworks,
             "Custom Networks",
             &custom_label,
             &custom_badges,
@@ -2336,10 +2366,13 @@ impl NetworkSetupScreen {
         .into()
     }
 
+    /// One summary tile on the Review step. It looks like the rail's step cards, so it acts like
+    /// one: a click jumps to `step` (pointer cursor, in Settings and setup alike).
     #[allow(clippy::too_many_arguments)]
     fn review_row<'a, F: Fn(&iced::Theme) -> container::Style + 'a>(
         &self,
         t: KaoTheme,
+        step: WizardStep,
         title: &'a str,
         value: &str,
         badges: &[(BadgeKind, &str)],
@@ -2351,7 +2384,7 @@ impl NetworkSetupScreen {
             badge_row = badge_row.push(privacy_badge(t, *kind, label));
         }
 
-        container(
+        let tile = container(
             row![
                 column![
                     text(title).size(11).color(t.sub).font(mono_bold()),
@@ -2366,8 +2399,11 @@ impl NetworkSetupScreen {
         )
         .padding(Padding::from([10, 14]))
         .width(Length::Fill)
-        .style(style_fn)
-        .into()
+        .style(style_fn);
+        mouse_area(tile)
+            .on_press(Message::GoToStep(step))
+            .interaction(iced::mouse::Interaction::Pointer)
+            .into()
     }
 
     fn rpc_badges(&self) -> Vec<(BadgeKind, &'static str)> {
@@ -2639,6 +2675,36 @@ mod tests {
             outcome.is_none(),
             "Save must not complete while any section is invalid",
         );
+    }
+
+    /// Every Review summary tile looks like a rail step card, so it acts like one: a click on it
+    /// jumps to its step — in setup and in Settings alike.
+    #[test]
+    fn review_tiles_jump_to_their_step() {
+        for mode in [WizardMode::Onboarding, WizardMode::Settings] {
+            for (title, step) in [
+                ("RPC Provider", WizardStep::Rpc),
+                ("API / Indexer", WizardStep::Api),
+                ("Safe TX Service", WizardStep::SafeTx),
+                ("Proxy", WizardStep::Proxy),
+                ("Consensus", WizardStep::Consensus),
+                ("Custom Networks", WizardStep::CustomNetworks),
+            ] {
+                let mut s = NetworkSetupScreen::new(mode);
+                let _ = s.update(Message::GoToStep(WizardStep::Review));
+                let t = KaoTheme::for_kind(crate::ui::kao_theme::ThemeKind::Void);
+                let published = crate::ui::wallet_dashboard::test_support::click_text(
+                    s.view_review_summary(t),
+                    title,
+                );
+                assert!(
+                    matches!(published.as_slice(), [Message::GoToStep(to)] if *to == step),
+                    "{title}: {published:?}"
+                );
+                let _ = s.update(published.into_iter().next().unwrap());
+                assert_eq!(s.step, step, "{title}");
+            }
+        }
     }
 
     /// The checkpoint fetch routes through the *draft* proxy (what the user is

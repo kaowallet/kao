@@ -19,6 +19,7 @@ mod sign;
 mod trace;
 mod txbuilder;
 mod ui;
+mod vault;
 mod wallet;
 mod walletconnect;
 

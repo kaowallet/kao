@@ -215,6 +215,87 @@ pub fn eip191_hash(message: &[u8]) -> B256 {
     alloy::primitives::eip191_hash_message(message)
 }
 
+/// The ERC-8213 rows the signed-message history keeps for a signed `call` — the same rows, in the
+/// same order and under the same labels, the review showed (`sign_review/wc.rs::erc8213_rows`):
+/// personal → the EIP-191 digest; typed → the EIP-712 triple (+ the inner calldata digest for a
+/// `SafeTx` that makes a call); a Safe identity → the SafeMessage triple its owners signed, then
+/// the dapp's own payload — the EIP-191 digest, or the typed rows under the "Dapp …" labels.
+/// Labels come from `crate::sign::digest`. A call that isn't a message has none.
+///
+/// The SafeMessage domain is the Safe's own chain — `chain_id`, the request's, is the same for
+/// every request Kao admits for a Safe. A Safe on a chain Kao doesn't know has no domain to hash
+/// (Kao never reviews such a request): only its inner rows are kept.
+pub fn digest_rows(
+    call: &WcCall,
+    identity: &WcIdentity,
+    chain_id: u64,
+) -> Vec<crate::vault::DigestRow> {
+    use crate::sign::digest::{
+        DAPP_DOMAIN_HASH_LABEL, DAPP_EIP712_DIGEST_LABEL, DAPP_MESSAGE_HASH_LABEL,
+        DOMAIN_HASH_LABEL, EIP191_DIGEST_LABEL, EIP712_DIGEST_LABEL, Eip712Digests,
+        INNER_CALLDATA_DIGEST_LABEL, MESSAGE_HASH_LABEL, calldata_digest,
+    };
+    use crate::vault::DigestRow;
+
+    const STANDARD: [&str; 3] = [EIP712_DIGEST_LABEL, DOMAIN_HASH_LABEL, MESSAGE_HASH_LABEL];
+    const DAPP: [&str; 3] = [
+        DAPP_EIP712_DIGEST_LABEL,
+        DAPP_DOMAIN_HASH_LABEL,
+        DAPP_MESSAGE_HASH_LABEL,
+    ];
+    fn push(rows: &mut Vec<DigestRow>, label: &str, hash: B256) {
+        rows.push(DigestRow {
+            label: label.to_string(),
+            hash,
+        });
+    }
+    fn triple(rows: &mut Vec<DigestRow>, d: &Eip712Digests, labels: [&str; 3]) {
+        push(rows, labels[0], d.digest);
+        push(rows, labels[1], d.domain_hash);
+        push(rows, labels[2], d.message_hash);
+    }
+    fn typed(rows: &mut Vec<DigestRow>, t: &TypedRequest, labels: [&str; 3]) {
+        triple(rows, &t.checked.digests, labels);
+        if let TypedKind::SafeTx { data, .. } = &t.checked.kind
+            && !data.is_empty()
+        {
+            push(rows, INNER_CALLDATA_DIGEST_LABEL, calldata_digest(data));
+        }
+    }
+
+    // Every digest here commits to its chain already (EIP-712 domains), or to none (EIP-191).
+    let _ = chain_id;
+    // What a Safe's owners sign over: the EIP-191 digest, or the dapp's EIP-712 digest.
+    let data_hash = match call {
+        WcCall::PersonalSign(p) => eip191_hash(&p.message),
+        WcCall::SignTypedData(t) => t.checked.digests.digest,
+        WcCall::SendTransaction(_)
+        | WcCall::SwitchChain { .. }
+        | WcCall::Accounts
+        | WcCall::ChainId => return Vec::new(),
+    };
+    let mut rows = Vec::new();
+    let inner = match identity {
+        WcIdentity::Eoa { .. } => STANDARD,
+        WcIdentity::Safe {
+            address,
+            chain_id: safe_chain,
+        } => {
+            // What the owners sign first, then what it wraps — the order a signer checks them in.
+            if let Some(chain) = crate::chain::Chain::from_chain_id(*safe_chain) {
+                let signed = crate::cow::safe_sig::safe_message_digests(data_hash, *address, chain);
+                triple(&mut rows, &signed, STANDARD);
+            }
+            DAPP
+        }
+    };
+    match call {
+        WcCall::SignTypedData(t) => typed(&mut rows, t, inner),
+        _ => push(&mut rows, EIP191_DIGEST_LABEL, data_hash),
+    }
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,6 +621,120 @@ mod tests {
         assert_eq!(
             eip191_hash(b"Hello"),
             alloy::primitives::keccak256(b"\x19Ethereum Signed Message:\n5Hello")
+        );
+    }
+
+    fn typed_call(raw: serde_json::Value, from: Address) -> WcCall {
+        use crate::walletconnect::typed::{check_typed_data, parse_typed_param};
+        let (td, raw) = parse_typed_param(&raw).expect("parses");
+        let checked = check_typed_data(&raw, &td, 1, from).expect("checks");
+        WcCall::SignTypedData(TypedRequest {
+            from,
+            typed: std::sync::Arc::new(td),
+            checked,
+        })
+    }
+
+    /// The history keeps the rows the review showed, in its order and under its labels: EIP-191
+    /// for a message, the EIP-712 triple for typed data (+ the inner call of a SafeTx), and for a
+    /// Safe the SafeMessage its owners signed first, then the dapp's own payload ("Dapp …").
+    #[test]
+    fn digest_rows_follow_the_review() {
+        use crate::cow::safe_sig::safe_message_digests;
+        use crate::sign::digest::*;
+        use crate::vault::DigestRow;
+        let labels = |rows: &[DigestRow]| rows.iter().map(|r| r.label.clone()).collect::<Vec<_>>();
+        let eoa = WcIdentity::Eoa { address: FROM };
+        let personal = WcCall::PersonalSign(PersonalSign {
+            from: FROM,
+            message: Bytes::from_static(b"hi"),
+            shape: classify(b"hi"),
+            siwe: None,
+        });
+        assert_eq!(
+            digest_rows(&personal, &eoa, 1),
+            vec![DigestRow {
+                label: EIP191_DIGEST_LABEL.into(),
+                hash: eip191_hash(b"hi"),
+            }]
+        );
+        let mail = typed_call(crate::walletconnect::testkit::fixtures::mail(1), FROM);
+        let WcCall::SignTypedData(t) = &mail else {
+            unreachable!("built as typed data")
+        };
+        let dapp = t.checked.digests;
+        let rows = digest_rows(&mail, &eoa, 1);
+        assert_eq!(
+            labels(&rows),
+            [EIP712_DIGEST_LABEL, DOMAIN_HASH_LABEL, MESSAGE_HASH_LABEL]
+        );
+        assert_eq!(
+            rows.iter().map(|r| r.hash).collect::<Vec<_>>(),
+            [dapp.digest, dapp.domain_hash, dapp.message_hash]
+        );
+
+        let safe_address = Address::repeat_byte(0x5a);
+        let safe = WcIdentity::Safe {
+            address: safe_address,
+            chain_id: 1,
+        };
+        let rows = digest_rows(&personal, &safe, 1);
+        let signed = safe_message_digests(
+            eip191_hash(b"hi"),
+            safe_address,
+            crate::chain::Chain::Mainnet,
+        );
+        assert_eq!(
+            labels(&rows),
+            [
+                EIP712_DIGEST_LABEL,
+                DOMAIN_HASH_LABEL,
+                MESSAGE_HASH_LABEL,
+                EIP191_DIGEST_LABEL
+            ]
+        );
+        assert_eq!(
+            rows.iter().map(|r| r.hash).collect::<Vec<_>>(),
+            [
+                signed.digest,
+                signed.domain_hash,
+                signed.message_hash,
+                eip191_hash(b"hi")
+            ]
+        );
+        let rows = digest_rows(&mail, &safe, 1);
+        let signed = safe_message_digests(dapp.digest, safe_address, crate::chain::Chain::Mainnet);
+        assert_eq!(
+            labels(&rows),
+            [
+                EIP712_DIGEST_LABEL,
+                DOMAIN_HASH_LABEL,
+                MESSAGE_HASH_LABEL,
+                DAPP_EIP712_DIGEST_LABEL,
+                DAPP_DOMAIN_HASH_LABEL,
+                DAPP_MESSAGE_HASH_LABEL
+            ]
+        );
+        assert_eq!(rows[0].hash, signed.digest);
+        assert_eq!(rows[3].hash, dapp.digest);
+
+        // An owner confirming a SafeTx: the inner call's calldata digest too.
+        let safe_tx = typed_call(
+            crate::walletconnect::testkit::fixtures::safe_tx(
+                safe_address,
+                Address::repeat_byte(0x40),
+                "0xdeadbeef",
+            ),
+            FROM,
+        );
+        let rows = digest_rows(&safe_tx, &eoa, 1);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[3].label, INNER_CALLDATA_DIGEST_LABEL);
+        assert_eq!(rows[3].hash, calldata_digest(&[0xde, 0xad, 0xbe, 0xef]));
+
+        assert!(
+            digest_rows(&WcCall::Accounts, &eoa, 1).is_empty(),
+            "not a message"
         );
     }
 }

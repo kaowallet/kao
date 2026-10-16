@@ -525,7 +525,9 @@ fn lock_flap(flap: &Mutex<FlapGuard>) -> MutexGuard<'_, FlapGuard> {
 struct ConnectorConfig {
     relay: url::Url,
     project_id: Option<String>,
-    /// Kao's relay identity: one per runtime, never persisted, so unlocks aren't linkable.
+    /// Kao's relay identity: fresh for a fresh start; its seed is saved with the sessions it
+    /// makes, and a restore of them over the same kind of route reuses it (the relay keeps what it
+    /// pushed per identity, so nothing is pushed twice — and the sessions link it anyway).
     identity: IdentityKey,
     route: Route,
     timeouts: Timeouts,
@@ -537,13 +539,20 @@ struct ConnectorConfig {
 /// under way when Kao locks or quits would otherwise run to completion — one more upgrade, with a
 /// fresh JWT for this runtime's relay identity, up to a minute after the user locked. Once closed,
 /// [`KaoConnector::connect`] refuses without dialling, a back-off in progress ends at once, a dial
-/// in progress is abandoned, and a socket that opened anyway is dropped instead of returned.
+/// in progress is abandoned, and a socket that opened anyway is dropped instead of returned. A
+/// socket already handed over keeps working: a suspend or teardown still sends its last answers
+/// and disconnects through it.
+///
+/// [`Self::abort`] goes further, for a restore the slot no longer wants: closed, and every socket
+/// this connector opened is dropped without one more frame written — no acknowledgement of what
+/// the relay pushed, which it then keeps for this relay identity's next connection.
 #[derive(Clone, Default)]
 pub struct ConnectorShutdown(Arc<ShutdownState>);
 
 #[derive(Default)]
 struct ShutdownState {
     closed: std::sync::atomic::AtomicBool,
+    aborted: std::sync::atomic::AtomicBool,
     notify: tokio::sync::Notify,
 }
 
@@ -556,18 +565,39 @@ impl ConnectorShutdown {
         self.0.notify.notify_waiters();
     }
 
+    /// [`Self::close`], and its live sockets dropped without writing anything more. Idempotent.
+    pub fn abort(&self) {
+        self.0
+            .aborted
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.close();
+    }
+
     pub fn is_closed(&self) -> bool {
         self.0.closed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    pub fn is_aborted(&self) -> bool {
+        self.0.aborted.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Resolves once closed (at once if it already is).
-    async fn closed(&self) {
+    pub async fn closed(&self) {
+        self.wait_for(Self::is_closed).await;
+    }
+
+    /// Resolves once aborted (at once if it already is).
+    pub async fn aborted(&self) {
+        self.wait_for(Self::is_aborted).await;
+    }
+
+    async fn wait_for(&self, done: impl Fn(&Self) -> bool) {
         loop {
             // Registered before the flag is read, so a `close` in between can't be missed.
             let notified = self.0.notify.notified();
             let mut notified = std::pin::pin!(notified);
             notified.as_mut().enable();
-            if self.is_closed() {
+            if done(self) {
                 return;
             }
             notified.await;
@@ -696,7 +726,7 @@ async fn connect_once(
     let (app_end, io_end) = Connection::pair();
     lock_flap(&flap).connected(Instant::now());
     debug!(route = ?kind, "relay socket open");
-    tokio::spawn(pump(ws, io_end, config.timeouts, flap));
+    tokio::spawn(pump(ws, io_end, config.timeouts, flap, shutdown.clone()));
     Ok(app_end)
 }
 
@@ -790,7 +820,9 @@ fn handshake_error(e: tokio_tungstenite::tungstenite::Error) -> String {
 /// - inbound Text, or Binary that is valid UTF-8 → `io.sender`; *any* frame, Pong included, proves
 ///   the relay alive and resets the idle timer (tungstenite answers the relay's pings itself);
 /// - a Ping every `ping_every`;
-/// - idle expiry, a Close, a socket error or the end of the stream → return.
+/// - idle expiry, a Close, a socket error or the end of the stream → return;
+/// - `shutdown` aborted → return at once, without writing anything more (no Close either): checked
+///   before every write too, so nothing the client queued meanwhile leaves.
 ///
 /// Returning drops `io.sender`, which is the crate's "connection died" signal: its receiver yields
 /// `None` and it reconnects through [`KaoConnector`]. Every write is bounded by `idle` too, so a
@@ -801,6 +833,7 @@ async fn pump<S>(
     io: Connection,
     timeouts: Timeouts,
     flap: Arc<Mutex<FlapGuard>>,
+    shutdown: ConnectorShutdown,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -819,7 +852,9 @@ async fn pump<S>(
 
     let ended: &'static str = loop {
         tokio::select! {
+            () = shutdown.aborted() => break "aborted",
             outgoing = receiver.recv() => match outgoing {
+                _ if shutdown.is_aborted() => break "aborted",
                 Some(text) => {
                     if !send_bounded(&mut sink, Message::text(text), timeouts.idle).await {
                         break "send failed";
@@ -853,6 +888,9 @@ async fn pump<S>(
                     Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => None,
                     Message::Close(_) => break "relay closed",
                 };
+                if shutdown.is_aborted() {
+                    break "aborted";
+                }
                 if let Some(text) = text
                     && sender.send(text).is_err()
                 {
@@ -862,6 +900,9 @@ async fn pump<S>(
                 }
             }
             _ = ping.tick() => {
+                if shutdown.is_aborted() {
+                    break "aborted";
+                }
                 if !send_bounded(&mut sink, Message::Ping(Default::default()), timeouts.idle).await {
                     break "ping failed";
                 }
@@ -1855,6 +1896,91 @@ mod tests {
         drop(conn);
         let what = tokio::time::timeout(WAIT, seen_rx.recv()).await.unwrap();
         assert_eq!(what, Some("close"));
+    }
+
+    /// Every frame a relay reads from one connection, until it ends: `data:<text>`, `close`, or
+    /// how the stream ended (`eof` / `error`).
+    async fn recording_relay() -> (u16, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        let (seen_tx, seen_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let port = ws_server(move |mut ws| {
+            let seen_tx = seen_tx.clone();
+            async move {
+                loop {
+                    let what = match ws.next().await {
+                        Some(Ok(Message::Text(t))) => format!("data:{}", t.as_str()),
+                        Some(Ok(Message::Close(_))) => "close".to_string(),
+                        Some(Ok(_)) => continue,
+                        Some(Err(_)) => "error".to_string(),
+                        None => "eof".to_string(),
+                    };
+                    let end = !what.starts_with("data:");
+                    let _ = seen_tx.send(what);
+                    if end {
+                        break;
+                    }
+                }
+            }
+        })
+        .await;
+        (port, seen_rx)
+    }
+
+    /// A restore the slot gave up on aborts its connector: the socket goes at once, and nothing
+    /// the client queues after that — an acknowledgement of a pushed message, say — reaches the
+    /// relay, not even a Close.
+    #[tokio::test]
+    async fn an_aborted_connector_drops_its_socket_without_writing_more() {
+        let (port, mut seen) = recording_relay().await;
+        let c = KaoConnector::new(
+            url(&format!("ws://127.0.0.1:{port}")),
+            None,
+            IdentityKey::generate(),
+            Route::Direct,
+            quick(WAIT),
+        );
+        let off = c.shutdown_handle();
+        let mut conn = c.connect().await.unwrap();
+        conn.sender.send("before".into()).unwrap();
+        let first = tokio::time::timeout(WAIT, seen.recv()).await.unwrap();
+        assert_eq!(first.as_deref(), Some("data:before"));
+        off.abort();
+        assert!(off.is_closed() && off.is_aborted());
+        let _ = conn.sender.send("after".into());
+        let next = tokio::time::timeout(WAIT, seen.recv()).await.unwrap();
+        assert!(
+            matches!(next.as_deref(), Some("eof" | "error")),
+            "dropped, with nothing more written: {next:?}"
+        );
+        let to_client = tokio::time::timeout(WAIT, conn.receiver.recv()).await;
+        assert!(
+            matches!(to_client, Ok(None)),
+            "the pump let go of the client"
+        );
+        assert!(
+            transport_error(c.connect().await).contains("shut down"),
+            "and nothing dials again"
+        );
+    }
+
+    /// Closing (lock, quit, retire) only stops new dials: the socket already open still carries
+    /// the suspend's or teardown's last answers and disconnects.
+    #[tokio::test]
+    async fn a_closed_connector_keeps_its_open_socket_working() {
+        let (port, mut seen) = recording_relay().await;
+        let c = KaoConnector::new(
+            url(&format!("ws://127.0.0.1:{port}")),
+            None,
+            IdentityKey::generate(),
+            Route::Direct,
+            quick(WAIT),
+        );
+        let off = c.shutdown_handle();
+        let conn = c.connect().await.unwrap();
+        off.close();
+        assert!(!off.is_aborted());
+        conn.sender.send("last answer".into()).unwrap();
+        let got = tokio::time::timeout(WAIT, seen.recv()).await.unwrap();
+        assert_eq!(got.as_deref(), Some("data:last answer"));
     }
 
     #[tokio::test]

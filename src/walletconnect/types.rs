@@ -97,6 +97,25 @@ impl Refusal {
             "Kao locked or quit",
         )
     }
+    /// A request still pending in a restored session that Kao never reviewed (it arrived before
+    /// Kao locked or quit and no answer was owed).
+    pub fn restarted() -> Self {
+        Self::new(
+            codes::DISCONNECTED,
+            "Kao restarted before this request was reviewed.",
+            "Kao restarted",
+        )
+    }
+    /// A request Kao was signing (or sending) when it locked or quit, its outcome unknown: never
+    /// "not reviewed" or "cancelled" — a transaction may have left the wallet.
+    pub fn interrupted() -> Self {
+        Self::new(
+            codes::INTERNAL,
+            "Kao closed while this request was being signed — it may have gone through; check \
+             your activity before trying again.",
+            "Kao closed while signing",
+        )
+    }
     pub fn limit() -> Self {
         Self::new(
             codes::LIMIT_EXCEEDED,
@@ -1019,6 +1038,10 @@ pub struct Effects {
     pub ui: Vec<UiEffect>,
     /// Something render-visible changed (the stream emits `Changed`).
     pub changed: bool,
+    /// History to record in the vault (through the runtime's epoch-checked `VaultSession`).
+    pub log: Vec<LogEffect>,
+    /// Whether (and how soon) the runtime should save its state to the vault.
+    pub persist: Persist,
 }
 
 impl Effects {
@@ -1026,7 +1049,116 @@ impl Effects {
         self.net.extend(other.net);
         self.ui.extend(other.ui);
         self.changed |= other.changed;
+        self.log.extend(other.log);
+        self.persist = self.persist.max(other.persist);
     }
+}
+
+/// When the runtime saves its WalletConnect state. Ordered, so merging two is `max`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Persist {
+    #[default]
+    None,
+    /// Dirty: housekeeping saves it within a couple of seconds.
+    Soon,
+    /// Save now (coalesced, off the UI thread): something a restore must not lose.
+    Now,
+}
+
+/// One history event for the vault.
+#[derive(Clone, PartialEq)]
+pub enum LogEffect {
+    ConnectionOpened(crate::vault::NewConnection),
+    ConnectionAcked {
+        topic: String,
+        ack: crate::vault::AckRecord,
+    },
+    ConnectionEnded {
+        topic: String,
+        at: u64,
+        reason: crate::vault::EndReason,
+    },
+    MessageSigned(crate::vault::NewSigned),
+    MessageDelivery {
+        topic: String,
+        request_id: u64,
+        delivery: crate::vault::Delivery,
+        /// The raw signature, for a `Delivered` one (the vault keeps it from then on).
+        signature: Option<Bytes>,
+    },
+}
+
+impl LogEffect {
+    fn topic(&self) -> &str {
+        match self {
+            Self::ConnectionOpened(c) => &c.topic,
+            Self::MessageSigned(s) => match &s.origin {
+                crate::vault::SignOrigin::WalletConnect { topic, .. } => topic,
+            },
+            Self::ConnectionAcked { topic, .. }
+            | Self::ConnectionEnded { topic, .. }
+            | Self::MessageDelivery { topic, .. } => topic,
+        }
+    }
+}
+
+/// Variant + the topic's first 8 chars only — never a payload, signature or dapp string.
+impl fmt::Debug for LogEffect {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::ConnectionOpened(_) => "ConnectionOpened",
+            Self::ConnectionAcked { .. } => "ConnectionAcked",
+            Self::ConnectionEnded { .. } => "ConnectionEnded",
+            Self::MessageSigned(_) => "MessageSigned",
+            Self::MessageDelivery { .. } => "MessageDelivery",
+        };
+        let topic: String = self.topic().chars().take(8).collect();
+        write!(f, "{name}({topic}…)")
+    }
+}
+
+// ───────────────────────────── restore (slot → dashboard) ─────────────────────────────
+
+/// What the WalletConnect pane shows while saved sessions are being restored (`WcSlot::restore_view`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreView {
+    /// Saved dapps being restored whose session is still alive.
+    pub sessions: usize,
+    /// Disconnects the restore still owes whose session is still alive: sessions the dapps hold
+    /// that no binding covers (a disconnect that hadn't reached the dapp). `sessions == 0` with
+    /// some of these is a restore left only a disconnect to deliver; both 0, everything it held
+    /// expired while it waited (the slot then ends it — see `WcSlot::restore_watch`).
+    pub pending_disconnects: usize,
+    pub phase: RestorePhase,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestorePhase {
+    Connecting,
+    /// A retryable failure; the next attempt is at `at` (unix seconds). `error` is Kao's own copy.
+    RetryingAt {
+        at: u64,
+        error: String,
+    },
+    /// Waits for the user: Retry / Reconnect anyway (`direct_override`: the route got less private
+    /// than the one the sessions were saved under) / Forget.
+    NeedsYou {
+        error: String,
+        direct_override: bool,
+    },
+}
+
+/// How a restore future ended (`WcMsg::Restored` — a UI nudge; the slot holds the real state).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreOutcome {
+    /// Installed: `generation` is the restored runtime's.
+    Restored { sessions: usize, generation: u64 },
+    /// Nothing to restore (no saved state, or none of it still alive).
+    Nothing,
+    /// Waiting on the user (`RestorePhase::NeedsYou`).
+    Waiting,
+    /// The slot closed, or the user forgot the saved sessions, while it ran.
+    Stopped,
 }
 
 // ───────────────────────────── snapshot (render-only) ─────────────────────────────
@@ -1043,6 +1175,10 @@ pub struct WcSnapshot {
     pub notices: Vec<NoticeView>,
     pub refused_count: u32,
     pub undelivered: usize,
+    /// The relay the live runtime uses (its origin, as its saved state keeps it): compare with the
+    /// configured one through [`super::runtime::same_relay`] — a restore against another relay
+    /// forgets these sessions.
+    pub relay_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1636,15 +1772,29 @@ mod tests {
             }],
             ui: vec![],
             changed: false,
+            persist: Persist::Now,
+            ..Default::default()
         };
         a.merge(Effects {
             net: vec![],
             ui: vec![UiEffect::Attention],
             changed: true,
+            log: vec![LogEffect::ConnectionAcked {
+                topic: "0123456789abcdef".into(),
+                ack: crate::vault::AckRecord::Confirmed,
+            }],
+            persist: Persist::Soon,
         });
         assert_eq!(a.net.len(), 1);
         assert_eq!(a.ui, vec![UiEffect::Attention]);
         assert!(a.changed);
+        assert_eq!(a.log.len(), 1);
+        assert_eq!(
+            a.persist,
+            Persist::Now,
+            "merge keeps the more urgent persist"
+        );
+        assert_eq!(format!("{:?}", a.log[0]), "ConnectionAcked(01234567…)");
     }
 
     #[test]

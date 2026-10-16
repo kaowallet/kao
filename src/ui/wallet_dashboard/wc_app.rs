@@ -4,9 +4,11 @@
 //! - **Launcher row** — a `wc:` field + Connect, and one status line, at the top of the Apps
 //!   launcher. Connect *moves* the pasted link (it carries the pairing symKey) into
 //!   [`Outcome::Pair`] and clears the field; the coordinator does the real parse.
-//! - **Home** — the relay line, the same `wc:` row, at most one connection request (the approval
-//!   card for the *active* identity), the requests waiting for the user, the connected dapps, the
-//!   recent activity, and a two-step "Turn off WalletConnect".
+//! - **Home** — the relay line (or, while saved sessions are being restored, the restore card), the
+//!   same `wc:` row, at most one connection request (the approval card for the *active* identity),
+//!   the requests waiting for the user, the connected dapps, the recent activity, the latest past
+//!   connections (from the vault, so also while WalletConnect is off), and a two-step "Turn off
+//!   WalletConnect".
 //! - **Settings** — the project id (typed fresh; the stored one is never shown back) and the relay
 //!   URL, validated inline with the settings module's own validators.
 //!
@@ -32,11 +34,12 @@ use crate::ui::kao_widgets::{
     mono_box, primary_button, privacy_badge, screen_subtitle, screen_title, secondary_button,
     small_danger_button, small_secondary_button, span_label, text_input_style,
 };
+use crate::vault::ConnectionRecord;
 use crate::walletconnect::{
     AckState, ChainLine, MethodLine, MethodSupport, NoticeView, PAIRING_HINT_AFTER_SECS,
     PairingState, ProjectIdSource, ProposalView, ProxyView, QueueState, RESTART_FOR_PROXY,
-    RelayStatus, RequestView, RouteKind, SessionView, Topic, WcConfigView, WcIdentity, WcKey,
-    WcSnapshot,
+    RelayStatus, RequestView, RestorePhase, RestoreView, RouteKind, SessionView, Topic,
+    WcConfigView, WcIdentity, WcKey, WcSnapshot,
 };
 
 /// The pane's mascot, also the launcher card's chip.
@@ -47,6 +50,71 @@ const IDLE_HINT_LAUNCHER: &str =
     "Connect Kao to a dapp: copy its WalletConnect link and paste it here.";
 const IDLE_HINT_PANE: &str =
     "Copy the WalletConnect link from a dapp's connect dialog and paste it here.";
+/// The relay card while WalletConnect is off.
+const OFF_LINE: &str = "Off — Kao connects to the relay when you paste a link, and when you unlock with dapps still \
+     connected.";
+/// Under CONNECTED DAPPS: what lock and quit do (and don't do) to a connection.
+pub(super) const STAY_CONNECTED_NOTE: &str = "These stay connected when Kao locks or quits. Disconnect a \
+     dapp, or turn WalletConnect off, to end it.";
+/// The same, while the vault can't save (no data key this session): lock and quit then fall back
+/// to the full teardown.
+pub(super) const NOT_SAVED_NOTE: &str = "Kao can't save your connections right now, so locking or quitting \
+     disconnects your dapps.";
+/// The same, once the user saved another relay than the live runtime's: the next start can't
+/// reach these dapps there, so it forgets them (without telling them).
+pub(super) const RELAY_CHANGED_NOTE: &str = "You changed the relay: these dapps will be forgotten at the \
+     next start — turn WalletConnect off to disconnect them.";
+/// A link that reaches Connect while saved sessions are being reconnected: a fresh runtime now
+/// would save over them. Connect took the link out of the field, so it asks for it again.
+pub(super) const STILL_RESTORING: &str =
+    "Kao is reconnecting your saved dapps — paste the link again in a moment.";
+/// The same, while that restore waits on the user (the restore card has Retry and Forget).
+pub(super) const RESTORE_FIRST: &str =
+    "Reconnect or forget your saved dapps first, then paste the link again.";
+/// [`STILL_RESTORING`] for a restore with no saved dapp, only a disconnect to deliver: a fresh
+/// runtime now would save over that owed disconnect.
+pub(super) const STILL_FINISHING_DISCONNECT: &str =
+    "Kao is finishing a disconnect — paste the link again in a moment.";
+/// [`RESTORE_FIRST`] for that restore.
+pub(super) const DISCONNECT_FIRST: &str =
+    "Retry or forget the pending disconnect first, then paste the link again.";
+/// A restore with no saved session left only delivers a disconnect the relay never took.
+const FINISHING_DISCONNECT: &str = "Finishing a disconnect…";
+/// The restore card's note for that restore while it waits (to retry, or on the user).
+const DISCONNECT_PENDING_NOTE: &str = "A disconnect you asked for hasn't reached its dapp yet.";
+/// [`STILL_RESTORING`] for a restore left with nothing alive and nothing owed: its saved sessions
+/// expired while it waited, and it clears them at its next step.
+pub(super) const STILL_CLEARING_EXPIRED: &str =
+    "Kao is clearing your expired connections — paste the link again in a moment.";
+/// [`RESTORE_FIRST`] for that restore.
+pub(super) const EXPIRED_FIRST: &str =
+    "Clear your expired connections first, then paste the link again.";
+/// That restore's line while its try is on the wire.
+const CLEARING_EXPIRED: &str = "Clearing your expired connections…";
+/// The restore card's note for that restore while it waits.
+const EXPIRED_NOTE: &str = "Your saved connections expired.";
+/// Connection settings: when a change applies, and what each way of applying it does to the dapps.
+const SETTINGS_APPLY_NOTE: &str = "Changes apply the next time WalletConnect starts. Restarting \
+     Kao, or locking and unlocking it, reconnects your dapps with the new settings — unless the \
+     relay changed, which forgets them. Turning WalletConnect off disconnects them.";
+/// The second step of "Forget" on the restore card.
+const FORGET_NOTE: &str = "Kao forgets these connections without telling the dapps.";
+/// The same for a restore that only delivers a disconnect: forgetting it drops the disconnect.
+const FORGET_DISCONNECT_NOTE: &str = "Kao stops trying — the dapp you disconnected won't be told \
+     and keeps the connection until it expires.";
+/// The same for a restore whose saved sessions all expired: nothing is lost.
+const FORGET_EXPIRED_NOTE: &str =
+    "Kao clears these connections — they expired, so no dapp is affected.";
+/// While the vault couldn't read the wallet file's sealed tables (`key_unavailable`): nothing
+/// WalletConnect saved is restored, and nothing new is saved until the user resets them.
+const SAVED_STATE_UNREADABLE_NOTE: &str = "Kao can't read the connections and history saved in \
+     your wallet file. Until that's fixed, new connections and history aren't saved — locking or \
+     quitting disconnects your dapps.";
+/// Saving a different relay while dapps are connected (or saved to reconnect).
+const RELAY_CHANGE_WARNING: &str = "Your connected dapps will be forgotten at the next start — \
+     turn WalletConnect off first to disconnect them.";
+/// How many ended connections the pane lists; the rest are in Settings → Connection history.
+pub(super) const PAST_SHOWN: usize = 3;
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -89,6 +157,25 @@ pub enum Message {
     AskStop,
     ConfirmStop,
     CancelStop,
+    /// [Retry now] / [Retry] on the restore card.
+    RetryRestore,
+    /// [Reconnect anyway]: the route is less private than the one the sessions were saved under.
+    ReconnectAnyway,
+    /// First step of "Forget" on the restore card; never forgets anything by itself.
+    AskForget,
+    ConfirmForget,
+    CancelForget,
+    /// First step of "Clear" on PAST CONNECTIONS.
+    AskClearPast,
+    ConfirmClearPast,
+    CancelClearPast,
+    /// "See all in Settings ›" under PAST CONNECTIONS.
+    SeeAllConnections,
+    /// First step of "Reset saved history and connections…" (shown while the wallet file's saved
+    /// state can't be read); never resets anything by itself.
+    AskReset,
+    ConfirmReset,
+    CancelReset,
     ToggleSettings,
     ProjectIdChanged(SecretInput),
     /// A relay draft can carry a `?projectId=…` pasted along with it: redacted like the id.
@@ -149,6 +236,19 @@ pub enum Outcome {
         topic: Topic,
     },
     Stop,
+    /// Try restoring the saved sessions again now (`allow_direct`: over a route less private than
+    /// the one they were saved under — the user said "Reconnect anyway").
+    RetryRestore {
+        allow_direct: bool,
+    },
+    /// Forget the saved sessions without telling the dapps.
+    ForgetRestore,
+    /// Remove every ended connection from the history (open ones stay).
+    ClearConnectionHistory,
+    /// Open Settings → Connection history.
+    OpenConnectionHistory,
+    /// Delete the saved history and connections the wallet file can't read, so Kao saves again.
+    ResetSavedState,
     SaveSettings {
         project_id: SettingEdit<SecretInput>,
         relay_url: SettingEdit<String>,
@@ -171,6 +271,11 @@ impl Outcome {
             Outcome::RejectAllFrom { .. } => "RejectAllFrom",
             Outcome::Resume { .. } => "Resume",
             Outcome::Stop => "Stop",
+            Outcome::RetryRestore { .. } => "RetryRestore",
+            Outcome::ForgetRestore => "ForgetRestore",
+            Outcome::ClearConnectionHistory => "ClearConnectionHistory",
+            Outcome::OpenConnectionHistory => "OpenConnectionHistory",
+            Outcome::ResetSavedState => "ResetSavedState",
             Outcome::SaveSettings { .. } => "SaveSettings",
             Outcome::Close => "Close",
         }
@@ -269,6 +374,25 @@ pub struct WcApp {
     /// Why the relay is off, when the runtime retired itself (idle, Turn off) — shown on the relay
     /// card until a runtime is back. Kao's own copy.
     off_reason: Option<String>,
+    /// The restore of saved sessions the slot is running or waiting on (`WcSlot::restore_view`):
+    /// it drives the relay card while no runtime exists.
+    restore: Option<RestoreView>,
+    /// The latest ended connections, newest first (at most [`PAST_SHOWN`]), and how many ended
+    /// ones the history holds — pushed from the vault, so they show while WalletConnect is off.
+    past: Vec<ConnectionRecord>,
+    past_total: usize,
+    /// "Forget" on the restore card is staged.
+    confirm_forget: bool,
+    /// "Clear" on PAST CONNECTIONS is staged.
+    confirm_clear_past: bool,
+    /// Whether the vault saves what this session records (it has its data key): the connected
+    /// dapps' note promises they survive a lock only then.
+    can_persist: bool,
+    /// The vault couldn't read the wallet file's saved state this session (`key_unavailable`):
+    /// the pane says so and offers the reset.
+    key_unavailable: bool,
+    /// "Reset saved history and connections" is staged.
+    confirm_reset: bool,
 }
 
 impl std::fmt::Debug for WcApp {
@@ -295,12 +419,17 @@ impl crate::ui::kao_widgets::CopyKick for Message {
 struct TraceSnapshot {
     view: &'static str,
     pairing: &'static str,
+    restore: &'static str,
     pending_pair: bool,
     confirm_disconnect: bool,
     confirm_stop: bool,
+    confirm_forget: bool,
+    confirm_clear_past: bool,
+    confirm_reset: bool,
     settings_error: bool,
     connect_ready: bool,
     off_reason: bool,
+    past: bool,
 }
 
 /// Esc, and nothing else, becomes a message: keystrokes typed into the link or project-id field
@@ -330,17 +459,72 @@ fn looks_like_wc_uri(s: &str) -> bool {
 /// What a dapp can ask for, in the user's words. `None` for anything not served.
 fn method_phrase(method: &str) -> Option<&'static str> {
     Some(match method {
-        "eth_sendTransaction" => "send transactions",
-        "personal_sign" => "sign messages",
-        "eth_signTypedData_v4" | "eth_signTypedData" => "sign typed data",
-        "wallet_switchEthereumChain" => "switch networks",
-        "eth_accounts" | "eth_requestAccounts" | "eth_chainId" => "read your address and network",
+        "eth_sendTransaction" => "Send transactions",
+        "personal_sign" => "Sign messages",
+        "eth_signTypedData_v4" | "eth_signTypedData" => "Sign typed data",
+        "wallet_switchEthereumChain" => "Switch networks",
+        "eth_accounts" | "eth_requestAccounts" | "eth_chainId" => "Read your address and network",
         _ => return None,
     })
 }
 
 fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// What a restore still has to do, from its live counts — the copy follows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreLeft {
+    /// Saved dapps whose sessions are still alive wait to reconnect.
+    Dapps,
+    /// No saved dapp is alive: only a disconnect the user asked for is still owed to its dapp.
+    Disconnect,
+    /// Nothing alive and nothing owed: the saved sessions expired while the restore waited.
+    Expired,
+}
+
+fn restore_left(r: &RestoreView) -> RestoreLeft {
+    if r.sessions > 0 {
+        RestoreLeft::Dapps
+    } else if r.pending_disconnects > 0 {
+        RestoreLeft::Disconnect
+    } else {
+        RestoreLeft::Expired
+    }
+}
+
+/// Why a link that reached Connect during `r` was turned away (the coordinator refuses every
+/// paste while a restore runs or waits): its saved dapps come back first — or, with none saved,
+/// the disconnect it still owes a dapp goes out first, or its expired connections are cleared.
+pub(super) fn paste_refusal(r: &RestoreView) -> &'static str {
+    let waits = matches!(r.phase, RestorePhase::NeedsYou { .. });
+    match (restore_left(r), waits) {
+        (RestoreLeft::Dapps, true) => RESTORE_FIRST,
+        (RestoreLeft::Dapps, false) => STILL_RESTORING,
+        (RestoreLeft::Disconnect, true) => DISCONNECT_FIRST,
+        (RestoreLeft::Disconnect, false) => STILL_FINISHING_DISCONNECT,
+        (RestoreLeft::Expired, true) => EXPIRED_FIRST,
+        (RestoreLeft::Expired, false) => STILL_CLEARING_EXPIRED,
+    }
+}
+
+/// The toast after the user forgot the restore `r` (with no saved dapp alive, what's dropped is
+/// a disconnect — or nothing, once everything expired). `turned_off`: Turn off did it.
+pub(super) fn forgot_notice(r: &RestoreView, turned_off: bool) -> &'static str {
+    match (restore_left(r), turned_off) {
+        (RestoreLeft::Dapps, false) => "Kao forgot your saved dapps — they weren't told.",
+        (RestoreLeft::Dapps, true) => "WalletConnect is off — Kao forgot your saved dapps.",
+        (RestoreLeft::Disconnect, false) => {
+            "Kao stopped trying to finish the disconnect — that dapp wasn't told."
+        }
+        (RestoreLeft::Disconnect, true) => {
+            "WalletConnect is off — Kao stopped trying to finish the disconnect."
+        }
+        (RestoreLeft::Expired, false) => "Kao cleared your expired connections.",
+        (RestoreLeft::Expired, true) => {
+            "WalletConnect is off — your saved connections had expired."
+        }
+    }
 }
 
 fn tone_color(t: KaoTheme, tone: Tone) -> Color {
@@ -369,6 +553,14 @@ impl WcApp {
             confirm_stop: false,
             settings_error: None,
             off_reason: None,
+            restore: None,
+            past: Vec::new(),
+            past_total: 0,
+            confirm_forget: false,
+            confirm_clear_past: false,
+            can_persist: true,
+            key_unavailable: false,
+            confirm_reset: false,
         }
     }
 
@@ -376,12 +568,17 @@ impl WcApp {
         TraceSnapshot {
             view: self.view.name(),
             pairing: self.pairing.name(),
+            restore: restore_name(self.restore.as_ref()),
             pending_pair: self.pending_pair.is_some(),
             confirm_disconnect: self.confirm_disconnect.is_some(),
             confirm_stop: self.confirm_stop,
+            confirm_forget: self.confirm_forget,
+            confirm_clear_past: self.confirm_clear_past,
+            confirm_reset: self.confirm_reset,
             settings_error: self.settings_error.is_some(),
             connect_ready: self.connect_enabled(),
             off_reason: self.off_reason.is_some(),
+            past: !self.past.is_empty(),
         }
     }
 
@@ -399,6 +596,9 @@ impl WcApp {
         if before.pairing != after.pairing {
             crate::trace::state("wc", "pairing_ui", before.pairing, after.pairing);
         }
+        if before.restore != after.restore {
+            crate::trace::state("wc", "restore", before.restore, after.restore);
+        }
         let flags = [
             ("pending_pair", before.pending_pair, after.pending_pair),
             (
@@ -408,12 +608,24 @@ impl WcApp {
             ),
             ("confirm_stop", before.confirm_stop, after.confirm_stop),
             (
+                "confirm_forget",
+                before.confirm_forget,
+                after.confirm_forget,
+            ),
+            (
+                "confirm_clear_past",
+                before.confirm_clear_past,
+                after.confirm_clear_past,
+            ),
+            ("confirm_reset", before.confirm_reset, after.confirm_reset),
+            (
                 "settings_error",
                 before.settings_error,
                 after.settings_error,
             ),
             ("connect_ready", before.connect_ready, after.connect_ready),
             ("off_reason", before.off_reason, after.off_reason),
+            ("past_connections", before.past, after.past),
         ];
         for (what, from, to) in flags {
             if from != to {
@@ -558,6 +770,66 @@ impl WcApp {
                 self.confirm_stop = false;
                 None
             }
+            Message::RetryRestore => match self.restore.as_ref().map(|r| &r.phase) {
+                Some(RestorePhase::RetryingAt { .. })
+                | Some(RestorePhase::NeedsYou {
+                    direct_override: false,
+                    ..
+                }) => Some(Outcome::RetryRestore {
+                    allow_direct: false,
+                }),
+                _ => None,
+            },
+            Message::ReconnectAnyway => match self.restore.as_ref().map(|r| &r.phase) {
+                Some(RestorePhase::NeedsYou {
+                    direct_override: true,
+                    ..
+                }) => Some(Outcome::RetryRestore { allow_direct: true }),
+                _ => None,
+            },
+            Message::AskForget => {
+                self.confirm_forget = self.restore_forgettable();
+                None
+            }
+            Message::ConfirmForget => {
+                if !std::mem::take(&mut self.confirm_forget) || !self.restore_forgettable() {
+                    return None;
+                }
+                Some(Outcome::ForgetRestore)
+            }
+            Message::CancelForget => {
+                self.confirm_forget = false;
+                None
+            }
+            Message::AskClearPast => {
+                self.confirm_clear_past = self.past_total > 0;
+                None
+            }
+            Message::ConfirmClearPast => {
+                if !std::mem::take(&mut self.confirm_clear_past) || self.past_total == 0 {
+                    return None;
+                }
+                Some(Outcome::ClearConnectionHistory)
+            }
+            Message::CancelClearPast => {
+                self.confirm_clear_past = false;
+                None
+            }
+            Message::SeeAllConnections => Some(Outcome::OpenConnectionHistory),
+            Message::AskReset => {
+                self.confirm_reset = self.key_unavailable;
+                None
+            }
+            Message::ConfirmReset => {
+                if !std::mem::take(&mut self.confirm_reset) || !self.key_unavailable {
+                    return None;
+                }
+                Some(Outcome::ResetSavedState)
+            }
+            Message::CancelReset => {
+                self.confirm_reset = false;
+                None
+            }
             Message::ToggleSettings => {
                 match self.view {
                     PaneView::Settings => self.close_settings(),
@@ -599,6 +871,15 @@ impl WcApp {
                 if self.confirm_disconnect.take().is_some() {
                     return None;
                 }
+                if std::mem::take(&mut self.confirm_forget) {
+                    return None;
+                }
+                if std::mem::take(&mut self.confirm_clear_past) {
+                    return None;
+                }
+                if std::mem::take(&mut self.confirm_reset) {
+                    return None;
+                }
                 match self.view {
                     PaneView::Settings => {
                         self.close_settings();
@@ -615,6 +896,9 @@ impl WcApp {
     fn close(&mut self) -> Option<Outcome> {
         self.confirm_stop = false;
         self.confirm_disconnect = None;
+        self.confirm_forget = false;
+        self.confirm_clear_past = false;
+        self.confirm_reset = false;
         Some(Outcome::Close)
     }
 
@@ -746,6 +1030,13 @@ impl WcApp {
         }
     }
 
+    /// Saving a different relay while dapps are connected or saved to reconnect: the next start
+    /// can't reach them on the new one, so they would be forgotten without being told.
+    fn relay_change_warning(&self) -> Option<&'static str> {
+        let changes = matches!(self.relay_edit(), Ok(EditKind::Set | EditKind::Clear));
+        (changes && self.dapps_at_stake() > 0).then_some(RELAY_CHANGE_WARNING)
+    }
+
     fn relay_feedback(&self) -> Option<(String, Tone)> {
         match self.relay_edit() {
             Err(e) => Some((e.to_string(), Tone::Error)),
@@ -778,6 +1069,9 @@ impl WcApp {
         }
         if snap.is_none() {
             self.confirm_stop = false;
+        } else {
+            // A live runtime: whatever restore was staged for forgetting is over.
+            self.confirm_forget = false;
         }
         // Once the runtime reports its own pairing progress, the local "starting" is superseded.
         if self.pairing == PairingUi::Starting
@@ -825,6 +1119,76 @@ impl WcApp {
         self.trace_delta(&before);
     }
 
+    /// The slot's restore of saved sessions, if one is running or waiting on the user. A staged
+    /// "Forget" stands while the restore does, whatever its phase: the retry loop moves between
+    /// connecting and waiting on its own, and the slot forgets a restore in any phase (a try still
+    /// dialing is aborted). It goes once the restore is over.
+    pub fn set_restore(&mut self, restore: Option<RestoreView>) {
+        if self.restore == restore {
+            return;
+        }
+        let before = self.trace_snapshot();
+        self.restore = restore;
+        if !self.restore_forgettable() {
+            self.confirm_forget = false;
+        }
+        // A refused paste's line described the restore as it was; once that state is over (the
+        // dapps reconnected or forgotten, or the restore moved on), it would send the user after a
+        // restore that isn't there.
+        let phase = self.restore.as_ref().map(|r| &r.phase);
+        let stale = match &self.pairing {
+            PairingUi::Failed(m)
+                if m == RESTORE_FIRST || m == DISCONNECT_FIRST || m == EXPIRED_FIRST =>
+            {
+                !matches!(phase, Some(RestorePhase::NeedsYou { .. }))
+            }
+            PairingUi::Failed(m)
+                if m == STILL_RESTORING
+                    || m == STILL_FINISHING_DISCONNECT
+                    || m == STILL_CLEARING_EXPIRED =>
+            {
+                !matches!(
+                    phase,
+                    Some(RestorePhase::Connecting | RestorePhase::RetryingAt { .. })
+                )
+            }
+            _ => false,
+        };
+        if stale {
+            self.pairing = PairingUi::Idle;
+        }
+        self.trace_delta(&before);
+    }
+
+    /// Whether the vault saves what this session records (see `can_persist`).
+    pub fn set_can_persist(&mut self, can_persist: bool) {
+        self.can_persist = can_persist;
+    }
+
+    /// Whether the vault couldn't read the wallet file's saved state this session
+    /// (`Unreadable::key_unavailable`). A staged reset stands only while it couldn't.
+    pub fn set_key_unavailable(&mut self, unavailable: bool) {
+        let before = self.trace_snapshot();
+        self.key_unavailable = unavailable;
+        if !unavailable {
+            self.confirm_reset = false;
+        }
+        self.trace_delta(&before);
+    }
+
+    /// The latest ended connections (newest first; only the first [`PAST_SHOWN`] are kept) and
+    /// how many ended ones the history holds. A staged "Clear" stands only while there are some.
+    pub fn set_past_connections(&mut self, mut past: Vec<ConnectionRecord>, total: usize) {
+        let before = self.trace_snapshot();
+        past.truncate(PAST_SHOWN);
+        self.past = past;
+        self.past_total = total;
+        if total == 0 {
+            self.confirm_clear_past = false;
+        }
+        self.trace_delta(&before);
+    }
+
     /// A settings setter's verdict. `Some` reopens the form (drafts intact) with the reason —
     /// nothing was stored; `None` clears it, and drops the drafts of a save that went through.
     pub fn set_settings_error(&mut self, e: Option<String>) {
@@ -867,6 +1231,30 @@ impl WcApp {
     }
 
     // ── derived state ────────────────────────────────────────────────────────
+
+    /// A restore the user can forget: any, in any phase — the slot aborts a try still dialing,
+    /// and an aborted try can no longer install.
+    fn restore_forgettable(&self) -> bool {
+        self.restore.is_some()
+    }
+
+    /// The live runtime runs on another relay than the one now saved in settings: the next start
+    /// won't reach its dapps there, and forgets them.
+    fn relay_changed(&self) -> bool {
+        let (Some(snap), Some(cfg)) = (&self.snapshot, &self.config) else {
+            return false;
+        };
+        let configured = cfg.relay_custom.as_deref().unwrap_or(cfg.default_relay);
+        !snap.relay_url.is_empty()
+            && !crate::walletconnect::runtime::same_relay(&snap.relay_url, configured)
+    }
+
+    /// Dapps connected now, or saved and waiting to be reconnected.
+    fn dapps_at_stake(&self) -> usize {
+        let live = self.snapshot.as_ref().map_or(0, |s| s.sessions.len());
+        let saved = self.restore.as_ref().map_or(0, |r| r.sessions);
+        live.max(saved)
+    }
 
     fn card(&self) -> Option<&ProposalView> {
         self.snapshot.as_ref()?.proposal.as_ref()
@@ -925,15 +1313,20 @@ impl WcApp {
 
     /// Anything on screen counting down — the 1 s Tick runs only then.
     fn countdowns_visible(&self) -> bool {
-        self.snapshot.as_ref().is_some_and(|s| {
-            s.proposal.is_some()
-                || !s.queue.is_empty()
-                || matches!(
-                    s.pairing,
-                    PairingState::Pairing { .. } | PairingState::Waiting { .. }
-                )
-                || matches!(s.relay, RelayStatus::Reconnecting { .. })
-        })
+        let restore_countdown = matches!(
+            self.restore.as_ref().map(|r| &r.phase),
+            Some(RestorePhase::RetryingAt { .. })
+        );
+        restore_countdown
+            || self.snapshot.as_ref().is_some_and(|s| {
+                s.proposal.is_some()
+                    || !s.queue.is_empty()
+                    || matches!(
+                        s.pairing,
+                        PairingState::Pairing { .. } | PairingState::Waiting { .. }
+                    )
+                    || matches!(s.relay, RelayStatus::Reconnecting { .. })
+            })
     }
 
     /// The one status line under the `wc:` field. `launcher`: the row sits on the Apps launcher
@@ -941,6 +1334,13 @@ impl WcApp {
     fn uri_status(&self, launcher: bool, now: u64) -> (String, Tone) {
         if let PairingUi::Failed(m) = &self.pairing {
             return (m.clone(), Tone::Error);
+        }
+        // A restore holds the slot's "starting" for its whole retry loop: the line says what it is
+        // doing, not "Connecting to the relay…" under a card that says the relay can't be reached.
+        if self.snapshot.is_none()
+            && let Some(line) = self.restore_summary(launcher)
+        {
+            return line;
         }
         if self.pairing == PairingUi::Starting {
             return ("Connecting to the relay…".to_string(), Tone::Info);
@@ -1038,8 +1438,95 @@ impl WcApp {
         (!parts.is_empty()).then(|| parts.join(" · "))
     }
 
+    /// The restore in one line, for the status line under the `wc:` field. On the launcher (and
+    /// its card) it summarises the restore; atop the pane, under which the restore card already
+    /// says so, it says why Connect waits instead.
+    fn restore_summary(&self, launcher: bool) -> Option<(String, Tone)> {
+        let r = self.restore.as_ref()?;
+        let waits = matches!(r.phase, RestorePhase::NeedsYou { .. });
+        let left = restore_left(r);
+        // Nothing alive and nothing owed: what's left is clearing the expired connections.
+        if left == RestoreLeft::Expired {
+            return Some(match (launcher, waits) {
+                (false, true) => (
+                    "Clear your expired connections below to connect another.".to_string(),
+                    Tone::Warn,
+                ),
+                (false, false) => (
+                    "You can connect another dapp once Kao has cleared your expired connections."
+                        .to_string(),
+                    Tone::Info,
+                ),
+                (true, true) => (
+                    "Your saved connections expired — open WalletConnect below.".to_string(),
+                    Tone::Warn,
+                ),
+                (true, false) => (CLEARING_EXPIRED.to_string(), Tone::Info),
+            });
+        }
+        // No saved session left: the restore only finishes a disconnect the relay never took.
+        if left == RestoreLeft::Disconnect && !launcher {
+            return Some(if waits {
+                (
+                    "Retry or forget the pending disconnect below to connect another.".to_string(),
+                    Tone::Warn,
+                )
+            } else {
+                (
+                    "You can connect another dapp once Kao has finished the disconnect."
+                        .to_string(),
+                    Tone::Info,
+                )
+            });
+        }
+        if !launcher {
+            return Some(if waits {
+                (
+                    "Reconnect or forget your saved dapps below to connect another.".to_string(),
+                    Tone::Warn,
+                )
+            } else {
+                (
+                    "You can connect another dapp once your saved ones are back.".to_string(),
+                    Tone::Info,
+                )
+            });
+        }
+        if left == RestoreLeft::Disconnect {
+            return Some(match r.phase {
+                RestorePhase::Connecting => (FINISHING_DISCONNECT.to_string(), Tone::Info),
+                RestorePhase::RetryingAt { .. } => (
+                    "Couldn't reach the relay to finish a disconnect yet — Kao keeps trying."
+                        .to_string(),
+                    Tone::Warn,
+                ),
+                RestorePhase::NeedsYou { .. } => (
+                    "A disconnect is still waiting to reach its dapp — open WalletConnect below."
+                        .to_string(),
+                    Tone::Warn,
+                ),
+            });
+        }
+        let dapps = plural(r.sessions, "saved dapp", "saved dapps");
+        Some(match r.phase {
+            RestorePhase::Connecting => (format!("Reconnecting to {dapps}…"), Tone::Info),
+            RestorePhase::RetryingAt { .. } => (
+                format!("Couldn't reconnect {dapps} yet — Kao keeps trying."),
+                Tone::Warn,
+            ),
+            RestorePhase::NeedsYou { .. } => (
+                format!(
+                    "{dapps} {} to reconnect — open WalletConnect below.",
+                    if r.sessions == 1 { "waits" } else { "wait" }
+                ),
+                Tone::Warn,
+            ),
+        })
+    }
+
     pub fn launcher_card_subtitle(&self) -> String {
         self.activity_summary()
+            .or_else(|| self.restore_summary(true).map(|(line, _)| line))
             .unwrap_or_else(|| "Use Kao with dapps — paste a WalletConnect link".to_string())
     }
 
@@ -1133,6 +1620,11 @@ impl WcApp {
         .width(Length::Fill)
         .max_width(560);
 
+        if self.key_unavailable {
+            body = body.push(Space::new().height(14));
+            body = body.push(self.saved_state_card(t));
+        }
+
         if let Some(snap) = &self.snapshot {
             if let Some(p) = &snap.proposal {
                 body = body.push(Space::new().height(20));
@@ -1156,6 +1648,20 @@ impl WcApp {
             if snap.sessions.is_empty() {
                 body = body.push(text("No dapps connected yet.").size(12).color(t.sub));
             } else {
+                // A session that can't save tears down at lock anyway; one that can, but whose
+                // relay setting moved on, forgets them at the next start.
+                body = body.push(if !self.can_persist {
+                    note(t, NOT_SAVED_NOTE)
+                } else if self.relay_changed() {
+                    text(RELAY_CHANGED_NOTE)
+                        .size(11)
+                        .color(caution_color())
+                        .font(bold())
+                        .into()
+                } else {
+                    note(t, STAY_CONNECTED_NOTE)
+                });
+                body = body.push(Space::new().height(8));
                 let mut list = column![].spacing(8).width(Length::Fill);
                 for s in &snap.sessions {
                     list = list.push(self.session_row(t, s));
@@ -1184,6 +1690,12 @@ impl WcApp {
             }
         }
 
+        // From the vault, not the runtime: past connections show while WalletConnect is off.
+        if !self.past.is_empty() {
+            body = body.push(Space::new().height(20));
+            body = body.push(self.past_connections(t, now));
+        }
+
         body = body.push(Space::new().height(20));
         body = body.push(self.settings_link(t));
         if self.snapshot.is_some() {
@@ -1195,12 +1707,18 @@ impl WcApp {
 
     /// The relay connection: a status chip plus what it means for the user's privacy.
     fn relay_card<'a>(&'a self, t: KaoTheme, now: u64) -> Element<'a, Message> {
-        const OFF: &str = "Off — Kao connects to the relay only when you paste a link.";
+        if self.snapshot.is_none()
+            && let Some(r) = &self.restore
+        {
+            return self.restore_card(t, r, now);
+        }
         let (chip, kind, line) = match &self.snapshot {
             None => (
                 "off",
                 BadgeKind::Info,
-                self.off_reason.clone().unwrap_or_else(|| OFF.to_string()),
+                self.off_reason
+                    .clone()
+                    .unwrap_or_else(|| OFF_LINE.to_string()),
             ),
             Some(s) => match s.relay {
                 RelayStatus::Connected => (
@@ -1228,7 +1746,7 @@ impl WcApp {
                         span_label(now.saturating_sub(since))
                     ),
                 ),
-                RelayStatus::Closed => ("off", BadgeKind::Info, OFF.to_string()),
+                RelayStatus::Closed => ("off", BadgeKind::Info, OFF_LINE.to_string()),
             },
         };
         let mut col = column![
@@ -1267,6 +1785,232 @@ impl WcApp {
             );
         }
         tile(t, col.into())
+    }
+
+    /// The relay card while saved sessions are being restored (no runtime yet): connecting
+    /// ([Forget…] only), waiting to retry (with a countdown, [Retry now] and [Forget…]), or waiting
+    /// on the user ([Retry] or [Reconnect anyway], and [Forget…]). Forgetting is two-step and says
+    /// what it means — for a restore with no saved dapp, that the disconnect it owes is dropped;
+    /// once everything it saved expired, only clearing them is left (no Retry: nothing to dial).
+    fn restore_card<'a>(
+        &'a self,
+        t: KaoTheme,
+        r: &'a RestoreView,
+        now: u64,
+    ) -> Element<'a, Message> {
+        let dapps = plural(r.sessions, "saved dapp", "saved dapps");
+        let left = restore_left(r);
+        let (chip, kind, line, retry) = match &r.phase {
+            RestorePhase::Connecting => (
+                "connecting",
+                BadgeKind::Info,
+                match left {
+                    RestoreLeft::Dapps => format!("Reconnecting to {dapps}…"),
+                    RestoreLeft::Disconnect => FINISHING_DISCONNECT.to_string(),
+                    RestoreLeft::Expired => CLEARING_EXPIRED.to_string(),
+                },
+                None,
+            ),
+            RestorePhase::RetryingAt { at, error } => {
+                let left = at.saturating_sub(now);
+                let when = if left == 0 {
+                    "Retrying now…".to_string()
+                } else {
+                    format!("Retrying in {}.", span_label(left))
+                };
+                (
+                    "reconnecting",
+                    BadgeKind::Caution,
+                    format!("{} {when}", relay_error_sentence(error)),
+                    Some(("Retry now", Message::RetryRestore)),
+                )
+            }
+            RestorePhase::NeedsYou {
+                error,
+                direct_override,
+            } => (
+                "waiting",
+                BadgeKind::Caution,
+                error.clone(),
+                Some(if *direct_override {
+                    ("Reconnect anyway", Message::ReconnectAnyway)
+                } else {
+                    ("Retry", Message::RetryRestore)
+                }),
+            ),
+        };
+        let mut col = column![
+            row![
+                privacy_badge(t, kind, chip),
+                Space::new().width(8),
+                text(line).size(12).color(t.text),
+            ]
+            .align_y(Alignment::Center)
+            .width(Length::Fill),
+        ]
+        .spacing(4)
+        .width(Length::Fill);
+        // With no saved dapp the restore only owes a dapp the disconnect the user asked for — or,
+        // with that gone too, has only expired connections to clear.
+        if !matches!(r.phase, RestorePhase::Connecting) {
+            col = col.push(match left {
+                RestoreLeft::Dapps => note_owned(
+                    t,
+                    format!(
+                        "{} {} waiting to reconnect.",
+                        dapps,
+                        if r.sessions == 1 { "is" } else { "are" }
+                    ),
+                ),
+                RestoreLeft::Disconnect => note(t, DISCONNECT_PENDING_NOTE),
+                RestoreLeft::Expired => note(t, EXPIRED_NOTE),
+            });
+        }
+        let retry = retry.filter(|_| left != RestoreLeft::Expired);
+        col = col.push(Space::new().height(6));
+        if self.confirm_forget {
+            let (why, keep, forget) = match left {
+                RestoreLeft::Dapps => (FORGET_NOTE, "Keep them", "Forget them"),
+                RestoreLeft::Disconnect => (FORGET_DISCONNECT_NOTE, "Keep trying", "Stop trying"),
+                RestoreLeft::Expired => (FORGET_EXPIRED_NOTE, "Cancel", "Clear them"),
+            };
+            col = col.push(text(why).size(12).color(t.down).font(bold()));
+            col = col.push(Space::new().height(6));
+            col = col.push(
+                row![
+                    Space::new().width(Length::Fill),
+                    small_secondary_button(t, keep).on_press(Message::CancelForget),
+                    small_danger_button(t, forget).on_press(Message::ConfirmForget),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center)
+                .width(Length::Fill),
+            );
+        } else {
+            // Connecting has no Retry (its try is on the wire), but can still be forgotten.
+            let mut controls = row![].spacing(6).align_y(Alignment::Center);
+            if let Some((label, msg)) = retry {
+                controls = controls.push(small_secondary_button(t, label).on_press(msg));
+            }
+            col = col.push(
+                controls
+                    .push(Space::new().width(Length::Fill))
+                    .push(
+                        small_danger_button(
+                            t,
+                            if left == RestoreLeft::Expired {
+                                "Clear…"
+                            } else {
+                                "Forget…"
+                            },
+                        )
+                        .on_press(Message::AskForget),
+                    )
+                    .width(Length::Fill),
+            );
+        }
+        if self
+            .config
+            .as_ref()
+            .is_some_and(|c| c.proxy == ProxyView::RestartPending)
+        {
+            col = col.push(
+                text(RESTART_FOR_PROXY)
+                    .size(11)
+                    .color(caution_color())
+                    .font(bold()),
+            );
+        }
+        tile(t, col.into())
+    }
+
+    /// The wallet file's saved WalletConnect state and history couldn't be read this session: what
+    /// that means, and the two-step reset that deletes them so Kao saves again.
+    fn saved_state_card<'a>(&'a self, t: KaoTheme) -> Element<'a, Message> {
+        let col = column![
+            text(SAVED_STATE_UNREADABLE_NOTE)
+                .size(12)
+                .color(caution_color())
+                .font(bold()),
+            Space::new().height(8),
+            super::signed_messages_settings::reset_controls(
+                t,
+                self.confirm_reset,
+                Message::AskReset,
+                Message::ConfirmReset,
+                Message::CancelReset,
+            ),
+        ]
+        .spacing(0)
+        .width(Length::Fill);
+        tile(t, col.into())
+    }
+
+    /// PAST CONNECTIONS: the latest ended connections, a two-step Clear (open ones stay), and the
+    /// way to the full history in Settings.
+    fn past_connections<'a>(&'a self, t: KaoTheme, now: u64) -> Element<'a, Message> {
+        let header: Element<'a, Message> = if self.confirm_clear_past {
+            row![
+                text(format!(
+                    "Remove {} from Kao?",
+                    plural(self.past_total, "past connection", "past connections")
+                ))
+                .size(12)
+                .color(t.down)
+                .font(bold()),
+                Space::new().width(Length::Fill),
+                small_secondary_button(t, "Keep").on_press(Message::CancelClearPast),
+                small_danger_button(t, "Clear").on_press(Message::ConfirmClearPast),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center)
+            .width(Length::Fill)
+            .into()
+        } else {
+            row![
+                section_label(t, "PAST CONNECTIONS"),
+                Space::new().width(Length::Fill),
+                small_secondary_button(t, "Clear").on_press(Message::AskClearPast),
+            ]
+            .align_y(Alignment::Center)
+            .width(Length::Fill)
+            .into()
+        };
+        let mut list = column![].spacing(8).width(Length::Fill);
+        for c in &self.past {
+            list = list.push(past_row(t, c, now));
+        }
+        let see_all = ghost_button(
+            t,
+            container(
+                row![
+                    text("See all in Settings ›")
+                        .size(13)
+                        .color(t.text)
+                        .font(bold()),
+                    Space::new().width(Length::Fill),
+                    text(plural(self.past_total, "ended", "ended"))
+                        .size(11)
+                        .color(t.sub)
+                        .font(mono()),
+                ]
+                .align_y(Alignment::Center)
+                .width(Length::Fill),
+            )
+            .padding(Padding::from([8, 4])),
+        )
+        .width(Length::Fill)
+        .on_press(Message::SeeAllConnections);
+        column![
+            header,
+            Space::new().height(8),
+            list,
+            Space::new().height(4),
+            see_all
+        ]
+        .spacing(0)
+        .width(Length::Fill)
+        .into()
     }
 
     /// The approval card: who is asking (host first, unverified), what connecting exposes
@@ -1364,40 +2108,35 @@ impl WcApp {
                 );
                 col = col.push(Space::new().height(10));
                 // Chain labels can carry the dapp's own CAIP-2 strings ("eip155:N (not
-                // available)"), so the list sits in a mono box like every dapp string.
+                // available)"), so the list sits in a mono box like every dapp string. Optional
+                // chains Kao doesn't have are only counted: a dapp can list dozens.
                 col = col.push(label_line(t, "Networks"));
-                let mut nets = column![].spacing(2).width(Length::Fill);
-                for (line, tone) in chain_lines(&plan.chains, granted) {
-                    nets = nets.push(text(line).size(12).color(tone_color(t, tone)).font(mono()));
-                }
-                col = col.push(mono_box(t, nets.into()));
-                let (asks, refused) = method_lines(&plan.methods);
-                col = col.push(Space::new().height(10));
-                col = col.push(label_line(t, "It can ask you to"));
-                col = col.push(
-                    text(if asks.is_empty() {
-                        "nothing Kao serves".to_string()
-                    } else {
-                        asks
-                    })
-                    .size(12)
-                    .color(t.text),
-                );
-                // Method names are the dapp's strings.
-                if !refused.is_empty() {
-                    col = col.push(Space::new().height(4));
-                    let mut lines = column![].spacing(2).width(Length::Fill);
-                    for r in refused {
-                        lines = lines.push(text(r).size(11).color(t.sub).font(mono()));
+                let (lines, skipped) = chain_lines(&plan.chains, granted);
+                if !lines.is_empty() {
+                    let mut nets = column![].spacing(2).width(Length::Fill);
+                    for (line, tone) in lines {
+                        nets =
+                            nets.push(text(line).size(12).color(tone_color(t, tone)).font(mono()));
                     }
-                    col = col.push(mono_box(t, lines.into()));
+                    col = col.push(mono_box(t, nets.into()));
                 }
+                if skipped > 0 {
+                    col = col.push(Space::new().height(4));
+                    col = col.push(
+                        text(format!(
+                            "Skipped {}: not set up in Kao.",
+                            plural(skipped, "optional network", "optional networks")
+                        ))
+                        .size(11)
+                        .color(t.sub),
+                    );
+                }
+                col = col.push(Space::new().height(12));
+                col = col.push(label_line(t, "It can ask you to"));
+                col = col.push(permissions_panel(t, method_lines(&plan.methods)));
                 if !plan.caveats.is_empty() {
                     col = col.push(Space::new().height(10));
-                    col = col.push(label_line(t, "Caveats"));
-                    for c in &plan.caveats {
-                        col = col.push(text(format!("· {c}")).size(11).color(t.text));
-                    }
+                    col = col.push(caveats_callout(t, &plan.caveats));
                 }
                 if let Err(block) = &plan.verdict {
                     col = col.push(Space::new().height(10));
@@ -1777,8 +2516,8 @@ impl WcApp {
         if self.confirm_stop {
             column![
                 text(
-                    "This disconnects every dapp and closes the relay connection. Requests still \
-                     waiting are cancelled."
+                    "This disconnects every dapp and Kao forgets them, then closes the relay \
+                     connection. Requests still waiting are cancelled."
                 )
                 .size(12)
                 .color(t.down)
@@ -1905,6 +2644,10 @@ impl WcApp {
             relay = relay.push(Space::new().height(4));
             relay = relay.push(text(msg).size(11).color(tone_color(t, tone)));
         }
+        if let Some(warning) = self.relay_change_warning() {
+            relay = relay.push(Space::new().height(4));
+            relay = relay.push(text(warning).size(11).color(caution_color()).font(bold()));
+        }
         body = body.push(relay);
         body = body.push(Space::new().height(12));
         body = body.push(
@@ -1915,12 +2658,7 @@ impl WcApp {
             .width(Length::Fill),
         );
         body = body.push(Space::new().height(14));
-        body = body.push(note(
-            t,
-            "Changes apply the next time WalletConnect starts — turn WalletConnect off and connect \
-             again, or restart Kao. Kao never restarts it on its own — that would drop your \
-             connected dapps.",
-        ));
+        body = body.push(note(t, SETTINGS_APPLY_NOTE));
         body = body.push(Space::new().height(4));
         body = body.push(note(
             t,
@@ -1951,13 +2689,15 @@ impl WcApp {
     }
 }
 
-/// The networks block of the approval card. With a grant, ✓ means "in the grant the Connect
-/// button sends" — so the list can't show a chain the approval wouldn't include, or hide one it
-/// would. A granted chain the plan didn't itemise is appended rather than dropped.
-fn chain_lines(lines: &[ChainLine], granted: Option<&[u64]>) -> Vec<(String, Tone)> {
+/// The networks block of the approval card, plus how many optional chains it leaves out. With a
+/// grant, ✓ means "in the grant the Connect button sends" — so the list can't show a chain the
+/// approval wouldn't include, or hide one it would. A granted chain the plan didn't itemise is
+/// appended rather than dropped; an optional chain outside the grant is only counted.
+fn chain_lines(lines: &[ChainLine], granted: Option<&[u64]>) -> (Vec<(String, Tone)>, usize) {
+    let mut skipped = 0;
     let mut out: Vec<(String, Tone)> = lines
         .iter()
-        .map(|l| {
+        .filter_map(|l| {
             let on = granted.map_or(l.granted, |g| g.contains(&l.chain_id));
             if on {
                 let mut s = format!("✓ {}", l.label);
@@ -1967,17 +2707,15 @@ fn chain_lines(lines: &[ChainLine], granted: Option<&[u64]>) -> Vec<(String, Ton
                 if l.unverified {
                     s.push_str(" (unverified network)");
                 }
-                (s, if l.unverified { Tone::Warn } else { Tone::Info })
+                Some((s, if l.unverified { Tone::Warn } else { Tone::Info }))
             } else if l.required {
-                (
+                Some((
                     format!("✕ {} — required, not available in Kao", l.label),
                     Tone::Error,
-                )
+                ))
             } else {
-                (
-                    format!("✕ {} — not set up in Kao (optional, skipped)", l.label),
-                    Tone::Info,
-                )
+                skipped += 1;
+                None
             }
         })
         .collect();
@@ -1989,41 +2727,160 @@ fn chain_lines(lines: &[ChainLine], granted: Option<&[u64]>) -> Vec<(String, Ton
             ));
         }
     }
-    out
+    (out, skipped)
 }
 
-/// "send transactions · sign messages …" for what the dapp may ask (and Kao serves), plus one
-/// line per method Kao grants only because the dapp requires it and then refuses on every call.
-fn method_lines(methods: &[MethodLine]) -> (String, Vec<String>) {
-    let mut asks: Vec<&'static str> = Vec::new();
-    let mut refused = Vec::new();
+/// What the dapp may ask for, in the user's words.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct MethodLines {
+    /// What Kao serves ("Send transactions").
+    asks: Vec<&'static str>,
+    /// What Kao serves, but refuses for this account (a Trezor's typed data, a Safe's messages).
+    refused: Vec<&'static str>,
+    /// Methods Kao grants only because the dapp requires them, then refuses on every call. They
+    /// carry the dapp's method names, so they're drawn in a mono box.
+    required_refused: Vec<String>,
+}
+
+fn method_lines(methods: &[MethodLine]) -> MethodLines {
+    let mut out = MethodLines::default();
     for m in methods {
         match m.support {
             MethodSupport::Served => {
                 if let Some(p) = method_phrase(&m.name)
-                    && !asks.contains(&p)
+                    && !out.asks.contains(&p)
                 {
-                    asks.push(p);
+                    out.asks.push(p);
                 }
             }
             MethodSupport::CapabilityRefused => {
-                if let Some(p) = method_phrase(&m.name) {
-                    refused.push(format!("Kao refuses to {p} for this account"));
+                if let Some(p) = method_phrase(&m.name)
+                    && !out.refused.contains(&p)
+                {
+                    out.refused.push(p);
                 }
             }
-            MethodSupport::Refused if m.required => refused.push(format!(
-                "Kao refuses {} — the dapp requires it, so every call gets a refusal",
+            MethodSupport::Refused if m.required => out.required_refused.push(format!(
+                "{} — the dapp requires it; Kao refuses every call",
                 m.name
             )),
-            MethodSupport::Unknown if m.required => refused.push(format!(
-                "✕ {} — not supported (required by the dapp)",
+            MethodSupport::Unknown if m.required => out.required_refused.push(format!(
+                "{} — not supported, but the dapp requires it",
                 m.name
             )),
             MethodSupport::Refused | MethodSupport::Unknown => {}
         }
     }
-    refused.dedup();
-    (asks.join(" · "), refused)
+    out.required_refused.dedup();
+    out
+}
+
+/// One ✓/✕ line of the permissions panel: a coloured mark, the label, and an optional reason.
+fn mark_line<'a>(
+    t: KaoTheme,
+    mark: &'a str,
+    tint: Color,
+    label: &'a str,
+    why: Option<&'a str>,
+) -> Element<'a, Message> {
+    let mut line = row![
+        text(mark).size(13).color(tint).font(bold()).width(14),
+        text(label).size(13).color(t.text).font(bold()),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+    if let Some(why) = why {
+        line = line.push(text(format!("— {why}")).size(12).color(t.sub));
+    }
+    line.width(Length::Fill).into()
+}
+
+/// The approval card's "It can ask you to": ✓ what Kao serves, ✕ what it refuses for this
+/// account, then the required methods Kao always refuses — in a mono box, as dapp strings.
+fn permissions_panel<'a>(t: KaoTheme, m: MethodLines) -> Element<'a, Message> {
+    let mut col = column![].spacing(6).width(Length::Fill);
+    if m.asks.is_empty() {
+        col = col.push(
+            text("Nothing Kao serves")
+                .size(13)
+                .color(t.sub)
+                .font(bold()),
+        );
+    }
+    for p in m.asks {
+        col = col.push(mark_line(t, "✓", t.up, p, None));
+    }
+    for p in m.refused {
+        col = col.push(mark_line(
+            t,
+            "✕",
+            t.down,
+            p,
+            Some("Kao refuses for this account"),
+        ));
+    }
+    let panel = container(col)
+        .padding(Padding::from([10, 12]))
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(t.card)),
+            border: Border {
+                color: t.border,
+                width: 1.0,
+                radius: Radius::from(10),
+            },
+            text_color: Some(t.text),
+            ..container::Style::default()
+        });
+    if m.required_refused.is_empty() {
+        return panel.into();
+    }
+    let mut lines = column![].spacing(4).width(Length::Fill);
+    for r in m.required_refused {
+        lines = lines.push(
+            row![
+                text("✕").size(12).color(t.down).font(bold()).width(14),
+                text(r).size(12).color(t.text).font(mono_bold()),
+            ]
+            .spacing(6),
+        );
+    }
+    column![panel, mono_box(t, lines.into())]
+        .spacing(6)
+        .width(Length::Fill)
+        .into()
+}
+
+/// The approval card's caveats in an amber callout. They're Kao's own sentences, so they sit
+/// outside any mono box.
+fn caveats_callout<'a>(t: KaoTheme, caveats: &'a [String]) -> Element<'a, Message> {
+    let amber = caution_color();
+    let mut col = column![text("⚠ Caveats").size(12).color(amber).font(mono_bold())]
+        .spacing(6)
+        .width(Length::Fill);
+    for c in caveats {
+        col = col.push(
+            row![
+                text("•").size(13).color(amber).font(bold()).width(14),
+                text(c.as_str()).size(13).color(t.text).font(bold()),
+            ]
+            .spacing(6),
+        );
+    }
+    container(col)
+        .padding(Padding::from([10, 12]))
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(with_alpha(amber, 0.10))),
+            border: Border {
+                color: with_alpha(amber, 0.55),
+                width: 1.0,
+                radius: Radius::from(10),
+            },
+            text_color: Some(t.text),
+            ..container::Style::default()
+        })
+        .into()
 }
 
 /// The recent notices, newest as the book keeps them, in one bordered mono box (they can name a
@@ -2060,6 +2917,67 @@ fn label_line<'a>(t: KaoTheme, label: &'a str) -> Element<'a, Message> {
 
 fn note<'a>(t: KaoTheme, msg: &'a str) -> Element<'a, Message> {
     text(msg).size(11).color(t.sub).into()
+}
+
+fn note_owned<'a>(t: KaoTheme, msg: String) -> Element<'a, Message> {
+    text(msg).size(11).color(t.sub).into()
+}
+
+/// The restore's coarse phase for the GUI trace.
+fn restore_name(r: Option<&RestoreView>) -> &'static str {
+    match r.map(|r| &r.phase) {
+        None => "none",
+        Some(RestorePhase::Connecting) => "connecting",
+        Some(RestorePhase::RetryingAt { .. }) => "retrying",
+        Some(RestorePhase::NeedsYou { .. }) => "needs_you",
+    }
+}
+
+/// A retryable restore failure as one sentence: "Couldn't reach the relay: …." — the error may
+/// already say so (the runtime's own wording), and is never doubled.
+fn relay_error_sentence(error: &str) -> String {
+    let e = error.trim().trim_end_matches('.');
+    if e.starts_with("Couldn't reach the relay") {
+        format!("{e}.")
+    } else {
+        format!("Couldn't reach the relay: {e}.")
+    }
+}
+
+/// One ended connection, compact: the host (in its box, as everywhere), the dapp's claim, the
+/// account it was connected as, and when and why it ended.
+fn past_row<'a>(t: KaoTheme, c: &'a ConnectionRecord, now: u64) -> Element<'a, Message> {
+    let host = c.dapp.host.as_deref().unwrap_or("unknown site");
+    let ended = match c.ended_at {
+        Some(at) => super::connection_history_settings::ended_phrase(at, c.end, now),
+        None => "connected now".to_string(),
+    };
+    tile(
+        t,
+        column![
+            row![
+                host_chip(t, host),
+                Space::new().width(6),
+                text(format!("calls itself \"{}\"", c.dapp.name))
+                    .size(11)
+                    .color(t.sub),
+            ]
+            .align_y(Alignment::Center)
+            .width(Length::Fill),
+            Space::new().height(4),
+            text(format!(
+                "as {} · {}",
+                c.account.label(),
+                crate::wallet::short_address(c.account.address())
+            ))
+            .size(11)
+            .color(t.text),
+            text(ended).size(11).color(t.sub),
+        ]
+        .spacing(0)
+        .width(Length::Fill)
+        .into(),
+    )
 }
 
 /// A section tile — the card the pane's rows sit in.
@@ -2212,6 +3130,7 @@ mod tests {
             notices: Vec::new(),
             refused_count: 0,
             undelivered: 0,
+            relay_url: wallet_connect::relay::rpc::DEFAULT_RELAY_URL.to_string(),
         }
     }
 
@@ -2471,20 +3390,22 @@ mod tests {
 
         // What the card lists as ✓ is exactly that grant — nothing more, nothing less.
         let p = plan(eoa(), Ok(vec![1, 8453]));
-        let lines = chain_lines(&p.chains, Some(&[1, 8453]));
-        let ticked: Vec<&str> = lines
-            .iter()
-            .filter(|(l, _)| l.starts_with('✓'))
-            .map(|(l, _)| l.as_str())
-            .collect();
-        assert_eq!(ticked, vec!["✓ Ethereum (required)", "✓ Base"]);
-        // A grant chain the plan didn't itemise still shows; a plan line outside the grant
-        // doesn't get a tick.
-        let lines = chain_lines(&p.chains[..1], Some(&[1, 10]));
-        assert_eq!(lines.len(), 2);
+        let (lines, skipped) = chain_lines(&p.chains, Some(&[1, 8453]));
+        let shown: Vec<&str> = lines.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(shown, vec!["✓ Ethereum (required)", "✓ Base"]);
+        // The optional chain Kao doesn't have is counted, not listed.
+        assert_eq!(skipped, 1);
+        // A grant chain the plan didn't itemise still shows; an optional plan line outside the
+        // grant isn't listed at all.
+        let (lines, skipped) = chain_lines(&p.chains[..1], Some(&[1, 10]));
+        assert_eq!((lines.len(), skipped), (2, 0));
         assert!(lines[1].0.starts_with("✓ "));
-        let lines = chain_lines(&p.chains, Some(&[1]));
-        assert!(lines[1].0.starts_with("✕ Base"));
+        let (lines, skipped) = chain_lines(&p.chains, Some(&[1]));
+        assert_eq!((lines.len(), skipped), (1, 2));
+        // A required chain outside the grant is never hidden.
+        let (lines, _) = chain_lines(&p.chains, Some(&[8453]));
+        assert_eq!(lines[0].0, "✕ Ethereum — required, not available in Kao");
+        assert_eq!(lines[0].1, Tone::Error);
 
         // A stale or foreign id does nothing.
         assert!(app.update(Message::Approve { proposal_id: 41 }).is_none());
@@ -2864,7 +3785,7 @@ mod tests {
             required,
             support,
         };
-        let (asks, refused) = method_lines(&[
+        let m = method_lines(&[
             line("eth_sendTransaction", false, MethodSupport::Served),
             line("personal_sign", true, MethodSupport::Served),
             line(
@@ -2876,18 +3797,24 @@ mod tests {
             line("eth_chainId", false, MethodSupport::Served),
             line("eth_sign", true, MethodSupport::Refused),
             line("eth_signTransaction", false, MethodSupport::Refused),
+            line("wallet_getCapabilities", true, MethodSupport::Unknown),
+            line("wallet_addEthereumChain", false, MethodSupport::Unknown),
         ]);
         assert_eq!(
-            asks,
-            "send transactions · sign messages · read your address and network"
-        );
-        assert_eq!(
-            refused,
-            vec![
-                "Kao refuses to sign typed data for this account".to_string(),
-                "Kao refuses eth_sign — the dapp requires it, so every call gets a refusal"
-                    .to_string(),
-            ]
+            m,
+            MethodLines {
+                asks: vec![
+                    "Send transactions",
+                    "Sign messages",
+                    "Read your address and network"
+                ],
+                refused: vec!["Sign typed data"],
+                // Only what the dapp *requires* is called out; optional refusals stay quiet.
+                required_refused: vec![
+                    "eth_sign — the dapp requires it; Kao refuses every call".to_string(),
+                    "wallet_getCapabilities — not supported, but the dapp requires it".to_string(),
+                ],
+            }
         );
     }
 
@@ -2896,7 +3823,9 @@ mod tests {
     #[test]
     fn home_view_renders_the_mirror() {
         let t = topic('h');
-        let mut snap = with_proposal(Some(plan(eoa(), Ok(vec![1, 8453]))));
+        let mut p = plan(eoa(), Ok(vec![1, 8453]));
+        p.caveats = vec!["Kao holds none of this Safe's owner keys.".into()];
+        let mut snap = with_proposal(Some(p));
         snap.sessions = vec![session(t.clone(), eoa())];
         snap.queue = vec![request(t.clone(), 1, eoa()), request(t, 2, safe())];
         snap.notices = vec![NoticeView {
@@ -2919,11 +3848,17 @@ mod tests {
             "CONNECTED DAPPS",
             "ACTIVITY",
             "✓ Ethereum (required)",
+            "Skipped 1 optional network: not set up in Kao.",
+            "Sign messages",
+            "⚠ Caveats",
+            "Kao holds none of this Safe's owner keys.",
             "Switch to Account 2",
             "Turn off WalletConnect",
         ] {
             assert!(texts.iter().any(|s| s == expected), "{expected}: {texts:?}");
         }
+        // The optional chain Kao doesn't have isn't listed by name.
+        assert!(!texts.iter().any(|s| s.contains("42161")), "{texts:?}");
 
         // The settings form renders too (empty drafts: no validator involved).
         let mut app = app;
@@ -2932,10 +3867,12 @@ mod tests {
         assert!(texts.iter().any(|s| s == "PROJECT ID"), "{texts:?}");
     }
 
-    /// The settings note names the restarts the user can actually make — turning WalletConnect off
-    /// and connecting again, or restarting Kao — never a lock the dashboard doesn't offer.
+    /// The settings note says what each way of applying a change does to the connected dapps:
+    /// restarting Kao (or locking and unlocking it) reconnects them with the new settings — unless
+    /// the relay changed, which forgets them — and turning WalletConnect off disconnects them. It
+    /// never offers Turn off as a way to keep them.
     #[test]
-    fn settings_note_names_restarts_the_user_can_make() {
+    fn settings_note_says_what_each_restart_does_to_the_dapps() {
         let mut app = pane_with(snapshot(), eoa());
         app.update(Message::ToggleSettings);
         let theme = KaoTheme::for_kind(crate::ui::kao_theme::ThemeKind::Void);
@@ -2944,11 +3881,881 @@ mod tests {
             .iter()
             .find(|s| s.starts_with("Changes apply"))
             .unwrap_or_else(|| panic!("the note: {texts:?}"));
-        assert!(!note.contains("lock"), "{note}");
+        assert_eq!(note, SETTINGS_APPLY_NOTE);
         assert!(
-            note.contains("turn WalletConnect off") && note.contains("restart Kao"),
+            note.contains("Restarting Kao, or locking and unlocking it, reconnects your dapps"),
             "{note}"
         );
+        assert!(note.contains("relay changed, which forgets them"), "{note}");
+        assert!(
+            note.contains("Turning WalletConnect off disconnects them"),
+            "{note}"
+        );
+        assert!(!note.contains("connect again"), "{note}");
+    }
+
+    /// A refused paste's line stands only while the restore it described does: "reconnect or
+    /// forget first" goes once the restore stops waiting on the user (reconnecting, or over), and
+    /// "still reconnecting" goes once the restore ends or waits on the user instead. Any other
+    /// failure stays.
+    #[test]
+    fn a_restore_refusal_goes_with_the_restore_it_described() {
+        let needs_you = || {
+            restoring(RestorePhase::NeedsYou {
+                error: "x".into(),
+                direct_override: false,
+            })
+        };
+        let failed = |app: &WcApp, m: &str| app.pairing == PairingUi::Failed(m.to_string());
+        let mut app = WcApp::new();
+        app.sync(None, Some(active(eoa())), config());
+
+        app.set_restore(Some(needs_you()));
+        app.set_pairing(PairingUi::Failed(RESTORE_FIRST.into()));
+        assert_eq!(app.uri_status(false, 0).0, RESTORE_FIRST);
+        app.set_restore(Some(restoring(RestorePhase::Connecting)));
+        assert!(
+            !failed(&app, RESTORE_FIRST),
+            "retried: no longer waiting on the user"
+        );
+        app.set_restore(Some(needs_you()));
+        app.set_pairing(PairingUi::Failed(RESTORE_FIRST.into()));
+        app.set_restore(None);
+        assert_eq!(app.pairing, PairingUi::Idle, "forgotten or reconnected");
+
+        app.set_restore(Some(restoring(RestorePhase::Connecting)));
+        app.set_pairing(PairingUi::Failed(STILL_RESTORING.into()));
+        app.set_restore(Some(restoring(RestorePhase::RetryingAt {
+            at: 1,
+            error: "e".into(),
+        })));
+        assert!(failed(&app, STILL_RESTORING), "still reconnecting");
+        app.set_restore(Some(needs_you()));
+        assert!(!failed(&app, STILL_RESTORING));
+        app.set_pairing(PairingUi::Failed(STILL_RESTORING.into()));
+        app.set_restore(None);
+        assert_eq!(app.pairing, PairingUi::Idle);
+
+        app.set_restore(Some(needs_you()));
+        app.set_pairing(PairingUi::Failed("Couldn't reach the relay".into()));
+        app.set_restore(None);
+        assert!(
+            failed(&app, "Couldn't reach the relay"),
+            "not a restore's line"
+        );
+        // Both refusals ask for the link again: Connect took it out of the field.
+        for m in [RESTORE_FIRST, STILL_RESTORING] {
+            assert!(m.contains("paste the link again"), "{m}");
+        }
+    }
+
+    fn theme() -> KaoTheme {
+        KaoTheme::for_kind(crate::ui::kao_theme::ThemeKind::Void)
+    }
+
+    fn restoring(phase: RestorePhase) -> RestoreView {
+        RestoreView {
+            sessions: 2,
+            pending_disconnects: 0,
+            phase,
+        }
+    }
+
+    /// No runtime, no restore: the relay card says when Kao dials — now including the unlock that
+    /// reconnects dapps left connected.
+    #[test]
+    fn off_line_names_both_times_kao_dials() {
+        let mut app = WcApp::new();
+        app.sync(None, Some(active(eoa())), config());
+        let texts = super::super::test_support::texts(app.view(theme()));
+        assert!(texts.iter().any(|s| s == OFF_LINE), "{texts:?}");
+        assert!(texts.iter().any(|s| s == "• off"), "{texts:?}");
+        assert!(!texts.iter().any(|s| s == "Turn off WalletConnect"));
+    }
+
+    /// The restore card, phase by phase, driven by the pane's setter as the coordinator drives it:
+    /// connecting says so and offers nothing; waiting to retry counts down and offers Retry now and
+    /// Forget; waiting on the user offers Retry (or Reconnect anyway after a route downgrade) and
+    /// Forget. Forget is two-step, and each control emits only what its phase allows.
+    #[test]
+    fn a_restore_with_only_a_disconnect_to_finish_counts_no_dapps() {
+        let mut app = WcApp::new();
+        app.sync(None, Some(active(eoa())), config());
+        let none = |phase| RestoreView {
+            sessions: 0,
+            pending_disconnects: 1,
+            phase,
+        };
+
+        app.set_restore(Some(none(RestorePhase::Connecting)));
+        app.sync_start(true);
+        let texts = super::super::test_support::texts(app.view(theme()));
+        assert!(
+            texts.iter().any(|s| s == "Finishing a disconnect…"),
+            "{texts:?}"
+        );
+        assert!(!texts.iter().any(|s| s.contains("0 saved")), "{texts:?}");
+        assert_eq!(app.uri_status(true, 0).0, "Finishing a disconnect…");
+
+        // Atop the pane, the line says what Connect waits for: the disconnect, not saved dapps.
+        assert_eq!(
+            app.uri_status(false, 0).0,
+            "You can connect another dapp once Kao has finished the disconnect."
+        );
+        assert_eq!(
+            paste_refusal(&none(RestorePhase::Connecting)),
+            STILL_FINISHING_DISCONNECT
+        );
+        // The card's staged forget says the disconnect is dropped, never "these connections".
+        app.update(Message::AskForget);
+        let texts = super::super::test_support::texts(app.view(theme()));
+        assert!(
+            texts.iter().any(|s| s == FORGET_DISCONNECT_NOTE),
+            "{texts:?}"
+        );
+        assert!(texts.iter().any(|s| s == "Stop trying"), "{texts:?}");
+        assert!(!texts.iter().any(|s| s == FORGET_NOTE), "{texts:?}");
+        app.update(Message::CancelForget);
+
+        let retrying = none(RestorePhase::RetryingAt {
+            at: crate::walletconnect::now_secs() + 30,
+            error: "connection refused".into(),
+        });
+        app.set_restore(Some(retrying.clone()));
+        assert_eq!(
+            app.launcher_card_subtitle(),
+            "Couldn't reach the relay to finish a disconnect yet — Kao keeps trying."
+        );
+        let texts = super::super::test_support::texts(app.view(theme()));
+        assert!(
+            texts.iter().any(|s| s == DISCONNECT_PENDING_NOTE),
+            "{texts:?}"
+        );
+        assert!(texts.iter().any(|s| s == "Retry now"), "{texts:?}");
+        assert!(!texts.iter().any(|s| s.contains("saved")), "{texts:?}");
+        assert_eq!(
+            app.uri_status(false, 0).0,
+            "You can connect another dapp once Kao has finished the disconnect."
+        );
+        assert_eq!(paste_refusal(&retrying), STILL_FINISHING_DISCONNECT);
+        app.update(Message::AskForget);
+        let texts = super::super::test_support::texts(app.view(theme()));
+        assert!(
+            texts.iter().any(|s| s == FORGET_DISCONNECT_NOTE),
+            "{texts:?}"
+        );
+        assert!(!texts.iter().any(|s| s.contains("saved")), "{texts:?}");
+        app.update(Message::CancelForget);
+
+        let needs_you = none(RestorePhase::NeedsYou {
+            error: "Kao's proxy is off now.".into(),
+            direct_override: true,
+        });
+        app.set_restore(Some(needs_you.clone()));
+        assert_eq!(
+            app.uri_status(true, 0).0,
+            "A disconnect is still waiting to reach its dapp — open WalletConnect below."
+        );
+        assert_eq!(
+            app.uri_status(false, 0),
+            (
+                "Retry or forget the pending disconnect below to connect another.".to_string(),
+                Tone::Warn
+            )
+        );
+        assert_eq!(paste_refusal(&needs_you), DISCONNECT_FIRST);
+        let texts = super::super::test_support::texts(app.view(theme()));
+        assert!(
+            texts.iter().any(|s| s == DISCONNECT_PENDING_NOTE),
+            "{texts:?}"
+        );
+        assert!(texts.iter().any(|s| s == "Reconnect anyway"), "{texts:?}");
+        assert!(!texts.iter().any(|s| s.contains("saved")), "{texts:?}");
+        app.update(Message::AskForget);
+        let texts = super::super::test_support::texts(app.view(theme()));
+        assert!(
+            texts.iter().any(|s| s == FORGET_DISCONNECT_NOTE),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|s| s == "Keep trying") && texts.iter().any(|s| s == "Stop trying"),
+            "{texts:?}"
+        );
+        assert!(!texts.iter().any(|s| s.contains("saved")), "{texts:?}");
+        // A refusal line for this restore goes with it, as the saved-dapps one does.
+        app.set_pairing(PairingUi::Failed(DISCONNECT_FIRST.into()));
+        app.set_restore(Some(retrying));
+        assert_eq!(
+            app.pairing,
+            PairingUi::Idle,
+            "no longer waiting on the user"
+        );
+        app.set_pairing(PairingUi::Failed(STILL_FINISHING_DISCONNECT.into()));
+        app.set_restore(None);
+        assert_eq!(app.pairing, PairingUi::Idle, "the disconnect went out");
+
+        // The toasts for forgetting it.
+        let disconnect = none(RestorePhase::Connecting);
+        assert_eq!(
+            forgot_notice(&disconnect, false),
+            "Kao stopped trying to finish the disconnect — that dapp wasn't told."
+        );
+        assert_eq!(
+            forgot_notice(&disconnect, true),
+            "WalletConnect is off — Kao stopped trying to finish the disconnect."
+        );
+        for turned_off in [false, true] {
+            assert!(!forgot_notice(&disconnect, turned_off).contains("saved dapps"));
+        }
+        assert_eq!(
+            forgot_notice(&restoring(RestorePhase::Connecting), false),
+            "Kao forgot your saved dapps — they weren't told."
+        );
+        assert_eq!(
+            forgot_notice(
+                &RestoreView {
+                    sessions: 1,
+                    pending_disconnects: 1,
+                    phase: RestorePhase::Connecting,
+                },
+                true
+            ),
+            "WalletConnect is off — Kao forgot your saved dapps."
+        );
+        // Both refusals ask for the link again: Connect took it out of the field.
+        for m in [DISCONNECT_FIRST, STILL_FINISHING_DISCONNECT] {
+            assert!(m.contains("paste the link again"), "{m}");
+        }
+        // With saved dapps, the refusals name them.
+        assert_eq!(
+            paste_refusal(&restoring(RestorePhase::Connecting)),
+            STILL_RESTORING
+        );
+        assert_eq!(
+            paste_refusal(&restoring(RestorePhase::NeedsYou {
+                error: "x".into(),
+                direct_override: false
+            })),
+            RESTORE_FIRST
+        );
+    }
+
+    /// A restore whose saved sessions all expired while it waited, with no disconnect owed either
+    /// (both counts 0): every line says the connections expired — never a disconnect the user
+    /// didn't ask for — and the card offers only clearing them.
+    #[test]
+    fn a_restore_whose_sessions_expired_says_so_not_disconnect() {
+        let mut app = WcApp::new();
+        app.sync(None, Some(active(eoa())), config());
+        let expired = |phase| RestoreView {
+            sessions: 0,
+            pending_disconnects: 0,
+            phase,
+        };
+        let disconnect_copy = |texts: &[String]| {
+            texts.iter().any(|s| {
+                s == DISCONNECT_PENDING_NOTE
+                    || s == FORGET_DISCONNECT_NOTE
+                    || s == FINISHING_DISCONNECT
+                    || s.contains("disconnect")
+                    || s.contains("0 saved")
+            })
+        };
+
+        let needs_you = expired(RestorePhase::NeedsYou {
+            error: "Kao's proxy is off now.".into(),
+            direct_override: true,
+        });
+        app.set_restore(Some(needs_you.clone()));
+        assert_eq!(paste_refusal(&needs_you), EXPIRED_FIRST);
+        assert_eq!(
+            app.uri_status(true, 0),
+            (
+                "Your saved connections expired — open WalletConnect below.".to_string(),
+                Tone::Warn
+            )
+        );
+        assert_eq!(
+            app.uri_status(false, 0).0,
+            "Clear your expired connections below to connect another."
+        );
+        let texts = super::super::test_support::texts(app.view(theme()));
+        assert!(texts.iter().any(|s| s == EXPIRED_NOTE), "{texts:?}");
+        assert!(!disconnect_copy(&texts), "{texts:?}");
+        assert!(
+            !texts
+                .iter()
+                .any(|s| s == "Reconnect anyway" || s == "Retry"),
+            "nothing to dial: {texts:?}"
+        );
+        assert!(texts.iter().any(|s| s == "Clear…"), "{texts:?}");
+        app.update(Message::AskForget);
+        let texts = super::super::test_support::texts(app.view(theme()));
+        assert!(texts.iter().any(|s| s == FORGET_EXPIRED_NOTE), "{texts:?}");
+        assert!(texts.iter().any(|s| s == "Clear them"), "{texts:?}");
+        assert!(!disconnect_copy(&texts), "{texts:?}");
+        assert!(matches!(
+            app.update(Message::ConfirmForget),
+            Some(Outcome::ForgetRestore)
+        ));
+
+        let retrying = expired(RestorePhase::RetryingAt {
+            at: crate::walletconnect::now_secs() + 30,
+            error: "connection refused".into(),
+        });
+        app.set_restore(Some(retrying.clone()));
+        assert_eq!(paste_refusal(&retrying), STILL_CLEARING_EXPIRED);
+        assert_eq!(app.launcher_card_subtitle(), CLEARING_EXPIRED);
+        assert_eq!(
+            app.uri_status(false, 0).0,
+            "You can connect another dapp once Kao has cleared your expired connections."
+        );
+        let texts = super::super::test_support::texts(app.view(theme()));
+        assert!(texts.iter().any(|s| s == EXPIRED_NOTE), "{texts:?}");
+        assert!(!texts.iter().any(|s| s == "Retry now"), "{texts:?}");
+        assert!(!disconnect_copy(&texts), "{texts:?}");
+
+        app.set_restore(Some(expired(RestorePhase::Connecting)));
+        let texts = super::super::test_support::texts(app.view(theme()));
+        assert!(texts.iter().any(|s| s == CLEARING_EXPIRED), "{texts:?}");
+        assert!(!disconnect_copy(&texts), "{texts:?}");
+
+        // A refusal line for it goes once the restore is over.
+        app.set_pairing(PairingUi::Failed(STILL_CLEARING_EXPIRED.into()));
+        app.set_restore(None);
+        assert_eq!(app.pairing, PairingUi::Idle);
+        for m in [EXPIRED_FIRST, STILL_CLEARING_EXPIRED] {
+            assert!(m.contains("paste the link again"), "{m}");
+        }
+
+        // The toasts for forgetting it, or turning WalletConnect off meanwhile.
+        assert_eq!(
+            forgot_notice(&needs_you, false),
+            "Kao cleared your expired connections."
+        );
+        assert_eq!(
+            forgot_notice(&needs_you, true),
+            "WalletConnect is off — your saved connections had expired."
+        );
+    }
+
+    /// One saved dapp waiting on the user: the launcher line and the Apps card agree in number.
+    #[test]
+    fn one_saved_dapp_waits_to_reconnect() {
+        let mut app = WcApp::new();
+        app.sync(None, Some(active(eoa())), config());
+        app.set_restore(Some(RestoreView {
+            sessions: 1,
+            pending_disconnects: 0,
+            phase: RestorePhase::NeedsYou {
+                error: "Kao's proxy is off now.".into(),
+                direct_override: true,
+            },
+        }));
+        assert_eq!(
+            app.launcher_card_subtitle(),
+            "1 saved dapp waits to reconnect — open WalletConnect below."
+        );
+        assert_eq!(
+            app.uri_status(true, 0).0,
+            "1 saved dapp waits to reconnect — open WalletConnect below."
+        );
+        let texts = super::super::test_support::texts(app.view(theme()));
+        assert!(
+            texts
+                .iter()
+                .any(|s| s == "1 saved dapp is waiting to reconnect."),
+            "{texts:?}"
+        );
+    }
+
+    /// The retry loop moves between waiting and dialing on its own: a "Forget them" the user staged
+    /// stands across those changes (the slot forgets a restore in any phase), so the buttons don't
+    /// vanish from under the cursor when the next try starts. It goes once the restore is over.
+    #[test]
+    fn a_staged_forget_survives_the_retry_loop() {
+        let mut app = WcApp::new();
+        app.sync(None, Some(active(eoa())), config());
+        app.set_restore(Some(restoring(RestorePhase::RetryingAt {
+            at: crate::walletconnect::now_secs() + 5,
+            error: "connection refused".into(),
+        })));
+        app.update(Message::AskForget);
+        assert!(app.confirm_forget);
+
+        // The backoff ran out: the next try dials.
+        app.set_restore(Some(restoring(RestorePhase::Connecting)));
+        assert!(app.confirm_forget, "still staged while connecting");
+        let texts = super::super::test_support::texts(app.view(theme()));
+        assert!(texts.iter().any(|s| s == FORGET_NOTE), "{texts:?}");
+        assert!(texts.iter().any(|s| s == "Forget them"), "{texts:?}");
+        // And it failed again.
+        app.set_restore(Some(restoring(RestorePhase::RetryingAt {
+            at: crate::walletconnect::now_secs() + 15,
+            error: "connection refused".into(),
+        })));
+        assert!(app.confirm_forget, "still staged");
+        assert!(matches!(
+            app.update(Message::ConfirmForget),
+            Some(Outcome::ForgetRestore)
+        ));
+
+        // Over (reconnected, or forgotten elsewhere): nothing left to stage.
+        app.update(Message::AskForget);
+        app.set_restore(None);
+        assert!(!app.confirm_forget);
+        app.update(Message::AskForget);
+        assert!(!app.confirm_forget);
+        assert!(app.update(Message::ConfirmForget).is_none());
+    }
+
+    #[test]
+    fn restore_card_states() {
+        let mut app = WcApp::new();
+        app.sync(None, Some(active(eoa())), config());
+
+        // As `wc_mirror` drives it: a running restore holds the slot's "starting".
+        app.set_restore(Some(restoring(RestorePhase::Connecting)));
+        app.sync_start(true);
+        let texts = super::super::test_support::texts(app.view(theme()));
+        assert!(texts.iter().any(|s| s == "• connecting"), "{texts:?}");
+        assert!(
+            texts.iter().any(|s| s == "Reconnecting to 2 saved dapps…"),
+            "{texts:?}"
+        );
+        // A try on the wire can't be retried, but it can be forgotten (the slot aborts it).
+        assert!(!texts.iter().any(|s| s == "Retry now"), "{texts:?}");
+        assert!(texts.iter().any(|s| s == "Forget…"), "{texts:?}");
+        assert!(
+            !app.countdowns_visible(),
+            "nothing counts down while connecting"
+        );
+        assert!(app.update(Message::RetryRestore).is_none());
+        app.update(Message::AskForget);
+        assert!(app.confirm_forget, "a restore on the wire can be forgotten");
+        app.update(Message::CancelForget);
+        // The launcher row says it too (the pane has the card); atop the pane, the line says why
+        // Connect waits — never "Connecting to the relay…".
+        assert_eq!(app.uri_status(true, 0).0, "Reconnecting to 2 saved dapps…");
+        assert_eq!(
+            app.uri_status(false, 0).0,
+            "You can connect another dapp once your saved ones are back."
+        );
+
+        let at = crate::walletconnect::now_secs() + 42;
+        app.set_restore(Some(restoring(RestorePhase::RetryingAt {
+            at,
+            error: "connection refused".into(),
+        })));
+        app.sync_start(true);
+        assert_eq!(
+            app.uri_status(true, 0),
+            (
+                "Couldn't reconnect 2 saved dapps yet — Kao keeps trying.".to_string(),
+                Tone::Warn
+            )
+        );
+        assert_eq!(
+            app.launcher_card_subtitle(),
+            "Couldn't reconnect 2 saved dapps yet — Kao keeps trying."
+        );
+        let texts = super::super::test_support::texts(app.view(theme()));
+        assert!(
+            !texts.iter().any(|s| s == "Connecting to the relay…"),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|s| s.starts_with(
+                "Couldn't reach the relay: connection refused. Retrying in"
+            )),
+            "{texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|s| s == "2 saved dapps are waiting to reconnect."),
+            "{texts:?}"
+        );
+        assert!(texts.iter().any(|s| s == "Retry now"), "{texts:?}");
+        assert!(texts.iter().any(|s| s == "Forget…"), "{texts:?}");
+        assert!(app.countdowns_visible(), "the countdown ticks");
+        assert!(matches!(
+            app.update(Message::RetryRestore),
+            Some(Outcome::RetryRestore {
+                allow_direct: false
+            })
+        ));
+        assert!(app.update(Message::ReconnectAnyway).is_none());
+        assert!(
+            app.update(Message::ConfirmForget).is_none(),
+            "never forgets unstaged"
+        );
+        app.update(Message::AskForget);
+        let texts = super::super::test_support::texts(app.view(theme()));
+        assert!(texts.iter().any(|s| s == FORGET_NOTE), "{texts:?}");
+        assert!(texts.iter().any(|s| s == "Forget them"), "{texts:?}");
+        // Esc unwinds the staged forget before anything else.
+        assert!(app.update(Message::Escape).is_none());
+        assert!(!app.confirm_forget);
+        app.update(Message::AskForget);
+        assert!(matches!(
+            app.update(Message::ConfirmForget),
+            Some(Outcome::ForgetRestore)
+        ));
+
+        // A runtime-made error already says "Couldn't reach the relay": not doubled.
+        app.set_restore(Some(restoring(RestorePhase::RetryingAt {
+            at,
+            error: "Couldn't reach the relay: timed out.".into(),
+        })));
+        let texts = super::super::test_support::texts(app.view(theme()));
+        assert!(
+            texts
+                .iter()
+                .any(|s| s.starts_with("Couldn't reach the relay: timed out. Retrying in")),
+            "{texts:?}"
+        );
+
+        app.set_restore(Some(restoring(RestorePhase::NeedsYou {
+            error: "Kao's proxy is off now — reconnecting would show your IP to the relay.".into(),
+            direct_override: true,
+        })));
+        app.sync_start(false);
+        assert_eq!(
+            app.uri_status(true, 0).0,
+            "2 saved dapps wait to reconnect — open WalletConnect below."
+        );
+        assert_eq!(
+            app.uri_status(false, 0).0,
+            "Reconnect or forget your saved dapps below to connect another."
+        );
+        let texts = super::super::test_support::texts(app.view(theme()));
+        assert!(texts.iter().any(|s| s == "Reconnect anyway"), "{texts:?}");
+        assert!(!texts.iter().any(|s| s == "Retry"), "{texts:?}");
+        assert!(app.update(Message::RetryRestore).is_none());
+        assert!(matches!(
+            app.update(Message::ReconnectAnyway),
+            Some(Outcome::RetryRestore { allow_direct: true })
+        ));
+        app.update(Message::AskForget);
+        assert!(app.confirm_forget);
+        // The restore went back on the wire: the staged forget stands (see
+        // a_staged_forget_survives_the_retry_loop); Keep unstages it.
+        app.set_restore(Some(restoring(RestorePhase::Connecting)));
+        assert!(app.confirm_forget);
+        app.update(Message::CancelForget);
+
+        app.set_restore(Some(restoring(RestorePhase::NeedsYou {
+            error: "WalletConnect needs a project ID for the default relay.".into(),
+            direct_override: false,
+        })));
+        let texts = super::super::test_support::texts(app.view(theme()));
+        assert!(texts.iter().any(|s| s == "Retry"), "{texts:?}");
+        assert!(!texts.iter().any(|s| s == "Reconnect anyway"), "{texts:?}");
+        assert!(matches!(
+            app.update(Message::RetryRestore),
+            Some(Outcome::RetryRestore {
+                allow_direct: false
+            })
+        ));
+
+        // Done: a live runtime's mirror replaces the card with the relay line.
+        app.set_restore(None);
+        app.sync(Some(snapshot()), Some(active(eoa())), config());
+        let texts = super::super::test_support::texts(app.view(theme()));
+        assert!(texts.iter().any(|s| s == "✓ connected"), "{texts:?}");
+        assert!(!texts.iter().any(|s| s.contains("saved dapp")), "{texts:?}");
+    }
+
+    fn ended(id: u64, host: &str) -> ConnectionRecord {
+        ConnectionRecord {
+            id,
+            topic: format!("{id:064}"),
+            dapp: crate::vault::DappRecord {
+                name: format!("{host} app"),
+                host: Some(host.into()),
+                url: format!("https://{host}"),
+                ..Default::default()
+            },
+            account: crate::vault::AccountRef::Eoa {
+                address: Address::repeat_byte(0x11),
+                label: "Account 2".into(),
+            },
+            chains: vec![1],
+            connected_at: 10,
+            ack: crate::vault::AckRecord::Confirmed,
+            ended_at: Some(20),
+            end: Some(crate::vault::EndReason::YouDisconnected),
+        }
+    }
+
+    /// PAST CONNECTIONS comes from the vault, so it shows with no runtime at all: the latest three
+    /// ended connections (host boxed before the claim), a two-step Clear, and the way to the full
+    /// history in Settings. With none, the section isn't drawn.
+    #[test]
+    fn past_connections_show_without_a_runtime() {
+        let mut app = WcApp::new();
+        app.sync(None, Some(active(eoa())), config());
+        let texts = super::super::test_support::texts(app.view(theme()));
+        assert!(!texts.iter().any(|s| s == "PAST CONNECTIONS"), "{texts:?}");
+
+        app.set_past_connections(
+            vec![
+                ended(4, "d.example"),
+                ended(3, "c.example"),
+                ended(2, "b.example"),
+                ended(1, "a.example"),
+            ],
+            5,
+        );
+        let texts = super::super::test_support::texts(app.view(theme()));
+        assert!(texts.iter().any(|s| s == "PAST CONNECTIONS"), "{texts:?}");
+        assert!(
+            texts.iter().any(|s| s == "See all in Settings ›"),
+            "{texts:?}"
+        );
+        assert!(texts.iter().any(|s| s == "d.example"), "{texts:?}");
+        assert!(
+            !texts.iter().any(|s| s == "a.example"),
+            "only the latest three: {texts:?}"
+        );
+        let host = texts.iter().position(|s| s == "d.example").unwrap();
+        let claim = texts
+            .iter()
+            .position(|s| s == "calls itself \"d.example app\"")
+            .unwrap();
+        assert!(host < claim, "{texts:?}");
+        assert!(
+            texts
+                .iter()
+                .any(|s| s.ends_with(" — you disconnected") && s.starts_with("ended ")),
+            "{texts:?}"
+        );
+        let clicked =
+            super::super::test_support::click_text(app.view(theme()), "See all in Settings ›");
+        assert!(
+            matches!(clicked.as_slice(), [Message::SeeAllConnections]),
+            "{clicked:?}"
+        );
+        assert!(matches!(
+            app.update(Message::SeeAllConnections),
+            Some(Outcome::OpenConnectionHistory)
+        ));
+
+        assert!(app.update(Message::ConfirmClearPast).is_none(), "unstaged");
+        app.update(Message::AskClearPast);
+        let texts = super::super::test_support::texts(app.view(theme()));
+        assert!(
+            texts
+                .iter()
+                .any(|s| s == "Remove 5 past connections from Kao?"),
+            "{texts:?}"
+        );
+        assert!(app.update(Message::Escape).is_none());
+        assert!(!app.confirm_clear_past, "Esc unwinds it");
+        app.update(Message::AskClearPast);
+        assert!(matches!(
+            app.update(Message::ConfirmClearPast),
+            Some(Outcome::ClearConnectionHistory)
+        ));
+        // Cleared: the section goes, and nothing can be staged.
+        app.set_past_connections(Vec::new(), 0);
+        app.update(Message::AskClearPast);
+        assert!(!app.confirm_clear_past);
+        let texts = super::super::test_support::texts(app.view(theme()));
+        assert!(!texts.iter().any(|s| s == "PAST CONNECTIONS"), "{texts:?}");
+    }
+
+    /// PAST CONNECTIONS rows read as sentences: one that ended while Kao was closed says so with
+    /// no relative time, a time inside the line is lowercase ("yesterday"), and the reason after
+    /// the em dash is lowercase.
+    #[test]
+    fn past_connection_rows_read_as_sentences() {
+        let now = crate::walletconnect::now_secs();
+        let mut lost = ended(3, "lost.example");
+        lost.ended_at = Some(now);
+        lost.end = Some(crate::vault::EndReason::Lost);
+        let mut yesterday = ended(2, "y.example");
+        yesterday.ended_at = Some(now - 90_000);
+        yesterday.end = Some(crate::vault::EndReason::DappDisconnected);
+        let mut app = WcApp::new();
+        app.sync(None, Some(active(eoa())), config());
+        app.set_past_connections(vec![lost, yesterday], 2);
+        let texts = super::super::test_support::texts(app.view(theme()));
+        assert!(
+            texts.iter().any(|s| s == "ended while Kao was closed"),
+            "{texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|s| s == "ended yesterday — the dapp disconnected"),
+            "{texts:?}"
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|s| s.contains("just now") || s.contains("Yesterday") || s.contains("— The")),
+            "{texts:?}"
+        );
+    }
+
+    /// Connected dapps say what lock and quit do to them now; the Turn-off confirm says Kao
+    /// forgets them too.
+    #[test]
+    fn connected_dapps_say_they_stay_connected() {
+        let mut snap = snapshot();
+        snap.sessions = vec![session(topic('s'), eoa())];
+        let mut app = pane_with(snap, eoa());
+        let texts = super::super::test_support::texts(app.view(theme()));
+        assert!(texts.iter().any(|s| s == STAY_CONNECTED_NOTE), "{texts:?}");
+        app.update(Message::AskStop);
+        let texts = super::super::test_support::texts(app.view(theme()));
+        assert!(
+            texts
+                .iter()
+                .any(|s| s.starts_with("This disconnects every dapp and Kao forgets them")),
+            "{texts:?}"
+        );
+        // No sessions: no note to make.
+        let app = pane_with(snapshot(), eoa());
+        let texts = super::super::test_support::texts(app.view(theme()));
+        assert!(!texts.iter().any(|s| s == STAY_CONNECTED_NOTE), "{texts:?}");
+    }
+
+    /// While the vault can't save, a lock or quit tears WalletConnect down: the note says the
+    /// dapps get disconnected then, instead of promising they stay connected.
+    #[test]
+    fn connected_dapps_dont_promise_to_stay_when_kao_cant_save() {
+        let mut snap = snapshot();
+        snap.sessions = vec![session(topic('s'), eoa())];
+        let mut app = pane_with(snap, eoa());
+        app.set_can_persist(false);
+        let texts = super::super::test_support::texts(app.view(theme()));
+        assert!(texts.iter().any(|s| s == NOT_SAVED_NOTE), "{texts:?}");
+        assert!(!texts.iter().any(|s| s == STAY_CONNECTED_NOTE), "{texts:?}");
+        app.set_can_persist(true);
+        let texts = super::super::test_support::texts(app.view(theme()));
+        assert!(texts.iter().any(|s| s == STAY_CONNECTED_NOTE), "{texts:?}");
+    }
+
+    /// Once the user saved another relay than the live runtime's, the next start forgets these
+    /// dapps (it can't reach them there): the note under CONNECTED DAPPS says so — and how to
+    /// disconnect them instead — rather than promising they stay connected.
+    #[test]
+    fn connected_dapps_warn_when_the_saved_relay_moved_on() {
+        let texts_with = |relay_custom: Option<&str>, can_persist: bool| {
+            let mut snap = snapshot();
+            snap.sessions = vec![session(topic('s'), eoa())];
+            let mut cfg = config();
+            cfg.relay_custom = relay_custom.map(str::to_string);
+            let mut app = WcApp::new();
+            app.sync(Some(snap), Some(active(eoa())), cfg);
+            app.set_can_persist(can_persist);
+            super::super::test_support::texts(app.view(theme()))
+        };
+        let texts = texts_with(Some("wss://relay.example.com"), true);
+        assert!(texts.iter().any(|s| s == RELAY_CHANGED_NOTE), "{texts:?}");
+        assert!(!texts.iter().any(|s| s == STAY_CONNECTED_NOTE), "{texts:?}");
+
+        // The same relay (only its path or query differs), or none saved over the default: no
+        // change.
+        let default_with_path = format!(
+            "{}/v1?projectId=x",
+            wallet_connect::relay::rpc::DEFAULT_RELAY_URL.trim_end_matches('/')
+        );
+        for same in [None, Some(default_with_path.as_str())] {
+            let texts = texts_with(same, true);
+            assert!(
+                texts.iter().any(|s| s == STAY_CONNECTED_NOTE),
+                "{same:?}: {texts:?}"
+            );
+            assert!(!texts.iter().any(|s| s == RELAY_CHANGED_NOTE), "{texts:?}");
+        }
+        // A session that can't save tears them down at lock anyway: that note wins.
+        let texts = texts_with(Some("wss://relay.example.com"), false);
+        assert!(texts.iter().any(|s| s == NOT_SAVED_NOTE), "{texts:?}");
+        assert!(!texts.iter().any(|s| s == RELAY_CHANGED_NOTE), "{texts:?}");
+    }
+
+    /// While the wallet file's saved state can't be read, the pane says what that means — nothing
+    /// restored, nothing new saved — and offers the two-step reset; the reset goes out only once
+    /// confirmed, and neither shows once the state is readable again.
+    #[test]
+    fn an_unreadable_saved_state_says_so_and_offers_the_reset() {
+        use super::super::signed_messages_settings::{RESET_CONFIRM, RESET_LABEL};
+        let mut app = WcApp::new();
+        app.sync(None, Some(active(eoa())), config());
+        let texts = super::super::test_support::texts(app.view(theme()));
+        assert!(!texts.iter().any(|s| s == SAVED_STATE_UNREADABLE_NOTE));
+        assert!(!texts.iter().any(|s| s == RESET_LABEL));
+
+        app.set_key_unavailable(true);
+        let texts = super::super::test_support::texts(app.view(theme()));
+        assert!(
+            texts.iter().any(|s| s == SAVED_STATE_UNREADABLE_NOTE),
+            "{texts:?}"
+        );
+        assert!(!SAVED_STATE_UNREADABLE_NOTE.contains("just now"));
+        assert!(texts.iter().any(|s| s == RESET_LABEL), "{texts:?}");
+        assert!(app.update(Message::ConfirmReset).is_none(), "unstaged");
+        let clicked = super::super::test_support::click_text(app.view(theme()), RESET_LABEL);
+        assert!(
+            matches!(clicked.as_slice(), [Message::AskReset]),
+            "{clicked:?}"
+        );
+        app.update(Message::AskReset);
+        let texts = super::super::test_support::texts(app.view(theme()));
+        assert!(texts.iter().any(|s| s == RESET_CONFIRM), "{texts:?}");
+        assert!(app.update(Message::Escape).is_none());
+        assert!(!app.confirm_reset, "Esc unwinds it");
+        app.update(Message::AskReset);
+        assert!(matches!(
+            app.update(Message::ConfirmReset),
+            Some(Outcome::ResetSavedState)
+        ));
+
+        // Readable again (the reset landed): the note and the staged confirm go.
+        app.update(Message::AskReset);
+        app.set_key_unavailable(false);
+        assert!(!app.confirm_reset);
+        let texts = super::super::test_support::texts(app.view(theme()));
+        assert!(!texts.iter().any(|s| s == SAVED_STATE_UNREADABLE_NOTE));
+        app.update(Message::AskReset);
+        assert!(app.update(Message::ConfirmReset).is_none());
+    }
+
+    /// Saving a different relay while dapps are connected — or saved, waiting to reconnect — warns
+    /// that they'd be forgotten; with none at stake, no warning.
+    #[test]
+    fn a_relay_change_warns_when_dapps_are_at_stake() {
+        let warned = |app: &WcApp| {
+            super::super::test_support::texts(app.view(theme()))
+                .iter()
+                .any(|s| s == RELAY_CHANGE_WARNING)
+        };
+        let mut snap = snapshot();
+        snap.sessions = vec![session(topic('r'), eoa())];
+        let mut app = pane_with(snap, eoa());
+        app.update(Message::ToggleSettings);
+        assert!(!warned(&app), "nothing changed yet");
+        app.update(Message::RelayUrlChanged("wss://relay.example.com".into()));
+        assert!(warned(&app));
+
+        let mut app = WcApp::new();
+        app.sync(None, Some(active(eoa())), config());
+        app.set_restore(Some(restoring(RestorePhase::NeedsYou {
+            error: "x".into(),
+            direct_override: false,
+        })));
+        app.update(Message::ToggleSettings);
+        app.update(Message::RelayUrlChanged("wss://relay.example.com".into()));
+        assert!(warned(&app), "saved sessions count too");
+
+        let mut app = pane_with(snapshot(), eoa());
+        app.update(Message::ToggleSettings);
+        app.update(Message::RelayUrlChanged("wss://relay.example.com".into()));
+        assert!(!warned(&app), "no dapps, no warning");
     }
 
     /// A proxy that applies on restart is said once on the pane (its relay card), with or without

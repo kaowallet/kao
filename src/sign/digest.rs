@@ -34,6 +34,18 @@ pub const MESSAGE_HASH_LABEL: &str = "Message Hash";
 /// above; the review shows it alongside them for WalletConnect messages.
 pub const EIP191_DIGEST_LABEL: &str = "Message Digest (EIP-191)";
 
+/// Labels for the dapp's own EIP-712 digests when a Safe signs typed data as an EIP-1271 message.
+/// The standard labels belong to the `SafeMessage` the owners sign; the inner triple gets a "Dapp"
+/// prefix so the two sets can't be mistaken for each other. Shared by the review
+/// (`sign_review/wc.rs`) and the signed-message history (`walletconnect::message::digest_rows`).
+pub const DAPP_EIP712_DIGEST_LABEL: &str = "Dapp EIP-712 Digest";
+pub const DAPP_DOMAIN_HASH_LABEL: &str = "Dapp Domain Hash";
+pub const DAPP_MESSAGE_HASH_LABEL: &str = "Dapp Message Hash";
+
+/// Label for the call a Safe transaction makes — the `SafeTx`'s own `data` — beside the
+/// `execTransaction` calldata digest of the transaction that carries it.
+pub const INNER_CALLDATA_DIGEST_LABEL: &str = "Calldata Digest (inner call)";
+
 /// ERC-8213 **Calldata Digest**: `keccak256( uint256(len(calldata)) ‖ calldata )`.
 ///
 /// The 32-byte big-endian length prefix is part of the pre-image; `chainId` is

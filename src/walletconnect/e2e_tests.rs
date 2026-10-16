@@ -1102,7 +1102,8 @@ async fn teardown_notifies_every_dapp_and_closes() {
         Some(QueueState::Waiting)
     );
 
-    // Lock: the App closes the slot and tears the runtime down.
+    // Turn off — or a lock / quit without a data key to save into: the full teardown. (A lock
+    // with one suspends instead: `runtime::restore_tests`.)
     let rt = slot.close().expect("installed");
     rt.mark_closed();
     rt.teardown(TEARDOWN_PER_PHASE).await;

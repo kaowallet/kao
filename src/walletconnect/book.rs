@@ -10,6 +10,14 @@
 //! Notices: everything the book reports is recorded in its activity ring (`snapshot().notices`).
 //! A `UiEffect::Notice` is raised in addition only when the notice deserves a toast — it is already
 //! in the ring, so the dashboard toasts it and must not push it again.
+//!
+//! History and saved state: a change the vault's history keeps (a connection opened, acknowledged
+//! or ended; a message signature handed out, then delivered or not) is a [`LogEffect`], and a change
+//! a restore needs (a session bound, ended, extended or paused; a request queued; an answer accepted
+//! — write-ahead — or delivered) asks the runtime to save its state ([`Effects::persist`]). The
+//! runtime applies both through its epoch-bound vault session. [`WcBook::teardown`] and
+//! [`WcBook::suspend`] emit neither: a closed runtime never saves, and whoever closes it records
+//! the end itself.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -21,6 +29,7 @@ use wallet_connect::crypto::Topic;
 use wallet_connect::rpc::ErrorObject;
 use wallet_connect::sign::{PendingRequest, Proposal, SdkError, Session};
 
+use super::persist::{PersistedAnswer, PersistedSession};
 use super::request;
 use super::types::*;
 use super::{
@@ -28,6 +37,10 @@ use super::{
     KAO_REQUEST_TTL_SECS, MAX_AUTO_ANSWERS_PER_MIN, MAX_NOTICES, MAX_QUEUE_PER_SESSION,
     MAX_QUEUE_TOTAL, MAX_SESSIONS, PAIRING_WAIT_DEFAULT_SECS, PAIRING_WAIT_MAX_SECS,
     REJECT_STREAK_PAUSE,
+};
+use crate::vault::{
+    AccountRef, AckRecord, DappRecord, Delivery, EndReason, NewConnection, NewSigned, SignOrigin,
+    SignedKind, SignedPayload,
 };
 
 /// `Retire` reason (and notice text) when nothing has needed the relay for [`IDLE_RETIRE_SECS`].
@@ -108,6 +121,9 @@ struct Outgoing {
     row: Option<PendingRow>,
     /// Sanitized dapp host, for notices about this answer.
     host: String,
+    /// The dapp's own deadline for the request, if it set one (saved with the answer: past it the
+    /// crate drops the request unanswered).
+    dapp_deadline: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -359,6 +375,31 @@ impl SafeExecHolds {
     }
 }
 
+/// What a restored book starts from ([`WcBook::seed`]): the saved bindings whose sessions the
+/// restored client state still holds, with their expiry and acknowledgement taken from that state.
+#[derive(Debug, Clone, Default)]
+pub struct BookSeed {
+    pub sessions: Vec<BoundSession>,
+    pub next_ordinal: u32,
+    /// Unix seconds (the restore's clock).
+    pub now: u64,
+}
+
+/// What a restored book does once installed ([`WcBook::apply_restore`]) — all worked out from the
+/// saved record before Kao dialed, never from the live client.
+#[derive(Debug, Clone, Default)]
+pub struct RestoreWork {
+    /// Answers the saved state still owed for requests the restored client still holds.
+    pub owed: Vec<PersistedAnswer>,
+    /// Requests the restored client holds that Kao never answered: refused, never reviewed.
+    pub stale: Vec<WcKey>,
+    /// Sessions in the restored client state with no binding (a disconnect that hadn't reached
+    /// the relay, or a binding lost): the dapp is told they're gone.
+    pub unbound: Vec<Topic>,
+    /// Pairings left in the restored client state: deleted, as after a settlement.
+    pub pairings: Vec<Topic>,
+}
+
 /// See the module docs.
 #[derive(Debug)]
 pub struct WcBook {
@@ -400,6 +441,16 @@ pub struct WcBook {
     /// The request a [Switch to ⟨account⟩] was clicked on, for the dashboard rebuilt for that
     /// account to open ([`Self::take_pick`]).
     pick: Option<WcKey>,
+    /// Message signatures in the outbox, recorded in the signed-message history as `Sending`
+    /// ([`LogEffect::MessageSigned`]) until their delivery is known either way.
+    signed_keys: BTreeSet<WcKey>,
+    /// Requests a lock or quit caught while Kao signed them whose entry a late answer has since
+    /// taken off the queue — with the transaction noted for each, if one was: the saved state
+    /// still owes each dapp the "it may have gone through" answer ([`Self::outbox_entries`]).
+    interrupted: BTreeMap<WcKey, Option<alloy::primitives::B256>>,
+    /// Torn down ([`Self::teardown`]): an answer its last try doesn't deliver is given up — nothing
+    /// sends it again — not kept for a re-send.
+    torn_down: bool,
 }
 
 impl Default for WcBook {
@@ -436,6 +487,9 @@ impl WcBook {
             clock: 0,
             safe_execs: SafeExecHolds::default(),
             pick: None,
+            signed_keys: BTreeSet::new(),
+            interrupted: BTreeMap::new(),
+            torn_down: false,
         }
     }
 
@@ -780,6 +834,15 @@ impl WcBook {
             ticket.identity_label
         );
         self.raise(&mut fx, text, false, false);
+        fx.log.push(LogEffect::ConnectionOpened(NewConnection {
+            topic: session.topic.to_string(),
+            dapp: DappRecord::from(&ticket.dapp),
+            account: AccountRef::from((ticket.identity, ticket.identity_label.clone())),
+            chains: ticket.grant.chains.clone(),
+            connected_at: now,
+            ack: AckRecord::Pending,
+        }));
+        fx.persist = Persist::Now;
         fx
     }
 
@@ -787,21 +850,34 @@ impl WcBook {
     pub fn on_ack(&mut self, topic: &Topic, result: Result<(), AckFailure>) -> Effects {
         let mut fx = Effects {
             changed: true,
+            persist: Persist::Now,
             ..Default::default()
         };
         let pairing = self
             .ack_pairings
             .remove(topic)
             .or_else(|| self.sessions.get(topic).map(|s| s.pairing_topic.clone()));
+        let acked = |fx: &mut Effects, ack| {
+            fx.log.push(LogEffect::ConnectionAcked {
+                topic: topic.to_string(),
+                ack,
+            })
+        };
         match result {
             Ok(()) => {
                 if let Some(s) = self.sessions.get_mut(topic) {
                     s.ack = AckState::Confirmed;
+                    acked(&mut fx, AckRecord::Confirmed);
                 }
             }
             Err(AckFailure::Refused) => {
                 // The crate already deleted the session, silently (it emits no event for that).
-                if let Some(s) = self.drop_session(topic, GoneReason::DappDisconnected, &mut fx) {
+                if let Some(s) = self.drop_session(
+                    topic,
+                    GoneReason::DappDisconnected,
+                    EndReason::DappDeclined,
+                    &mut fx,
+                ) {
                     let text = format!("{} declined the connection.", s.dapp.headline());
                     self.raise(&mut fx, text, true, true);
                 }
@@ -809,12 +885,14 @@ impl WcBook {
             Err(AckFailure::Timeout) => {
                 if let Some(s) = self.sessions.get_mut(topic) {
                     s.ack = AckState::Unconfirmed;
+                    acked(&mut fx, AckRecord::Unconfirmed);
                 }
             }
             Err(AckFailure::Closed) => {
                 // The runtime is shutting down: the pairing dies with it.
                 if let Some(s) = self.sessions.get_mut(topic) {
                     s.ack = AckState::Unconfirmed;
+                    acked(&mut fx, AckRecord::Unconfirmed);
                 }
                 return fx;
             }
@@ -846,6 +924,8 @@ impl WcBook {
         match &result {
             Ok(()) => {
                 self.owed_rejects.remove(&id);
+                // The crate forgot the proposal.
+                fx.persist = Persist::Soon;
             }
             Err(_) => {
                 if let Some(owed) = self.owed_rejects.get_mut(&id) {
@@ -1040,6 +1120,8 @@ impl WcBook {
         });
         fx.ui.push(UiEffect::Attention);
         fx.changed = true;
+        // The crate holds it now (and the relay won't push it to this client id again).
+        fx.persist = Persist::Now;
         fx
     }
 
@@ -1058,7 +1140,19 @@ impl WcBook {
         fx.changed = true;
         match result {
             RespondResult::Delivered => {
+                let signature = self
+                    .outbox
+                    .remove(key)
+                    .and_then(|out| answer_signature(&out.answer));
+                self.signed_delivery(key, Delivery::Delivered, signature, &mut fx);
+                fx.persist = Persist::Now;
+            }
+            // The teardown's last try: nothing sends it again (the client shuts down, and the
+            // saved state is cleared or was never written).
+            RespondResult::Retry(why) if self.torn_down => {
+                debug!(id = key.id, why = %why, "answer not delivered by the last try; given up");
                 self.outbox.remove(key);
+                self.signed_delivery(key, Delivery::NotDelivered, None, &mut fx);
             }
             RespondResult::Retry(why) => {
                 out.in_flight = false;
@@ -1085,6 +1179,8 @@ impl WcBook {
                     );
                     self.raise(&mut fx, text, true, true);
                 }
+                self.signed_delivery(key, Delivery::NotDelivered, None, &mut fx);
+                fx.persist = Persist::Now;
             }
         }
         fx
@@ -1102,6 +1198,7 @@ impl WcBook {
             // Gone = the crate no longer knows the session: nothing left to tell the dapp.
             RespondResult::Delivered | RespondResult::Gone(_) => {
                 self.disconnects.remove(topic);
+                fx.persist = Persist::Now;
             }
             RespondResult::Retry(why) => {
                 d.in_flight = false;
@@ -1149,7 +1246,11 @@ impl WcBook {
 
     /// SessionRequestExpire from the crate: the dapp's deadline passed and the crate forgot it.
     pub fn on_request_expired(&mut self, key: &WcKey) -> Effects {
-        let mut fx = Effects::default();
+        // The crate forgot the request.
+        let mut fx = Effects {
+            persist: Persist::Soon,
+            ..Default::default()
+        };
         // An answer still waiting for the relay can't be delivered any more.
         if self.outbox.get(key).is_some_and(|o| !o.in_flight)
             && let Some(out) = self.outbox.remove(key)
@@ -1162,6 +1263,7 @@ impl WcBook {
                 );
                 self.raise(&mut fx, text, true, true);
             }
+            self.signed_delivery(key, Delivery::NotDelivered, None, &mut fx);
         }
         let Some(pos) = self.queue.iter().position(|q| &q.key == key) else {
             return fx;
@@ -1445,6 +1547,8 @@ impl WcBook {
             self.host_of(&key.topic)
         );
         self.raise(&mut fx, text, false, false);
+        // The saved state no longer owes the dapp an "unconfirmed" refusal for it.
+        fx.persist = Persist::Soon;
         fx
     }
 
@@ -1500,23 +1604,30 @@ impl WcBook {
     /// Waiting → dropped; InReview → RequestGone; Signing → gone; outbox for topic dropped; notice.
     pub fn on_session_gone(&mut self, topic: &Topic, reason: GoneReason) -> Effects {
         let mut fx = Effects::default();
-        if let Some(s) = self.drop_session(topic, reason, &mut fx) {
+        if let Some(s) = self.drop_session(topic, reason, end_reason(reason), &mut fx) {
             let text = session_end_text(s.dapp.headline(), reason);
             self.raise(&mut fx, text, false, false);
         }
         fx
     }
 
-    pub fn on_session_extended(&mut self, topic: &Topic, expiry: u64) {
+    /// The dapp extended the session (to `expiry`, unix s).
+    pub fn on_session_extended(&mut self, topic: &Topic, expiry: u64) -> Effects {
+        let mut fx = Effects {
+            changed: true,
+            ..Default::default()
+        };
         if let Some(s) = self.sessions.get_mut(topic) {
             s.expiry = expiry;
+            fx.persist = Persist::Soon;
         }
+        fx
     }
 
     /// Kao-initiated: remove now (optimistic) + Disconnect; a failed send keeps the topic "doomed".
     pub fn user_disconnect(&mut self, topic: &Topic, reason: GoneReason) -> Effects {
         let mut fx = Effects::default();
-        if let Some(s) = self.drop_session(topic, reason, &mut fx) {
+        if let Some(s) = self.drop_session(topic, reason, end_reason(reason), &mut fx) {
             let text = session_end_text(s.dapp.headline(), reason);
             self.raise(&mut fx, text, false, false);
             self.disconnects.insert(
@@ -1566,11 +1677,15 @@ impl WcBook {
         fx
     }
 
-    pub fn resume(&mut self, topic: &Topic) {
+    pub fn resume(&mut self, topic: &Topic) -> Effects {
+        let mut fx = Effects::default();
         if let Some(s) = self.sessions.get_mut(topic) {
             s.paused = false;
             s.reject_streak = 0;
+            fx.changed = true;
+            fx.persist = Persist::Soon;
         }
+        fx
     }
 
     /// Sessions whose identity ∉ available ⇒ user_disconnect(IdentityRemoved).
@@ -1760,8 +1875,75 @@ impl WcBook {
 
     /// 4900 to Waiting/InReview, Signing → gone(Teardown), Disconnect every session.
     ///
-    /// Every answer-like effect (Respond, RejectProposal) precedes every Disconnect in `net`.
+    /// Every answer-like effect (Respond, RejectProposal) precedes every Disconnect in `net`. No
+    /// history and no save: a closed runtime never saves, and Turn off ends the history (and clears
+    /// the saved state) itself, before the teardown starts.
     pub fn teardown(&mut self) -> Effects {
+        self.torn_down = true;
+        let mut fx = self.close_out();
+        // `shutdown()` alone never tells a dapp: disconnect each session first.
+        let topics: BTreeSet<Topic> = self
+            .sessions
+            .keys()
+            .chain(self.disconnects.keys())
+            .cloned()
+            .collect();
+        self.sessions.clear();
+        for topic in topics {
+            self.disconnects.insert(
+                topic.clone(),
+                Resend {
+                    in_flight: true,
+                    ..Resend::default()
+                },
+            );
+            fx.net.push(NetEffect::Disconnect { topic });
+        }
+        fx
+    }
+
+    /// The end of a teardown, once its client is shut down: every answer still owed is given up —
+    /// nothing will send it again — so each message signature among them is `NotDelivered` in the
+    /// history (the runtime records it: Turn off's vault epoch is still current).
+    pub fn abandon_outbox(&mut self) -> Effects {
+        let mut fx = Effects {
+            changed: !self.outbox.is_empty(),
+            ..Default::default()
+        };
+        self.outbox.clear();
+        let signed: Vec<WcKey> = self.signed_keys.iter().cloned().collect();
+        for key in signed {
+            self.signed_delivery(&key, Delivery::NotDelivered, None, &mut fx);
+        }
+        fx
+    }
+
+    /// Lock / quit with somewhere to save: [`Self::teardown`]'s answers, but **no** disconnect of a
+    /// bound session — the sessions stay (with the crate, and in the state the suspend saves), so
+    /// the dapps stay connected for the next unlock to restore. Disconnects the user already asked
+    /// for and that haven't reached the relay get their last try, as a teardown gives them (one
+    /// that fails again leaves its session in the saved client state, unbound: the restore tells
+    /// the dapp). No history and no save, as for a teardown.
+    pub fn suspend(&mut self) -> Effects {
+        let owed: Vec<Topic> = self
+            .disconnects
+            .iter()
+            .filter(|(_, d)| !d.in_flight)
+            .map(|(topic, _)| topic.clone())
+            .collect();
+        // `close_out` marks them in flight (its `undelivered`) without sending them.
+        let mut fx = self.close_out();
+        fx.net.extend(
+            owed.into_iter()
+                .map(|topic| NetEffect::Disconnect { topic }),
+        );
+        fx
+    }
+
+    /// What a teardown and a suspend share: 4900 (or the unconfirmed refusal) to Waiting /
+    /// InReview, Signing → gone(Teardown), one last try for undelivered answers and proposal
+    /// rejections, the open card rejected, pastes forgotten, the relay Closed.
+    fn close_out(&mut self) -> Effects {
         let mut fx = Effects {
             changed: true,
             ..Default::default()
@@ -1820,25 +2002,9 @@ impl WcBook {
         }
         self.expectations.clear();
         self.pairing = PairingState::Idle;
-        // `shutdown()` alone never tells a dapp: disconnect each session first.
-        let topics: BTreeSet<Topic> = self
-            .sessions
-            .keys()
-            .chain(self.disconnects.keys())
-            .cloned()
-            .collect();
-        self.sessions.clear();
-        for topic in topics {
-            self.disconnects.insert(
-                topic.clone(),
-                Resend {
-                    in_flight: true,
-                    ..Resend::default()
-                },
-            );
-            fx.net.push(NetEffect::Disconnect { topic });
-        }
         self.relay = RelayStatus::Closed;
+        fx.log.clear();
+        fx.persist = Persist::None;
         fx
     }
 
@@ -1854,7 +2020,7 @@ impl WcBook {
         }
     }
 
-    /// generation/route are filled by the runtime.
+    /// generation/route/relay_url are filled by the runtime.
     pub fn snapshot(&self, now: u64) -> WcSnapshot {
         let proposal = self.card.as_ref().map(|c| ProposalView {
             id: c.proposal.id,
@@ -1938,6 +2104,7 @@ impl WcBook {
             notices: self.notices.iter().cloned().collect(),
             refused_count: self.refused_count,
             undelivered: self.outbox.values().filter(|o| o.attempts > 0).count(),
+            relay_url: String::new(),
         }
     }
 
@@ -1945,6 +2112,218 @@ impl WcBook {
     #[cfg(test)]
     pub(crate) fn outbox_len(&self) -> usize {
         self.outbox.len()
+    }
+
+    // ── saved state & restore ──
+
+    /// The bindings as the saved state keeps them, in "Session N" order, and the next N.
+    pub fn bindings(&self) -> (Vec<PersistedSession>, u32) {
+        let sessions = self
+            .sessions()
+            .into_iter()
+            .map(|s| PersistedSession {
+                topic: s.topic.clone(),
+                pairing_topic: s.pairing_topic.clone(),
+                ordinal: s.ordinal,
+                identity: s.identity.into(),
+                identity_label: s.identity_label.clone(),
+                chains: s.chains.clone(),
+                methods: s.methods.clone(),
+                events: s.events.clone(),
+                dapp: DappRecord::from(&s.dapp),
+                expiry: s.expiry,
+                paused: s.paused,
+            })
+            .collect();
+        (sessions, self.next_ordinal)
+    }
+
+    /// The answers Kao owes dapps, for the saved state: every outbox entry not known delivered,
+    /// and — for a request still queued whose transaction may be on its way — the "unconfirmed"
+    /// refusal a restore must send for it (never "cancelled": it may yet be mined). A request Kao
+    /// is signing (or was, when a lock or quit caught it) is owed an answer too, its outcome
+    /// unknown: the "unconfirmed" refusal when a transaction was noted, else
+    /// [`Refusal::interrupted`] — never "not reviewed".
+    pub fn outbox_entries(&self) -> Vec<PersistedAnswer> {
+        let mut owed: Vec<PersistedAnswer> = self
+            .outbox
+            .iter()
+            .map(|(key, o)| PersistedAnswer {
+                topic: key.topic.clone(),
+                id: key.id,
+                answer: o.answer.clone(),
+                unconfirmed_tx: None,
+                signed_message: self.signed_keys.contains(key),
+                dapp_deadline: o.dapp_deadline,
+            })
+            .collect();
+        let unknown_outcome = |key: &WcKey, tx: Option<alloy::primitives::B256>, deadline| {
+            let refusal = tx.map_or_else(Refusal::interrupted, Refusal::unconfirmed);
+            PersistedAnswer {
+                topic: key.topic.clone(),
+                id: key.id,
+                answer: Err(refusal.error_object()),
+                unconfirmed_tx: tx,
+                signed_message: false,
+                dapp_deadline: deadline,
+            }
+        };
+        owed.extend(
+            self.queue
+                .iter()
+                .filter(|q| !self.outbox.contains_key(&q.key))
+                .filter_map(|q| {
+                    let tx = q.unconfirmed.as_ref().map(|tx| tx.hash);
+                    // Its session or the request itself gone: nothing can reach the dapp.
+                    let signing = matches!(q.state, QueueState::Signing { .. })
+                        && q.gone.is_none_or(|g| g == GoneReason::Teardown);
+                    (tx.is_some() || signing).then(|| unknown_outcome(&q.key, tx, q.dapp_deadline))
+                }),
+        );
+        owed.extend(
+            self.interrupted
+                .iter()
+                .filter(|(key, _)| {
+                    !self.outbox.contains_key(key) && !self.queue.iter().any(|q| &q.key == *key)
+                })
+                .map(|(key, tx)| unknown_outcome(key, *tx, None)),
+        );
+        owed
+    }
+
+    /// A restored runtime's book, before its forwarder runs: the bindings still alive in the
+    /// restored client state (so whatever the relay delivered while Kao was away finds its
+    /// session), numbered on from where the saved state left off.
+    pub fn seed(&mut self, seed: BookSeed) {
+        self.tick_clock(seed.now);
+        let after_seeded = seed
+            .sessions
+            .iter()
+            .map(|s| s.ordinal.saturating_add(1))
+            .max()
+            .unwrap_or(1);
+        self.next_ordinal = self.next_ordinal.max(seed.next_ordinal).max(after_seeded);
+        for s in seed.sessions {
+            self.sessions.insert(s.topic.clone(), s);
+        }
+    }
+
+    /// Once a restored runtime is installed: re-send the answers it still owes (they stay
+    /// answered, and a message signature's delivery is tracked again), refuse each request it
+    /// never reviewed ([`Refusal::restarted`]), tell the dapps of sessions Kao no longer binds
+    /// that they're gone (re-sent until delivered), and delete leftover pairings.
+    pub fn apply_restore(&mut self, work: RestoreWork) -> Effects {
+        let mut fx = Effects {
+            changed: true,
+            persist: Persist::Now,
+            ..Default::default()
+        };
+        let interrupted = Refusal::interrupted().error_object();
+        let mut told_interrupted: BTreeMap<String, usize> = BTreeMap::new();
+        for owed in work.owed {
+            let key = WcKey {
+                topic: owed.topic,
+                id: owed.id,
+            };
+            if self.answered.contains(&key) {
+                continue;
+            }
+            if owed.signed_message {
+                self.signed_keys.insert(key.clone());
+            }
+            let host = self.host_of(&key.topic);
+            if owed.answer.as_ref().err() == Some(&interrupted) {
+                *told_interrupted.entry(host.clone()).or_default() += 1;
+            }
+            self.send_answer(key.clone(), owed.answer, None, host, &mut fx);
+            // Saved again with the answer, should this restore be suspended in turn.
+            if let Some(out) = self.outbox.get_mut(&key) {
+                out.dapp_deadline = owed.dapp_deadline;
+            }
+        }
+        for (host, n) in told_interrupted {
+            let text = match n {
+                1 => format!(
+                    "Kao closed while signing a request from {host}; told it the request may have \
+                     gone through."
+                ),
+                n => format!(
+                    "Kao closed while signing {n} requests from {host}; told it they may have \
+                     gone through."
+                ),
+            };
+            self.raise(&mut fx, text, false, false);
+        }
+        let mut refused: BTreeMap<String, usize> = BTreeMap::new();
+        for key in work.stale {
+            if self.answered.contains(&key) {
+                continue;
+            }
+            let host = self.host_of(&key.topic);
+            *refused.entry(host.clone()).or_default() += 1;
+            let refusal = Refusal::restarted().error_object();
+            self.send_answer(key, Err(refusal), None, host, &mut fx);
+        }
+        for (host, n) in refused {
+            let text = match n {
+                1 => {
+                    format!("Told {host} that a request it sent before Kao closed wasn't reviewed.")
+                }
+                n => format!(
+                    "Told {host} that {n} requests it sent before Kao closed weren't reviewed."
+                ),
+            };
+            self.raise(&mut fx, text, false, false);
+        }
+        for topic in work.unbound {
+            if self.sessions.contains_key(&topic) {
+                continue;
+            }
+            self.disconnects.insert(
+                topic.clone(),
+                Resend {
+                    in_flight: true,
+                    ..Resend::default()
+                },
+            );
+            fx.net.push(NetEffect::Disconnect { topic });
+        }
+        fx.net.extend(
+            work.pairings
+                .into_iter()
+                .map(|topic| NetEffect::DeletePairing { topic }),
+        );
+        fx
+    }
+
+    /// Sessions whose settlement Kao hasn't seen acknowledged (restored, or the ack timed out):
+    /// the runtime asks its client whether a late acknowledgement arrived — the crate records one
+    /// without an event.
+    pub fn unconfirmed_sessions(&self) -> Vec<Topic> {
+        self.sessions
+            .values()
+            .filter(|s| s.ack == AckState::Unconfirmed)
+            .map(|s| s.topic.clone())
+            .collect()
+    }
+
+    /// The client saw `topic`'s settlement acknowledged after all.
+    pub fn late_ack(&mut self, topic: &Topic) -> Effects {
+        let mut fx = Effects::default();
+        if let Some(s) = self
+            .sessions
+            .get_mut(topic)
+            .filter(|s| s.ack != AckState::Confirmed)
+        {
+            s.ack = AckState::Confirmed;
+            fx.changed = true;
+            fx.persist = Persist::Soon;
+            fx.log.push(LogEffect::ConnectionAcked {
+                topic: topic.to_string(),
+                ack: AckRecord::Confirmed,
+            });
+        }
+        fx
     }
 
     // ── private ──
@@ -1963,7 +2342,15 @@ impl WcBook {
             return fx;
         };
         if entry.gone.is_some() {
-            // Its session or the request died while signing: nothing can reach the dapp now.
+            // Its session or the request died while signing: nothing can reach the dapp now. Or a
+            // lock or quit closed Kao while it signed: the dapp is still owed word of it, which
+            // the state the suspend saves keeps ([`Self::outbox_entries`]).
+            if entry.gone == Some(GoneReason::Teardown)
+                && matches!(entry.state, QueueState::Signing { .. })
+            {
+                let tx = entry.unconfirmed.as_ref().map(|tx| tx.hash);
+                self.interrupted.insert(key.clone(), tx);
+            }
             let host = self.host_of(&key.topic);
             self.queue.remove(pos);
             fx.changed = true;
@@ -1986,6 +2373,12 @@ impl WcBook {
         let row = self.pending_row(&entry, &host);
         match answer {
             Answer::Result(value) => {
+                // A message signature leaves Kao here: into the history, `Sending` until the
+                // relay confirms it (or the dapp is known to have stopped waiting).
+                if let Some(signed) = self.signed_record(&entry, &value) {
+                    fx.log.push(LogEffect::MessageSigned(signed));
+                    self.signed_keys.insert(key.clone());
+                }
                 if let Some(s) = self.sessions.get_mut(&key.topic) {
                     s.reject_streak = 0;
                 }
@@ -2022,6 +2415,7 @@ impl WcBook {
             );
             return;
         }
+        let dapp_deadline = row.as_ref().and_then(|r| r.dapp_deadline);
         self.outbox.insert(
             key.clone(),
             Outgoing {
@@ -2031,10 +2425,96 @@ impl WcBook {
                 retry_at: 0,
                 row,
                 host,
+                dapp_deadline,
             },
         );
         fx.net.push(NetEffect::Respond { key, answer });
         fx.changed = true;
+        // Write-ahead: the answer is saved before (or while) it goes out, so a restore re-sends it
+        // instead of refusing a request Kao already answered.
+        fx.persist = Persist::Now;
+    }
+
+    /// The history record for a message signature `entry` is answered with (`value`, its `"0x…"`
+    /// hex), or `None` for anything else — or for a signature that isn't hex (logged, not kept).
+    fn signed_record(&self, entry: &QueuedRequest, value: &Value) -> Option<NewSigned> {
+        let (kind, primary_type, payload) = match &entry.call {
+            WcCall::PersonalSign(p) => (
+                SignedKind::Message,
+                None,
+                SignedPayload::Message {
+                    bytes: p.message.to_vec(),
+                },
+            ),
+            WcCall::SignTypedData(t) => {
+                let Ok(json) = serde_json::to_string(&*t.typed) else {
+                    warn!(id = entry.key.id, "signed typed data could not be recorded");
+                    return None;
+                };
+                (
+                    SignedKind::TypedData,
+                    Some(t.checked.primary_type.clone()),
+                    SignedPayload::TypedData { json },
+                )
+            }
+            WcCall::SendTransaction(_)
+            | WcCall::SwitchChain { .. }
+            | WcCall::Accounts
+            | WcCall::ChainId => return None,
+        };
+        let signature = value
+            .as_str()
+            .and_then(|s| s.strip_prefix("0x"))
+            .and_then(|h| alloy::hex::decode(h).ok());
+        let Some(signature) = signature else {
+            warn!(
+                id = entry.key.id,
+                "a message signature that isn't hex; not recorded"
+            );
+            return None;
+        };
+        let session = self.sessions.get(&entry.key.topic)?;
+        Some(NewSigned {
+            at: self.clock,
+            origin: SignOrigin::WalletConnect {
+                topic: entry.key.topic.to_string(),
+                request_id: entry.key.id,
+                session_ordinal: session.ordinal,
+                dapp: DappRecord::from(&session.dapp),
+            },
+            account: AccountRef::from((entry.identity, session.identity_label.clone())),
+            chain_id: entry.chain_id,
+            // Signed by a Safe's owners as an EIP-1271 SafeMessage, whatever the dapp sent.
+            kind: if entry.identity.is_safe() {
+                SignedKind::SafeMessage
+            } else {
+                kind
+            },
+            primary_type,
+            payload,
+            digests: super::message::digest_rows(&entry.call, &entry.identity, entry.chain_id),
+            signature: signature.into(),
+            delivery: Delivery::Sending,
+        })
+    }
+
+    /// `key`'s message signature (if it is one) now known `delivery`: its history record says so
+    /// — with the signature itself once `Delivered` (the history keeps a delivered one).
+    fn signed_delivery(
+        &mut self,
+        key: &WcKey,
+        delivery: Delivery,
+        signature: Option<alloy::primitives::Bytes>,
+        fx: &mut Effects,
+    ) {
+        if self.signed_keys.remove(key) {
+            fx.log.push(LogEffect::MessageDelivery {
+                topic: key.topic.to_string(),
+                request_id: key.id,
+                delivery,
+                signature: signature.filter(|_| delivery == Delivery::Delivered),
+            });
+        }
     }
 
     /// Answer a refusal with no review, and say so: in the activity list always (within the
@@ -2106,6 +2586,7 @@ impl WcBook {
         s.reject_streak = s.reject_streak.saturating_add(1);
         if s.reject_streak >= REJECT_STREAK_PAUSE && !s.paused {
             s.paused = true;
+            fx.persist = fx.persist.max(Persist::Soon);
             let text = format!(
                 "Requests from {} no longer open on their own after {} rejections — \
                  resume them under Apps › WalletConnect.",
@@ -2118,14 +2599,29 @@ impl WcBook {
 
     /// Remove a session and everything queued on it. Waiting requests vanish (the crate dropped
     /// them with the session), an open review is told why, and a signing task is marked gone so its
-    /// `before_send` / `is_live` checks refuse before anything irreversible.
+    /// `before_send` / `is_live` checks refuse before anything irreversible. A bound session's
+    /// connection record ends for `end` (an expiry at the session's own expiry, if that was
+    /// earlier), and the state is saved.
     fn drop_session(
         &mut self,
         topic: &Topic,
         reason: GoneReason,
+        end: EndReason,
         fx: &mut Effects,
     ) -> Option<BoundSession> {
         let removed = self.sessions.remove(topic);
+        if let Some(s) = &removed {
+            let at = match end {
+                EndReason::Expired => self.clock.min(s.expiry),
+                _ => self.clock,
+            };
+            fx.log.push(LogEffect::ConnectionEnded {
+                topic: topic.to_string(),
+                at,
+                reason: end,
+            });
+            fx.persist = Persist::Now;
+        }
         self.budgets.remove(topic);
         self.refusal_toasts.remove(topic);
         let before = self.queue.len();
@@ -2166,6 +2662,7 @@ impl WcBook {
             {
                 lost_result = Some(o.host);
             }
+            self.signed_delivery(&k, Delivery::NotDelivered, None, fx);
         }
         if let Some(host) = lost_result {
             let text = format!("{host} went away before Kao's answer reached it.");
@@ -2236,6 +2733,14 @@ impl WcBook {
     }
 }
 
+/// The raw signature in a message signature's answer (its `"0x…"` hex), if it is one.
+pub(super) fn answer_signature(
+    answer: &Result<Value, ErrorObject>,
+) -> Option<alloy::primitives::Bytes> {
+    let hex = answer.as_ref().ok()?.as_str()?.strip_prefix("0x")?;
+    alloy::hex::decode(hex).ok().map(Into::into)
+}
+
 /// The Activity line for a request refused without a review, naming what was refused: the dapp's
 /// RPC method, or the request's kind when only that is left. Both it and the detail are sanitized
 /// and clamped, since a method name is the dapp's own text.
@@ -2273,6 +2778,17 @@ fn safe_key(identity: &WcIdentity) -> Option<crate::wallet::SafeKey> {
 fn resend_after(attempts: u32) -> u64 {
     let doublings = attempts.saturating_sub(QUICK_RESENDS + 1).min(4);
     (RESEND_BACKOFF_SECS << doublings).min(RESEND_BACKOFF_MAX_SECS)
+}
+
+/// The history's reason for a session that ended for `reason`.
+fn end_reason(reason: GoneReason) -> EndReason {
+    match reason {
+        GoneReason::DappDisconnected => EndReason::DappDisconnected,
+        GoneReason::SessionExpired | GoneReason::Expired => EndReason::Expired,
+        GoneReason::UserDisconnected => EndReason::YouDisconnected,
+        GoneReason::IdentityRemoved => EndReason::AccountRemoved,
+        GoneReason::Teardown => EndReason::TurnedOff,
+    }
 }
 
 fn session_end_text(host: &str, reason: GoneReason) -> String {
@@ -4296,6 +4812,10 @@ mod tests {
         );
         assert_eq!(book.relay(), RelayStatus::Closed);
         assert!(book.sessions().is_empty() && book.proposal().is_none());
+        // Turn off ends the history and clears the saved state itself; a closed runtime saves
+        // nothing.
+        assert!(fx.log.is_empty(), "{:?}", fx.log);
+        assert_eq!(fx.persist, Persist::None);
     }
 
     #[test]
@@ -4345,5 +4865,647 @@ mod tests {
         let fx = book.on_request(&req(&t, 2, None), NOW, Ok(switch(10)), NOW);
         assert_eq!(error_code(&fx), Some(codes::UNRECOGNIZED_CHAIN));
         assert!(!fx.net.iter().any(|e| matches!(e, NetEffect::Emit { .. })));
+    }
+
+    // ── history & saved state ──
+
+    fn ended(fx: &Effects) -> Vec<(String, u64, EndReason)> {
+        fx.log
+            .iter()
+            .filter_map(|e| match e {
+                LogEffect::ConnectionEnded { topic, at, reason } => {
+                    Some((topic.clone(), *at, *reason))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn deliveries(fx: &Effects) -> Vec<(u64, Delivery)> {
+        fx.log
+            .iter()
+            .filter_map(|e| match e {
+                LogEffect::MessageDelivery {
+                    request_id,
+                    delivery,
+                    ..
+                } => Some((*request_id, *delivery)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn signature_hex() -> Value {
+        json!(format!("0x{}", "11".repeat(65)))
+    }
+
+    #[test]
+    fn a_connection_is_logged_from_bind_to_its_end_and_each_step_saves() {
+        let mut book = WcBook::new();
+        let t = topic(1);
+        let p = proposal(1_001, pairing(1), NOW + 300);
+        let fx = book.bind_session(
+            &session(t.clone(), pairing(1)),
+            &ticket(&p, eoa(), &[]),
+            NOW,
+        );
+        assert_eq!(fx.persist, Persist::Now);
+        assert_eq!(
+            fx.log,
+            vec![LogEffect::ConnectionOpened(NewConnection {
+                topic: t.to_string(),
+                dapp: DappRecord::from(&DappLabel::from_metadata(&meta())),
+                account: AccountRef::Eoa {
+                    address: ADDR,
+                    label: "Account 1".into()
+                },
+                chains: vec![1, 8453],
+                connected_at: NOW,
+                ack: AckRecord::Pending,
+            })]
+        );
+        let fx = book.on_ack(&t, Ok(()));
+        assert_eq!(fx.persist, Persist::Now);
+        assert_eq!(
+            fx.log,
+            vec![LogEffect::ConnectionAcked {
+                topic: t.to_string(),
+                ack: AckRecord::Confirmed
+            }]
+        );
+        let timed_out = bound(&mut book, 2, eoa());
+        let fx = book.on_ack(&timed_out, Err(AckFailure::Timeout));
+        assert_eq!(
+            fx.log,
+            vec![LogEffect::ConnectionAcked {
+                topic: timed_out.to_string(),
+                ack: AckRecord::Unconfirmed
+            }]
+        );
+
+        // Each way a session ends, with its own reason.
+        book.tick(NOW + 10);
+        let fx = book.user_disconnect(&t, GoneReason::UserDisconnected);
+        assert_eq!(fx.persist, Persist::Now);
+        assert_eq!(
+            ended(&fx),
+            vec![(t.to_string(), NOW + 10, EndReason::YouDisconnected)]
+        );
+        let fx = book.on_session_gone(&timed_out, GoneReason::DappDisconnected);
+        assert_eq!(ended(&fx)[0].2, EndReason::DappDisconnected);
+        let declined = bound(&mut book, 3, eoa());
+        let fx = book.on_ack(&declined, Err(AckFailure::Refused));
+        assert_eq!(
+            ended(&fx)[0].2,
+            EndReason::DappDeclined,
+            "not \"disconnected\""
+        );
+        let removed = bound(&mut book, 4, safe());
+        let fx = book.reconcile(&[eoa()]);
+        assert_eq!(
+            ended(&fx),
+            vec![(removed.to_string(), NOW + 10, EndReason::AccountRemoved)]
+        );
+        // An expiry ends at the session's own expiry when the sweep runs late.
+        let late = bound(&mut book, 5, eoa());
+        book.tick(NOW + 8 * 86_400);
+        let fx = book.on_session_gone(&late, GoneReason::SessionExpired);
+        assert_eq!(
+            ended(&fx),
+            vec![(late.to_string(), NOW + 7 * 86_400, EndReason::Expired)]
+        );
+        // Nothing bound, nothing logged.
+        assert!(
+            book.on_session_gone(&late, GoneReason::DappDisconnected)
+                .log
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn extend_resume_and_pause_save_soon() {
+        let mut book = WcBook::new();
+        let t = bound(&mut book, 1, eoa());
+        let fx = book.on_session_extended(&t, NOW + 30 * 86_400);
+        assert_eq!(fx.persist, Persist::Soon);
+        assert_eq!(book.session(&t).map(|s| s.expiry), Some(NOW + 30 * 86_400));
+        assert_eq!(
+            book.on_session_extended(&topic(9), NOW).persist,
+            Persist::None
+        );
+        let mut paused = Persist::None;
+        for id in 1..=REJECT_STREAK_PAUSE as u64 {
+            queue(&mut book, &t, id);
+            let fx = book.answer(&key(&t, id), Answer::Refuse(Refusal::user_rejected()));
+            paused = paused.max(fx.persist);
+        }
+        assert!(book.session(&t).is_some_and(|s| s.paused));
+        assert!(paused >= Persist::Soon);
+        let fx = book.resume(&t);
+        assert_eq!(fx.persist, Persist::Soon);
+        assert!(book.session(&t).is_some_and(|s| !s.paused));
+    }
+
+    #[test]
+    fn a_request_and_every_answer_save_at_once() {
+        let mut book = WcBook::new();
+        let t = bound(&mut book, 1, eoa());
+        assert_eq!(
+            queue(&mut book, &t, 1).persist,
+            Persist::Now,
+            "the client holds it"
+        );
+        let fx = book.answer(&key(&t, 1), Answer::Refuse(Refusal::user_rejected()));
+        assert_eq!(fx.persist, Persist::Now, "write-ahead of the outbox");
+        let fx = book.on_responded(&key(&t, 1), RespondResult::Delivered);
+        assert_eq!(fx.persist, Persist::Now);
+        assert!(fx.log.is_empty(), "a refusal is no signature");
+    }
+
+    #[test]
+    fn a_message_signature_is_logged_then_its_delivery() {
+        let mut book = WcBook::new();
+        let t = bound(&mut book, 1, eoa());
+        for id in 1..=3 {
+            queue(&mut book, &t, id);
+            to_signing(&mut book, &key(&t, id), id);
+        }
+        let fx = book.answer(&key(&t, 1), Answer::Result(signature_hex()));
+        let [LogEffect::MessageSigned(signed)] = fx.log.as_slice() else {
+            panic!("one MessageSigned: {:?}", fx.log);
+        };
+        assert_eq!(signed.kind, SignedKind::Message);
+        assert_eq!(signed.delivery, Delivery::Sending);
+        assert_eq!(signed.signature.len(), 65);
+        assert_eq!(signed.chain_id, 1);
+        assert_eq!(
+            signed.payload,
+            SignedPayload::Message {
+                bytes: b"hi".to_vec()
+            }
+        );
+        assert_eq!(
+            signed.digests,
+            super::super::message::digest_rows(&personal().call, &eoa(), 1)
+        );
+        assert!(!signed.digests.is_empty());
+        assert_eq!(
+            signed.origin,
+            SignOrigin::WalletConnect {
+                topic: t.to_string(),
+                request_id: 1,
+                session_ordinal: 1,
+                dapp: DappRecord::from(&DappLabel::from_metadata(&meta())),
+            }
+        );
+        let owed = book.outbox_entries();
+        assert!(owed.iter().any(|a| a.id == 1 && a.signed_message));
+        let fx = book.on_responded(&key(&t, 1), RespondResult::Delivered);
+        assert_eq!(deliveries(&fx), vec![(1, Delivery::Delivered)]);
+
+        book.answer(&key(&t, 2), Answer::Result(signature_hex()));
+        let fx = book.on_responded(&key(&t, 2), RespondResult::Gone("gone".into()));
+        assert_eq!(deliveries(&fx), vec![(2, Delivery::NotDelivered)]);
+        // Once known, never again.
+        assert!(
+            book.on_responded(&key(&t, 2), RespondResult::Delivered)
+                .log
+                .is_empty()
+        );
+
+        // A "signature" that isn't hex is answered, but not recorded.
+        let fx = book.answer(&key(&t, 3), Answer::Result(json!("not hex")));
+        assert!(fx.log.is_empty());
+        assert_eq!(responds(&fx).len(), 1);
+    }
+
+    #[test]
+    fn a_safe_message_is_logged_as_one() {
+        let mut book = WcBook::new();
+        let t = bound(&mut book, 1, safe());
+        let admitted = Admitted {
+            chain_id: 8453,
+            ..personal()
+        };
+        book.on_request(&req(&t, 1, None), NOW, Ok(admitted), NOW);
+        to_signing(&mut book, &key(&t, 1), 1);
+        let fx = book.answer(&key(&t, 1), Answer::Result(signature_hex()));
+        let [LogEffect::MessageSigned(signed)] = fx.log.as_slice() else {
+            panic!("one MessageSigned: {:?}", fx.log);
+        };
+        assert_eq!(signed.kind, SignedKind::SafeMessage);
+        assert_eq!(
+            signed.account,
+            AccountRef::Safe {
+                address: SAFE,
+                chain_id: 8453,
+                label: "Account 1".into()
+            }
+        );
+        assert_eq!(signed.digests.len(), 4, "the SafeMessage triple + EIP-191");
+    }
+
+    #[test]
+    fn an_undelivered_signature_ends_not_delivered_when_its_session_or_request_goes() {
+        let mut book = WcBook::new();
+        let t = bound(&mut book, 1, eoa());
+        for id in 1..=2 {
+            queue(&mut book, &t, id);
+            to_signing(&mut book, &key(&t, id), id);
+            book.answer(&key(&t, id), Answer::Result(signature_hex()));
+        }
+        // Both failed once and wait for the next connection.
+        book.on_relay(false, NOW);
+        for id in 1..=2 {
+            book.on_responded(&key(&t, id), RespondResult::Retry("down".into()));
+        }
+        let fx = book.on_request_expired(&key(&t, 1));
+        assert_eq!(deliveries(&fx), vec![(1, Delivery::NotDelivered)]);
+        let fx = book.on_session_gone(&t, GoneReason::DappDisconnected);
+        assert_eq!(deliveries(&fx), vec![(2, Delivery::NotDelivered)]);
+    }
+
+    /// Torn down (Turn off, a lock or quit without a data key), the book gives up what its last
+    /// try doesn't deliver — nothing sends it again — and, once the client is shut down, every
+    /// answer still owed: each message signature among them `NotDelivered`, never `Sending`
+    /// forever. A suspend keeps a failed answer owed instead (its saved state carries it).
+    #[test]
+    fn a_torn_down_book_gives_up_the_signatures_it_couldnt_deliver() {
+        let signed_and_refused = |book: &mut WcBook, ids: &[u64]| {
+            let t = bound(book, 1, eoa());
+            for &id in ids {
+                queue(book, &t, id);
+                to_signing(book, &key(&t, id), id);
+                book.answer(&key(&t, id), Answer::Result(signature_hex()));
+            }
+            book.on_relay(false, NOW);
+            for &id in ids {
+                book.on_responded(&key(&t, id), RespondResult::Retry("down".into()));
+            }
+            t
+        };
+        let mut book = WcBook::new();
+        let t = signed_and_refused(&mut book, &[1, 2]);
+        let fx = book.teardown();
+        assert_eq!(responds(&fx).len(), 2, "each gets its last try");
+        let fx = book.on_responded(&key(&t, 1), RespondResult::Retry("down".into()));
+        assert_eq!(deliveries(&fx), vec![(1, Delivery::NotDelivered)]);
+        assert!(responds(&fx).is_empty(), "no further try");
+        assert!(book.outbox_entries().iter().all(|o| o.id != 1));
+        // The other's last try was cut short: given up with the rest.
+        let fx = book.abandon_outbox();
+        assert_eq!(deliveries(&fx), vec![(2, Delivery::NotDelivered)]);
+        assert!(book.outbox_entries().is_empty());
+        assert!(deliveries(&book.abandon_outbox()).is_empty(), "once");
+
+        let mut kept = WcBook::new();
+        let u = signed_and_refused(&mut kept, &[1]);
+        kept.suspend();
+        let fx = kept.on_responded(&key(&u, 1), RespondResult::Retry("down".into()));
+        assert!(deliveries(&fx).is_empty());
+        assert_eq!(
+            kept.outbox_entries().len(),
+            1,
+            "still owed, for the restore"
+        );
+    }
+
+    /// An owed answer is saved with its request's dapp deadline — and saved again with it by a
+    /// restored book — so a restore can tell when the crate may have dropped the request
+    /// unanswered at that deadline.
+    #[test]
+    fn an_owed_answer_is_saved_with_its_dapp_deadline() {
+        let mut book = WcBook::new();
+        let t = bound(&mut book, 1, eoa());
+        book.on_request(&req(&t, 1, Some(NOW + 600)), NOW, Ok(personal()), NOW);
+        to_signing(&mut book, &key(&t, 1), 1);
+        book.answer(&key(&t, 1), Answer::Result(signature_hex()));
+        let owed = book.outbox_entries();
+        assert_eq!(owed.len(), 1);
+        assert_eq!(
+            (owed[0].dapp_deadline, owed[0].signed_message),
+            (Some(NOW + 600), true)
+        );
+        let mut restored = WcBook::new();
+        bound(&mut restored, 1, eoa());
+        restored.apply_restore(RestoreWork {
+            owed: owed.clone(),
+            ..RestoreWork::default()
+        });
+        assert_eq!(restored.outbox_entries(), owed);
+    }
+
+    #[test]
+    fn suspend_answers_like_a_teardown_but_keeps_every_session() {
+        let mut book = WcBook::new();
+        let a = bound(&mut book, 1, eoa());
+        let b = bound(&mut book, 2, safe());
+        queue(&mut book, &a, 1);
+        queue(&mut book, &a, 2);
+        to_signing(&mut book, &key(&a, 2), 1);
+        book.user_disconnect(&b, GoneReason::UserDisconnected);
+        let fx = book.suspend();
+        assert!(
+            !fx.net
+                .iter()
+                .any(|e| matches!(e, NetEffect::Disconnect { .. })),
+            "no dapp is disconnected: {:?}",
+            fx.net
+        );
+        assert_eq!(error_code(&fx), Some(codes::DISCONNECTED));
+        assert_eq!(
+            book.request(&key(&a, 2)).and_then(|q| q.gone),
+            Some(GoneReason::Teardown)
+        );
+        assert!(book.session(&a).is_some(), "the session stays");
+        assert_eq!(book.relay(), RelayStatus::Closed);
+        assert!(fx.log.is_empty() && fx.persist == Persist::None);
+        let (sessions, next) = book.bindings();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].topic, a);
+        assert_eq!(next, 3);
+    }
+
+    /// A request Kao is signing when a lock or quit closes it may have gone out (a transaction
+    /// past its guard broadcasts regardless): the saved state owes the dapp "it may have gone
+    /// through" — the "unconfirmed" refusal once a transaction was noted — never "not reviewed",
+    /// even after a late result took the entry off the queue.
+    #[test]
+    fn a_request_signing_at_suspend_is_owed_word_of_its_unknown_outcome() {
+        let mut book = WcBook::new();
+        let t = bound(&mut book, 1, eoa());
+        for id in 1..=3 {
+            queue(&mut book, &t, id);
+        }
+        to_signing(&mut book, &key(&t, 1), 1);
+        // Signing right now (a crash would leave it there): already owed.
+        let owed = book.outbox_entries();
+        assert_eq!(
+            owed.iter()
+                .map(|o| (o.id, o.answer.clone()))
+                .collect::<Vec<_>>(),
+            vec![(1, Err(Refusal::interrupted().error_object()))]
+        );
+        to_signing(&mut book, &key(&t, 2), 2);
+        let hash = alloy::primitives::B256::repeat_byte(0xcd);
+        book.note_unconfirmed(
+            &key(&t, 2),
+            UnconfirmedTx {
+                hash,
+                raw: Bytes::from_static(&[1]),
+                nonce: 0,
+            },
+        );
+        let fx = book.suspend();
+        assert_eq!(
+            responds(&fx),
+            vec![(key(&t, 3), Err(Refusal::closing().error_object()))],
+            "only the request nobody reviewed is cancelled"
+        );
+        let owed_now = |book: &WcBook| {
+            let mut owed: Vec<(u64, Result<Value, ErrorObject>, Option<_>)> = book
+                .outbox_entries()
+                .into_iter()
+                .filter(|o| o.id != 3)
+                .map(|o| (o.id, o.answer, o.unconfirmed_tx))
+                .collect();
+            owed.sort_by_key(|o| o.0);
+            owed
+        };
+        let expected = vec![
+            (1, Err(Refusal::interrupted().error_object()), None),
+            (
+                2,
+                Err(Refusal::unconfirmed(hash).error_object()),
+                Some(hash),
+            ),
+        ];
+        assert_eq!(owed_now(&book), expected);
+        // The broadcast's result lands after the suspend closed the book: discarded, and still
+        // owed as before.
+        let fx = book.answer(&key(&t, 1), Answer::Result(json!("0xabab")));
+        assert!(responds(&fx).is_empty());
+        book.answer(&key(&t, 2), Answer::Refuse(Refusal::failed("timed out")));
+        assert!(book.request(&key(&t, 1)).is_none() && book.request(&key(&t, 2)).is_none());
+        assert_eq!(owed_now(&book), expected);
+        // A request whose session went while it was signed is owed nothing.
+        let mut gone = WcBook::new();
+        let u = bound(&mut gone, 2, eoa());
+        queue(&mut gone, &u, 1);
+        to_signing(&mut gone, &key(&u, 1), 1);
+        gone.on_session_gone(&u, GoneReason::DappDisconnected);
+        gone.suspend();
+        assert!(gone.outbox_entries().is_empty());
+
+        // A restored book sends it, and its Activity list says so — not "wasn't reviewed".
+        let mut restored = WcBook::new();
+        bound(&mut restored, 1, eoa());
+        let fx = restored.apply_restore(RestoreWork {
+            owed: book
+                .outbox_entries()
+                .into_iter()
+                .filter(|o| o.id == 1)
+                .collect(),
+            ..RestoreWork::default()
+        });
+        assert_eq!(
+            responds(&fx),
+            vec![(key(&t, 1), Err(Refusal::interrupted().error_object()))]
+        );
+        let notices: Vec<String> = restored
+            .snapshot(NOW)
+            .notices
+            .into_iter()
+            .map(|n| n.text)
+            .collect();
+        assert!(
+            notices.iter().any(|n| n.contains("may have gone through")),
+            "{notices:?}"
+        );
+        assert!(
+            !notices.iter().any(|n| n.contains("reviewed")),
+            "{notices:?}"
+        );
+    }
+
+    /// A disconnect the user asked for that hasn't reached the relay gets its last try at a
+    /// suspend, as at a teardown — and no bound session is disconnected.
+    #[test]
+    fn suspend_gives_an_owed_disconnect_its_last_try() {
+        let mut book = WcBook::new();
+        let kept = bound(&mut book, 1, eoa());
+        let doomed = bound(&mut book, 2, eoa());
+        let in_flight = bound(&mut book, 3, eoa());
+        book.user_disconnect(&doomed, GoneReason::UserDisconnected);
+        book.on_relay(false, NOW);
+        book.on_disconnected(&doomed, RespondResult::Retry("down".into()));
+        book.user_disconnect(&in_flight, GoneReason::UserDisconnected);
+        let fx = book.suspend();
+        let disconnects: Vec<&Topic> = fx
+            .net
+            .iter()
+            .filter_map(|e| match e {
+                NetEffect::Disconnect { topic } => Some(topic),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(disconnects, vec![&doomed], "once, and only the owed one");
+        assert!(book.session(&kept).is_some());
+        // Delivered: nothing is owed any more.
+        book.on_disconnected(&doomed, RespondResult::Delivered);
+        book.on_disconnected(&in_flight, RespondResult::Delivered);
+        assert!(
+            book.suspend()
+                .net
+                .iter()
+                .all(|e| !matches!(e, NetEffect::Disconnect { .. }))
+        );
+    }
+
+    /// A delivered message signature's history update carries the signature (the history keeps a
+    /// delivered one); an undelivered one's never does.
+    #[test]
+    fn a_delivered_signature_reaches_the_history_with_its_bytes() {
+        let mut book = WcBook::new();
+        let t = bound(&mut book, 1, eoa());
+        for id in 1..=2 {
+            queue(&mut book, &t, id);
+            to_signing(&mut book, &key(&t, id), id);
+            book.answer(&key(&t, id), Answer::Result(signature_hex()));
+        }
+        let signature = |fx: &Effects| {
+            fx.log.iter().find_map(|e| match e {
+                LogEffect::MessageDelivery { signature, .. } => Some(signature.clone()),
+                _ => None,
+            })
+        };
+        let fx = book.on_responded(&key(&t, 1), RespondResult::Delivered);
+        assert_eq!(
+            signature(&fx),
+            Some(Some(Bytes::from(vec![0x11; 65]))),
+            "delivered, with its bytes"
+        );
+        let fx = book.on_responded(&key(&t, 2), RespondResult::Gone("gone".into()));
+        assert_eq!(signature(&fx), Some(None), "not delivered, no bytes");
+    }
+
+    #[test]
+    fn bindings_and_owed_answers_seed_a_restored_book() {
+        let mut book = WcBook::new();
+        let a = bound(&mut book, 1, eoa());
+        let b = bound(&mut book, 2, safe());
+        book.resume(&a);
+        // One answer owed, one transaction that may be on its way.
+        queue(&mut book, &a, 1);
+        to_signing(&mut book, &key(&a, 1), 1);
+        book.answer(&key(&a, 1), Answer::Result(signature_hex()));
+        queue(&mut book, &a, 2);
+        to_signing(&mut book, &key(&a, 2), 2);
+        let hash = alloy::primitives::B256::repeat_byte(0xab);
+        book.note_unconfirmed(
+            &key(&a, 2),
+            UnconfirmedTx {
+                hash,
+                raw: Bytes::from_static(&[1]),
+                nonce: 0,
+            },
+        );
+        let (saved, next_ordinal) = book.bindings();
+        let owed = book.outbox_entries();
+        assert_eq!(owed.len(), 2);
+        let unconfirmed = owed
+            .iter()
+            .find(|o| o.id == 2)
+            .expect("the unconfirmed one");
+        assert_eq!(unconfirmed.unconfirmed_tx, Some(hash));
+        assert_eq!(
+            unconfirmed.answer,
+            Err(Refusal::unconfirmed(hash).error_object())
+        );
+
+        // A restored book: the bindings seeded as the plan would.
+        let mut restored = WcBook::new();
+        let sessions = saved
+            .iter()
+            .map(|s| BoundSession {
+                topic: s.topic.clone(),
+                pairing_topic: s.pairing_topic.clone(),
+                ordinal: s.ordinal,
+                identity: s.identity.into(),
+                identity_label: s.identity_label.clone(),
+                chains: s.chains.clone(),
+                methods: s.methods.clone(),
+                events: s.events.clone(),
+                dapp: (&s.dapp).into(),
+                expiry: s.expiry,
+                ack: AckState::Unconfirmed,
+                paused: s.paused,
+                reject_streak: 0,
+            })
+            .collect();
+        restored.seed(BookSeed {
+            sessions,
+            next_ordinal,
+            now: NOW,
+        });
+        assert_eq!(restored.sessions().len(), 2);
+        assert_eq!(restored.session(&b).map(|s| s.identity), Some(safe()));
+        assert_eq!(restored.session(&a).map(|s| s.ordinal), Some(1));
+        let fresh = bound(&mut restored, 3, eoa());
+        assert_eq!(restored.session(&fresh).map(|s| s.ordinal), Some(3));
+
+        let stale = key(&a, 9);
+        let fx = restored.apply_restore(RestoreWork {
+            owed,
+            stale: vec![stale.clone()],
+            unbound: vec![topic(7)],
+            pairings: vec![pairing(1)],
+        });
+        assert_eq!(fx.persist, Persist::Now);
+        let answers = responds(&fx);
+        assert!(
+            answers.contains(&(key(&a, 1), Ok(signature_hex()))),
+            "re-sent as it was"
+        );
+        assert!(answers.contains(&(key(&a, 2), Err(Refusal::unconfirmed(hash).error_object()))));
+        assert!(answers.contains(&(stale.clone(), Err(Refusal::restarted().error_object()))));
+        assert!(fx.net.contains(&NetEffect::Disconnect { topic: topic(7) }));
+        assert!(
+            fx.net
+                .contains(&NetEffect::DeletePairing { topic: pairing(1) })
+        );
+        // The unbound session is doomed until the dapp hears.
+        assert!(!restored.is_idle());
+        let fx = restored.on_disconnected(&topic(7), RespondResult::Delivered);
+        assert_eq!(fx.persist, Persist::Now);
+        // The owed signature's delivery is tracked again; a replay of the stale id is a duplicate.
+        let fx = restored.on_responded(&key(&a, 1), RespondResult::Delivered);
+        assert_eq!(deliveries(&fx), vec![(1, Delivery::Delivered)]);
+        restored.on_responded(&stale, RespondResult::Delivered);
+        let fx = restored.on_request(&req(&a, 9, None), NOW, Ok(personal()), NOW);
+        assert_eq!(error_code(&fx), Some(codes::INVALID_REQUEST));
+    }
+
+    #[test]
+    fn a_late_acknowledgement_confirms_the_session() {
+        let mut book = WcBook::new();
+        let t = bound(&mut book, 1, eoa());
+        assert!(
+            book.unconfirmed_sessions().is_empty(),
+            "pending, with a waiter"
+        );
+        book.on_ack(&t, Err(AckFailure::Timeout));
+        assert_eq!(book.unconfirmed_sessions(), vec![t.clone()]);
+        let fx = book.late_ack(&t);
+        assert_eq!(fx.persist, Persist::Soon);
+        assert_eq!(
+            fx.log,
+            vec![LogEffect::ConnectionAcked {
+                topic: t.to_string(),
+                ack: AckRecord::Confirmed
+            }]
+        );
+        assert!(book.unconfirmed_sessions().is_empty());
+        assert!(book.late_ack(&t).log.is_empty(), "once");
     }
 }

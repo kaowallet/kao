@@ -4857,6 +4857,94 @@ mod tests {
         assert!(err.stale && err.text.contains("queue"), "{err:?}");
     }
 
+    // ── signed-message history: the same fingerprints the review showed ────────
+
+    /// Every ERC-8213 row the review showed for `steps`, in order.
+    fn review_rows(steps: &[SignStep]) -> Vec<(String, B256)> {
+        steps
+            .iter()
+            .flat_map(super::super::sign_review::erc8213_rows)
+            .collect()
+    }
+
+    fn history_rows(call: &wc::WcCall, identity: &wc::WcIdentity) -> Vec<(String, B256)> {
+        crate::walletconnect::message::digest_rows(call, identity, 1)
+            .into_iter()
+            .map(|r| (r.label, r.hash))
+            .collect()
+    }
+
+    /// What the signed-message history keeps (`walletconnect::message::digest_rows`) is exactly
+    /// what the review showed (`sign_review::erc8213_rows`) — same rows, same labels, same order —
+    /// for a message and typed data, from an EOA and through a Safe.
+    #[test]
+    fn history_digests_match_the_review_fingerprints() {
+        let eoa = local_addr(0x11);
+        let safe = addr(SAFE);
+        let net = NetworkId::Builtin(Chain::Mainnet);
+        let personal = |from: Address| wc::PersonalSign {
+            from,
+            message: Bytes::from_static(b"Sign in to app.example"),
+            shape: wc::MessageShape::Text {
+                lines: vec!["Sign in to app.example".into()],
+            },
+            siwe: None,
+        };
+
+        let id = wc::WcIdentity::Eoa { address: eoa };
+        let call = personal(eoa);
+        let (steps, _) = personal_steps(origin(id, "Sign message"), eoa, net, &call, false);
+        let review = review_rows(&steps);
+        assert!(!review.is_empty());
+        assert_eq!(history_rows(&wc::WcCall::PersonalSign(call), &id), review);
+
+        let req = typed_request(eoa);
+        let (steps, _) = typed_steps(origin(id, "Sign typed data"), eoa, net, &req, false, None);
+        let review = review_rows(&steps);
+        assert_eq!(review.len(), 3, "the EIP-712 triple");
+        assert_eq!(history_rows(&wc::WcCall::SignTypedData(req), &id), review);
+
+        let id = wc::WcIdentity::Safe {
+            address: safe,
+            chain_id: 1,
+        };
+        let call = personal(safe);
+        let (steps, _, _) = safe_message_steps(
+            origin(id, "Sign message"),
+            safe,
+            Chain::Mainnet,
+            1,
+            1,
+            Vec::new(),
+            WcSafeMessageSource::Personal(&call),
+        );
+        let review = review_rows(&steps);
+        assert!(
+            review.len() > 3,
+            "the SafeMessage triple plus the dapp's digest"
+        );
+        assert_eq!(history_rows(&wc::WcCall::PersonalSign(call), &id), review);
+
+        let req = typed_request(safe);
+        let (steps, _, _) = safe_message_steps(
+            origin(id, "Sign typed data"),
+            safe,
+            Chain::Mainnet,
+            1,
+            1,
+            Vec::new(),
+            WcSafeMessageSource::Typed(&req),
+        );
+        let review = review_rows(&steps);
+        assert!(
+            review
+                .iter()
+                .any(|(label, _)| label == crate::sign::digest::DAPP_EIP712_DIGEST_LABEL),
+            "{review:?}"
+        );
+        assert_eq!(history_rows(&wc::WcCall::SignTypedData(req), &id), review);
+    }
+
     // ── Safe messages (EIP-1271) ──────────────────────────────────────────────
 
     /// The copy follows the verdict, not the detail's wording: a rejection reads as one whatever

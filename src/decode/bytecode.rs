@@ -63,11 +63,22 @@ pub fn extract(code: &[u8]) -> Vec<ExtractedFn> {
 /// Convenience: arg-type list for one specific selector, or `None` if
 /// `code` doesn't expose that selector. Keeps callers from open-coding
 /// `extract().into_iter().find(...)`.
+///
+/// Skips evmole's state-mutability pass, which dominates [`extract`]'s cost
+/// on large contracts (tens of ms) and which this caller discards.
 pub fn lookup(code: &[u8], selector: [u8; 4]) -> Option<Vec<DynSolType>> {
-    extract(code)
+    if code.is_empty() {
+        return None;
+    }
+    let args = evmole::ContractInfoArgs::new(code)
+        .with_selectors()
+        .with_arguments();
+    evmole::contract_info(args)
+        .functions
+        .unwrap_or_default()
         .into_iter()
         .find(|f| f.selector == selector)
-        .map(|f| f.arg_types)
+        .map(|f| f.arguments.unwrap_or_default())
 }
 
 /// Minimal compiled `transfer(address,uint256)` dispatcher. Hand-

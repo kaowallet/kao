@@ -116,27 +116,29 @@ pub async fn resolve_implementation(
     }
 }
 
-/// Read each known proxy slot in turn. Returns the first slot that
-/// holds a non-zero address, plus whether THAT read was verified. Slot
-/// errors are non-fatal — a borked RPC for one slot doesn't prevent the
-/// walker from trying the next.
+/// Read every known proxy slot. Returns the first slot (in [`SLOTS`]
+/// order) that holds a non-zero address, plus whether THAT read was
+/// verified. Slot errors are non-fatal — a borked RPC for one slot
+/// doesn't prevent the walker from using the next.
+///
+/// The reads are issued concurrently: each is a full proof round-trip, and
+/// a plain (non-proxy) contract — the common case — has to read all of
+/// them to find out it isn't one.
 async fn probe_slots(
     net: &dyn BalanceFetcher,
     chain: Chain,
     addr: Address,
 ) -> Option<(Address, bool)> {
-    for slot in SLOTS {
-        let slot_u256 = U256::from_be_bytes(slot.0);
-        match net.get_storage_at(addr, slot_u256, chain).await {
-            Ok(read) => {
-                if let Some(impl_addr) = address_from_slot(read.value) {
-                    return Some((impl_addr, read.verified));
-                }
-            }
-            Err(_) => continue,
-        }
-    }
-    None
+    let reads = futures::future::join_all(
+        SLOTS
+            .iter()
+            .map(|slot| net.get_storage_at(addr, U256::from_be_bytes(slot.0), chain)),
+    )
+    .await;
+    reads.into_iter().find_map(|read| {
+        let read = read.ok()?;
+        address_from_slot(read.value).map(|impl_addr| (impl_addr, read.verified))
+    })
 }
 
 /// ERC-1167 minimal-proxy runtime, split around the 20-byte target it embeds:

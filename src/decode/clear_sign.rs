@@ -11,8 +11,8 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use alloy::primitives::{Address, Bytes, U256};
 use tracing::{debug, info, trace, warn};
@@ -47,6 +47,14 @@ pub struct KaoDataProvider<'a> {
     /// Built once at task-spawn time so the async decode doesn't need
     /// the `RwLock<ContactsBook>`.
     local_names: HashMap<Address, String>,
+    /// Per-decode memo of [`DataProvider::resolve_token`], keyed by
+    /// `(chain_id, address)`. The engine renders fields one at a time and
+    /// then renders them again to interpolate the intent, so without this
+    /// every token in a call costs two rounds of verified `eth_call`s.
+    tokens: Mutex<HashMap<(u64, Address), Option<TokenMeta>>>,
+    /// Per-decode memo of [`DataProvider::resolve_ens_name`] — the same
+    /// double render, and a reverse lookup is four dependent verified reads.
+    ens_names: Mutex<HashMap<Address, Option<String>>>,
 }
 
 impl<'a> KaoDataProvider<'a> {
@@ -60,11 +68,23 @@ impl<'a> KaoDataProvider<'a> {
             chain,
             all_verified: Arc::new(AtomicBool::new(true)),
             local_names,
+            tokens: Mutex::new(HashMap::new()),
+            ens_names: Mutex::new(HashMap::new()),
         }
     }
 
     pub fn all_verified(&self) -> bool {
         self.all_verified.load(Ordering::Relaxed)
+    }
+
+    fn tokens_memo(&self) -> std::sync::MutexGuard<'_, HashMap<(u64, Address), Option<TokenMeta>>> {
+        self.tokens.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn ens_memo(&self) -> std::sync::MutexGuard<'_, HashMap<Address, Option<String>>> {
+        self.ens_names
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -90,7 +110,11 @@ impl DataProvider for KaoDataProvider<'_> {
                     return None;
                 }
             };
-            match read_token_meta(self.net, chain, addr).await {
+            if let Some(hit) = self.tokens_memo().get(&(chain_id, addr)) {
+                trace!(%addr, "clear-sign: resolve_token: memoized");
+                return hit.clone();
+            }
+            let meta = match read_token_meta(self.net, chain, addr).await {
                 Some((info, verified)) => {
                     if !verified {
                         self.all_verified.store(false, Ordering::Relaxed);
@@ -113,7 +137,9 @@ impl DataProvider for KaoDataProvider<'_> {
                     trace!(%addr, "clear-sign: no token metadata for address");
                     None
                 }
-            }
+            };
+            self.tokens_memo().insert((chain_id, addr), meta.clone());
+            meta
         })
     }
 
@@ -158,11 +184,15 @@ impl DataProvider for KaoDataProvider<'_> {
                     return None;
                 }
             };
+            if let Some(hit) = self.ens_memo().get(&addr) {
+                trace!(%addr, "clear-sign: resolve_ens_name: memoized");
+                return hit.clone();
+            }
             // Verified (Helios, mainnet-only) reverse lookup across ENS / GNS /
             // WNS — an unverified read fails closed inside `lookup_address`, so
             // a hostile RPC can't fabricate a name on the clear-signing review
             // surface.
-            match crate::names::lookup_address(self.net, addr).await {
+            let name = match crate::names::lookup_address(self.net, addr).await {
                 Ok(Some(name)) => {
                     debug!(%addr, %name, "clear-sign: resolved ENS name");
                     Some(name)
@@ -175,7 +205,9 @@ impl DataProvider for KaoDataProvider<'_> {
                     debug!(%addr, error = %e, "clear-sign: ENS lookup failed");
                     None
                 }
-            }
+            };
+            self.ens_memo().insert(addr, name.clone());
+            name
         })
     }
 }
@@ -345,6 +377,18 @@ impl DecodeResult {
 // ---------------------------------------------------------------------------
 // Orchestrator
 
+/// The embedded ERC-7730 registry, indexed once per process. Building it
+/// parses ~200 KB of index JSON, and the snapshot is compiled in, so it can
+/// never change underneath the cache. An `Err` is a broken snapshot (build-time
+/// data) and stays broken; kept as its message so every decode can log it.
+static BUNDLED_REGISTRY: LazyLock<Result<BundledRegistrySource, String>> = LazyLock::new(|| {
+    let source = BundledRegistrySource::new().map_err(|e| format!("{e:?}"));
+    if source.is_ok() {
+        debug!("clear-sign: bundled registry loaded");
+    }
+    source
+});
+
 /// Top-level decode entry point. Tries ERC-7730 descriptors first, then
 /// falls back to the heuristic pipeline.
 pub async fn decode_transaction(
@@ -381,9 +425,8 @@ pub async fn decode_transaction(
     );
 
     // Walk the proxy chain so we can pass the implementation address to
-    // the descriptor resolver. The heuristic path re-walks this (cheap,
-    // cached in Helios); keeping it self-contained simplifies the
-    // fallback.
+    // the descriptor resolver. The heuristic fallback reuses this walk
+    // rather than repeating its slot reads.
     let resolved = proxy::resolve_implementation(net, chain, to).await;
     let impl_addr = resolved.implementation;
     let proxy_hops = resolved.hops.clone();
@@ -425,10 +468,9 @@ pub async fn decode_transaction(
     let data_provider = KaoDataProvider::new(net, chain, local_names);
 
     // Try the bundled registry.
-    match BundledRegistrySource::new() {
+    match &*BUNDLED_REGISTRY {
         Ok(source) => {
-            debug!("clear-sign: bundled registry loaded");
-            match resolve_descriptors_for_tx(&tx_ctx, &source, Some(&data_provider)).await {
+            match resolve_descriptors_for_tx(&tx_ctx, source, Some(&data_provider)).await {
                 Ok(ResolvedDescriptorResolution::Found(descriptors)) => {
                     info!(
                         count = descriptors.len(),
@@ -466,7 +508,8 @@ pub async fn decode_transaction(
                                 diagnostics = diagnostics.len(),
                                 "clear-sign: fallback result, running heuristic too"
                             );
-                            let heuristic = decode_call(net, chain, to, calldata).await;
+                            let heuristic =
+                                decode_call(net, chain, to, calldata, Some(resolved)).await;
                             return DecodeResult::Fallback {
                                 model,
                                 reason,
@@ -497,13 +540,13 @@ pub async fn decode_transaction(
             }
         }
         Err(e) => {
-            warn!(error = ?e, "clear-sign: failed to load bundled registry");
+            warn!(error = %e, "clear-sign: failed to load bundled registry");
         }
     }
 
     // Heuristic fallback.
     debug!(%selector, "clear-sign: using heuristic pipeline");
-    let decoded = decode_call(net, chain, to, calldata).await;
+    let decoded = decode_call(net, chain, to, calldata, Some(resolved)).await;
     DecodeResult::Heuristic(decoded)
 }
 
@@ -775,6 +818,32 @@ mod tests {
         assert!(provider.resolve_token(999_999, &token).await.is_none());
         assert!(net.called_chains().is_empty());
         assert!(provider.all_verified());
+    }
+
+    /// The engine renders every field twice (once for the entries, once to
+    /// interpolate the intent); the second lookup of the same token must not
+    /// go back to the network. A different chain is a different token.
+    #[tokio::test]
+    async fn resolve_token_reads_each_token_once_per_decode() {
+        let net = TokenMetaMock::new(true);
+        let provider = KaoDataProvider::new(&net, Chain::Mainnet, HashMap::new());
+        let token = Address::repeat_byte(0x55).to_checksum(None);
+
+        let first = provider
+            .resolve_token(Chain::Mainnet.chain_id(), &token)
+            .await;
+        let again = provider
+            .resolve_token(Chain::Mainnet.chain_id(), &token)
+            .await;
+        assert_eq!(first.map(|m| m.symbol), again.map(|m| m.symbol));
+        // symbol() + decimals(), once.
+        assert_eq!(net.called_chains(), vec![Chain::Mainnet, Chain::Mainnet]);
+
+        provider.resolve_token(Chain::Base.chain_id(), &token).await;
+        assert_eq!(
+            net.called_chains(),
+            vec![Chain::Mainnet, Chain::Mainnet, Chain::Base, Chain::Base]
+        );
     }
 
     // ── headline ─────────────────────────────────────────────────────

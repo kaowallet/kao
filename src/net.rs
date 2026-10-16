@@ -1487,6 +1487,7 @@ async fn build_op_backend(
     let exec_url = url::Url::parse(execution_rpc).map_err(|e| format!("execution rpc url: {e}"))?;
     let consensus_url =
         url::Url::parse(consensus_rpc).map_err(|e| format!("consensus rpc url: {e}"))?;
+    probe_op_consensus(&consensus_url).await?;
     let client = OpStackClientBuilder::new()
         .network(op_network)
         .execution_rpc(exec_url)
@@ -1500,8 +1501,63 @@ async fn build_op_backend(
         .map_err(|e| e.to_string())?;
     client.wait_synced().await.map_err(|e| e.to_string())?;
     let backend = HeliosBackend::Op(Arc::new(client));
-    wait_for_head(&backend).await?;
+    if let Err(e) = wait_for_head(&backend).await {
+        // A no-op at helios 2af9b41 (see `probe_op_consensus`), kept so the
+        // failed build is released the moment upstream makes it stop.
+        backend.shutdown().await;
+        return Err(e);
+    }
     Ok(backend)
+}
+
+/// Check that an OP-stack consensus endpoint is serving sequencer
+/// commitments *before* handing it to helios.
+///
+/// helios's OP-stack consensus task polls `{consensus_rpc}/latest` every
+/// second from a `tokio::spawn` with no exit, and its `shutdown()` is a no-op
+/// (helios 2af9b41) — so every client built is a poller for the rest of the
+/// process. Against a dead endpoint each build also burns [`wait_for_head`]'s
+/// full 45 s before failing, and the next read after the cooldown builds
+/// another: the pollers pile up, each logging `failed to advance` once a
+/// second, while every read on the chain waits out the build. One GET parsed
+/// the way helios parses it turns that into a sub-second skip that spawns
+/// nothing.
+///
+/// Only the response shape is checked; the signature is helios's job.
+async fn probe_op_consensus(consensus_url: &url::Url) -> Result<(), String> {
+    static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
+        std::sync::OnceLock::new();
+    let client = CLIENT
+        .get_or_init(|| {
+            // Default proxy detection, like helios's own `reqwest::get`, so
+            // the probe takes the same route the poller will.
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .connect_timeout(Duration::from_secs(3))
+                .user_agent(concat!("kao/", env!("CARGO_PKG_VERSION")))
+                .build()
+                .map_err(|e| format!("HTTP client build failed: {e}"))
+        })
+        .as_ref()
+        .map_err(Clone::clone)?;
+    // Same join helios does, so a base URL with a path probes what it polls.
+    let url = consensus_url
+        .join("latest")
+        .map_err(|e| format!("consensus rpc url: {e}"))?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("consensus rpc unreachable: {e}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("consensus rpc returned HTTP {status}"));
+    }
+    response
+        .json::<helios_opstack::SequencerCommitment>()
+        .await
+        .map(drop)
+        .map_err(|e| format!("consensus rpc returned no sequencer commitment: {e}"))
 }
 
 /// `wait_synced()` returns once the consensus client has bootstrapped
@@ -2521,5 +2577,87 @@ mod checkpoint_tests {
                 "unexpected slot URL: {slots}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod op_consensus_probe_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A loopback consensus endpoint that answers one request with `status`,
+    /// `content_type` and `body`, and hands back the request line it saw.
+    async fn serve_once(
+        status: &'static str,
+        content_type: &'static str,
+        body: String,
+    ) -> (url::Url, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = url::Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let served = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = sock.read(&mut chunk).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            let resp = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+            String::from_utf8_lossy(&buf)
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        });
+        (base, served)
+    }
+
+    /// What operationsolarstorm.org's Cloudflare front answered while its
+    /// backend was down — the body helios logs `error decoding response body`
+    /// for, once a second per leaked poller.
+    #[tokio::test]
+    async fn a_gateway_error_is_refused_before_helios_is_built() {
+        let (base, served) =
+            serve_once("502 Bad Gateway", "text/plain", "error code: 502".into()).await;
+        let err = probe_op_consensus(&base).await.unwrap_err();
+        assert!(err.contains("502"), "{err}");
+        assert_eq!(served.await.unwrap(), "GET /latest HTTP/1.1");
+    }
+
+    #[tokio::test]
+    async fn a_success_status_without_a_commitment_is_refused() {
+        let (base, _served) =
+            serve_once("200 OK", "text/html", "<html>maintenance</html>".into()).await;
+        let err = probe_op_consensus(&base).await.unwrap_err();
+        assert!(err.contains("no sequencer commitment"), "{err}");
+    }
+
+    /// A commitment in the shape helios deserializes passes — the probe must
+    /// never turn a healthy endpoint away.
+    #[tokio::test]
+    async fn a_sequencer_commitment_passes() {
+        let signature = alloy::primitives::Signature::new(U256::from(1), U256::from(2), false);
+        let body = serde_json::json!({ "data": "0x00", "signature": signature }).to_string();
+        let (base, served) = serve_once("200 OK", "application/json", body).await;
+        probe_op_consensus(&base).await.unwrap();
+        assert_eq!(served.await.unwrap(), "GET /latest HTTP/1.1");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_endpoint_is_refused() {
+        // Bind then drop: the port is closed by the time the probe connects.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = url::Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        drop(listener);
+        let err = probe_op_consensus(&base).await.unwrap_err();
+        assert!(err.contains("unreachable"), "{err}");
     }
 }

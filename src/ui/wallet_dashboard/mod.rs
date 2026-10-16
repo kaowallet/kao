@@ -8923,6 +8923,9 @@ async fn decode_leg(
     }
 }
 
+/// How many batch sub-calls [`decode_batch_sub_legs`] decodes at once.
+const BATCH_DECODE_CONCURRENCY: usize = 4;
+
 /// Recover a batch's sub-calls from the outer calldata that is about to be
 /// signed — `multiSend(bytes)` or `executeBatch(Call[])`, picked by selector —
 /// and clear-sign each one into its own [`ReviewLeg`].
@@ -8987,10 +8990,27 @@ async fn decode_batch_sub_legs(
                 .collect()
         };
 
+    // Decode the sub-calls a few at a time: each is a chain of verified reads
+    // that needs nothing from its neighbours, but an unbounded fan-out over a
+    // long batch would hammer the execution RPC into rate-limiting, and one
+    // failed read drops every read in the cooldown onto the unverified path.
+    // `buffered` keeps the results in batch order.
+    use futures::StreamExt;
+    let decodes: Vec<_> = calls
+        .iter()
+        .map(|(to, value, data, _)| {
+            decode_leg(network, net, sender, *to, data.clone(), *value, local_names)
+        })
+        .collect();
+    let decoded: Vec<_> = futures::stream::iter(decodes)
+        .buffered(BATCH_DECODE_CONCURRENCY)
+        .collect()
+        .await;
+
     let total = calls.len();
     let mut legs = Vec::with_capacity(total);
-    for (i, (to, value, data, redirected)) in calls.into_iter().enumerate() {
-        let decoded = decode_leg(network, net, sender, to, data.clone(), value, local_names).await;
+    for (i, ((to, value, data, redirected), decoded)) in calls.into_iter().zip(decoded).enumerate()
+    {
         let self_admin = self_admin_warning(sender, is_safe, to, &data).map(|w| {
             if redirected {
                 // The dapp, or another wallet, may show this call as going to

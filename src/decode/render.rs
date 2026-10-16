@@ -161,11 +161,18 @@ pub enum Warning {
 // ---------------------------------------------------------------------------
 // Top-level pipeline
 
+/// Heuristic decode of one call to `to`.
+///
+/// `resolved` is `to`'s proxy walk when the caller has already done it (the
+/// clear-sign orchestrator does, to find the descriptor's implementation
+/// address) — passing it in saves repeating every slot read in it. `None`
+/// walks here.
 pub async fn decode_call(
     net: &dyn BalanceFetcher,
     chain: Chain,
     to: Address,
     calldata: Bytes,
+    resolved: Option<proxy::ProxyResolution>,
 ) -> DecodedCall {
     let mut out = DecodedCall {
         to,
@@ -193,15 +200,25 @@ pub async fn decode_call(
     out.selector = selector;
     out.state = ResolutionState::Unknown;
 
-    // Phase 3: walk the proxy chain rooted at `to`.
-    let resolved = proxy::resolve_implementation(net, chain, to).await;
+    // Phase 3 → 1+4: walk the proxy chain rooted at `to`, then fetch
+    // verified bytecode for the implementation. Runs concurrently with the
+    // symbol() / decimals() probe further down, which targets `to` itself
+    // and so needs nothing from the walk.
+    let implementation = async {
+        let resolved = match resolved {
+            Some(r) => r,
+            None => proxy::resolve_implementation(net, chain, to).await,
+        };
+        let code = net.get_code(resolved.implementation, chain).await;
+        (resolved, code)
+    };
+    let ((resolved, code), token_meta) =
+        futures::future::join(implementation, read_token_meta(net, chain, to)).await;
     out.proxy_hops = resolved.hops.clone();
     if !resolved.all_verified {
         out.all_verified = false;
     }
-
-    // Phase 1+4: fetch verified bytecode for the implementation, run evmole.
-    let code = match net.get_code(resolved.implementation, chain).await {
+    let code = match code {
         Ok(read) => {
             if !read.verified {
                 out.all_verified = false;
@@ -264,15 +281,15 @@ pub async fn decode_call(
             .push(Warning::UnaccountedCalldata { decoded, total });
     }
 
-    // Probe the call target (NOT the implementation — `to` is what the
-    // user thinks they're interacting with) for symbol() / decimals().
+    // The call target was probed (NOT the implementation — `to` is what the
+    // user thinks they're interacting with) for symbol() / decimals() above.
     // Goes through the verified `eth_call` path so an attacker on the
     // RPC can't relabel a hostile contract as "USDC". Probe failures
     // are non-fatal (the contract just doesn't expose the standard
     // ERC-20 selectors); a fallback (verified=false) marks
     // `all_verified=false` and the `UnverifiedBytecode` warning fires
     // alongside the existing bytecode/storage warnings.
-    if let Some((meta, verified)) = read_token_meta(net, chain, to).await {
+    if let Some((meta, verified)) = token_meta {
         out.target_token = Some(meta);
         out.target_token_verified = verified;
         if !verified {
@@ -280,12 +297,15 @@ pub async fn decode_call(
         }
     }
 
-    // Humanize each arg in turn.
-    let mut humanized: Vec<DecodedArg> = Vec::with_capacity(raw_args.len());
-    for (ty, value) in arg_types.iter().zip(raw_args.iter()) {
-        humanized.push(humanize_arg(ty, value, &out, net, chain).await);
-    }
-    out.args = humanized;
+    // Humanize every arg at once — each address arg is its own chain of
+    // verified name-service reads, independent of the others.
+    out.args = futures::future::join_all(
+        arg_types
+            .iter()
+            .zip(raw_args.iter())
+            .map(|(ty, value)| humanize_arg(ty, value, &out, net, chain)),
+    )
+    .await;
 
     // Heuristic warnings.
     if matches!(
@@ -441,8 +461,12 @@ pub(crate) async fn read_token_meta(
     chain: Chain,
     addr: Address,
 ) -> Option<(TokenInfo, bool)> {
-    let (symbol, sym_v) = call_decode_string(net, chain, addr, SYMBOL_SELECTOR).await?;
-    let (decimals, dec_v) = call_decode_u8(net, chain, addr, DECIMALS_SELECTOR).await?;
+    let (symbol, decimals) = futures::future::join(
+        call_decode_string(net, chain, addr, SYMBOL_SELECTOR),
+        call_decode_u8(net, chain, addr, DECIMALS_SELECTOR),
+    )
+    .await;
+    let ((symbol, sym_v), (decimals, dec_v)) = (symbol?, decimals?);
     Some((TokenInfo { symbol, decimals }, sym_v && dec_v))
 }
 
@@ -624,7 +648,7 @@ mod tests {
         use crate::chain::Chain;
         use crate::net::MockFetcher;
         let net = MockFetcher::new();
-        let out = decode_call(&net, Chain::Mainnet, Address::ZERO, Bytes::new()).await;
+        let out = decode_call(&net, Chain::Mainnet, Address::ZERO, Bytes::new(), None).await;
         assert!(matches!(out.state, ResolutionState::Empty));
         assert!(out.warnings.is_empty());
         assert!(out.args.is_empty());
@@ -642,6 +666,7 @@ mod tests {
             Chain::Mainnet,
             Address::ZERO,
             Bytes::from_static(&[0xa9, 0x05, 0x9c]),
+            None,
         )
         .await;
         assert!(matches!(out.state, ResolutionState::Unknown));
@@ -904,7 +929,7 @@ mod tests {
         cd.extend_from_slice(recipient.as_slice());
         cd.extend_from_slice(&U256::from(1_000_000u64).to_be_bytes::<32>());
 
-        let out = decode_call(&net, Chain::Mainnet, usdc, Bytes::from(cd)).await;
+        let out = decode_call(&net, Chain::Mainnet, usdc, Bytes::from(cd), None).await;
         assert!(out.target_token.is_some());
         let token = out.target_token.unwrap();
         assert_eq!(token.symbol, "USDC");
@@ -941,7 +966,7 @@ mod tests {
         cd.extend_from_slice(spender.as_slice());
         cd.extend_from_slice(&U256::MAX.to_be_bytes::<32>());
 
-        let out = decode_call(&net, Chain::Mainnet, usdc, Bytes::from(cd)).await;
+        let out = decode_call(&net, Chain::Mainnet, usdc, Bytes::from(cd), None).await;
         assert_eq!(out.function_name.as_deref(), Some("approve"));
         assert!(
             out.warnings
@@ -967,7 +992,7 @@ mod tests {
         cd.extend_from_slice(&[0u8; 32]);
         cd.extend_from_slice(&U256::from(1u64).to_be_bytes::<32>());
 
-        let out = decode_call(&net, Chain::Mainnet, addr, Bytes::from(cd)).await;
+        let out = decode_call(&net, Chain::Mainnet, addr, Bytes::from(cd), None).await;
         assert!(!out.all_verified);
         assert!(
             out.warnings

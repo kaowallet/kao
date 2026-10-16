@@ -1028,6 +1028,14 @@ impl SignReview {
             .is_some_and(|t| now.saturating_duration_since(t) < ARMING_DELAY)
     }
 
+    /// Shows a WalletConnect origin card, whose "received … ago · the dapp waits …" line counts
+    /// in whole seconds — the overlay keeps a clock tick running so it moves on its own.
+    pub fn shows_countdown(&self) -> bool {
+        self.steps
+            .iter()
+            .any(|s| matches!(s, SignStep::WcOrigin(_)))
+    }
+
     /// A WalletConnect review: the dapp is answered by the coordinator, and the
     /// backdrop never rejects it.
     pub fn is_walletconnect(&self) -> bool {

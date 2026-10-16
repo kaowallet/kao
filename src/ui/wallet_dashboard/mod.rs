@@ -7934,6 +7934,15 @@ impl WalletScreen {
                     .is_some_and(|r| r.signing_since.is_some() || r.arming(now))
             {
                 subs.push(iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick));
+            } else if self
+                .sign_review
+                .as_ref()
+                .is_some_and(sign_review::SignReview::shows_countdown)
+            {
+                // The early return below drops the Apps pane's own 1 s tick, so without this a
+                // WalletConnect review's age and deadline only redraw when some unrelated event
+                // happens to arrive.
+                subs.push(iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick));
             }
             if self.tracked_orders.iter().any(|o| !o.status.is_terminal()) {
                 subs.push(iced::time::every(Duration::from_secs(10)).map(|_| Message::CowPollTick));

@@ -2013,18 +2013,12 @@ impl WcApp {
         .into()
     }
 
-    /// The approval card: who is asking (host first, unverified), what connecting exposes
+    /// The approval card: who is asking (host first), what connecting exposes
     /// (the active identity only), on which networks, what the dapp can ask for, and the caveats.
     fn proposal_card<'a>(&'a self, t: KaoTheme, p: &'a ProposalView) -> Element<'a, Message> {
         let left = self.secs_left(p.secs_left);
         let mut col = column![
-            row![
-                text("wants to connect").size(11).color(t.sub).font(bold()),
-                Space::new().width(Length::Fill),
-                privacy_badge(t, BadgeKind::Caution, "unverified"),
-            ]
-            .align_y(Alignment::Center)
-            .width(Length::Fill),
+            text("wants to connect").size(11).color(t.sub).font(bold()),
             Space::new().height(6),
             mono_box(
                 t,
@@ -2354,7 +2348,7 @@ impl WcApp {
         tile(t, col.into())
     }
 
-    /// One connected dapp: host first (unverified), its claimed name, the identity and networks it
+    /// One connected dapp: host first, its claimed name, the identity and networks it
     /// was granted, and the two-step Disconnect.
     fn session_row<'a>(&'a self, t: KaoTheme, s: &'a SessionView) -> Element<'a, Message> {
         let chains = s
@@ -2364,16 +2358,10 @@ impl WcApp {
             .collect::<Vec<_>>()
             .join(", ");
         let mut col = column![
-            row![
-                text(format!("Session {}", s.ordinal))
-                    .size(11)
-                    .color(t.sub)
-                    .font(mono_bold()),
-                Space::new().width(Length::Fill),
-                privacy_badge(t, BadgeKind::Caution, "unverified"),
-            ]
-            .align_y(Alignment::Center)
-            .width(Length::Fill),
+            text(format!("Session {}", s.ordinal))
+                .size(11)
+                .color(t.sub)
+                .font(mono_bold()),
             Space::new().height(6),
             mono_box(
                 t,

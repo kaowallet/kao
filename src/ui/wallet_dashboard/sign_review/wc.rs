@@ -4,8 +4,8 @@
 //! Every string a dapp controls reaches the screen in exactly one of two ways: inside a bordered
 //! monospace box (the dapp's host, message text, typed-data fields, SIWE fields), or explicitly
 //! labelled as the dapp's claim (`calls itself "…"`). The self-declared name never leads — the
-//! origin card's headline is the host the dapp's metadata URL names, badged **unverified**, because
-//! Kao has no way to confirm either (the protocol crate has no Verify API).
+//! origin card's headline is the host the dapp's metadata URL names, captioned as unconfirmed,
+//! because Kao has no way to confirm either (the protocol crate has no Verify API).
 //!
 //! Every panel renders from the review structs the coordinator pinned at open / prepare time, so
 //! what is drawn here is what the sign task re-derives and signs. The ERC-8213 rows for the new
@@ -279,16 +279,10 @@ fn kao_closes(timing: &mut String, deadline: u64, now: u64) {
 fn origin_card<'a>(t: KaoTheme, o: &'a WcOriginCard, signing: bool) -> Element<'a, Message> {
     let txt = origin_text(o, crate::walletconnect::now_secs(), signing);
     let mut col = column![
-        row![
-            text("WalletConnect request")
-                .size(11)
-                .color(t.sub)
-                .font(bold()),
-            Space::new().width(Length::Fill),
-            privacy_badge(t, BadgeKind::Caution, "unverified"),
-        ]
-        .align_y(Alignment::Center)
-        .width(Length::Fill),
+        text("WalletConnect request")
+            .size(11)
+            .color(t.sub)
+            .font(bold()),
         Space::new().height(6),
         mono_box(
             t,

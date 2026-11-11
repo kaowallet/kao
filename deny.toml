@@ -41,6 +41,21 @@ ignore = [
     { id = "RUSTSEC-2025-0161", reason = "libsecp256k1 0.7.2 unmaintained. Used by libp2p-identity for p2p peer IDs only — wallet transaction signing goes through alloy/k256 directly. No known vuln." },
     { id = "RUSTSEC-2024-0384", reason = "instant 0.1.13 unmaintained. Time-measurement utility used by libp2p/parking_lot 0.11/wasm-timer. No known vuln, no exposure beyond clock reads." },
     { id = "RUSTSEC-2024-0370", reason = "proc-macro-error 1.0.4 unmaintained. Build-time only, used by multihash-derive in the libp2p subtree. No runtime surface." },
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils 0.1.0 unmaintained (archived 2026-10; no known vuln). Only via libp2p-gossipsub → wasm-timer in helios-opstack's p2p stack; a stack-pinning macro with no runtime state. Revisit when helios moves off libp2p 0.51." },
+
+    # ── wallet signing path (alloy → k256 0.13 → elliptic-curve 0.13 →
+    #    crypto-bigint 0.5) ─────────────────────────────────────────────────
+    # The exception to the threat-model note above: this one DOES touch
+    # software-key signing. Ignored only because no fix exists on this line;
+    # it is a known, accepted risk, not a "no exposure" call.
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5: some 'constant-time' ops (incl. subtraction) may branch on secrets depending on compiler/CPU. k256 0.13's Scalar add/sub/neg are crypto-bigint U256 ops, so ECDSA signing and BIP-32 derivation with software keys (seed/private-key accounts) run through it; Ledger/Trezor sign on-device and are unaffected. Fixed only in crypto-bigint 0.7.6, which needs k256 0.14; alloy 2.4 pins k256 0.13 and there is no 0.5.x patch. Exploiting it needs a local timing/microarchitectural observer during signing. Revisit as soon as alloy moves to k256 0.14." },
+
+    # ── iced Linux desktop-appearance subtree (iced_winit → mundy → zbus 5)
+    # mundy reads the desktop's dark-mode/accent settings over D-Bus on Linux.
+    # zbus 6 folded these crates in; nothing to update until mundy moves.
+    { id = "RUSTSEC-2026-0370", reason = "zvariant 5.15.0 unmaintained (merged into zbus 6; no known vuln). Linux-only, via iced_winit → mundy → zbus 5 for reading desktop appearance over the session bus. Never sees keys, storage or chain data. Revisit when mundy/iced move to zbus 6." },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names 4.3.4 unmaintained (merged into zbus 6; no known vuln). Same mundy → zbus 5 appearance path as zvariant." },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive 5.15.0 unmaintained (merged into zbus 6; no known vuln). Build-time derive macro for the same mundy → zbus 5 path." },
 
     # ── helios DNS subtree (reqwest 0.12 → hickory-resolver/hickory-proto) ─
     # reqwest only uses hickory when the `hickory-dns` feature is on (helios

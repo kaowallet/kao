@@ -1,7 +1,7 @@
 //! Four-step network setup wizard for the Kao wallet.
 //!
 //! Guides the user through choosing an RPC provider, API/indexer provider,
-//! Safe Transaction Service endpoint, and optional SOCKS proxy. Each step
+//! Safe Transaction Service API key, and optional SOCKS proxy. Each step
 //! presents option cards with privacy badges; a left-rail sidebar tracks
 //! progress and shows a live privacy meter.
 //!
@@ -20,7 +20,7 @@ use std::str::FromStr;
 use alloy::primitives::B256;
 
 use crate::chain::{Chain, PerChain};
-use crate::settings::{self, ApiProvider, ProxyType, RpcProvider, SafeTxService};
+use crate::settings::{self, ApiProvider, ProxyType, RpcProvider};
 use crate::ui::kao_theme::{KaoTheme, with_alpha};
 use crate::ui::kao_widgets::{
     BadgeKind, auth_background, black, bold, error_text, kao_scrollable_style, kao_text,
@@ -33,7 +33,7 @@ use crate::ui::kao_widgets::{
 const RPC_KEY_INPUT_ID: &str = "nw_rpc_key_input";
 const CUSTOM_RPC_URL_INPUT_ID: &str = "nw_custom_rpc_url_input";
 const API_KEY_INPUT_ID: &str = "nw_api_key_input";
-const SAFE_TX_URL_INPUT_ID: &str = "nw_safe_tx_url_input";
+const SAFE_API_KEY_INPUT_ID: &str = "nw_safe_api_key_input";
 const KAO_SERVER_INPUT_ID: &str = "nw_kao_server_input";
 const BLOCKSCOUT_URL_INPUT_ID: &str = "nw_blockscout_url_input";
 const BLOCKSCOUT_KEY_INPUT_ID: &str = "nw_blockscout_key_input";
@@ -109,7 +109,7 @@ impl WizardStep {
                 "Pick an indexer for transaction history and token balances. Disabling it means slower lookups but no third-party data sharing."
             }
             Self::SafeTx => {
-                "The Safe Transaction Service coordinates multisig proposals. You can use the default or host your own."
+                "The Safe Transaction Service coordinates multisig proposals. Add an API key so Safe's limit on requests without one doesn't stop your Safes loading."
             }
             Self::Proxy => {
                 "Route all network traffic through a SOCKS5 proxy to hide your IP address from RPC and API providers."
@@ -280,8 +280,7 @@ struct WizardDraft {
     api_key: SecretInput,
     blockscout_url: String,
     blockscout_api_key: SecretInput,
-    safe_tx_service: SafeTxService,
-    safe_tx_service_url: String,
+    safe_api_key: SecretInput,
     proxy_enabled: bool,
     proxy_type: ProxyType,
     proxy_address: String,
@@ -307,8 +306,7 @@ impl Default for WizardDraft {
             api_key: SecretInput::default(),
             blockscout_url: String::new(),
             blockscout_api_key: SecretInput::default(),
-            safe_tx_service: SafeTxService::default(),
-            safe_tx_service_url: String::new(),
+            safe_api_key: SecretInput::default(),
             proxy_enabled: false,
             proxy_type: ProxyType::default(),
             proxy_address: "127.0.0.1:9050".to_string(),
@@ -346,8 +344,7 @@ pub enum Message {
     ApiKeyInput(SecretInput),
     BlockscoutUrlInput(String),
     BlockscoutApiKeyInput(SecretInput),
-    SetSafeTxService(SafeTxService),
-    SafeTxServiceUrlInput(String),
+    SafeApiKeyInput(SecretInput),
     ToggleProxy,
     SetProxyType(ProxyType),
     ProxyAddressInput(String),
@@ -436,8 +433,7 @@ impl NetworkSetupScreen {
                     api_key: settings::api_key().unwrap_or_default().into(),
                     blockscout_url: settings::blockscout_base_url().unwrap_or_default(),
                     blockscout_api_key: settings::blockscout_api_key().unwrap_or_default().into(),
-                    safe_tx_service: settings::safe_tx_service(),
-                    safe_tx_service_url: settings::safe_tx_service_url().unwrap_or_default(),
+                    safe_api_key: settings::safe_api_key().unwrap_or_default().into(),
                     proxy_enabled: settings::proxy_enabled(),
                     proxy_type: settings::proxy_type(),
                     proxy_address: settings::proxy_address(),
@@ -536,13 +532,8 @@ impl NetworkSetupScreen {
                 self.draft.blockscout_api_key = s;
                 (Task::none(), None)
             }
-            Message::SetSafeTxService(s) => {
-                self.draft.safe_tx_service = s;
-                self.error = None;
-                (Task::none(), None)
-            }
-            Message::SafeTxServiceUrlInput(s) => {
-                self.draft.safe_tx_service_url = s;
+            Message::SafeApiKeyInput(s) => {
+                self.draft.safe_api_key = s;
                 (Task::none(), None)
             }
             Message::ToggleProxy => {
@@ -649,8 +640,8 @@ impl NetworkSetupScreen {
                 self.draft.custom_rpc_url.clear();
                 self.draft.api_provider = ApiProvider::Kao;
                 self.draft.api_key.clear();
-                self.draft.safe_tx_service = SafeTxService::Default;
-                self.draft.safe_tx_service_url.clear();
+                // A key ties Safe lookups to a developer account.
+                self.draft.safe_api_key.clear();
                 self.draft.proxy_enabled = true;
                 self.draft.proxy_type = ProxyType::Tor;
                 self.draft.proxy_address = "127.0.0.1:9050".to_string();
@@ -762,6 +753,14 @@ impl NetworkSetupScreen {
     /// step (including Review) via `GoToStep`, bypassing the linear
     /// `Continue` gate — so Review re-checks every step rather than trusting
     /// that prior steps were passed in order.
+    fn has_safe_api_key(&self) -> bool {
+        !self.draft.safe_api_key.as_str().trim().is_empty()
+    }
+
+    fn safe_api_key_valid(&self) -> bool {
+        settings::valid_safe_api_key(self.draft.safe_api_key.as_str().trim())
+    }
+
     fn step_valid(&self, step: WizardStep) -> bool {
         match step {
             WizardStep::Rpc => match self.draft.rpc_provider {
@@ -787,15 +786,7 @@ impl NetworkSetupScreen {
                 ApiProvider::Drpc => !self.draft.api_key.as_str().trim().is_empty(),
                 _ => true,
             },
-            WizardStep::SafeTx => match self.draft.safe_tx_service {
-                SafeTxService::Custom => {
-                    let s = self.draft.safe_tx_service_url.trim();
-                    url::Url::parse(s)
-                        .map(|u| u.scheme() == "https")
-                        .unwrap_or(false)
-                }
-                _ => true,
-            },
+            WizardStep::SafeTx => self.safe_api_key_valid(),
             WizardStep::Proxy => {
                 // A malformed address would make reqwest silently ignore the
                 // proxy and connect directly, leaking the real IP — so block
@@ -855,10 +846,8 @@ impl NetworkSetupScreen {
             ApiProvider::Blockscout => 1,
             ApiProvider::Drpc => 0,
         };
-        let safe = match self.draft.safe_tx_service {
-            SafeTxService::Custom => 1,
-            SafeTxService::Default => 0,
-        };
+        // A key ties every Safe lookup to the holder's Safe developer account.
+        let safe = if self.has_safe_api_key() { 0 } else { 1 };
         let proxy = if self.draft.proxy_enabled { 2 } else { 0 };
         rpc + api + safe + proxy
     }
@@ -917,14 +906,9 @@ impl NetworkSetupScreen {
                 Some(key.to_string())
             });
         }
-        settings::set_safe_tx_service(self.draft.safe_tx_service);
-        if self.draft.safe_tx_service == SafeTxService::Custom {
-            settings::set_safe_tx_service_url(Some(
-                self.draft.safe_tx_service_url.trim().to_string(),
-            ));
-        } else {
-            settings::set_safe_tx_service_url(None);
-        }
+        // Applies to every Safe without a per-Safe mirror.
+        let safe_key = self.draft.safe_api_key.as_str().trim();
+        settings::set_safe_api_key((!safe_key.is_empty()).then(|| safe_key.to_string()));
         settings::set_proxy_enabled(self.draft.proxy_enabled);
         if self.draft.proxy_enabled {
             settings::set_proxy_type(self.draft.proxy_type);
@@ -1257,10 +1241,13 @@ impl NetworkSetupScreen {
                 ApiProvider::Drpc => "dRPC".to_string(),
                 ApiProvider::None => "Disabled".to_string(),
             },
-            WizardStep::SafeTx => match self.draft.safe_tx_service {
-                SafeTxService::Default => "Default".to_string(),
-                SafeTxService::Custom => "Custom URL".to_string(),
-            },
+            WizardStep::SafeTx => {
+                if self.has_safe_api_key() {
+                    "Safe Global · API key".to_string()
+                } else {
+                    "Safe Global · no key".to_string()
+                }
+            }
             WizardStep::Proxy => {
                 if self.draft.proxy_enabled {
                     match self.draft.proxy_type {
@@ -1693,57 +1680,69 @@ impl NetworkSetupScreen {
     // ── Step 3: Safe TX Service ─────────────────────────────────────────
 
     fn view_safe_tx(&self, t: KaoTheme) -> Element<'_, Message> {
-        let selected = self.draft.safe_tx_service;
-
-        let default_card = self.option_card(
-            t,
-            selected == SafeTxService::Default,
-            "Default Safe Service",
-            Some("(recommended)"),
-            "Uses the official Safe Transaction Service endpoints operated by Safe Global.",
-            &[
-                (BadgeKind::Info, "Official endpoints"),
-                (BadgeKind::Caution, "Third-party"),
-            ],
-            None,
-            Message::SetSafeTxService(SafeTxService::Default),
-        );
-
-        let custom_body: Option<Element<'_, Message>> = if selected == SafeTxService::Custom {
-            let input = text_input(
-                "https://safe-tx.example.com",
-                &self.draft.safe_tx_service_url,
-            )
-            .id(SAFE_TX_URL_INPUT_ID)
-            .on_input(Message::SafeTxServiceUrlInput)
+        let input = text_input("Paste your key", self.draft.safe_api_key.as_str())
+            .id(SAFE_API_KEY_INPUT_ID)
+            .on_input(|s| Message::SafeApiKeyInput(s.into()))
             .padding(Padding::from([10, 12]))
             .size(13)
             .font(mono())
             .style(move |_theme, status| text_input_style(t, status));
-            Some(input.into())
+        let note = if self.safe_api_key_valid() {
+            text(
+                "Without a key, Safe allows 5,000 requests a month and Safe wallets stop \
+                 loading once that runs out. Get a key at developer.safe.global. Kao sends it \
+                 only to Safe's own service, and it links your Safe lookups to your Safe \
+                 developer account.",
+            )
+            .size(11)
+            .color(t.sub)
         } else {
-            None
+            text("That key has spaces or unsupported characters.")
+                .size(11)
+                .color(t.down)
         };
 
-        let custom_card = self.option_card(
-            t,
-            selected == SafeTxService::Custom,
-            "Custom URL",
-            None,
-            "Self-host or use an alternative Safe TX Service. Must be HTTPS.",
-            &[
-                (BadgeKind::Good, "Self-hosted"),
-                (BadgeKind::Good, "Full control"),
-            ],
-            custom_body,
-            Message::SetSafeTxService(SafeTxService::Custom),
-        );
+        let mut badge_row = row![].spacing(4);
+        for (kind, label) in self.safe_tx_badges() {
+            badge_row = badge_row.push(privacy_badge(t, kind, label));
+        }
+
+        // One service, so a plain card rather than a one-option radio list.
+        let card = container(
+            column![
+                text("Safe Global's service").size(14).color(t.text).font(bold()),
+                vspace(2),
+                text("Proposals and co-signer signatures go through the Safe Transaction Service operated by Safe Global.")
+                    .size(12)
+                    .color(t.sub),
+                vspace(4),
+                badge_row,
+                vspace(10),
+                text("API key (optional)").size(11).color(t.sub).font(mono()),
+                vspace(4),
+                input,
+                vspace(6),
+                note,
+            ]
+            .width(Length::Fill),
+        )
+        .padding(Padding::from([14, 16]))
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(with_alpha(t.a1, 0.06))),
+            border: Border {
+                color: with_alpha(t.a1, 0.45),
+                width: 1.5,
+                radius: Radius::from(14),
+            },
+            ..container::Style::default()
+        });
 
         let info_note = container(
             row![
                 text("ദ്ദി◝ ⩊ ◜.ᐟ").size(13).color(t.sub),
                 Space::new().width(8),
-                text("The Safe TX Service is only used for multisig (Safe) wallets. If you only use EOA wallets, this setting has no effect.")
+                text("Only multisig (Safe) wallets use this. To point a Safe at a self-hosted service instead, set it for that Safe under Settings > Safes; co-signers on Safe Global's service won't see proposals made there.")
                     .size(12)
                     .color(t.sub),
             ]
@@ -1762,7 +1761,7 @@ impl NetworkSetupScreen {
             ..container::Style::default()
         });
 
-        column![default_card, vspace(8), custom_card, vspace(12), info_note,]
+        column![card, vspace(12), info_note]
             .width(Length::Fill)
             .into()
     }
@@ -2444,16 +2443,14 @@ impl NetworkSetupScreen {
     }
 
     fn safe_tx_badges(&self) -> Vec<(BadgeKind, &'static str)> {
-        match self.draft.safe_tx_service {
-            SafeTxService::Default => vec![
-                (BadgeKind::Info, "Official"),
-                (BadgeKind::Caution, "Third-party"),
-            ],
-            SafeTxService::Custom => vec![
-                (BadgeKind::Good, "Self-hosted"),
-                (BadgeKind::Good, "Full control"),
-            ],
+        let mut badges = vec![
+            (BadgeKind::Info, "Official"),
+            (BadgeKind::Caution, "Third-party"),
+        ];
+        if self.has_safe_api_key() {
+            badges.push((BadgeKind::Caution, "Account-linked key"));
         }
+        badges
     }
 
     fn proxy_badges(&self) -> Vec<(BadgeKind, &'static str)> {
@@ -2587,36 +2584,30 @@ impl NetworkSetupScreen {
 mod tests {
     use super::*;
 
-    /// Selecting the custom Safe TX Service with an empty URL must not let
-    /// the wizard finish, even when the user jumps straight to Review via the
-    /// rail (which bypasses the linear `Continue` gate).
+    /// A key that can't be a header value must not reach settings, where it
+    /// would be dropped silently; jumping via the rail can't get around it.
     #[test]
-    fn empty_custom_safe_tx_url_blocks_review() {
+    fn malformed_safe_api_key_blocks_review() {
         let mut s = NetworkSetupScreen::new(WizardMode::Onboarding);
-        let _ = s.update(Message::SetSafeTxService(SafeTxService::Custom));
-
-        // Jump past the SafeTx step's own gate straight to Review.
         let _ = s.update(Message::GoToStep(WizardStep::Review));
-        assert!(
-            !s.can_advance(),
-            "empty custom URL should leave Review un-finishable"
-        );
+        assert!(s.can_advance(), "the key is optional");
 
-        // A whitespace-only URL is just as empty.
-        let _ = s.update(Message::SafeTxServiceUrlInput("   ".to_string()));
+        let _ = s.update(Message::SafeApiKeyInput("two words".to_string().into()));
         assert!(!s.can_advance());
 
-        // A non-HTTPS URL is rejected too.
-        let _ = s.update(Message::SafeTxServiceUrlInput(
-            "http://safe.example".to_string(),
-        ));
-        assert!(!s.can_advance());
-
-        // A valid HTTPS URL unblocks finishing.
-        let _ = s.update(Message::SafeTxServiceUrlInput(
-            "https://safe-tx.example.com".to_string(),
-        ));
+        // Surrounding whitespace from a paste is trimmed, not an error.
+        let _ = s.update(Message::SafeApiKeyInput("  abc.def-1\n".to_string().into()));
         assert!(s.can_advance());
+    }
+
+    #[test]
+    fn most_private_preset_drops_the_safe_api_key() {
+        let mut s = NetworkSetupScreen::new(WizardMode::Onboarding);
+        let _ = s.update(Message::SafeApiKeyInput("abc".to_string().into()));
+        let _ = s.update(Message::MostPrivatePreset);
+        assert!(s.draft.safe_api_key.as_str().is_empty());
+        // With the key gone, the preset is the most private setup there is.
+        assert_eq!(s.privacy_score(), 8);
     }
 
     /// A successful refresh overwrites whatever was in the override field
@@ -2661,14 +2652,14 @@ mod tests {
     /// gated on the entire draft being valid (the same check as Review) — a
     /// half-typed section elsewhere can't be silently written by saving from a
     /// different step. When invalid, Save is a no-op (no `Completed`, and it
-    /// must not apply). Uses an invalid custom Safe TX URL to force the gate.
+    /// must not apply). Uses a malformed Safe API key to force the gate.
     #[test]
     fn save_refuses_invalid_draft() {
         let mut s = NetworkSetupScreen::new(WizardMode::Onboarding);
-        let _ = s.update(Message::SetSafeTxService(SafeTxService::Custom));
+        let _ = s.update(Message::SafeApiKeyInput("two words".to_string().into()));
         assert!(
             !s.step_valid(WizardStep::Review),
-            "an empty custom Safe TX URL must leave the draft invalid",
+            "a malformed Safe API key must leave the draft invalid",
         );
         let (_, outcome) = s.update(Message::Save);
         assert!(

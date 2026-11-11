@@ -5,10 +5,11 @@
 //! Reads: the Safe's pending queue (with a derived lifecycle
 //! [`SafeTxState`] per entry) and per-tx detail. Writes: [`propose`] and
 //! [`confirm`], which only ever carry a signature the caller produced
-//! after on-chain hash verification. The service is hit **keyless** —
-//! the public endpoint allows ~2 RPS without an `Authorization` header,
-//! which is plenty for a single user's wallet. Execution never goes
-//! through the service; Kao broadcasts `execTransaction` directly via
+//! after on-chain hash verification. Without a key the public gateway
+//! allows 2 RPS and 5,000 requests a month, and can refuse a wallet for
+//! days once that runs out, so an optional key from Settings is sent as a
+//! bearer token ([`Access`]). Execution never goes through the service;
+//! Kao broadcasts `execTransaction` directly via
 //! [`super::tx::execute_safe_tx`].
 //!
 //! ### Trust posture
@@ -408,6 +409,100 @@ fn map_raw(raw: RawMultisigTx, threshold: u32, current_nonce: u64) -> Option<Pen
     })
 }
 
+/// How a request reaches the service, which decides whether it carries the
+/// user's key and what a refusal means. Deliberately no `Debug`: it holds the
+/// key.
+enum Access {
+    /// A self-hosted or third-party service. Never sees the key: it is
+    /// Safe's credential, and a mirror's quota is none of Safe's business.
+    Mirror,
+    Keyless,
+    Keyed(String),
+}
+
+impl Access {
+    fn resolve(base: &str, configured: Option<String>) -> Self {
+        if base != DEFAULT_TX_SERVICE_BASE {
+            return Self::Mirror;
+        }
+        configured.map_or(Self::Keyless, Self::Keyed)
+    }
+
+    fn current(base: &str) -> Self {
+        Self::resolve(base, crate::settings::safe_api_key())
+    }
+
+    fn apply(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self {
+            Self::Keyed(key) => request.bearer_auth(key),
+            Self::Mirror | Self::Keyless => request,
+        }
+    }
+}
+
+const ADD_SAFE_KEY: &str = "Add a Safe API key under Settings > Networks > Safe TX Service.";
+
+/// A user-facing sentence for a quota or auth refusal from Safe's gateway, or
+/// `None` to report the response as-is. The body and header are untrusted, so
+/// they only choose between fixed wordings and are never echoed.
+fn refusal_message(
+    status: reqwest::StatusCode,
+    body: &str,
+    reset_secs: Option<u64>,
+    access: &Access,
+) -> Option<String> {
+    if matches!(access, Access::Mirror) {
+        return None;
+    }
+    let keyed = matches!(access, Access::Keyed(_));
+    match status {
+        reqwest::StatusCode::TOO_MANY_REQUESTS => {
+            let resets = reset_secs
+                .and_then(reset_phrase)
+                .map(|when| format!(" It resets in {when}."))
+                .unwrap_or_default();
+            let monthly = body.to_ascii_lowercase().contains("quota");
+            Some(match (monthly, keyed) {
+                (true, false) => format!(
+                    "Safe's monthly limit for requests without an API key is used up.{resets} \
+                     {ADD_SAFE_KEY}"
+                ),
+                (true, true) => format!(
+                    "Your Safe API key's monthly quota is used up.{resets} You can raise it at \
+                     developer.safe.global."
+                ),
+                (false, false) => format!(
+                    "Safe is rate-limiting requests without an API key.{resets} {ADD_SAFE_KEY}"
+                ),
+                (false, true) => format!("Safe is rate-limiting this API key.{resets}"),
+            })
+        }
+        reqwest::StatusCode::UNAUTHORIZED => Some(if keyed {
+            "Safe rejected your API key. Check it under Settings > Networks > Safe TX Service."
+                .to_string()
+        } else {
+            format!("Safe's service now requires an API key. {ADD_SAFE_KEY}")
+        }),
+        _ => None,
+    }
+}
+
+/// `secs` as a rough duration, or `None` for a value no monthly quota could
+/// produce (a garbled header shouldn't promise a date).
+fn reset_phrase(secs: u64) -> Option<String> {
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+    let about = |n: u64, unit: &str| format!("about {n} {unit}{}", if n == 1 { "" } else { "s" });
+    match secs {
+        s if s > 45 * DAY => None,
+        s if s >= DAY => Some(about(s / DAY, "day")),
+        s if s >= HOUR => Some(about(s / HOUR, "hour")),
+        s if s >= MINUTE => Some(about(s / MINUTE, "minute")),
+        _ => Some("less than a minute".to_string()),
+    }
+}
+
 /// Resolve a Safe-service response: pass 2xx through, otherwise fold the
 /// response **body** into the error string. The service returns its real
 /// diagnostic as JSON in the body (field-level validation errors on
@@ -416,13 +511,28 @@ fn map_raw(raw: RawMultisigTx, threshold: u32, current_nonce: u64) -> Option<Pen
 /// leave an opaque `HTTP 422`. The body is service-authored text about
 /// our own request — no URL, no key — so it's safe to surface, truncated
 /// so a misbehaving upstream can't flood the log.
-async fn check_status(context: &str, resp: reqwest::Response) -> Result<reqwest::Response, String> {
+///
+/// A quota or auth refusal from Safe's own gateway becomes a sentence the
+/// user can act on instead (see [`refusal_message`]).
+async fn check_status(
+    context: &str,
+    access: &Access,
+    resp: reqwest::Response,
+) -> Result<reqwest::Response, String> {
     let status = resp.status();
     if status.is_success() {
         return Ok(resp);
     }
+    let reset_secs = resp
+        .headers()
+        .get("x-ratelimit-reset")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
     let body = resp.text().await.unwrap_or_default();
     let body = body.trim();
+    if let Some(message) = refusal_message(status, body, reset_secs, access) {
+        return Err(message);
+    }
     if body.is_empty() {
         Err(format!("{context}: HTTP {status}"))
     } else {
@@ -479,15 +589,16 @@ pub async fn fetch_pending(
 ) -> Result<Vec<PendingSafeTx>, String> {
     let current_nonce = current_safe_nonce(net, safe, chain).await?;
     let client = crate::indexer::http_client_or_err()?;
+    let access = Access::current(base);
     let mut out: Vec<PendingSafeTx> = Vec::new();
     let mut offset = 0usize;
     for _ in 0..QUEUE_MAX_PAGES {
         let url = queue_url(base, safe, chain, current_nonce, offset);
         let resp =
-            client.get(&url).send().await.map_err(|e| {
+            access.apply(client.get(&url)).send().await.map_err(|e| {
                 format!("safe-service GET: {}", crate::indexer::redact_url_in_err(e))
             })?;
-        let page: MultisigPage = check_status("safe-service queue", resp)
+        let page: MultisigPage = check_status("safe-service queue", &access, resp)
             .await?
             .json()
             .await
@@ -635,8 +746,9 @@ pub async fn fetch_detail(
 ) -> Result<SafeTxDetail, String> {
     let current_nonce = current_safe_nonce(net, safe, chain).await?;
     let url = detail_url(base, safe_tx_hash, chain);
-    let resp = crate::indexer::http_client_or_err()?
-        .get(&url)
+    let access = Access::current(base);
+    let resp = access
+        .apply(crate::indexer::http_client_or_err()?.get(&url))
         .send()
         .await
         .map_err(|e| {
@@ -645,7 +757,7 @@ pub async fn fetch_detail(
                 crate::indexer::redact_url_in_err(e)
             )
         })?;
-    let raw: RawMultisigTx = check_status("safe-service detail", resp)
+    let raw: RawMultisigTx = check_status("safe-service detail", &access, resp)
         .await?
         .json()
         .await
@@ -718,8 +830,9 @@ pub async fn propose(
         signature: signature.to_string(),
         origin: origin.map(str::to_string),
     };
-    let resp = crate::indexer::http_client_or_err()?
-        .post(propose_url(base, safe, chain))
+    let access = Access::current(base);
+    let resp = access
+        .apply(crate::indexer::http_client_or_err()?.post(propose_url(base, safe, chain)))
         .json(&body)
         .send()
         .await
@@ -729,7 +842,7 @@ pub async fn propose(
                 crate::indexer::redact_url_in_err(e)
             )
         })?;
-    check_status("safe-service propose", resp).await?;
+    check_status("safe-service propose", &access, resp).await?;
     Ok(())
 }
 
@@ -744,8 +857,15 @@ pub async fn confirm(
     let body = ConfirmBody {
         signature: signature.to_string(),
     };
-    let resp = crate::indexer::http_client_or_err()?
-        .post(confirmations_url(base, safe_tx_hash, chain))
+    let access = Access::current(base);
+    let resp = access
+        .apply(
+            crate::indexer::http_client_or_err()?.post(confirmations_url(
+                base,
+                safe_tx_hash,
+                chain,
+            )),
+        )
         .json(&body)
         .send()
         .await
@@ -755,7 +875,7 @@ pub async fn confirm(
                 crate::indexer::redact_url_in_err(e)
             )
         })?;
-    check_status("safe-service confirm", resp).await?;
+    check_status("safe-service confirm", &access, resp).await?;
     Ok(())
 }
 
@@ -1009,7 +1129,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_status_passes_success_through_with_body_intact() {
-        let resp = check_status("ctx", response(200, r#"{"results": []}"#))
+        let resp = check_status("ctx", &Access::Mirror, response(200, r#"{"results": []}"#))
             .await
             .unwrap();
         // The body must still be readable downstream — check_status only
@@ -1023,7 +1143,7 @@ mod tests {
         // service's field-level diagnostic must survive into the error
         // string the UI and logs surface.
         let body = r#"{"signature": ["Signature does not match sender"]}"#;
-        let err = check_status("safe-service propose", response(422, body))
+        let err = check_status("safe-service propose", &Access::Mirror, response(422, body))
             .await
             .unwrap_err();
         assert!(err.starts_with("safe-service propose: HTTP 422"), "{err}");
@@ -1032,10 +1152,12 @@ mod tests {
 
     #[tokio::test]
     async fn check_status_empty_body_is_status_only() {
-        let err = check_status("ctx", response(503, "")).await.unwrap_err();
+        let err = check_status("ctx", &Access::Mirror, response(503, ""))
+            .await
+            .unwrap_err();
         assert_eq!(err, "ctx: HTTP 503 Service Unavailable");
         // Whitespace-only bodies collapse to the same shape.
-        let err = check_status("ctx", response(503, "  \n"))
+        let err = check_status("ctx", &Access::Mirror, response(503, "  \n"))
             .await
             .unwrap_err();
         assert_eq!(err, "ctx: HTTP 503 Service Unavailable");
@@ -1046,9 +1168,123 @@ mod tests {
         // 'z' rather than 'x': the context and status text must not
         // collide with the char we count.
         let body = "z".repeat(5_000);
-        let err = check_status("ctx", response(500, &body)).await.unwrap_err();
+        let err = check_status("ctx", &Access::Mirror, response(500, &body))
+            .await
+            .unwrap_err();
         assert!(err.ends_with('…'), "{err}");
         assert_eq!(err.chars().filter(|c| *c == 'z').count(), 300);
+    }
+
+    // ── API key and refusals ─────────────────────────────────────────
+
+    fn auth_header(access: &Access) -> Option<String> {
+        access
+            .apply(reqwest::Client::new().get("https://example.org/"))
+            .build()
+            .unwrap()
+            .headers()
+            .get(reqwest::header::AUTHORIZATION)
+            .map(|v| v.to_str().unwrap().to_string())
+    }
+
+    #[test]
+    fn api_key_goes_to_the_default_gateway_only() {
+        let key = || Some("SECRET".to_string());
+        assert_eq!(
+            auth_header(&Access::resolve(DEFAULT_TX_SERVICE_BASE, key())).as_deref(),
+            Some("Bearer SECRET"),
+        );
+        assert_eq!(
+            auth_header(&Access::resolve(DEFAULT_TX_SERVICE_BASE, None)),
+            None
+        );
+        for mirror in [
+            "https://safe.example.org",
+            "https://api.safe.global.example.org",
+            "http://localhost:8000",
+        ] {
+            assert_eq!(
+                auth_header(&Access::resolve(mirror, key())),
+                None,
+                "{mirror}"
+            );
+        }
+    }
+
+    fn quota_response() -> reqwest::Response {
+        reqwest::Response::from(
+            http::Response::builder()
+                .status(429)
+                .header("x-ratelimit-reset", "209151")
+                .body(r#"{"error_msg":"Monthly quota exceeded"}"#.to_string())
+                .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn exhausted_keyless_quota_says_when_and_what_to_do() {
+        let err = check_status("safe-service queue", &Access::Keyless, quota_response())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            "Safe's monthly limit for requests without an API key is used up. It resets in \
+             about 2 days. Add a Safe API key under Settings > Networks > Safe TX Service."
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_keyed_quota_does_not_suggest_adding_a_key() {
+        let err = check_status(
+            "safe-service queue",
+            &Access::Keyed("SECRET".into()),
+            quota_response(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.starts_with("Your Safe API key's monthly quota"),
+            "{err}"
+        );
+        assert!(!err.contains("SECRET"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_mirror_429_is_reported_as_is() {
+        let err = check_status("safe-service queue", &Access::Mirror, quota_response())
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("safe-service queue: HTTP 429"), "{err}");
+        assert!(!err.contains("API key"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn rejected_key_is_named() {
+        let err = check_status(
+            "ctx",
+            &Access::Keyed("SECRET".into()),
+            response(401, "nope"),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.starts_with("Safe rejected your API key"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn refusal_never_echoes_the_untrusted_body() {
+        let err = check_status("ctx", &Access::Keyless, response(429, "visit evil.example"))
+            .await
+            .unwrap_err();
+        assert!(!err.contains("evil.example"), "{err}");
+    }
+
+    #[test]
+    fn reset_phrase_rounds_down_and_rejects_garbage() {
+        assert_eq!(reset_phrase(30).as_deref(), Some("less than a minute"));
+        assert_eq!(reset_phrase(60).as_deref(), Some("about 1 minute"));
+        assert_eq!(reset_phrase(7_300).as_deref(), Some("about 2 hours"));
+        assert_eq!(reset_phrase(209_151).as_deref(), Some("about 2 days"));
+        assert_eq!(reset_phrase(u64::MAX), None);
     }
 
     // ── parsable_confirmations ───────────────────────────────────────

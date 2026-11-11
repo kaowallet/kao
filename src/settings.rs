@@ -165,33 +165,6 @@ impl ApiProvider {
     }
 }
 
-/// Safe Transaction Service endpoint choice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SafeTxService {
-    /// Use the default Safe Transaction Service endpoints.
-    #[default]
-    Default,
-    /// User-supplied custom URL.
-    Custom,
-}
-
-impl SafeTxService {
-    pub fn key(self) -> &'static str {
-        match self {
-            Self::Default => "default",
-            Self::Custom => "custom",
-        }
-    }
-
-    pub fn from_key(s: &str) -> Option<Self> {
-        match s {
-            "default" => Some(Self::Default),
-            "custom" => Some(Self::Custom),
-            _ => None,
-        }
-    }
-}
-
 /// SOCKS proxy type for network tunneling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ProxyType {
@@ -334,8 +307,8 @@ struct State {
     custom_rpc_url: Option<String>,
     api_provider: ApiProvider,
     api_key: Option<String>,
-    safe_tx_service: SafeTxService,
-    safe_tx_service_url: Option<String>,
+    /// Bearer key for Safe's public gateway. Never sent to a custom mirror.
+    safe_api_key: Option<String>,
     proxy_enabled: bool,
     proxy_type: ProxyType,
     proxy_address: String,
@@ -381,8 +354,7 @@ impl std::fmt::Debug for State {
             .field("custom_rpc_url", &self.custom_rpc_url)
             .field("api_provider", &self.api_provider)
             .field("api_key", &redact(&self.api_key))
-            .field("safe_tx_service", &self.safe_tx_service)
-            .field("safe_tx_service_url", &self.safe_tx_service_url)
+            .field("safe_api_key", &redact(&self.safe_api_key))
             .field("proxy_enabled", &self.proxy_enabled)
             .field("proxy_type", &self.proxy_type)
             .field("proxy_address", &self.proxy_address)
@@ -439,8 +411,7 @@ fn default_state() -> State {
         custom_rpc_url: None,
         api_provider: ApiProvider::default(),
         api_key: None,
-        safe_tx_service: SafeTxService::default(),
-        safe_tx_service_url: None,
+        safe_api_key: None,
         proxy_enabled: false,
         proxy_type: ProxyType::default(),
         proxy_address: "127.0.0.1:9050".to_string(),
@@ -521,9 +492,7 @@ struct OnDisk {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    safe_tx_service: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    safe_tx_service_url: Option<String>,
+    safe_api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     proxy_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -686,14 +655,9 @@ fn parse(text: &str) -> State {
         state.api_key = state.drpc_api_key.clone();
     }
 
-    if let Some(p) = on_disk.safe_tx_service.as_deref()
-        && let Some(parsed) = SafeTxService::from_key(p)
-    {
-        state.safe_tx_service = parsed;
-    }
-    state.safe_tx_service_url = on_disk
-        .safe_tx_service_url
-        .filter(|s| !s.is_empty() && is_https_url(s));
+    state.safe_api_key = on_disk
+        .safe_api_key
+        .filter(|s| !s.is_empty() && valid_safe_api_key(s));
 
     if let Some(enabled) = on_disk.proxy_enabled {
         state.proxy_enabled = enabled;
@@ -813,8 +777,7 @@ fn serialize(state: &State) -> String {
         custom_rpc_url: state.custom_rpc_url.clone(),
         api_provider: Some(state.api_provider.key().to_string()),
         api_key: state.api_key.clone(),
-        safe_tx_service: Some(state.safe_tx_service.key().to_string()),
-        safe_tx_service_url: state.safe_tx_service_url.clone(),
+        safe_api_key: state.safe_api_key.clone(),
         proxy_enabled: if state.proxy_enabled {
             Some(true)
         } else {
@@ -1333,42 +1296,33 @@ pub fn set_api_key(value: Option<String>) {
     write_all();
 }
 
-pub fn safe_tx_service() -> SafeTxService {
+pub fn safe_api_key() -> Option<String> {
     ensure()
         .lock()
         .expect("settings mutex poisoned")
-        .safe_tx_service
-}
-
-pub fn set_safe_tx_service(value: SafeTxService) {
-    let old = {
-        let mut state = ensure().lock().expect("settings mutex poisoned");
-        std::mem::replace(&mut state.safe_tx_service, value)
-    };
-    crate::trace::state("settings", "safe_tx_service", old.key(), value.key());
-    write_all();
-}
-
-pub fn safe_tx_service_url() -> Option<String> {
-    ensure()
-        .lock()
-        .expect("settings mutex poisoned")
-        .safe_tx_service_url
+        .safe_api_key
         .clone()
 }
 
-pub fn set_safe_tx_service_url(value: Option<String>) {
-    let cleaned = value.filter(|s| !s.is_empty() && is_https_url(s));
-    let to = presence(cleaned.is_some());
+pub fn set_safe_api_key(value: Option<String>) {
+    let value = value.filter(|s| !s.is_empty() && valid_safe_api_key(s));
+    let to = presence(value.is_some());
     let from = {
         let mut state = ensure().lock().expect("settings mutex poisoned");
-        let from = presence(state.safe_tx_service_url.is_some());
-        state.safe_tx_service_url = cleaned;
+        let from = presence(state.safe_api_key.is_some());
+        state.safe_api_key = value;
         from
     };
-    // URL can embed credentials — presence only.
-    crate::trace::state("settings", "safe_tx_service_url", from, to);
+    // Credential — presence only.
+    crate::trace::state("settings", "safe_api_key", from, to);
     write_all();
+}
+
+/// Whether `key` can travel in an `Authorization` header. A stray space or
+/// non-ASCII character would otherwise fail every Safe service request with
+/// an opaque builder error. Blank passes, because the key is optional.
+pub fn valid_safe_api_key(key: &str) -> bool {
+    key.bytes().all(|b| b.is_ascii_graphic())
 }
 
 pub fn proxy_enabled() -> bool {
@@ -2425,6 +2379,7 @@ enabled = true
             drpc_api_key: Some("DRPC_TEST_KEY".into()),
             blockscout_base_url: Some("https://base.blockscout.com".into()),
             blockscout_api_key: Some("BLOCKSCOUT_TEST_KEY".into()),
+            safe_api_key: Some("SAFE_TEST_KEY".into()),
             ..default_state()
         };
         let serialized = serialize(&original);
@@ -2444,6 +2399,8 @@ enabled = true
         assert_eq!(parsed.drpc_api_key, original.drpc_api_key);
         assert_eq!(parsed.blockscout_base_url, original.blockscout_base_url);
         assert_eq!(parsed.blockscout_api_key, original.blockscout_api_key);
+        assert_eq!(parsed.safe_api_key, original.safe_api_key);
+        assert!(!format!("{original:?}").contains("SAFE_TEST_KEY"));
         // auto_checkpoint isn't persisted; parsed value reverts to the default.
         assert_eq!(parsed.auto_checkpoint, default_state().auto_checkpoint);
     }
@@ -2469,6 +2426,18 @@ enabled = true
         assert!(!is_https_url("ftp://example.com"));
         assert!(!is_https_url(""));
         assert!(!is_https_url("not a url"));
+    }
+
+    #[test]
+    fn safe_api_key_must_fit_in_a_header() {
+        assert!(valid_safe_api_key(""));
+        assert!(valid_safe_api_key("eyJhbGciOi.J9-abc_123"));
+        assert!(!valid_safe_api_key("two words"));
+        assert!(!valid_safe_api_key("line\nbreak"));
+        assert!(!valid_safe_api_key("ключ"));
+
+        let s = parse("safe_api_key = \"not a header value\"\n");
+        assert!(s.safe_api_key.is_none());
     }
 
     #[test]
@@ -2837,12 +2806,17 @@ enabled = true
         assert!(ApiProvider::from_key("bogus").is_none());
     }
 
+    /// The wizard's global Safe service URL was stored but never used, and is
+    /// gone; files that still carry it must load, and lose it on the next save.
     #[test]
-    fn safe_tx_service_key_round_trip() {
-        for p in [SafeTxService::Default, SafeTxService::Custom] {
-            assert_eq!(SafeTxService::from_key(p.key()), Some(p));
-        }
-        assert!(SafeTxService::from_key("bogus").is_none());
+    fn retired_safe_tx_service_keys_are_ignored() {
+        let s = parse(
+            "safe_tx_service = \"custom\"\n\
+             safe_tx_service_url = \"https://safe.example.org\"\n\
+             safe_api_key = \"abc\"\n",
+        );
+        assert_eq!(s.safe_api_key.as_deref(), Some("abc"));
+        assert!(!serialize(&s).contains("safe_tx_service"));
     }
 
     #[test]

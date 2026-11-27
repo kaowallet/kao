@@ -66,7 +66,7 @@ dirs = "6"
 # UTS-46 / ENSIP-15 normalization for ENS names. Rejects bidi controls,
 # zero-width chars, mixed-script confusables, and other display-spoofing
 # inputs that a naive ASCII-lowercase pass would accept.
-ens-normalize-rs = "0.1.1"
+ens-normalize-rs = "0.2.0"
 # Bytecode introspection — extracts function selectors and arg-type lists
 # from EVM bytecode without needing source. Used by clear-signing to
 # narrow ambiguous 4byte matches by intersecting with what the contract

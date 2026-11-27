@@ -1239,7 +1239,7 @@ version = "0.12.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.ens-normalize-rs]]
-version = "0.1.1"
+version = "0.2.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.enum-as-inner]]
@@ -2531,10 +2531,6 @@ version = "0.3.55"
 criteria = "safe-to-deploy"
 
 [[exemptions.ordered-float]]
-version = "2.10.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.ordered-float]]
 version = "5.5.1"
 criteria = "safe-to-deploy"
 
@@ -3332,10 +3328,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.serde]]
 version = "1.0.229"
-criteria = "safe-to-deploy"
-
-[[exemptions.serde-aux]]
-version = "4.7.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.serde_core]]

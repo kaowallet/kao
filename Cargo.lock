@@ -5219,8 +5219,8 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "helios-common"
-version = "0.12.0"
-source = "git+https://github.com/a16z/helios?rev=2af9b41887e069144ee56cd710f3ddca195473f8#2af9b41887e069144ee56cd710f3ddca195473f8"
+version = "0.12.1"
+source = "git+https://github.com/a16z/helios?rev=77a88ee29cae45c9fdc7d9c776b58cb2fd78f8b5#77a88ee29cae45c9fdc7d9c776b58cb2fd78f8b5"
 dependencies = [
  "alloy",
  "async-trait",
@@ -5235,8 +5235,8 @@ dependencies = [
 
 [[package]]
 name = "helios-consensus-core"
-version = "0.12.0"
-source = "git+https://github.com/a16z/helios?rev=2af9b41887e069144ee56cd710f3ddca195473f8#2af9b41887e069144ee56cd710f3ddca195473f8"
+version = "0.12.1"
+source = "git+https://github.com/a16z/helios?rev=77a88ee29cae45c9fdc7d9c776b58cb2fd78f8b5#77a88ee29cae45c9fdc7d9c776b58cb2fd78f8b5"
 dependencies = [
  "alloy",
  "alloy-rlp",
@@ -5259,8 +5259,8 @@ dependencies = [
 
 [[package]]
 name = "helios-core"
-version = "0.12.0"
-source = "git+https://github.com/a16z/helios?rev=2af9b41887e069144ee56cd710f3ddca195473f8#2af9b41887e069144ee56cd710f3ddca195473f8"
+version = "0.12.1"
+source = "git+https://github.com/a16z/helios?rev=77a88ee29cae45c9fdc7d9c776b58cb2fd78f8b5#77a88ee29cae45c9fdc7d9c776b58cb2fd78f8b5"
 dependencies = [
  "alloy",
  "alloy-trie",
@@ -5270,7 +5270,6 @@ dependencies = [
  "getrandom 0.3.4",
  "getrandom 0.4.3",
  "helios-common",
- "helios-verifiable-api-client",
  "hex",
  "jsonrpsee",
  "openssl",
@@ -5290,8 +5289,8 @@ dependencies = [
 
 [[package]]
 name = "helios-ethereum"
-version = "0.12.0"
-source = "git+https://github.com/a16z/helios?rev=2af9b41887e069144ee56cd710f3ddca195473f8#2af9b41887e069144ee56cd710f3ddca195473f8"
+version = "0.12.1"
+source = "git+https://github.com/a16z/helios?rev=77a88ee29cae45c9fdc7d9c776b58cb2fd78f8b5#77a88ee29cae45c9fdc7d9c776b58cb2fd78f8b5"
 dependencies = [
  "alloy",
  "alloy-trie",
@@ -5328,8 +5327,8 @@ dependencies = [
 
 [[package]]
 name = "helios-opstack"
-version = "0.12.0"
-source = "git+https://github.com/a16z/helios?rev=2af9b41887e069144ee56cd710f3ddca195473f8#2af9b41887e069144ee56cd710f3ddca195473f8"
+version = "0.12.1"
+source = "git+https://github.com/a16z/helios?rev=77a88ee29cae45c9fdc7d9c776b58cb2fd78f8b5#77a88ee29cae45c9fdc7d9c776b58cb2fd78f8b5"
 dependencies = [
  "alloy",
  "alloy-rlp",
@@ -5374,8 +5373,8 @@ dependencies = [
 
 [[package]]
 name = "helios-revm-utils"
-version = "0.12.0"
-source = "git+https://github.com/a16z/helios?rev=2af9b41887e069144ee56cd710f3ddca195473f8#2af9b41887e069144ee56cd710f3ddca195473f8"
+version = "0.12.1"
+source = "git+https://github.com/a16z/helios?rev=77a88ee29cae45c9fdc7d9c776b58cb2fd78f8b5#77a88ee29cae45c9fdc7d9c776b58cb2fd78f8b5"
 dependencies = [
  "alloy",
  "eyre",
@@ -5385,36 +5384,6 @@ dependencies = [
  "revm 43.0.3",
  "thiserror 1.0.69",
  "tracing",
-]
-
-[[package]]
-name = "helios-verifiable-api-client"
-version = "0.12.0"
-source = "git+https://github.com/a16z/helios?rev=2af9b41887e069144ee56cd710f3ddca195473f8#2af9b41887e069144ee56cd710f3ddca195473f8"
-dependencies = [
- "alloy",
- "async-trait",
- "eyre",
- "helios-common",
- "helios-verifiable-api-types",
- "reqwest 0.12.28",
- "reqwest-middleware",
- "reqwest-retry",
- "serde",
- "serde_json",
- "tokio",
- "url",
-]
-
-[[package]]
-name = "helios-verifiable-api-types"
-version = "0.12.0"
-source = "git+https://github.com/a16z/helios?rev=2af9b41887e069144ee56cd710f3ddca195473f8#2af9b41887e069144ee56cd710f3ddca195473f8"
-dependencies = [
- "alloy",
- "helios-common",
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -6287,9 +6256,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e0242819d153cba4b4b05a5a8f2a7e9bbf97b6055b2a002b395c96b5ff3c0222"
 dependencies = [
  "cfg-if",
- "js-sys",
- "wasm-bindgen",
- "web-sys",
 ]
 
 [[package]]
@@ -10079,43 +10045,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "reqwest-middleware"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57f17d28a6e6acfe1733fe24bcd30774d13bffa4b8a22535b4c8c98423088d4e"
-dependencies = [
- "anyhow",
- "async-trait",
- "http 1.5.0",
- "reqwest 0.12.28",
- "serde",
- "thiserror 1.0.69",
- "tower-service",
-]
-
-[[package]]
-name = "reqwest-retry"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29c73e4195a6bfbcb174b790d9b3407ab90646976c55de58a6515da25d851178"
-dependencies = [
- "anyhow",
- "async-trait",
- "futures",
- "getrandom 0.2.17",
- "http 1.5.0",
- "hyper 1.11.1",
- "parking_lot 0.11.2",
- "reqwest 0.12.28",
- "reqwest-middleware",
- "retry-policies",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "wasm-timer",
-]
-
-[[package]]
 name = "resolv-conf"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10224,15 +10153,6 @@ checksum = "c38316070fbd6504dcbb6042225f2608f2323c71155836c9b48f192113f68782"
 dependencies = [
  "tokio",
  "zduny-wasm-timer",
-]
-
-[[package]]
-name = "retry-policies"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5875471e6cab2871bc150ecb8c727db5113c9338cc3354dc5ee3425b6aa40a1c"
-dependencies = [
- "rand 0.8.8",
 ]
 
 [[package]]

@@ -75,10 +75,10 @@ ens-normalize-rs = "0.1.1"
 evmole = "0.9"
 futures = "0.3"
 getrandom = "0.4.3"
-# Pinned to the commit tag 0.12.0 points at (alloy 2.1, revm 43). Pinned by
+# Pinned to the commit tag 0.12.1 points at (alloy 2.1, revm 43). Pinned by
 # rev, not tag, so a re-pointed tag can't change the build. Bump deliberately
 # rather than tracking a branch.
-helios-ethereum = { git = "https://github.com/a16z/helios", rev = "2af9b41887e069144ee56cd710f3ddca195473f8" }
+helios-ethereum = { git = "https://github.com/a16z/helios", rev = "77a88ee29cae45c9fdc7d9c776b58cb2fd78f8b5" }
 # Same git rev as helios-ethereum: both crates ship from the a16z/helios
 # workspace and share types (alloy versions, network presets, etc.). The
 # OP-Stack client wraps Helios's verified L1 anchor with L2 fault-proof
@@ -86,7 +86,7 @@ helios-ethereum = { git = "https://github.com/a16z/helios", rev = "2af9b41887e06
 #
 # Pulls in the yanked `core2 0.4.0` (libp2p chain), which we work around
 # via [patch.crates-io] below. See the patch entry for the full story.
-helios-opstack = { git = "https://github.com/a16z/helios", rev = "2af9b41887e069144ee56cd710f3ddca195473f8" }
+helios-opstack = { git = "https://github.com/a16z/helios", rev = "77a88ee29cae45c9fdc7d9c776b58cb2fd78f8b5" }
 # `advanced` exposes the custom-widget API (Widget/Tree/Clipboard), used by
 # `colored_address`'s hover-grey + click-to-copy widget in src/ui/kao_widgets.rs.
 iced = { version = "0.14.0", features = ["tokio", "image", "qr_code", "svg", "advanced"] }
@@ -115,11 +115,12 @@ redb = "4.2.0"
 # whose nonce is one ahead of the on-chain account or whose max-fee
 # happens to dip below the base-fee window should still simulate, not
 # abort with a config error. Matches helios's own feature set verbatim
-# (helios/Cargo.toml workspace dep, rev 2af9b41) so the unified build has
+# (helios/Cargo.toml workspace dep, rev 77a88ee) so the unified build has
 # the same EVM semantics inside Kao as Helios uses for its verified
 # eth_call.
 revm = { version = "43.0.3", default-features = false, features = [
     "std",
+    "memory_limit",
     "optional_block_gas_limit",
     "optional_eip3607",
     "optional_no_base_fee",

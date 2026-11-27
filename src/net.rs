@@ -1502,7 +1502,7 @@ async fn build_op_backend(
     client.wait_synced().await.map_err(|e| e.to_string())?;
     let backend = HeliosBackend::Op(Arc::new(client));
     if let Err(e) = wait_for_head(&backend).await {
-        // A no-op at helios 2af9b41 (see `probe_op_consensus`), kept so the
+        // A no-op at helios 77a88ee (see `probe_op_consensus`), kept so the
         // failed build is released the moment upstream makes it stop.
         backend.shutdown().await;
         return Err(e);
@@ -1515,7 +1515,7 @@ async fn build_op_backend(
 ///
 /// helios's OP-stack consensus task polls `{consensus_rpc}/latest` every
 /// second from a `tokio::spawn` with no exit, and its `shutdown()` is a no-op
-/// (helios 2af9b41) — so every client built is a poller for the rest of the
+/// (helios 77a88ee) — so every client built is a poller for the rest of the
 /// process. Against a dead endpoint each build also burns [`wait_for_head`]'s
 /// full 45 s before failing, and the next read after the cooldown builds
 /// another: the pollers pile up, each logging `failed to advance` once a

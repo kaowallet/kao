@@ -2934,14 +2934,6 @@ criteria = "safe-to-deploy"
 version = "0.13.5"
 criteria = "safe-to-deploy"
 
-[[exemptions.reqwest-middleware]]
-version = "0.4.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.reqwest-retry]]
-version = "0.7.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.resolv-conf]]
 version = "0.7.6"
 criteria = "safe-to-deploy"
@@ -2972,10 +2964,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.retri]]
 version = "0.1.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.retry-policies]]
-version = "0.4.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.revm]]

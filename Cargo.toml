@@ -62,7 +62,7 @@ postcard = { version = "1.1", default-features = false, features = ["use-std"] }
 # `src/main.rs` for the call site and `proxy-env/src/lib.rs` for the rationale.
 proxy-env = { path = "proxy-env" }
 chacha20poly1305 = "0.11.0"
-dirs = "6"
+dirs = "7"
 # UTS-46 / ENSIP-15 normalization for ENS names. Rejects bidi controls,
 # zero-width chars, mixed-script confusables, and other display-spoofing
 # inputs that a naive ASCII-lowercase pass would accept.
@@ -72,7 +72,7 @@ ens-normalize-rs = "0.2.0"
 # narrow ambiguous 4byte matches by intersecting with what the contract
 # actually implements, and to fall back to "selector + arg types only"
 # when 4byte has no entry. MIT-licensed; uses alloy-dyn-abi internally.
-evmole = "0.9"
+evmole = "0.10"
 futures = "0.3"
 getrandom = "0.4.3"
 # Pinned to the commit tag 0.12.1 points at (alloy 2.1, revm 43). Pinned by
@@ -156,7 +156,7 @@ tokio-tungstenite = { version = "0.29", default-features = false, features = ["h
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 # Mozilla roots for the relay's TLS (the same set reqwest/hyper-rustls bundle).
 webpki-roots = "1"
-toml = "0.9"
+toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"

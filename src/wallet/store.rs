@@ -38,7 +38,7 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex, PoisonError};
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use rand::{RngCore, rngs::OsRng};
 use redb::{
     Database, ReadTransaction, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction,
@@ -1460,14 +1460,19 @@ fn derive_master_key(
     Ok(out)
 }
 
+/// The record cipher for a 32-byte key. A wrong-length key is an error, not a panic.
+fn blob_cipher(key: &[u8]) -> Result<XChaCha20Poly1305, WalletError> {
+    XChaCha20Poly1305::new_from_slice(key)
+        .map_err(|_| WalletError::Encryption("bad key length".into()))
+}
+
 fn encrypt_blob(key: &[u8], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, WalletError> {
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
+    let cipher = blob_cipher(key)?;
     let mut nonce_bytes = [0u8; NONCE_LEN];
     OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = XNonce::from_slice(&nonce_bytes);
     let ct = cipher
         .encrypt(
-            nonce,
+            &XNonce::from(nonce_bytes),
             Payload {
                 msg: plaintext,
                 aad,
@@ -1487,11 +1492,12 @@ fn decrypt_blob(key: &[u8], aad: &[u8], blob: &[u8]) -> Result<Zeroizing<Vec<u8>
     if blob.len() < NONCE_LEN + TAG_LEN {
         return Err(WalletError::Encryption("ciphertext too short".into()));
     }
-    let nonce = XNonce::from_slice(&blob[..NONCE_LEN]);
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
+    let nonce = XNonce::try_from(&blob[..NONCE_LEN])
+        .map_err(|_| WalletError::Encryption("bad nonce length".into()))?;
+    let cipher = blob_cipher(key)?;
     cipher
         .decrypt(
-            nonce,
+            &nonce,
             Payload {
                 msg: &blob[NONCE_LEN..],
                 aad,
@@ -1959,6 +1965,92 @@ mod tests {
 
     fn pw(s: &str) -> SecretString {
         SecretString::new(s.to_string().into_boxed_str())
+    }
+
+    /// Known answers pinned from argon2 0.5.3. A KDF crate upgrade that changed
+    /// any of these would derive a different master key and lock every
+    /// existing wallet, so the values must never be regenerated to make a
+    /// bump pass. The last row is the production work factor.
+    #[test]
+    fn argon2id_master_key_matches_pinned_known_answers() {
+        use alloy::hex;
+        let cases: [(u32, u32, u32, &str); 3] = [
+            (
+                8,
+                1,
+                1,
+                "5dd8ba5e5bfb9d0cf5c47fa6878b7c792a77dd5991d169a96efda8bc98bd1264",
+            ),
+            (
+                64,
+                2,
+                2,
+                "a29dbc3d3b9253461d861da10be21b4b5b445db710fd3d5c5705720bfd1aa0c7",
+            ),
+            (
+                48 * 1024,
+                3,
+                1,
+                "cc922d6d5b86f51b5741b0f8fc5272bf61b311a134ec908cdb6aab913a1dd629",
+            ),
+        ];
+        for (m_cost_kib, t_cost, p_cost, want) in cases {
+            let key = derive_master_key(
+                &pw("correct horse battery staple"),
+                b"kao-kat-salt-016",
+                m_cost_kib,
+                t_cost,
+                p_cost,
+            )
+            .unwrap();
+            assert_eq!(
+                hex::encode(*key),
+                want,
+                "m={m_cost_kib} t={t_cost} p={p_cost}"
+            );
+        }
+    }
+
+    /// The XChaCha20-Poly1305 vector from draft-irtf-cfrg-xchacha-03 §A.3.1,
+    /// laid out as a stored blob (nonce || ciphertext || tag). Pins the
+    /// on-disk record format across cipher crate upgrades: an old blob must
+    /// still open, and wrong AAD must still be refused.
+    #[test]
+    fn xchacha20poly1305_blob_matches_ietf_draft_vector() {
+        use alloy::hex;
+        let key: Vec<u8> = (0x80u8..=0x9f).collect();
+        let nonce: Vec<u8> = (0x40u8..=0x57).collect();
+        let aad = hex::decode("50515253c0c1c2c3c4c5c6c7").unwrap();
+        let plaintext: &[u8] = b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
+        let ciphertext = hex::decode(concat!(
+            "bd6d179d3e83d43b9576579493c0e939572a1700252bfaccbed2902c21396cbb",
+            "731c7f1b0b4aa6440bf3a82f4eda7e39ae64c6708c54c216cb96b72e1213b452",
+            "2f8c9ba40db5d945b11b69b982c1bb9e3f3fac2bc369488f76b2383565d3fff9",
+            "21f9664c97637da9768812f615c68b13b52e",
+            "c0875924c1c7987947deafd8780acf49",
+        ))
+        .unwrap();
+        let mut blob = nonce.clone();
+        blob.extend_from_slice(&ciphertext);
+
+        assert_eq!(
+            decrypt_blob(&key, &aad, &blob).unwrap().as_slice(),
+            plaintext
+        );
+        assert!(decrypt_blob(&key, b"other aad", &blob).is_err());
+
+        // A wrong-length key is refused, not a panic.
+        assert!(decrypt_blob(&key[..31], &aad, &blob).is_err());
+        assert!(encrypt_blob(&key[..31], &aad, plaintext).is_err());
+
+        // Encrypt side: a fresh blob has the same layout and opens again.
+        let fresh = encrypt_blob(&key, &aad, plaintext).unwrap();
+        assert_eq!(fresh.len(), NONCE_LEN + plaintext.len() + TAG_LEN);
+        assert_ne!(fresh[..NONCE_LEN], nonce[..]);
+        assert_eq!(
+            decrypt_blob(&key, &aad, &fresh).unwrap().as_slice(),
+            plaintext
+        );
     }
 
     #[test]

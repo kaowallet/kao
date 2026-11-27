@@ -54,14 +54,14 @@ async-trait = "0.1"
 # clear-signing's `symbol()` / `decimals()` probes then re-execute
 # against proof-verified state instead of trusting the raw RPC.
 op-alloy-rpc-types = "2"
-argon2 = "0.5.3"
+argon2 = "0.6.0"
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }
 # Isolated helper crate whose sole job is the one `unsafe std::env::set_var`
 # call that installs a process-wide proxy (`ALL_PROXY`) at startup. Lives in
 # its own crate so this crate can keep `#![forbid(unsafe_code)]`. See
 # `src/main.rs` for the call site and `proxy-env/src/lib.rs` for the rationale.
 proxy-env = { path = "proxy-env" }
-chacha20poly1305 = "0.10.1"
+chacha20poly1305 = "0.11.0"
 dirs = "6"
 # UTS-46 / ENSIP-15 normalization for ENS names. Rejects bidi controls,
 # zero-width chars, mixed-script confusables, and other display-spoofing

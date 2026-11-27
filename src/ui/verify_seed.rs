@@ -77,7 +77,7 @@ impl VerifySeedScreen {
         let word_count = seed_phrase.expose_secret().split_whitespace().count();
 
         let mut all_indices: Vec<usize> = (0..word_count).collect();
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         all_indices.shuffle(&mut rng);
         let mut blank_indices = all_indices[..BLANK_COUNT].to_vec();
         blank_indices.sort();

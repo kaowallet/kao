@@ -1160,18 +1160,18 @@ where
 /// Pick a kaomoji from the pool. Avoids returning the current value so
 /// a click always changes something — if the pool only has one entry
 /// (it doesn't, but be defensive) the same value is returned. Uses
-/// `rand::thread_rng()` rather than a deterministic seed: this is UI
+/// `rand::rng()` rather than a deterministic seed: this is UI
 /// flair, not a security primitive.
 fn pick_random_kaomoji(current: &str) -> String {
-    use rand::Rng;
+    use rand::RngExt;
     if KAOMOJI_POOL.is_empty() {
         return current.to_string();
     }
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     // At most a handful of attempts to avoid the current value; bail
     // out if the pool happens to be saturated with the current pick.
     for _ in 0..6 {
-        let idx = rng.gen_range(0..KAOMOJI_POOL.len());
+        let idx = rng.random_range(0..KAOMOJI_POOL.len());
         let candidate = KAOMOJI_POOL[idx];
         if candidate != current {
             return candidate.to_string();

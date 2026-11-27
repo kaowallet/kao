@@ -6634,7 +6634,7 @@ dependencies = [
 
 [[package]]
 name = "kao"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "alloy",
  "alloy-core",
@@ -6658,7 +6658,7 @@ dependencies = [
  "postcard",
  "privacy-pools",
  "proxy-env",
- "rand 0.8.8",
+ "rand 0.10.4",
  "redb",
  "reqwest 0.12.28",
  "revm 43.0.3",

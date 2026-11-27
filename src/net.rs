@@ -27,7 +27,7 @@ use alloy::providers::{Provider, RootProvider};
 use alloy::rpc::client::RpcClient;
 use alloy::rpc::types::eth::{Header, TransactionInput, TransactionRequest};
 use async_trait::async_trait;
-use rand::seq::SliceRandom;
+use rand::seq::{IndexedRandom, SliceRandom};
 use tokio::sync::Mutex;
 
 use helios_ethereum::config::checkpoints::{CheckpointFallback, Slot};
@@ -480,7 +480,7 @@ impl NetworkClient {
         }
         let rpcs = settings::rpcs(chain);
         let url = rpcs
-            .choose(&mut rand::thread_rng())
+            .choose(&mut rand::rng())
             .ok_or_else(|| format!("no execution RPCs configured for {}", chain.label()))?;
         let provider = build_fallback(url)
             .ok_or_else(|| format!("cannot build RPC provider for {}", chain.label()))?;
@@ -605,7 +605,7 @@ impl NetworkClient {
             // Helios never even chose an exec RPC — pick one ourselves
             // so the fallback path has somewhere to send the request.
             let rpcs = settings::rpcs(chain);
-            if let Some(url) = rpcs.choose(&mut rand::thread_rng()) {
+            if let Some(url) = rpcs.choose(&mut rand::rng()) {
                 r.provider = build_fallback(url);
             }
         }
@@ -1379,13 +1379,13 @@ fn current_snapshot(chain: Chain) -> ConfigSnapshot {
 }
 
 fn pick_rpc(rpcs: &[String]) -> String {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     rpcs.choose(&mut rng).cloned().unwrap_or_default()
 }
 
 fn shuffled(rpcs: &[String]) -> Vec<String> {
     let mut out: Vec<String> = rpcs.to_vec();
-    out.shuffle(&mut rand::thread_rng());
+    out.shuffle(&mut rand::rng());
     out
 }
 

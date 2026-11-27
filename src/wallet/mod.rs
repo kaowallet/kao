@@ -1370,16 +1370,25 @@ pub fn handoff_with(signer: KaoSigner) -> SignerHandoff {
 
 // ── Software-wallet helpers (unchanged behaviour) ──────────────────────────
 
+/// A BIP39 mnemonic over `N` bytes of entropy read straight from the OS CSPRNG
+/// (16 bytes → 12 words, 32 bytes → 24 words). The entropy buffer is scrubbed
+/// once the mnemonic holds its own copy.
+fn fresh_mnemonic<const N: usize>() -> coins_bip39::Mnemonic<English>
+where
+    coins_bip39::Entropy: From<[u8; N]>,
+{
+    let mut entropy = zeroize::Zeroizing::new([0u8; N]);
+    store::os_random(entropy.as_mut_slice());
+    coins_bip39::Mnemonic::new_from_entropy((*entropy).into())
+}
+
 /// Generate a new random 12-word BIP39 mnemonic and return the phrase and the derived signer.
 ///
 /// The phrase is wrapped in `SecretString` so its heap allocation is zeroed on
 /// drop. Callers must keep it inside `SecretString` (or `Zeroizing`) for the
 /// rest of its lifetime — converting to a plain `String` defeats the wrapper.
 pub fn generate_mnemonic() -> Result<(SecretString, PrivateKeySigner), WalletError> {
-    let mut rng = rand::thread_rng();
-    let mnemonic = coins_bip39::Mnemonic::<English>::new_with_count(&mut rng, 12)
-        .map_err(|e: coins_bip39::MnemonicError| WalletError::Mnemonic(e.to_string()))?;
-    let phrase = mnemonic.to_phrase();
+    let phrase = fresh_mnemonic::<16>().to_phrase();
     let signer = MnemonicBuilder::<English>::default()
         .phrase(&phrase)
         .build()
@@ -1394,10 +1403,9 @@ pub fn generate_mnemonic() -> Result<(SecretString, PrivateKeySigner), WalletErr
 /// keyring root, not a per-account key. Returned wrapped in `SecretString`; keep
 /// it inside `SecretString`/`Zeroizing` for its whole lifetime.
 pub fn generate_pp_mnemonic() -> Result<SecretString, WalletError> {
-    let mut rng = rand::thread_rng();
-    let mnemonic = coins_bip39::Mnemonic::<English>::new_with_count(&mut rng, 24)
-        .map_err(|e: coins_bip39::MnemonicError| WalletError::Mnemonic(e.to_string()))?;
-    Ok(SecretString::new(mnemonic.to_phrase().into_boxed_str()))
+    Ok(SecretString::new(
+        fresh_mnemonic::<32>().to_phrase().into_boxed_str(),
+    ))
 }
 
 /// Validate that a string is a well-formed BIP39 mnemonic (12 or 24 words).
@@ -2346,6 +2354,41 @@ mod tests {
         // Second take returns None.
         let again = cell.lock().unwrap().take();
         assert!(again.is_none());
+    }
+
+    /// The entropy → phrase mapping used by `fresh_mnemonic`, pinned to the
+    /// BIP39 reference vectors for all-zero entropy.
+    #[test]
+    fn mnemonic_from_entropy_matches_bip39_reference_vectors() {
+        let twelve = coins_bip39::Mnemonic::<English>::new_from_entropy([0u8; 16].into());
+        assert_eq!(
+            twelve.to_phrase(),
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+        );
+        let twenty_four = coins_bip39::Mnemonic::<English>::new_from_entropy([0u8; 32].into());
+        assert_eq!(
+            twenty_four.to_phrase(),
+            format!("{}art", "abandon ".repeat(23))
+        );
+    }
+
+    /// Fresh mnemonics have the right length, a valid BIP39 checksum, and are
+    /// not the all-zero phrase (the OS entropy actually landed in the buffer).
+    #[test]
+    fn generated_mnemonics_are_valid_bip39_of_the_right_length() {
+        use secrecy::ExposeSecret;
+        let (phrase, _) = generate_mnemonic().unwrap();
+        let pp = generate_pp_mnemonic().unwrap();
+        for (secret, words) in [(&phrase, 12), (&pp, 24)] {
+            let text = secret.expose_secret();
+            assert_eq!(text.split_whitespace().count(), words);
+            coins_bip39::Mnemonic::<English>::new_from_phrase(text).expect("valid checksum");
+            assert!(!text.starts_with("abandon abandon abandon abandon"));
+        }
+        assert_ne!(
+            generate_pp_mnemonic().unwrap().expose_secret(),
+            pp.expose_secret()
+        );
     }
 
     #[test]

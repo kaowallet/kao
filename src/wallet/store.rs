@@ -39,7 +39,7 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex, PoisonError};
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-use rand::{RngCore, rngs::OsRng};
+use rand::{TryRng, rngs::SysRng};
 use redb::{
     Database, ReadTransaction, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction,
 };
@@ -439,10 +439,19 @@ impl std::fmt::Debug for DataKey {
     }
 }
 
+/// Fill `buf` straight from the operating system's CSPRNG. Every key, salt,
+/// nonce and seed in the wallet comes from here. Panics if the OS cannot
+/// supply randomness — there is no safe way to continue without it.
+pub(crate) fn os_random(buf: &mut [u8]) {
+    SysRng
+        .try_fill_bytes(buf)
+        .expect("operating system randomness unavailable");
+}
+
 impl DataKey {
     fn generate() -> Self {
         let mut key = Zeroizing::new([0u8; 32]);
-        OsRng.fill_bytes(key.as_mut_slice());
+        os_random(key.as_mut_slice());
         Self(key)
     }
 
@@ -921,7 +930,13 @@ fn store_wrapped_key(txn: &WriteTransaction, wrapped_key: &[u8]) -> Result<(), W
 /// Rename `table` out of the way (a catalog change only — its pages aren't read), tolerating its
 /// absence.
 fn move_aside(txn: &WriteTransaction, table: ResetTable) -> Result<(), WalletError> {
-    let name = format!("{}.unreadable.{:016x}", table.name(), OsRng.next_u64());
+    let mut tag = [0u8; 8];
+    os_random(&mut tag);
+    let name = format!(
+        "{}.unreadable.{:016x}",
+        table.name(),
+        u64::from_le_bytes(tag)
+    );
     let renamed = match table {
         ResetTable::Sealed(t) => {
             txn.rename_table(t.def(), TableDefinition::<u64, &[u8]>::new(&name))
@@ -1107,7 +1122,7 @@ fn save_to(
         None => {
             // Fresh wallet — mint a salt and seal a fresh auth-check blob.
             let mut salt = [0u8; SALT_LEN];
-            OsRng.fill_bytes(&mut salt);
+            os_random(&mut salt);
             let key = derive_master_key(
                 pw,
                 &salt,
@@ -1469,7 +1484,7 @@ fn blob_cipher(key: &[u8]) -> Result<XChaCha20Poly1305, WalletError> {
 fn encrypt_blob(key: &[u8], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, WalletError> {
     let cipher = blob_cipher(key)?;
     let mut nonce_bytes = [0u8; NONCE_LEN];
-    OsRng.fill_bytes(&mut nonce_bytes);
+    os_random(&mut nonce_bytes);
     let ct = cipher
         .encrypt(
             &XNonce::from(nonce_bytes),

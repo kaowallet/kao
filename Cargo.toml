@@ -3,7 +3,7 @@ members = ["xtask", "proxy-env"]
 
 [package]
 name = "kao"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 publish = false
 
@@ -106,7 +106,7 @@ privacy-pools = { git = "https://github.com/kaowallet/privacy-pools", features =
 # (tokio-tungstenite::connect_async), which dials the relay directly and would
 # bypass the user's SOCKS5 proxy; Kao supplies its own proxy-aware connector.
 wallet-connect = { git = "https://github.com/kaowallet/wallet-connect", default-features = false }
-rand = "0.8"
+rand = "0.10"
 redb = "5.0.0"
 # Local EVM for transaction preflight. Pinned to the same version helios
 # pulls in (cargo unifies them into one build of revm 43.0.3 instead of

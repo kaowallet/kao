@@ -2931,7 +2931,7 @@ version = "1.0.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.redb]]
-version = "4.6.0"
+version = "5.0.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.redox_syscall]]

@@ -816,7 +816,7 @@ pub(crate) fn write_sealed_at(
         }
     }
     txn.commit().map_err(redb_err)?;
-    if cleared && let Err(e) = opened.db.compact() {
+    if cleared && let Err(e) = opened.db.compact(redb::CompactionMode::Balanced) {
         debug!(error = %e, "store: compact after a clear failed (ignored)");
     }
     Ok(())
@@ -860,7 +860,7 @@ pub(crate) fn reset_sealed_at(
         unlock_master_key(&txn, pw)?
     };
     let (key, moved_aside) = replace_data_key(&opened.db, &master_key)?;
-    if !moved_aside && let Err(e) = opened.db.compact() {
+    if !moved_aside && let Err(e) = opened.db.compact(redb::CompactionMode::Balanced) {
         debug!(error = %e, "store: compact after a reset failed (ignored)");
     }
     Ok((key, KeyOrigin::Minted))

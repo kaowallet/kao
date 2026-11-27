@@ -107,7 +107,7 @@ privacy-pools = { git = "https://github.com/kaowallet/privacy-pools", features =
 # bypass the user's SOCKS5 proxy; Kao supplies its own proxy-aware connector.
 wallet-connect = { git = "https://github.com/kaowallet/wallet-connect", default-features = false }
 rand = "0.8"
-redb = "4.2.0"
+redb = "5.0.0"
 # Local EVM for transaction preflight. Pinned to the same version helios
 # pulls in (cargo unifies them into one build of revm 43.0.3 instead of
 # duplicating). The three `optional_*` features disable basefee / nonce /

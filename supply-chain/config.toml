@@ -1150,6 +1150,10 @@ criteria = "safe-to-deploy"
 version = "5.0.1"
 criteria = "safe-to-deploy"
 
+[[exemptions.dirs]]
+version = "7.0.0"
+criteria = "safe-to-deploy"
+
 [[exemptions.dirs-sys]]
 version = "0.4.1"
 criteria = "safe-to-deploy"
@@ -1327,7 +1331,7 @@ version = "0.5.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.evmole]]
-version = "0.9.6"
+version = "0.10.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.exr]]
@@ -3695,7 +3699,7 @@ version = "0.8.23"
 criteria = "safe-to-deploy"
 
 [[exemptions.toml]]
-version = "0.9.12+spec-1.1.0"
+version = "1.2.3+spec-1.1.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.toml_datetime]]

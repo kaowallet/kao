@@ -42,6 +42,16 @@ ignore = [
     { id = "RUSTSEC-2024-0384", reason = "instant 0.1.13 unmaintained. Time-measurement utility used by libp2p/parking_lot 0.11/wasm-timer. No known vuln, no exposure beyond clock reads." },
     { id = "RUSTSEC-2024-0370", reason = "proc-macro-error 1.0.4 unmaintained. Build-time only, used by multihash-derive in the libp2p subtree. No runtime surface." },
     { id = "RUSTSEC-2026-0441", reason = "pin-utils 0.1.0 unmaintained (archived 2026-10; no known vuln). Only via libp2p-gossipsub → wasm-timer in helios-opstack's p2p stack; a stack-pinning macro with no runtime state. Revisit when helios moves off libp2p 0.51." },
+    # gossipsub is used only by helios-opstack's `server` module (the p2p
+    # block-gossip node behind helios's standalone `server` binary, entered
+    # through `server::start_server`). Kao never calls it: its OP-stack
+    # client polls the consensus RPC over HTTP (net::build_op_backend), so no
+    # swarm is started and no peer can send it control messages. Revisit if
+    # Kao ever runs the gossip node, or when helios moves off libp2p 0.51.
+    { id = "RUSTSEC-2026-0534", reason = "libp2p-gossipsub 0.44.4 unbounded backoff state from PRUNE messages for unknown topics (memory DoS by a connected peer). Kao never starts a gossipsub swarm; fixed only in 0.50.1." },
+    { id = "RUSTSEC-2026-0535", reason = "libp2p-gossipsub 0.44.4 remote panic from an oversized PRUNE backoff. Kao never starts a gossipsub swarm; fixed only in 0.49.3+." },
+    { id = "RUSTSEC-2026-0536", reason = "libp2p-gossipsub 0.44.4 unbounded memory growth from GRAFT messages for unsubscribed topics. Kao never starts a gossipsub swarm; fixed only in 0.49.5+." },
+    { id = "RUSTSEC-2026-0537", reason = "libp2p-gossipsub 0.44.4 remote panic in the heartbeat from a large PRUNE backoff. Kao never starts a gossipsub swarm; fixed only in 0.49.4+." },
 
     # ── wallet signing path (alloy → k256 0.13 → elliptic-curve 0.13 →
     #    crypto-bigint 0.5) ─────────────────────────────────────────────────
@@ -58,11 +68,43 @@ ignore = [
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive 5.15.0 unmaintained (merged into zbus 6; no known vuln). Build-time derive macro for the same mundy → zbus 5 path." },
 
     # ── helios DNS subtree (reqwest 0.12 → hickory-resolver/hickory-proto) ─
-    # reqwest only uses hickory when the `hickory-dns` feature is on (helios
-    # enables it). Both issues fail-closed into DoS: the wallet can't fetch
-    # chain data, but keys never touch this path.
+    # reqwest only uses hickory when the `hickory-dns` feature is on. helios
+    # enables it, and cargo unifies features, so Kao's own reqwest 0.12
+    # clients resolve through hickory too. The reachable issues fail-closed
+    # into DoS: the wallet can't fetch chain data, but keys never touch this
+    # path. hickory is built with features futures-io/std/tokio (proto) and
+    # system-config/tokio (resolver) only — no `dnssec-*`, no `text-parsing`.
+    # reqwest 0.12 pins hickory-resolver 0.25, which gets no backports;
+    # every entry here goes away when helios moves to reqwest 0.13.
     { id = "RUSTSEC-2026-0118", reason = "hickory-proto 0.25.2 NSEC3 closest-encloser proof: unbounded loop on cross-zone responses can OOM the resolver task. Caps at helios losing RPC connectivity; no fix path until helios moves to hickory 0.26." },
     { id = "RUSTSEC-2026-0119", reason = "hickory-proto 0.25.2 O(n²) name compression on encode: CPU DoS via crafted DNS messages. Same DoS-only cap as -0118." },
+    { id = "RUSTSEC-2026-0491", reason = "hickory-proto 0.25.2 pre-allocates section vectors from the record counts in the DNS header: a spoofed response claiming 65,535 records reserves ~18 MB before decoding fails. Reachable by whoever can answer or spoof the wallet's DNS; transient memory DoS only, same cap as -0118. Fixed in 0.26.2." },
+    # Zone-file (text) parser. Lives in hickory-proto's `serialize::txt`
+    # module, compiled only with the `text-parsing` feature, which is off —
+    # a stub resolver decodes wire-format responses and never parses zone
+    # files. The code is not in the binary.
+    { id = "RUSTSEC-2026-0487", reason = "hickory-proto 0.25.2 panic on a malformed `alpn` value in SVCB/HTTPS records parsed from zone-file text. `text-parsing` feature is off; not compiled." },
+    { id = "RUSTSEC-2026-0489", reason = "hickory-proto 0.25.2 panic on a single-quote SVCB/HTTPS parameter value parsed from zone-file text. `text-parsing` feature is off; not compiled." },
+    { id = "RUSTSEC-2026-0490", reason = "hickory-proto 0.25.2 zone-file lexer panic on a token of 4096+ characters. `text-parsing` feature is off; not compiled." },
+    # DNSSEC validation. hickory-proto's `dnssec` module is compiled only
+    # with `dnssec-ring` / `dnssec-aws-lc-rs`; neither is enabled, so the
+    # validator is not in the binary and nothing treats a lookup as
+    # DNSSEC-validated. Endpoint authenticity comes from TLS (webpki roots),
+    # not DNS. Revisit all eleven if any dep ever turns a `dnssec-*` feature on.
+    { id = "RUSTSEC-2026-0504", reason = "hickory-proto 0.25 inverted NSEC3 comparison in DNSSEC validation. No `dnssec-*` feature; validator not compiled." },
+    { id = "RUSTSEC-2026-0505", reason = "hickory-proto NSEC3 owner names not checked against the zone in DNSSEC validation. No `dnssec-*` feature; validator not compiled." },
+    { id = "RUSTSEC-2026-0511", reason = "hickory-proto NXDOMAIN accepted for a proven empty non-terminal (DNSSEC validation). No `dnssec-*` feature; validator not compiled." },
+    { id = "RUSTSEC-2026-0512", reason = "hickory-proto DNSSEC validation accepted an unrelated signed RRset as the answer. No `dnssec-*` feature; validator not compiled." },
+    { id = "RUSTSEC-2026-0514", reason = "hickory-resolver 0.25.2 `lookup`/`lookup_ip` returned records that failed DNSSEC validation. Only with validation enabled; no `dnssec-*` feature, and reqwest never asks for validated answers." },
+    { id = "RUSTSEC-2026-0530", reason = "hickory-proto parent-side NSEC at a zone cut accepted as proof of nonexistence (DNSSEC validation). No `dnssec-*` feature; validator not compiled." },
+    { id = "RUSTSEC-2026-0531", reason = "hickory-proto child-side NSEC/NSEC3 accepted as proof a delegation has no DS record (DNSSEC validation). No `dnssec-*` feature; validator not compiled." },
+    { id = "RUSTSEC-2026-0532", reason = "hickory-proto 0.25 parent-side NSEC3 at a zone cut accepted as proof of nonexistence (DNSSEC validation). No `dnssec-*` feature; validator not compiled." },
+    { id = "RUSTSEC-2026-0549", reason = "hickory-proto NSEC3 NODATA at a zone apex accepted without a matching NSEC3 record (DNSSEC validation). No `dnssec-*` feature; validator not compiled." },
+    { id = "RUSTSEC-2026-0550", reason = "hickory-proto unsigned NSEC/NSEC3 record used in a nonexistence proof (DNSSEC validation). No `dnssec-*` feature; validator not compiled." },
+    { id = "RUSTSEC-2026-0551", reason = "hickory-proto records with a DNS class other than the query's marked secure without validation (DNSSEC validation). No `dnssec-*` feature; validator not compiled." },
+
+    # ── helios-ethereum time arithmetic (helios-ethereum → chrono 0.4) ─────
+    { id = "RUSTSEC-2026-0543", reason = "chrono 0.4.45 unmaintained (no known vuln; advisory recommends jiff/time). Only via helios-ethereum, which uses `chrono::Duration` for one consensus-sync delay computation — no parsing of untrusted input, no keys. Kao has no direct chrono dep. Revisit when helios drops chrono." },
 
     # ── helios checkpoint-fallback subtree (helios-ethereum → serde_yaml 0.9
     #    → unsafe-libyaml) ─────────────────────────────────────────────────

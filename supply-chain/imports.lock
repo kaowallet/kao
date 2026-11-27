@@ -2574,13 +2574,6 @@ delta = "1.9.0 -> 1.13.3"
 notes = "Unsafe code is forbidden, so there's no new unsafe code. There are 3 new optional dependencies, all reasonable (adding trait impls)."
 aggregated-from = "https://raw.githubusercontent.com/mozilla/cargo-vet/main/supply-chain/audits.toml"
 
-[[audits.mozilla.audits.toml_datetime]]
-who = "Jan-Erik Rediger <jrediger@mozilla.com>"
-criteria = "safe-to-deploy"
-version = "0.7.5+spec-1.1.0"
-notes = "Pure data type crate with some datetime parsing. No unsafe."
-aggregated-from = "https://raw.githubusercontent.com/mozilla/glean/main/supply-chain/audits.toml"
-
 [[audits.mozilla.audits.tracing-core]]
 who = "Alex Franchuk <afranchuk@mozilla.com>"
 criteria = "safe-to-deploy"
@@ -2759,12 +2752,6 @@ who = "Schell Carl Scivally <efsubenovex@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.20.10 -> 0.20.11"
 notes = "Only includes changes to cargo packaging, the library source itself is unchanged."
-aggregated-from = "https://raw.githubusercontent.com/zcash/librustzcash/main/supply-chain/audits.toml"
-
-[[audits.zcash.audits.dirs]]
-who = "Jack Grigg <jack@electriccoin.co>"
-criteria = "safe-to-deploy"
-delta = "5.0.1 -> 6.0.0"
 aggregated-from = "https://raw.githubusercontent.com/zcash/librustzcash/main/supply-chain/audits.toml"
 
 [[audits.zcash.audits.dirs-sys]]
